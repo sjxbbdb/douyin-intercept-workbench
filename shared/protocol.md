@@ -43,6 +43,7 @@
 | `active_hours_default` / `min_interval_ms_range` | `[["08:00","23:00"]]` / comment `60000–180000` / live_danmaku `30000–90000` / dm `300000–900000` | 默认活跃时段（**单一窗口 08:00–23:00**；客户端只能调更短，不可延长或新增窗口） / 各渠道最小发送间隔的**允许区间**；服务端取值必须落在区间内，客户端只能取更长间隔 |
 | `tier_day_boundaries` | observation 1–3 / warm_up 4–7 / ramp_up 8–14 / stable 15+ | 账号等级按**天数边界**判定（见 4.6），不得写成自定义区间 |
 | `stable_daily_max_total` / `plan_credit_ratio` / `min_plan_credit` | `70` / `1.0` / `12600` | 稳定期三来源日上限合计（评论 30 + 弹幕 30 + 私信 10，区间取上限）/ 套餐折扣系数 / 半年套餐最低积分（**运行时由 tier_table 推导，不得写死**） |
+| `agent_enabled` / `agent_batch_max_items` | `false` / `10` | **方案 B（专用 Agent）专用**，方案 A 不实现时保持默认即可。`agent_enabled` 为 Agent 自动审批的总开关，**默认 `false`**（与需求规格 FR-2.5「默认半自动」一致：Agent 不得在未获商家显式授权时自主投递发送）；`agent_batch_max_items` 是 `review_batch` 单批返回条数的**服务端上限**，客户端与 Agent 均**无法扩大**（Agent 可请求更小值）。服务端未下发时客户端按 `0` 处理并禁用 Agent 自动审批 |
 
 ## 2. 认证模型
 ### 2.1 会话、续期与失效

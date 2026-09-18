@@ -736,6 +736,8 @@ module.exports = { appendDecision }
 | 硬规则 | 提示词 | 代码层的强制点 | 文件 |
 |---|---|---|---|
 | 观察期不得发送任何内容 | §5.2 红线 1 | `review_batch` 在 `sending_enabled=false` 时**直接返回空批次**；`approve_batch` 返回 `POLICY_SENDING_DISABLED` | `review-batch.js` / `approve-batch.js` |
+| 不得把"看起来发出去了"当成成功 | §5.2 红线 2 | 成功判定复用既有 `platform/publish-verifier.js`：**只有 `verdict=sent_confirmed` 且 `confirm_signal=platform_response` 且 `platform_status_code=0` 才算成功与计费**；Agent 的汇报文本**不参与任何判定** | `platform/publish-verifier.js` + `license/reporter.js` |
+| 决策留痕必须是真实生效值 | §5.2 红线 3 | 决策记录带 `policy_version`；审计记录实际生效值而非设置值 | `planner.js` + `safety/audit.js` |
 | 不得超过日上限 | §5.2 能力边界 | `review_batch` 只返回额度内候选；`approve_batch` 二次校验 | 同上 + `safety/guard.js` |
 | 不得绕过最小间隔 | §5.2 能力边界 | 发送执行层强制；`approve_batch` 提前拦截 `SAFETY_INTERVAL_TOO_SHORT` | `approve-batch.js` + `host/scheduler.js` |
 | 不得发送候选池外内容 | §5.2 能力边界 | `approve_batch` 校验 `draft_id ∈ 该批次 candidates` | `approve-batch.js` |
@@ -1058,7 +1060,7 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 | **C-5** | `complaint`/`irrelevant` 的排除位置 | 契约 §3.4 注：「规则层应默认不进入待发批次」 | 契约 §四示例中，Agent 在 `review_batch` 返回的 10 条里 `reject` 了 2 条 `complaint` + 1 条 `irrelevant` | 两处**语义不同、并存不矛盾**：① `intent=complaint/irrelevant` 的线索在**预筛**阶段即被排除（代码保证）；② 示例中 Agent `reject` 的是**意图被判为询价但语气负面**的内容（语义级判断）。建议在契约文档补一句说明 |
 | **C-6** | `agent_*` 计数上报字段 | `shared/protocol.md` §7.5 字段白名单强校验，未知字段被丢弃 | 方案 B 需上报 Agent 计数与哈希 | 按 §8.1「新增可选请求字段」流程：**服务端先上线支持**。在此之前 Agent 计数**只落本地审计**。需在 `shared/protocol.md` 增补字段 |
 | **C-7** | 依赖白名单 | `AGENTS.md` §2.14 与 `shared/术语与选型基准.md` §3.2：唯一允许的第三方依赖是 `ws` | 接入 LLM 需要 HTTP(S) 客户端 | **用内置 `node:https` 自研**（约 80 行），**不引入任何 SDK**。引入官方 SDK 会违反依赖白名单，必须先报备 |
-| **C-8** | `plans/` 与 `shared/` 文档缺失 | `README-DEV.md` §七 声明 7 份 `plans/` 文档与 7 份 `shared/` 文档均 ✅ | 实际仓库中只有 `00-两方案对比与选型建议.md` 与 `B-工具契约与粒度设计.md` | 本文档引用的 `plans/A-工具链路开发指导.md`、`plans/A-分阶段任务清单.md`，以及 `shared/开发规范.md`、`测试策略.md`、`安全与合规要求.md`、`已知陷阱与平台知识.md`、`AI协作开发指引.md` **尚未创建**。第 0 步前置检查需要它们 |
+| **C-8** | 文档引用的既有规范需回读 | 本文档引用了 `shared/开发规范.md`、`测试策略.md`、`安全与合规要求.md`、`已知陷阱与平台知识.md`、`AI协作开发指引.md` 与 `plans/A-*.md` | 这些文档与本文件**同期编写**，可能存在口径细节差异（尤其**审计字段定义**与**测试分层**两处） | 开工前请**回读这六份文档**，确认：① 审计字段与本文 §7.2 一致；② 评估集在 `shared/测试策略.md` 中的分层定位与本文 §一 一致；③ `plans/A-分阶段任务清单.md` 的接口约定与本文 §3.1 的四处 adapters 出口一致。**发现冲突以 `docs/需求规格.md` 与 `shared/protocol.md` 为准** |
 
 ### 12.4 已发现的其他文档陈旧点（不阻塞，但应修正）
 

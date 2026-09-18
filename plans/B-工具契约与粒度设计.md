@@ -186,6 +186,23 @@
 | `SAFETY_SIMILARITY_BLOCKED` | 相似度过高 |
 | `SAFETY_INTERVAL_TOO_SHORT` | 间隔不足 |
 
+### ⚠️ 阻断码 ↔ 协议错误码的映射（两个命名空间，勿混用）
+
+上表是**工具层业务阻断码**（面向 Agent 与商家的可读结果），`shared/protocol.md` §3 里的 `POLICY_*` 是**协议层错误码**（面向 HTTP 响应的工程错误）。两者**不是同一套**，必须显式映射，否则 Agent 会拿到无法处理的错误码。
+
+| 工具阻断码 | 对应协议错误码 | 说明 |
+|---|---|---|
+| `POLICY_DAILY_CAP` | `POLICY_DAILY_CAP_EXCEEDED`(200) | ⚠️ **名称不同**。协议里是 `..._EXCEEDED` 且返回 **200**（业务结果非错误）；工具层对外统一暴露为 `POLICY_DAILY_CAP` |
+| `POLICY_SENDING_DISABLED` | `POLICY_SENDING_DISABLED`(409) | 同名 |
+| `POLICY_CIRCUIT_OPEN` | 心跳下发的 `commands:[{type:"circuit_break"}]`（无独立错误码） | 熔断是**状态**而非单次错误，工具层需从账号状态判定 |
+| `SAFETY_SIMILARITY_BLOCKED` | 无对应协议码（纯客户端护栏） | 客户端本地拦截，不上报为错误 |
+| `SAFETY_INTERVAL_TOO_SHORT` | 无对应协议码（纯客户端护栏） | 同上 |
+| `AGENT_DRAFT_NOT_IN_CANDIDATES` | `AGENT_DRAFT_NOT_IN_CANDIDATES`(400) | 同名 |
+| `AGENT_BATCH_EXPIRED` | `AGENT_BATCH_EXPIRED`(409) | 同名 |
+| （限流类，工具层未设独立码） | `RATE_TOO_MANY_REQUESTS`(429) | ⚠️ 限流属**传输层**，工具层不新增阻断码；客户端应自动退避重试，不作为业务阻断暴露给 Agent |
+
+**实现要求**：工具层**不得**把协议错误码原样抛给 Agent。Agent 只应看到上表左列的业务阻断码，形如 `{item_id, code, message}`。协议细节（HTTP 状态、错误信封）留在客户端与授权中心之间。
+
 ---
 
 ## 四、一次完整交互的例子
@@ -207,22 +224,41 @@ Agent 调用 T-01 query_leads({ intent: "price_inquiry", region: "南京", limit
 Agent 调用 T-06 review_batch({ source_type: "comment", max_items: 10 })
   ← { batch_id: "b-8f2a", items: [10 条，每条含 excerpt、intent、
        draft_options[3 条]、recommended_draft_id、safety 全通过] }
-  ⚠️ 关键：这 10 条是代码预筛的，全部已通过配额/间隔/相似度校验
+  ⚠️ 关键 1：这 10 条是代码预筛的，全部已通过配额/间隔/相似度校验
+  ⚠️ 关键 2：批次里【不含】 complaint / irrelevant —— 那些在规则层就被
+      排除了（见下文"两层过滤"）。所以 Agent 在批次里看不到投诉项。
 
-Agent 决策：3 条 request 语气匹配 → approve
-            2 条是 complaint → reject（reason: "负面评论不自动回复"）
-            1 条 irrelevant → reject
-            4 条 approve（选了比 recommended 更贴合语气的候选）
+Agent 决策：6 条 approve（其中 2 条选了比 recommended 更贴合语气的候选）
+            4 条 reject（reason: "这条问的是售后，话术池里没有匹配的候选"）
+            —— reject 是 Agent 的【合法否决权】：候选虽通过安全校验，
+               但 Agent 认为语义上不该回，可以否决。
 
 Agent 调用 T-07 approve_batch({ batch_id: "b-8f2a", decisions: [...10 条] })
-  ← { accepted: 7, rejected: 3, queued_send_ids: [...],
+  ← { accepted: 6, rejected: 4, queued_send_ids: [...],
       blocked: [{item_id: "it-7", code: "SAFETY_INTERVAL_TOO_SHORT"}] }
   ⚠️ 服务端二次校验拦掉了 1 条（该条刚好触发了间隔限制）
+  ⚠️ 注意 accepted 与 queued_send_ids 的关系：accepted 含被二次校验拦下的项，
+     queued_send_ids 只含真正入队待发的项
 
 Agent 向用户汇报：
-  "看了南京 17 条询价，挑了 7 条回复（已发出），
-   3 条是投诉或无关内容没有回，1 条因为发送间隔限制没发出去。"
+  "看了南京 17 条询价，挑了 6 条回复（已发出），
+   4 条因为话术池没有匹配的候选没有回，1 条因为发送间隔限制没发出去。"
 ```
+
+### 两层过滤（⚠️ 最容易误读的一处，务必分清）
+
+`complaint` / `irrelevant` 的排除与 Agent 的 `reject` 是**两个不同层次**，不是一回事：
+
+| 层 | 谁来做 | 作用对象 | 说明 |
+|---|---|---|---|
+| **第一层：规则层排除** | **代码**（不由 Agent 判断） | `complaint`、`irrelevant` 等高风险意图 | 在**生成待发批次之前**就排除，**这些项根本不会出现在 `review_batch` 的返回里**。理由：在负面评论下自动回复有公关风险，这个判断**不能依赖概率模型** |
+| **第二层：Agent 否决权** | **Agent** | 批次内已通过安全校验的候选 | Agent 看到候选后，可因**语义不匹配**（如话术池没有合适候选、语气不对）而 `reject` |
+
+**为什么这样分层**：第一层管"不该碰的"（高风险，硬规则，代码强制）；第二层管"该不该由这条回复"（语义判断，Agent 擅长）。
+
+⚠️ **实现要求**：`review_batch` 的返回中**不得出现** `complaint` / `irrelevant` 的项。若测试发现批次里出现这两类意图，说明第一层过滤缺失，属缺陷（验收项见 §八）。
+
+⚠️ **反过来说**：Agent 的 `reject` **不是**用来兜底高风险意图的。不能因为"Agent 会 reject 掉投诉"就省掉第一层过滤——那等于把公关风险交给概率模型。
 
 **这个例子里 Agent 做了三件有价值的事**：① 理解"别超过 10 个"并映射到 `max_items`；② 把负面评论挑出来不回复（语义判断，规则难做）；③ 在候选里选更贴合语气的文案。
 
