@@ -528,12 +528,13 @@ P2 完成后，**必须**用**真实抖音测试账号**（专门小号，不要
 ### 8.2 全项目完成定义
 
 1. `docs/需求规格.md` §九 的 **23 条验收标准**逐条可复现、可举证。
-2. `docs/架构说明.md` §一 的 **S-1~S-6** 稳定指标全部达标：72 小时不崩溃 / 自愈率 ≥95% / 每个失败可定位到阶段与原因 / 改版修复只改 1 个文件 / 零重复发送与零重复扣费 / 故障不跨实例传播。
-3. **三条红线有对应的自动化测试**：
+2. `docs/架构说明.md` §一 的 **S-1~S-6** 全部达标：72 小时不崩溃 / 自愈率 ≥95% / 每个失败可定位到阶段与原因 / 改版修复只改 1 个文件 / 零重复发送与零重复扣费 / 故障不跨实例传播。
+3. **三条红线各有对应的自动化测试**：
    - 红线 1：越权上报返回 `POLICY_VIOLATION`；观察期无法通过任何界面操作开始发送；策略收紧后 60 秒内生效。
    - 红线 2：风控拒绝的发送不扣费且台账无消耗记录；同 `send_id` 重复上报 10 次只扣 1 条；`confirm_signal=dom_stable` 永不产生 `billed`。
-   - 红线 3：审计记录含 `applied_policy_version` 与 `applied_limits`；上报体内不含任何禁用隐私字段；`POLICY_VIOLATION` 的越权尝试可在导出中检索到。
-4. 全仓无 `data-e2e` 字符串出现在 `client/platform/selectors.js` 之外；无生产代码 `require('../../legacy/...')`；`license-server/` 与 `client/` 之间无 `require`。
+   - 红线 3：审计含 `applied_policy_version` 与 `applied_limits`；上报体内无任何禁用隐私字段；越权尝试可在 `audit export` 中检索到。
+4. 全仓无 `data-e2e` 字符串出现在 `client/platform/selectors.js` 之外；无生产代码 `require` `legacy/`；`license-server/` 与 `client/` 之间无 `require`；无空 `catch {}`（`AGENTS.md` §2.8 的自检命令输出 `EMPTY_CATCH_TOTAL 0`）。
+5. 涉及页面操作的功能**已真机验证**（`AGENTS.md` §6：**"代码写完"不等于"完成"**）。
 
 ---
 
