@@ -190,8 +190,9 @@ douyin-intercept-workbench/
 1. 路径 2 全部内容（**B 依赖 A 的底座，不能跳过**）
 2. `plans/B-Agent开发指导.md`（**主文档**）
 3. `plans/B-工具契约与粒度设计.md`（**最关键：粒度切错了整个方案就失败**）
-4. `plans/B-评估集与成本模型.md`
-5. `plans/B-与方案A的差异说明.md`
+4. `plans/B-分阶段任务清单.md`（**逐项执行，BP0~BP5，含验收判据**）
+5. `plans/B-评估集与成本模型.md`
+6. `plans/B-与方案A的差异说明.md`
 
 ### 路径 4：我是 AI 编码智能体，被指派实现某个模块
 
@@ -259,6 +260,7 @@ douyin-intercept-workbench/
 | `plans/B-工具契约与粒度设计.md` | **Agent 工具粒度设计**（方案 B 成败关键） | ✅ |
 | `plans/B-评估集与成本模型.md` | Agent 评估方法、token 成本测算、定价影响 | ✅ |
 | `plans/B-与方案A的差异说明.md` | 增量改动清单（复用 A 底座） | ✅ |
+| `plans/B-分阶段任务清单.md` | 方案 B 逐项任务（BP0~BP5，含验收判据与硬阻塞点） | ✅ |
 
 ---
 
