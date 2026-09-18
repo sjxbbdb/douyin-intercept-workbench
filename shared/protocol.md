@@ -37,7 +37,7 @@
 | `device_limit` / `login_fail_limit` / `login_lock_ms` | `1` / `5` / `600000` | 并发设备上限 / 密码错误阈值 / 锁定 10 分钟 |
 | `sign_ts_tolerance_ms` / `nonce_ttl_ms` | `300000` / `600000` | 签名时间戳容忍 ±5 分钟 / nonce 保留 10 分钟 |
 | `max_pending_sends` / `min_client_version` / `stats_tz_offset_minutes` | `20000` / `3.0.0` / `480` | 本地待上报上限（超出丢最旧并告警）/ 最低客户端版本 / 统计时区 |
-| `plan_credit_ratio` / `stable_daily_max_total` / `min_plan_credit` | `1.0` / `340` / `61200` | 套餐折扣系数 / 稳定期三来源日上限合计 / 半年套餐最低积分（见 4.14） |
+| `plan_credit_ratio` / `stable_daily_max_total` / `min_plan_credit` | `1.0` / `70` / `12600` | 套餐折扣系数 / 稳定期三来源日上限合计 / 半年套餐最低积分（见 4.14） |
 
 ## 2. 认证模型
 ### 2.1 会话、续期与失效
@@ -84,7 +84,7 @@
 | `CREDIT_REDEEM_CODE_EXPIRED` / `CREDIT_REDEEM_CODE_DISABLED` | 410 / 403 | 卡密已过期 / 卡密已作废或绑定其他账号 | 提示联系客服换新 / 提示不可用，联系客服 |
 | `CREDIT_REDEEM_ALREADY_DONE` | 200 | 同 `request_id` 重复兑换（幂等命中） | 展示首次结果 |
 | `PLAN_NOT_FOUND` | 404 | 套餐不存在 | 展示错误，不重试 |
-| `PLAN_QUOTA_BELOW_MIN` / `PLAN_INVALID_DURATION` | 400 | 发放积分低于 `min_plan_credit`（默认 61200）/ `valid_days` ≤ 0 或 > 3650 | 提示管理员调整套餐或修正时长 |
+| `PLAN_QUOTA_BELOW_MIN` / `PLAN_INVALID_DURATION` | 400 | 发放积分低于 `min_plan_credit`（默认 12600）/ `valid_days` ≤ 0 或 > 3650 | 提示管理员调整套餐或修正时长 |
 | `PLAN_ALREADY_ACTIVE` | 409 | 同套餐已生效且未到期 | 提示剩余天数 |
 
 | `POLICY_VIOLATION` | 409 | 上报的生效配置**高于**服务端策略 | 立即把本地上限降到服务端值并重新上报；**不得继续按高配发送** |
@@ -123,11 +123,11 @@
 {"ok":true,"server_time_ms":1758096000000,"protocol_version":2,"token":"b7f1c0...e4a9","token_expires_ms":1758700800000,
  "sign_key":"3d91ab...07fe","sign_key_expires_ms":1758700800000,"privacy_salt":"a41c9b...2d77","privacy_salt_version":1,
  "account":{"account_id":"acc_1001","display_name":"示例店铺","status":"active","plan_id":"plan_half_year","plan_expires_ms":1773676800000,"device_limit":1},
- "credit":{"balance_milli":61200000,"credit_per_reply_milli":1000,"updated_at_ms":1758096000000},
- "policy":{"policy_version":7,"account_tier":"observation","tier_started_ms":1758096000000,"active_hours":{"tz_offset_minutes":480,"windows":[["09:00","12:00"],["14:00","22:30"]]},
-   "limits":{"comment":{"daily_max":30,"min_interval_ms":30000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":20,"min_interval_ms":45000,"content_similarity_max":0.85},"dm":{"daily_max":3,"min_interval_ms":300000,"content_similarity_max":0.75,"new_conversation_daily_max":2}},
+ "credit":{"balance_milli":12600000,"credit_per_reply_milli":1000,"updated_at_ms":1758096000000},
+ "policy":{"policy_version":7,"account_tier":"observation","tier_started_ms":1758096000000,"active_hours":{"tz_offset_minutes":480,"windows":[["08:00","23:00"]]},
+   "limits":{"comment":{"daily_max":0,"min_interval_ms":60000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":0,"min_interval_ms":60000,"content_similarity_max":0.85},"dm":{"daily_max":0,"min_interval_ms":900000,"content_similarity_max":0.75,"new_conversation_daily_max":2}},
    "circuit_breaker":{"failure_rate_threshold":0.4,"failure_rate_window":20,"platform_reject_threshold":3,"cooldown_ms":1800000,"risk_code_cooldown_ms":86400000},"idle_pause_ms":7200000,"effective_from_ms":1758096000000,"expires_ms":1758700800000,"policy_hash":"5b2e...a10c"},
- "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 340 条（评论 200 / 弹幕 120 / 私信 20）。半年套餐 61200 积分按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延。积分只对平台确认成功的回复扣减。","daily_cap_total":340,"valid_days":180,"credits":61200},
+ "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 70 条（评论 30 / 弹幕 30 / 私信 10）。半年套餐 12600 积分按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延。积分只对平台确认成功的回复扣减。","daily_cap_total":70,"valid_days":180,"credits":12600},
  "limits":{"heartbeat_interval_ms":60000,"grace_ms":86400000,"send_batch_interval_ms":300000,"send_batch_max":50,"audit_batch_max":500,"offline_send_grace_ms":900000,"offline_budget_ratio":0.5,"sign_ts_tolerance_ms":300000,"max_pending_sends":20000},
  "kicked_device_id":null,"min_client_version":"3.0.0","force_upgrade":false,"upgrade_url":"https://license.example.com/download","login_proof":"c81f...9ab3"}
 ```
@@ -195,9 +195,9 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 用于启动、`POLICY_VERSION_UNKNOWN`、收到 `reload_policy` 时按需拉取。
 ```json
 {"ok":true,"server_time_ms":1758096060000,"policy":{"policy_version":8,"account_tier":"warm_up","…":"结构同 4.1"},
- "tier_table":[{"tier":"observation","min_days":0,"limits":{"comment":{"daily_max":30,"min_interval_ms":30000},"live_danmaku":{"daily_max":20,"min_interval_ms":45000},"dm":{"daily_max":3,"min_interval_ms":300000}}},{"tier":"warm_up","min_days":8,"limits":{"comment":{"daily_max":80,"min_interval_ms":30000},"live_danmaku":{"daily_max":50,"min_interval_ms":45000},"dm":{"daily_max":8,"min_interval_ms":240000}}},
-   {"tier":"ramp_up","min_days":15,"limits":{"comment":{"daily_max":150,"min_interval_ms":25000},"live_danmaku":{"daily_max":90,"min_interval_ms":40000},"dm":{"daily_max":15,"min_interval_ms":180000}}},{"tier":"stable","min_days":31,"limits":{"comment":{"daily_max":200,"min_interval_ms":20000},"live_danmaku":{"daily_max":120,"min_interval_ms":30000},"dm":{"daily_max":20,"min_interval_ms":120000}}}],
- "daily_cap_total_by_tier":{"observation":53,"warm_up":138,"ramp_up":255,"stable":340},"client_may_lower_only":true}
+ "tier_table":[{"tier":"observation","day_from":1,"day_to":3,"limits":{"comment":{"daily_max":0,"min_interval_ms":60000},"live_danmaku":{"daily_max":0,"min_interval_ms":60000},"dm":{"daily_max":0,"min_interval_ms":900000}}},{"tier":"warm_up","day_from":4,"day_to":7,"limits":{"comment":{"daily_max":10,"min_interval_ms":60000},"live_danmaku":{"daily_max":10,"min_interval_ms":60000},"dm":{"daily_max":3,"min_interval_ms":900000}}},
+   {"tier":"ramp_up","day_from":8,"day_to":14,"limits":{"comment":{"daily_max":25,"min_interval_ms":60000},"live_danmaku":{"daily_max":25,"min_interval_ms":60000},"dm":{"daily_max":8,"min_interval_ms":900000}}},{"tier":"stable","day_from":15,"limits":{"comment":{"daily_max":30,"min_interval_ms":60000},"live_danmaku":{"daily_max":30,"min_interval_ms":60000},"dm":{"daily_max":10,"min_interval_ms":900000}}}],
+ "daily_cap_total_by_tier":{"observation":0,"warm_up":23,"ramp_up":58,"stable":70},"client_may_lower_only":true}
 ```
 **客户端只能调低，不能调高**；任一项高于当前 `policy` → 该次上报返回 `POLICY_VIOLATION`｜**幂等**：是。
 
@@ -308,11 +308,11 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 
 ### 4.14 `GET /api/v1/account/plan`（鉴权+签名）
 ```json
-{"ok":true,"server_time_ms":1758096060000,"credit_per_reply_milli":1000,"stable_daily_max_total":340,"min_plan_credit":61200,"plan_credit_formula":"stable_daily_max_total × valid_days × plan_credit_ratio",
- "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 340 条（评论 200 / 弹幕 120 / 私信 20）。半年套餐 61200 积分 = 按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延为额外发送量。积分只对平台确认成功的回复扣减，失败与被风控拒绝不扣费。",
-   "daily_cap_total":340,"daily_cap_detail":{"comment":200,"live_danmaku":120,"dm":20},"credits_per_day_at_cap":340,"valid_days":180,"estimated_days_at_cap":180,"note":"安全上限会限制实际消耗速度，因此套餐按期而非按量承诺；额度按积分计量，有效期按 valid_days 计算。"},
- "plans":[{"plan_id":"plan_half_year","name":"半年套餐","valid_days":180,"credits":61200,"credits_milli":61200000,"price_cents":59900,"active":true,"hours":null},{"plan_id":"plan_year","name":"年套餐","valid_days":365,"credits":124100,"credits_milli":124100000,"price_cents":99900,"active":true,"hours":null}],
- "current":{"plan_id":"plan_half_year","expires_ms":1773676800000,"remaining_days":176,"credits_remaining_milli":61188000}}
+{"ok":true,"server_time_ms":1758096060000,"credit_per_reply_milli":1000,"stable_daily_max_total":70,"min_plan_credit":12600,"plan_credit_formula":"stable_daily_max_total × valid_days × plan_credit_ratio",
+ "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 70 条（评论 30 / 弹幕 30 / 私信 10）。半年套餐 12600 积分 = 按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延为额外发送量。积分只对平台确认成功的回复扣减，失败与被风控拒绝不扣费。",
+   "daily_cap_total":70,"daily_cap_detail":{"comment":30,"live_danmaku":30,"dm":10},"credits_per_day_at_cap":70,"valid_days":180,"estimated_days_at_cap":180,"note":"安全上限会限制实际消耗速度，因此套餐按期而非按量承诺；额度按积分计量，有效期按 valid_days 计算。"},
+ "plans":[{"plan_id":"plan_half_year","name":"半年套餐","valid_days":180,"credits":12600,"credits_milli":12600000,"price_cents":0,"active":true,"hours":null},{"plan_id":"plan_year","name":"年套餐","valid_days":365,"credits":25550,"credits_milli":25550000,"price_cents":0,"active":true,"hours":null}],
+ "current":{"plan_id":"plan_half_year","expires_ms":1773676800000,"remaining_days":176,"credits_remaining_milli":12588000}}
 ```
 | 套餐字段 | 类型 | 说明 |
 |---|---|---|
@@ -321,12 +321,14 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 | `hours` | int\|null | **已废弃**：历史字段，服务端恒返回 `null`，客户端必须忽略，禁止据此展示 |
 
 ```
-stable_daily_max_total = policy(stable).comment.daily_max + policy(stable).live_danmaku.daily_max + policy(stable).dm.daily_max   // 默认 200+120+20 = 340
+stable_daily_max_total = policy(stable).comment.daily_max + policy(stable).live_danmaku.daily_max + policy(stable).dm.daily_max   // 默认 30+30+10 = 70
 plan.credits           = ceil(stable_daily_max_total × valid_days × plan_credit_ratio)   // ratio 默认 1.0
-min_plan_credit        = ceil(stable_daily_max_total × 180 × plan_credit_ratio)          // 默认 61200
+min_plan_credit        = ceil(stable_daily_max_total × 180 × plan_credit_ratio)          // 默认 12600
 plan.credits < min_plan_credit → PLAN_QUOTA_BELOW_MIN（半年套餐不得低于 6 个月折算额度）
 ```
-默认数值：半年套餐 `valid_days=180`、`credits=340×180=61200`；年套餐 `valid_days=365`、`credits=340×365=124100`。
+默认数值：半年套餐 `valid_days=180`、`credits=70×180=12600`；年套餐 `valid_days=365`、`credits=70×365=25550`。
+**实现强制要求（防止文案与策略不同步）**：`plan.credits`、`min_plan_credit` 与 `quota_notice` 中的全部数字**必须在运行时由 `tier_table` 实时推导**，禁止在代码或数据库中硬编码。理由：安全上限会随平台风控变化而调整（这正是"策略服务端下发"的意义），若积分与文案写死，改上限后会出现"界面写每日 70 条、套餐却按 340 条折算"这类错误告知，将直接成为售后纠纷与举证不利的依据。`price_cents` 由商务在管理后台配置，**契约中的价格为占位值，不得作为定价依据**。
+**阈值语义**：`content_similarity_max` 表示"与近期已发内容的相似度**超过**该值即拒绝发送"（`0.85` = 相似度超过 85% 时拒绝第二条）。实现时注意方向，不得反转为"低于才拒绝"。
 **必须写进产品文案的一条**：买了半年套餐 ≠ 半年内能无限发。平台的日上限才是真正的量级约束，套餐只是预付额度。因此：① 客户端在**套餐展示页、充值页、首次登录弹窗、余额不足提示**四处必须原样显示 `quota_notice.headline` 与 `detail`，不得改写、折叠或隐藏；② 余额展示必须同时显示"剩余可发条数 `replies_affordable`"与"今日剩余额度 `daily_quota.*.remaining`"；③ 兼容：`protocol_version=1` 的旧客户端请求本接口时服务端额外返回按废弃汇率折算的 `hours` 并记 `audit_flag:"legacy_hours_served"`，新客户端忽略该字段。
 **错误码** `AUTH_*` `PLAN_NOT_FOUND`｜**幂等**：是。
 
@@ -469,7 +471,7 @@ function settleSendBatch(acc, batch, nowMs) {
 | 9 | 余额剩 0.3 条，来 1 条成功 | 该条全额入账（跨零点唯一一次透支），余额变 -0.7 条积分，`state="exhausted"` |
 | 10 | 同一 `send_id` 先报 `sent_confirmed`，后报 `failed` | `AUDIT_SEND_CONFLICT`(409)，拒绝且保留首次计费记录 |
 | 11 | 服务端重启 | 状态全在 SQLite（`send_log` UNIQUE/`credit_ledger`/`account_billing`）；未 ACK 明细按原 `send_id` 重发，唯一索引保证只扣一次 |
-| 12 | 客户端把 `applied_limits.dm.daily_max` 上报为 60（策略 20） | `POLICY_VIOLATION`(409) 整批拒绝，`detail` 给出 `field/reported/allowed/policy_version`；客户端必须降回 20 |
+| 12 | 客户端把 `applied_limits.dm.daily_max` 上报为 20（策略 10） | `POLICY_VIOLATION`(409) 整批拒绝，`detail` 给出 `field/reported/allowed/policy_version`；客户端必须降回 10 |
 | 13 | 客户端谎报 `account_tier="stable"` | `POLICY_TIER_UNKNOWN`(400)；等级只以服务端下发为准，客户端上报值不参与任何计算 |
 | 14 | `online_seconds` 很大但无任何发送明细 | 消耗 0 积分（时长不计费）；仅影响"在线时长"运营统计 |
 
