@@ -40,6 +40,13 @@ const BILLING_STATUS = Object.freeze([
 
 const ACCOUNT_TIERS = Object.freeze(['observation', 'warm_up', 'ramp_up', 'stable'])
 
+// ⚠️ 时间口径常量放这里（而不是某一端），因为**双端必须完全一致**：
+//    "哪一天"的定义如果两端不同，配额计算与计费就会错位。
+//    shared/lib 是唯一允许双端共享的地方。
+const MS_PER_DAY = 86400000
+/** 统计与等级判定的时区偏移（UTC+8，分钟） */
+const TZ_OFFSET_MINUTES = 480
+
 // 等级按天数边界（protocol.md §4.6 / §1.4）
 const TIER_DAY_BOUNDARIES = Object.freeze([
   { tier: 'observation', day_from: 1,  day_to: 3 },
@@ -52,4 +59,5 @@ module.exports = {
   PROTOCOL_VERSION, API_PREFIX,
   SOURCE_TYPES, VERDICTS, SOURCE_COUNTERS, CONFIRM_SIGNALS, FAILURE_REASONS,
   PLATFORM_ENDPOINTS, BILLING_STATUS, ACCOUNT_TIERS, TIER_DAY_BOUNDARIES,
+  MS_PER_DAY, TZ_OFFSET_MINUTES,
 }

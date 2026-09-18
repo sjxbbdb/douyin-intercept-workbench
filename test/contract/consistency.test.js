@@ -269,39 +269,114 @@ test('契约：data-e2e 只允许出现在 selectors.js', () => {
 })
 
 // ---------- 5. 空 catch（AGENTS.md §2.8） ----------
+/**
+ * 找出"体里没有任何处理逻辑"的 catch。
+ *
+ * ⚠️ 两个必须避开的坑（都实际踩过）：
+ *
+ *   1. **不能简单用 /catch\s*\{\s*\}/** —— 那样会把
+ *      `catch { /* 说明 *\/ corrupt++ }` 这种**有逻辑但带注释**的误报为空。
+ *
+ *   2. **必须先剥离注释再扫描**。踩过的坑：源码注释里写着
+ *      "旧代码用 try{}catch{} 静默吞掉写盘失败"，正则把这句**注释文字**
+ *      当成了真的 catch，报出一个根本不存在的空 catch。
+ *      剥离注释同时也避免注释里的花括号打乱配对。
+ */
+function findEmptyCatches(src) {
+  // 先剥离注释（保留长度无关，只需语义正确）
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+
+  const hits = []
+  const re = /catch\s*(?:\([^)]*\))?\s*\{/g
+  let m
+  while ((m = re.exec(code)) !== null) {
+    // 从 { 之后开始做括号配对，取出 catch 体
+    let depth = 1
+    let i = m.index + m[0].length
+    const start = i
+    while (i < code.length && depth > 0) {
+      const ch = code[i]
+      if (ch === '{') depth++
+      else if (ch === '}') depth--
+      i++
+    }
+    const body = code.slice(start, i - 1).trim()
+    if (body === '') hits.push(src.slice(0, m.index).split('\n').length)
+  }
+  return hits
+}
+
 test('契约：不存在空 catch', () => {
   const offenders = []
   for (const dir of ['client', 'license-server', 'shared']) {
     for (const f of collectJsFiles(path.join(ROOT, dir))) {
       const src = fs.readFileSync(f, 'utf8')
-      if (/catch\s*(\([^)]*\))?\s*\{\s*\}/.test(src)) offenders.push(path.relative(ROOT, f))
+      const lines = findEmptyCatches(src)
+      if (lines.length > 0) {
+        offenders.push(`${path.relative(ROOT, f)}:${lines.join(',')}`)
+      }
     }
   }
-  assert.deepStrictEqual(offenders, [], '发现空 catch（旧代码因此静默丢数据）：\n' + offenders.join('\n'))
+  assert.deepStrictEqual(offenders, [],
+    '发现空 catch（旧代码因此静默丢数据）：\n' + offenders.join('\n') +
+    '\n即使确实要忽略，也必须写明原因或计数——注释不算处理逻辑。')
 })
 
 // ---------- 6. 单写者（AGENTS.md §2.9） ----------
-test('契约：writeFileSync 只允许出现在 host/store.js', () => {
+// ⚠️ 校验目标是"**运行数据**的写入只有一个写者"，
+//    不是"禁止出现 writeFileSync 这个 API"。
+//    因此允许两个白名单：
+//      · client/host/store.js —— 运行数据的唯一写者
+//      · client/config.js     —— 只写**实例配置文件**（原子写），
+//                                不涉及队列/历史等运行数据
+test('契约：运行数据的 writeFileSync 只允许出现在 host/store.js', () => {
+  const ALLOWED = new Set([
+    path.join('host', 'store.js'),
+    'config.js', // client/config.js：仅写实例配置，且用原子写
+  ])
   const offenders = []
   for (const f of collectJsFiles(path.join(ROOT, 'client'))) {
-    if (f.endsWith(path.join('host', 'store.js'))) continue
+    const rel = path.relative(path.join(ROOT, 'client'), f)
+    if (ALLOWED.has(rel)) continue
     if (fs.readFileSync(f, 'utf8').includes('writeFileSync')) offenders.push(path.relative(ROOT, f))
   }
-  assert.deepStrictEqual(offenders, [])
+  assert.deepStrictEqual(offenders, [],
+    '运行数据只能由 host/store.js 写入（单写者）：\n' + offenders.join('\n') +
+    '\n如确需新增写入点，请先确认它不涉及运行数据，并加入本测试的白名单。')
 })
 
 // ---------- 7. 绝对路径（D-1 阻断级缺陷） ----------
+// ⚠️ 校验目标是"**不写死开发机/部署机的具体路径**"，
+//    不是"禁止出现任何 Windows 盘符"。
+//    因此放行系统路径探测（Program Files / LOCALAPPDATA 等）——
+//    那是跨机器可移植的，与 `D:\deep seek\...` 这种硬编码性质不同。
+const SYSTEM_PATH_PATTERNS = [
+  /["'`][A-Za-z]:\\\\Program Files/i,
+  /["'`][A-Za-z]:\\\\Program Files \(x86\)/i,
+  /["'`][A-Za-z]:\\\\Windows/i,
+  /["'`][A-Za-z]:\\\\Users\\\\/i,
+]
 test('契约：不存在硬编码绝对路径', () => {
   const offenders = []
   for (const dir of ['client', 'license-server', 'shared']) {
     for (const f of collectJsFiles(path.join(ROOT, dir))) {
       const src = fs.readFileSync(f, 'utf8')
-      if (/["'`][A-Za-z]:\\\\/.test(src) || /["'`]\/(home|root|var|opt)\//.test(src)) {
-        offenders.push(path.relative(ROOT, f))
-      }
+      const lines = src.split('\n')
+      lines.forEach((line, i) => {
+        if (SYSTEM_PATH_PATTERNS.some((re) => re.test(line))) return // 系统路径探测，放行
+        if (/["'`][A-Za-z]:\\\\/.test(line)) {
+          offenders.push(`${path.relative(ROOT, f)}:${i + 1}`)
+        } else if (/["'`]\/(home|root|var|opt)\//.test(line)) {
+          offenders.push(`${path.relative(ROOT, f)}:${i + 1}`)
+        }
+      })
     }
   }
-  assert.deepStrictEqual(offenders, [], '硬编码绝对路径（旧代码阻断级缺陷 D-1）：\n' + offenders.join('\n'))
+  assert.deepStrictEqual(offenders, [],
+    '硬编码绝对路径（旧代码阻断级缺陷 D-1，换机器即跑不通）：\n' + offenders.join('\n') +
+    '\n路径请经 REPLY_WORKSPACE 或 path.join 解析。')
 })
 
 // ---------- 8. 白名单依赖 ----------
@@ -311,6 +386,74 @@ test('契约：package.json 只依赖 ws', () => {
   const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'))
   const deps = Object.keys(pkg.dependencies || {})
   assert.deepStrictEqual(deps.filter((d) => d !== 'ws'), [], '引入了白名单外的依赖')
+})
+
+// ---------- 9. 跨端依赖禁令 ----------
+// ⚠️ license-server 与 client 是**两个独立部署单元**：
+//    一个跑在厂商的 Linux 服务器上，一个跑在商家 Windows 机器上。
+//    它们只能通过 shared/protocol.md 定义的 HTTP 接口通信，
+//    代码层面**不得互相 require**。
+//
+//    实际踩过：客户端 safety/guard.js 曾 require 服务端的 policy.js
+//    来取时间常量。这在单仓库里"能跑"，但打包成两个分发包后
+//    客户端会因为找不到 license-server/** 而启动失败。
+test('契约：license-server 与 client 不得互相 require', () => {
+  const offenders = []
+
+  const scan = (dir, forbidden) => {
+    for (const f of collectJsFiles(path.join(ROOT, dir))) {
+      const src = fs.readFileSync(f, 'utf8')
+      for (const m of src.matchAll(/require\(['"]([^'"]+)['"]\)/g)) {
+        const spec = m[1]
+        if (spec.startsWith('.')) {
+          // 解析相对路径，判断是否跨到对方目录
+          const resolved = path.resolve(path.dirname(f), spec)
+          if (resolved.includes(path.sep + forbidden + path.sep)) {
+            offenders.push(`${path.relative(ROOT, f)} → ${spec}`)
+          }
+        } else if (spec.startsWith(`${forbidden}/`) || spec === forbidden) {
+          offenders.push(`${path.relative(ROOT, f)} → ${spec}`)
+        }
+      }
+    }
+  }
+
+  scan('client', 'license-server')
+  scan('license-server', 'client')
+
+  assert.deepStrictEqual(offenders, [],
+    '发现跨端依赖（打包成独立分发包后会启动失败）：\n' + offenders.join('\n') +
+    '\n共享代码请放 shared/lib/')
+})
+
+test('契约：shared/lib 不得依赖任一端', () => {
+  const offenders = []
+  for (const f of collectJsFiles(path.join(ROOT, 'shared'))) {
+    const src = fs.readFileSync(f, 'utf8')
+    for (const m of src.matchAll(/require\(['"]([^'"]+)['"]\)/g)) {
+      const spec = m[1]
+      if (/^(\.\.\/)+(client|license-server)\//.test(spec) ||
+          /^(client|license-server)\//.test(spec)) {
+        offenders.push(`${path.relative(ROOT, f)} → ${spec}`)
+      }
+    }
+  }
+  assert.deepStrictEqual(offenders, [],
+    'shared/lib 必须保持中立（它是双端共享层）：\n' + offenders.join('\n'))
+})
+
+test('契约：时间口径常量在 shared/lib 中定义且双端引用同一份', () => {
+  const P = require('../../shared/lib/protocol')
+  assert.strictEqual(P.MS_PER_DAY, 86400000)
+  assert.strictEqual(P.TZ_OFFSET_MINUTES, 480)
+
+  // 服务端不得重新定义（否则会与客户端漂移）
+  const policySrc = fs.readFileSync(
+    path.join(ROOT, 'license-server/domain/policy.js'), 'utf8')
+  assert.ok(!/const\s+MS_PER_DAY\s*=/.test(policySrc),
+    'license-server/domain/policy.js 不得重新定义 MS_PER_DAY')
+  assert.ok(!/const\s+TZ_OFFSET_MINUTES\s*=/.test(policySrc),
+    'license-server/domain/policy.js 不得重新定义 TZ_OFFSET_MINUTES')
 })
 
 function collectJsFiles(dir) {

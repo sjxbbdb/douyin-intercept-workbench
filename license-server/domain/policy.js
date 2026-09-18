@@ -18,7 +18,9 @@
 const crypto = require('node:crypto')
 const { stableStringify } = require('../../shared/lib/stable-stringify')
 const { AppError } = require('../../shared/lib/errors')
-const { SOURCE_TYPES, ACCOUNT_TIERS, TIER_DAY_BOUNDARIES } = require('../../shared/lib/protocol')
+const {
+  SOURCE_TYPES, ACCOUNT_TIERS, TIER_DAY_BOUNDARIES, MS_PER_DAY, TZ_OFFSET_MINUTES,
+} = require('../../shared/lib/protocol')
 
 // ═══════════════════════════════════════════════════════════
 // 1. 等级表（唯一来源）
@@ -100,9 +102,9 @@ const ACTIVE_HOURS_DEFAULT = Object.freeze([Object.freeze(['08:00', '23:00'])])
 const CONTENT_SIMILARITY_SEMANTICS =
   '与近期已发内容的相似度**超过**该值即拒绝发送（0.85 = 相似度 > 85% 拒绝）'
 
-const MS_PER_DAY = 86400000
-/** 统计与等级判定的时区偏移（UTC+8，分钟） */
-const TZ_OFFSET_MINUTES = 480
+// ⚠️ MS_PER_DAY 与 TZ_OFFSET_MINUTES 从 shared/lib/protocol.js 引入，
+//    不在此处重新定义。理由：客户端也要用同一套时间口径，
+//    两处定义迟早漂移——而"哪一天"的定义不一致会让配额与计费错位。
 
 // ═══════════════════════════════════════════════════════════
 // 2. 等级推导
