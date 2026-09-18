@@ -131,6 +131,27 @@ class PublishVerifier {
   }
 
   /**
+   * 中止捕获（异常路径用）。
+   *
+   * ⚠️ 存在的理由：抓不到响应时 `verify()` 内部会关掉捕获，但如果
+   *    **调用方在 `verify()` 之前就抛错**了（例如输入文案失败），
+   *    捕获会一直开着。而 `Network` 域的监听器是**累加**的——
+   *    泄漏几次之后每个响应都会被处理多遍，内存与 CPU 都会慢慢涨上去，
+   *    表现是"跑了一夜之后变卡"。所以异常路径必须能主动收尾。
+   *
+   * 幂等：重复调用不抛错。
+   */
+  async abortCapture() {
+    try {
+      await this.host.stopResponseCapture()
+      return { ok: true }
+    } catch (e) {
+      this.#log('warn', 'abort_capture_failed', { message: e && e.message })
+      return { ok: false, message: e && e.message }
+    }
+  }
+
+  /**
    * 把抓到的响应翻译成 verdict。
    *
    * @param {object|null} hit  `{ status, rawBody, url, requestId }` 或 null

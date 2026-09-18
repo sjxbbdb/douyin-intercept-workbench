@@ -87,6 +87,7 @@ class Reporter {
     this.guard = opts.guard || null
     this.clientVersion = opts.clientVersion || '0.0.0'
     this.logger = opts.logger || null
+    this.now = opts.now || (() => Date.now())
 
     /** 最近一次结算结果（供界面展示） */
     this.lastSettlement = null
@@ -148,6 +149,76 @@ class Reporter {
   /** 本地待上报条数（心跳要报 `pending_send_count`）。 */
   pendingCount() {
     return this.store.readJson(F_PENDING, []).length
+  }
+
+  /**
+   * 把发送链路的 outbox 里"结果未知"的记录转成待上报明细。
+   *
+   * ⚠️ 路径依赖很关键：`client/adapters/send-outbox.js` 的处理是
+   *    "先落盘 send_id → 发送 → 原地更新结果"，而**崩溃**会留下
+   *    `state: 'unknown'` 的记录。这些记录对应的发送**可能已经真的发出去了**，
+   *    所以正确处置是：
+   *
+   *      · **不重发**（重发就是重复回复，也是最容易被平台识别的行为）
+   *      · 按 `sent_suspected` 上报，且 `is_final: false`
+   *        —— 保留之后升级为 `sent_confirmed` 的可能（契约 §6.3）
+   *
+   *    `sent_suspected` **不计费**，所以这条路径对商家是安全的；
+   *    而它对厂商的意义是"账目完整"：那一笔在台账里有一条记录，
+   *    而不是凭空消失。
+   *
+   * @param {string} file 适配器写入 outbox 的文件名（默认 `send-outbox.json`）
+   * @returns {number} 转移了多少条
+   */
+  drainOutbox(file = 'send-outbox.json') {
+    const F_OUT = file
+    const now = this.now()
+    const recovered = []
+    this.store.update(F_OUT, [], (list) => {
+      for (let i = 0; i < list.length; i++) {
+        const r = list[i]
+        if (!r || r.state !== 'unknown') continue
+        list[i] = { ...r, state: 'suspected', settled_at_ms: now }
+        recovered.push(r)
+      }
+      return list
+    })
+    if (!recovered.length) return 0
+
+    const existing = new Set(this.store.readJson(F_PENDING, []).map((s) => s.send_id))
+    this.store.update(F_PENDING, [], (list) => {
+      for (const r of recovered) {
+        if (existing.has(r.send_id)) continue // 已在队列里，别写第二条
+        list.push({
+          send_id: r.send_id,
+          source_type: r.source_type,
+          target_hash: r.target_hash,
+          user_key_hash: r.user_key_hash,
+          user_key_type: r.user_key_type,
+          content_hash: r.content_hash,
+          verdict: 'sent_suspected',
+          is_final: false,
+          evidence: {
+            confirm_signal: 'none',
+            platform_status_code: null,
+            risk_control_signal: null,
+            note: 'recovered_after_crash',
+          },
+          failure_reason: null,
+          attempt_seq: Number(r.attempt_seq || 1),
+          sent_at_ms: Number(r.sent_at_ms),
+          applied_policy_version: r.applied_policy_version === null
+            ? null : Number(r.applied_policy_version),
+        })
+      }
+      return list
+    })
+
+    this.#log('warn', 'outbox_drained_to_pending', {
+      count: recovered.length,
+      hint: '这些发送的结果未知（进程中断）。按 sent_suspected 上报且不计费，绝不重发。',
+    })
+    return recovered.length
   }
 
   /**

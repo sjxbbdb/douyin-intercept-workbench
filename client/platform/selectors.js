@@ -86,6 +86,28 @@ module.exports = {
     fixture: 'video-page-desktop-01.html',
     notes: '⚠️ 必须在含「回复中」的 comment-item 内查找（legacy reply_worker.js:305）',
   },
+  sendButton: {
+    key: 'sendButton',
+    name: '内联回复框的发送按钮',
+    channel: 'comment',
+    // ⚠️ 这不是一个"正常"的选择器：发送按钮在页面上没有稳定的 id/class，
+    //    唯一可辨识的特征是它内部的 SVG path 填充色为品牌红 #FE2C55
+    //    （legacy reply_worker.js:395）。所以这里给的是**结构候选**，
+    //    实际定位由 page-comment.js 在"含「回复中」的评论项内"再筛一层。
+    //
+    //    confidence 标 medium 而不是 high：依赖品牌色意味着平台换主题
+    //    就会失效。但它本来就只是**兜底路径**——Enter 才是主路径
+    //    （legacy 实测：Enter 一直有效，按钮坐标在部分版本里不稳）。
+    candidates: ['svg', 'button', '[role="button"]'],
+    match: 'first',
+    required: false,
+    lastVerifiedAt: '2026-09-18',
+    liveVerifiedAt: null,          // ⚠️ 未经【真机】验证：P2 验证门 G-4 完成后回填
+    verifiedBy: null,
+    confidence: 'medium',
+    fixture: 'video-page-desktop-01.html',
+    notes: '兜底路径；主路径是 Enter（legacy reply_worker.js:385-388）。品牌色 #FE2C55 是唯一稳定特征，平台换主题即失效',
+  },
   danmakuRow: {
     key: 'danmakuRow',
     name: '直播弹幕行',

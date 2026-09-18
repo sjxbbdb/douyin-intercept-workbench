@@ -475,6 +475,153 @@ class CommentPage {
   }
 
   /**
+   * 向内联编辑器输入文案，并**回读校验**。
+   *
+   * ⚠️ 回读校验不是可选项。`Input.insertText` 与分块输入都可能被页面
+   *    的输入法/组件吞掉（尤其是刚 focus 完的那一瞬间），而"输入丢了"
+   *    的表现是发出一条空回复或半截回复——比发不出去更糟，
+   *    因为它真的发出去了、真的会被计费、也真的会让用户困惑。
+   *
+   * ⚠️ 也**不能**用 `Runtime.evaluate` 直接给编辑器赋值。那样绕过了
+   *    真实的输入事件，React 类框架的受控组件不会更新内部 state，
+   *    于是"页面上看得见文字、提交时发出去的是空的"。
+   *    所以必须走 browser-host 的真实键盘路径。
+   *
+   * @param {string} text
+   * @param {object} p
+   * @param {Array<{text:string, delayMs:number}>} [p.plan] 打字计划（来自 safety/timing.js）
+   * @param {number} [p.timeoutMs]
+   */
+  async typeIntoEditor(text, p = {}) {
+    const expected = String(text || '')
+    if (!expected) {
+      throw new WorkbenchError('CONTENT_TOO_SHORT', '回复文案为空，已拒绝发送')
+    }
+
+    if (Array.isArray(p.plan) && p.plan.length) {
+      await this.host.type(this.role, null, null, { plan: p.plan })
+    } else {
+      // 没有计划就一次性插入。⚠️ 这是**降级**路径：一次性插入的
+      //    时间特征与真人差异最大，只应该在调用方明确要求时走。
+      await this.host.type(this.role, null, expected)
+    }
+
+    // ── 回读校验 ─────────────────────────────────────────────
+    const readBack = await this.#evaluate(`(function(){
+      var eds=Array.from(document.querySelectorAll('[contenteditable=true],textarea'));
+      var main=document.querySelector('.comment-input-container');
+      for(var i=0;i<eds.length;i++){
+        var ed=eds[i];
+        var r=ed.getBoundingClientRect();
+        if(r.width<=0||r.height<=0) continue;
+        if(main && main.contains(ed)) continue;
+        var v=(ed.value!==undefined && ed.value!==null) ? String(ed.value) : String(ed.innerText||ed.textContent||'');
+        return {ok:true, value:v};
+      }
+      return {ok:false, reason:'editor_not_found_after_typing'};
+    })()`, { defaultValue: { ok: false, reason: 'evaluate_failed' } })
+
+    if (!readBack || !readBack.ok) {
+      throw new WorkbenchError('ELEMENT_TIMEOUT',
+        '输入文案后找不到编辑器，无法确认内容是否写入', { selector: 'inlineEditor' })
+    }
+    if (normalizeForReadback(readBack.value) !== normalizeForReadback(expected)) {
+      // ⚠️ 不重试输入。输入不一致说明页面组件状态与我们的认知不同，
+      //    盲目重试可能造成"文字重复追加"。抛错让上层决定（通常是重排队）。
+      throw new WorkbenchError('ELEMENT_TIMEOUT',
+        '输入文案与预期不一致（可能被页面组件吞掉），已中止本次发送以免发出半截回复',
+        { expected_length: expected.length, got_length: String(readBack.value || '').length })
+    }
+
+    return { ok: true, length: expected.length }
+  }
+
+  /**
+   * 提交回复。
+   *
+   * ⚠️ **Enter 是主路径**，不是点发送按钮（legacy reply_worker.js:385-388）。
+   *    旧代码实测发现：内联回复框的发送按钮在部分版本里位于 SVG 内部，
+   *    点击坐标不稳定（`path[fill="#FE2C55"]`），而 Enter 一直有效。
+   *
+   * ⚠️ 发送按钮兜底只在这里做，且**不重复按 Enter**：
+   *    重复 Enter 有发出两条评论的风险，而重复回复是平台最容易
+   *    识别的机器人特征。所以顺序是：按一次 Enter → 等 →
+   *    若编辑器仍在（说明 Enter 没生效）→ 点一次按钮 → 等。
+   */
+  async submitReply({ enterWaitMs = 5000, fallbackWaitMs = 6000 } = {}) {
+    await this.host.pressEnter(this.role)
+    await sleep(enterWaitMs)
+
+    // Enter 是否生效？判据是**编辑器消失**（这是"继续下一步"的判据，
+    // ⚠️ 绝不是成功判据 —— 成功只能由 publish-verifier 从响应体判定）。
+    const stillOpen = await this.#evaluate(`(function(){
+      var eds=Array.from(document.querySelectorAll('[contenteditable=true]'));
+      var main=document.querySelector('.comment-input-container');
+      for(var i=0;i<eds.length;i++){
+        var ed=eds[i];
+        var r=ed.getBoundingClientRect();
+        if(r.width<=0||r.height<=0) continue;
+        if(main && main.contains(ed)) continue;
+        var inReplyItem=false;
+        var a=ed, d=0;
+        while(a && d<6){ if(String(a.innerText||'').indexOf('\\u56de\\u590d\\u4e2d')>=0){ inReplyItem=true; break; } a=a.parentElement; d++; }
+        if(inReplyItem) return true;
+      }
+      return false;
+    })()`, { defaultValue: false })
+
+    if (!stillOpen) return { via: 'enter' }
+
+    // 兜底：点发送按钮（只点一次）
+    // ⚠️ 选择器来自 selectors.js 的 `sendButton`，**不得**在这里内联写死。
+    //    内联的后果是平台改版时只改 selectors.js 不生效——
+    //    而"改一个文件就能修好选择器失效"正是 S-4 这条约束的全部意义。
+    const { css: itemCss } = this.#css('commentItem')
+    const { css: sendBtnCss } = this.#css('sendButton')
+    const btn = await this.#evaluate(`(function(){
+      ${VISIBLE_JS}
+      var items=Array.from(document.querySelectorAll(${JSON.stringify(itemCss)}));
+      for(var i=0;i<items.length;i++){
+        if(String(items[i].innerText||'').indexOf('\\u56de\\u590d\\u4e2d')<0) continue;
+        var cands=Array.from(items[i].querySelectorAll(${JSON.stringify(sendBtnCss)}));
+        for(var s=0;s<cands.length;s++){
+          var el=cands[s];
+          // 品牌红是页面上唯一稳定的可辨识特征（legacy reply_worker.js:395）
+          var p=el.querySelector ? el.querySelector('path[fill="#FE2C55"]') : null;
+          if(!p && !(el.tagName||'').match(/^(svg)$/i)) continue;
+          var clickable=el.parentElement||el;
+          var r=clickable.getBoundingClientRect();
+          if(r.width>0&&r.height>0){
+            return {ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)};
+          }
+        }
+      }
+      return {ok:false};
+    })()`, { defaultValue: { ok: false } })
+
+    if (!btn || !btn.ok) {
+      this.#log('warn', 'submit_button_not_found', {})
+      return { via: 'enter', editor_still_open: true }
+    }
+
+    this.#log('info', 'submit_via_button_fallback', {})
+    await this.host.click(this.role, { at: { x: btn.x, y: btn.y } })
+    await sleep(fallbackWaitMs)
+    return { via: 'button' }
+  }
+
+  /**
+   * 拾取"某条规则命中"所需的原始文本（供适配器做关键词匹配）。
+   *
+   * ⚠️ 本方法返回评论文本，它是**页面数据**。调用方不得直接落盘——
+   *    落盘与上报必须经 `license/privacy.js` 的哈希处理（红线 3）。
+   */
+  async pickTexts({ limit = 100 } = {}) {
+    const items = await this.scan({ limit })
+    return items.map((it) => ({ index: it.index, text: it.text, user: it.user }))
+  }
+
+  /**
    * 等待某个选择器对应的元素**可见**。
    * @returns {Promise<boolean>}
    */
@@ -524,6 +671,23 @@ function sleep(ms) {
   return new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref() })
 }
 
+/**
+ * 回读比对用的归一化。
+ *
+ * ⚠️ 比 `NORMALIZE_JS` **宽松得多**：只统一换行、不换行空格与首尾空白。
+ *    理由：回读的目的是"确认文字没丢"，而不是"确认逐字节相同"。
+ *    编辑器的 `innerText` 会把换行规范化、可能插入 `\u00a0`，
+ *    用它套 NORMALIZE_JS（那会删掉所有标点）反而会把"丢了标点"
+ *    这种真实差异掩盖掉。
+ */
+function normalizeForReadback(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim()
+}
+
 module.exports = {
   CommentPage,
   CHANNEL,
@@ -531,4 +695,5 @@ module.exports = {
   VISIBLE_JS,
   PICK_ROOT_JS,
   targetMatcher,
+  normalizeForReadback,
 }
