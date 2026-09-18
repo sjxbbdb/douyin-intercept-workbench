@@ -2,283 +2,94 @@
 
 // license-server/crypto/sign.js
 //
-// HMAC 签名与验签。**严格按 shared/protocol.md §5 实现**。
+// 服务端签名适配层。
 //
-// ⚠️ 签名串的每一个字符都有契约依据，改任何一个字符都是不兼容变更。
+// ⚠️ **签名原语全部来自 shared/lib/sign.js**，本文件只做两件事：
+//    1. 再导出（保持既有 require 路径不变）
+//    2. 提供服务端独有的密钥/令牌生成
 //
-// 请求签名（§5.1）：
-//   canonical = METHOD + "\n" + PATH_WITH_QUERY + "\n" + ts_ms + "\n" + nonce
-//               + "\n" + sha256_hex(raw_body_bytes)
-//   字段走**请求头**：X-Lic-Ts / X-Lic-Nonce / X-Lic-Sign
-//
-// 响应签名（§5.2）：
-//   canonical = "RESP" + "\n" + http_status + "\n" + PATH_WITH_QUERY + "\n"
-//               + request_nonce + "\n" + server_time_ms + "\n" + sha256_hex(raw_body)
-//   字段走**响应头**：X-Lic-Server-Ts / X-Lic-Sign
-//
-// ⚠️ 三个实现要点（我最初写错，已按契约纠正）：
-//   1. **签的是原始字节的哈希，不是重新序列化的对象**。若两端各自
-//      JSON.stringify，key 顺序或空格差异会让签名不一致。
-//   2. **路径必须含 query**。`/credit/ledger?granularity=raw` 与
-//      `/credit/ledger` 是两个不同的请求，不含 query 等于允许在参数上做手脚。
-//   3. **字段走 header，不走 body**。放 body 里会导致 GET 请求无法携带
-//      （GET 无 body），且签名覆盖自己所在字段会造成自指。
-//
-// ⚠️ 错误响应也**必须签名**（§5.2），否则客户端无法区分
-//    "服务端说余额不足" 与 "中间人伪造余额不足"。
+// 为什么不在本文件重新实现：
+//    签名要求两端算出的字符串**逐字节相同**。两份实现迟早漂移，
+//    而漂移的后果是校验失败 → fail-closed 停机 → 排查成本极高。
+//    契约 §5.1/§5.2 的拼串规则只应有一份实现。
 
 const crypto = require('node:crypto')
+const shared = require('../../shared/lib/sign')
 const { AppError } = require('../../shared/lib/errors')
 
-const SIGN_ALGO = 'sha256'
-/** 签名时间戳容忍窗口（protocol.md §1.4）：±5 分钟 */
-const SIGN_TS_TOLERANCE_MS = 5 * 60 * 1000
-/** nonce 长度约束。契约写 16–32 位 hex；实现放宽上界到 64，见 §附注 */
-const NONCE_MIN_LEN = 16
-const NONCE_MAX_LEN = 64
-
-// ═══════════════════════════════════════════════════════════
-// 基础工具
-// ═══════════════════════════════════════════════════════════
-
+/** 生成 32 字节签名密钥（hex）。 */
 function generateSignKey() {
   return crypto.randomBytes(32).toString('hex')
 }
 
+/** 生成会话令牌（32 字节随机 hex）。服务端只存其 sha256。 */
 function generateToken() {
   return crypto.randomBytes(32).toString('hex')
 }
 
-function sha256Hex(input) {
-  return crypto.createHash('sha256').update(input).digest('hex')
-}
-
-function hmacHex(key, payload) {
-  return crypto.createHmac(SIGN_ALGO, key).update(payload, 'utf8').digest('hex')
-}
-
-/** 定时安全比较。长度不同或非 hex 直接 false。 */
-function safeEqualHex(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false
-  if (!/^[0-9a-f]*$/i.test(a) || !/^[0-9a-f]*$/i.test(b)) return false
-  const ba = Buffer.from(a, 'hex')
-  const bb = Buffer.from(b, 'hex')
-  if (ba.length === 0 || ba.length !== bb.length) return false
-  return crypto.timingSafeEqual(ba, bb)
-}
-
-// ═══════════════════════════════════════════════════════════
-// 请求签名（§5.1）
-// ═══════════════════════════════════════════════════════════
-
 /**
- * 构造请求签名串。
+ * 服务端侧：对响应签名并附加到响应头。
  *
- * @param {object} p
- * @param {string} p.method        HTTP 方法（内部转大写）
- * @param {string} p.pathWithQuery 从 `/api/` 开始，**含 query**，不重编码
- * @param {number|string} p.ts     13 位 Unix 毫秒
- * @param {string} p.nonce
- * @param {string|Buffer} p.rawBody 原始请求体字节；无 body 传空
+ * ⚠️ 返回的是**响应头**，不是 body 字段。契约 §5.2 规定
+ *    签名字段走 `X-Lic-Server-Ts` / `X-Lic-Sign`。
+ *    放 body 里会导致"签名覆盖自己"的自指问题。
  */
-function buildRequestSignString({ method, pathWithQuery, ts, nonce, rawBody }) {
-  const bodyBytes = rawBody === undefined || rawBody === null ? '' : rawBody
-  return [
-    String(method || '').toUpperCase(),
-    String(pathWithQuery || ''),
-    String(ts),
-    String(nonce),
-    sha256Hex(bodyBytes),
-  ].join('\n')
-}
-
-/** 计算请求签名。客户端与服务端共用同一函数，避免两端实现漂移。 */
-function signRequest({ signKey, method, pathWithQuery, ts, nonce, rawBody }) {
-  return hmacHex(signKey, buildRequestSignString({ method, pathWithQuery, ts, nonce, rawBody }))
-}
-
-/**
- * 校验请求签名。
- *
- * @returns {{ok:true, ts:number, nonce:string} | {ok:false, code:string, message:string, detail?:object}}
- */
-function verifyRequestSignature({
-  signKey, method, pathWithQuery, rawBody, ts, nonce, signature, nowMs,
-}) {
-  const now = nowMs === undefined ? Date.now() : nowMs
-
-  if (!signature || ts === undefined || ts === null || !nonce) {
-    return { ok: false, code: 'AUTH_SIGN_MISSING', message: '缺少 X-Lic-Sign / X-Lic-Ts / X-Lic-Nonce' }
-  }
-
-  const tsNum = Number(ts)
-  if (!Number.isFinite(tsNum)) {
-    return { ok: false, code: 'AUTH_SIGN_INVALID', message: 'X-Lic-Ts 不是合法数字' }
-  }
-
-  if (!/^[0-9a-f]+$/i.test(String(nonce)) ||
-      String(nonce).length < NONCE_MIN_LEN || String(nonce).length > NONCE_MAX_LEN) {
-    return {
-      ok: false,
-      code: 'AUTH_SIGN_INVALID',
-      message: `X-Lic-Nonce 必须是 ${NONCE_MIN_LEN}~${NONCE_MAX_LEN} 位 hex`,
-    }
-  }
-
-  if (Math.abs(now - tsNum) > SIGN_TS_TOLERANCE_MS) {
-    return {
-      ok: false,
-      code: 'AUTH_TS_SKEW',
-      message: '请求时间戳超出容忍窗口，请用 server_time_ms 校准本机时钟后重试',
-      detail: { skew_ms: now - tsNum, tolerance_ms: SIGN_TS_TOLERANCE_MS },
-    }
-  }
-
-  const expected = signRequest({ signKey, method, pathWithQuery, ts: tsNum, nonce, rawBody })
-  if (!safeEqualHex(expected, String(signature))) {
-    return { ok: false, code: 'AUTH_SIGN_INVALID', message: '签名校验失败' }
-  }
-  return { ok: true, ts: tsNum, nonce: String(nonce) }
-}
-
-// ═══════════════════════════════════════════════════════════
-// 响应签名（§5.2）
-// ═══════════════════════════════════════════════════════════
-
-/**
- * 构造响应签名串。
- *
- * ⚠️ 含 `request_nonce`：把响应与**这一次请求**绑定，
- *    防止攻击者把旧响应重放给新请求（如重放"余额充足"）。
- */
-function buildResponseSignString({ httpStatus, pathWithQuery, requestNonce, serverTimeMs, rawBody }) {
-  return [
-    'RESP',
-    String(httpStatus),
-    String(pathWithQuery || ''),
-    String(requestNonce || ''),
-    String(serverTimeMs),
-    sha256Hex(rawBody === undefined || rawBody === null ? '' : rawBody),
-  ].join('\n')
-}
-
-/** 计算响应签名。 */
-function signResponseRaw({ signKey, httpStatus, pathWithQuery, requestNonce, serverTimeMs, rawBody }) {
-  return hmacHex(signKey, buildResponseSignString({
-    httpStatus, pathWithQuery, requestNonce, serverTimeMs, rawBody,
-  }))
-}
-
-/**
- * 客户端侧：校验服务端响应。
- *
- * ⚠️ fail-closed：验签失败必须抛错并停止，不得"继续使用该响应"。
- *    否则中间人可以把余额改成很大、把策略改成无限额。
- */
-function verifyResponseSignature(p) {
-  const { signKey, httpStatus, pathWithQuery, requestNonce, serverTsHeader, signatureHeader, rawBody } = p
-
-  if (!signatureHeader || !serverTsHeader) {
-    throw new AppError('AUTH_SIGN_MISSING', '服务端响应缺少 X-Lic-Sign 或 X-Lic-Server-Ts')
-  }
-  const expected = signResponseRaw({
-    signKey, httpStatus, pathWithQuery, requestNonce,
-    serverTimeMs: Number(serverTsHeader), rawBody,
+function buildResponseHeaders(signKey, httpStatus, pathWithQuery, requestNonce, rawBody, serverTimeMs) {
+  const sign = shared.signResponseRaw({
+    signKey, httpStatus, pathWithQuery, requestNonce, serverTimeMs, rawBody,
   })
-  if (!safeEqualHex(expected, String(signatureHeader))) {
-    throw new AppError('AUTH_SIGN_INVALID', '服务端响应签名校验失败，连接可能被篡改')
+  return {
+    'X-Lic-Server-Ts': String(serverTimeMs),
+    'X-Lic-Sign': sign,
   }
-  return true
-}
-
-// ═══════════════════════════════════════════════════════════
-// login_proof（§4.1）
-// ═══════════════════════════════════════════════════════════
-
-/**
- * 登录响应自证。
- *
- * ⚠️ 解决的问题：登录响应本身携带 `sign_key`，无法用它给自己签名
- *    （鸡生蛋）。因此改用**密码派生密钥**签名，客户端用同一派生
- *    方式复算即可确认响应未被篡改。
- */
-function deriveLoginKey(password, account, deviceId) {
-  return crypto
-    .pbkdf2Sync(password, `dsh-login|${account}|${deviceId}`, 100000, 32, 'sha256')
-    .toString('hex')
-}
-
-/** 覆盖范围排除 login_proof 自身。 */
-function buildLoginProof(password, account, deviceId, responseBody) {
-  const key = deriveLoginKey(password, account, deviceId)
-  const { login_proof, ...rest } = responseBody
-  return hmacHex(key, sha256Hex(stableJson(rest)))
-}
-
-function verifyLoginProof(password, account, deviceId, responseBody) {
-  if (!responseBody || !responseBody.login_proof) {
-    throw new AppError('AUTH_SIGN_MISSING', '登录响应缺少 login_proof')
-  }
-  const expected = buildLoginProof(password, account, deviceId, responseBody)
-  if (!safeEqualHex(expected, responseBody.login_proof)) {
-    throw new AppError('AUTH_SIGN_INVALID', '登录响应被篡改，已拒绝登录')
-  }
-  return true
 }
 
 /**
- * login_proof 用的确定性序列化。
- *
- * ⚠️ 这里用确定性 JSON 而非原始字节，因为 login_proof 覆盖的是
- *    "已解析的响应对象"（两端都是我们自己的实现）。但 key 顺序
- *    必须两端一致——所以必须排序。
+ * 服务端侧：校验请求签名。失败时抛 AppError（便于统一错误处理）。
  */
-function stableJson(value) {
-  if (value === null) return 'null'
-  const t = typeof value
-  if (t === 'undefined') return undefined
-  if (t === 'boolean') return value ? 'true' : 'false'
-  if (t === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError(`不允许非有限数字 ${value}`)
-    return String(value)
-  }
-  if (t === 'string') return JSON.stringify(value)
-  if (Array.isArray(value)) {
-    return '[' + value.map((v) => {
-      const s = stableJson(v)
-      return s === undefined ? 'null' : s
-    }).join(',') + ']'
-  }
-  if (t === 'object') {
-    const parts = []
-    for (const k of Object.keys(value).sort()) {
-      const s = stableJson(value[k])
-      if (s === undefined) continue
-      parts.push(`${JSON.stringify(k)}:${s}`)
-    }
-    return '{' + parts.join(',') + '}'
-  }
-  return undefined
+function assertRequestSignature(params) {
+  const r = shared.verifyRequestSignature(params)
+  if (!r.ok) throw new AppError(r.code, r.message, r.detail)
+  return r
 }
 
 module.exports = {
-  SIGN_ALGO,
-  SIGN_TS_TOLERANCE_MS,
-  NONCE_MIN_LEN,
-  NONCE_MAX_LEN,
+  // ── 共享原语（再导出）────────────────────────────────────
+  SIGN_ALGO: shared.SIGN_ALGO,
+  SIGN_TS_TOLERANCE_MS: shared.SIGN_TS_TOLERANCE_MS,
+  NONCE_MIN_LEN: shared.NONCE_MIN_LEN,
+  NONCE_MAX_LEN: shared.NONCE_MAX_LEN,
+  sha256Hex: shared.sha256Hex,
+  hmacHex: shared.hmacHex,
+  safeEqualHex: shared.safeEqualHex,
+  randomHex: shared.randomHex,
+  buildRequestSignString: shared.buildRequestSignString,
+  signRequest: shared.signRequest,
+  verifyRequestSignature: shared.verifyRequestSignature,
+  buildResponseSignString: shared.buildResponseSignString,
+  signResponseRaw: shared.signResponseRaw,
+  // ⚠️ 服务端/测试沿用"失败即抛"的旧语义；客户端请直接用
+  //    shared/lib/sign.js 的 result 形式（fail-closed 由调用方决定）。
+  verifyResponseSignature: (p) => {
+    const r = shared.verifyResponseSignature(p)
+    if (!r.ok) throw new AppError(r.code, r.message)
+    return true
+  },
+  deriveLoginKey: shared.deriveLoginKey,
+  buildLoginProof: shared.buildLoginProof,
+  verifyLoginProof: (password, account, deviceId, responseBody) => {
+    // ⚠️ 服务端测试用：把 result 形式转成"失败即抛"的旧语义，
+    //    保持既有调用点不变。客户端请直接用 shared 的 result 形式。
+    const r = shared.verifyLoginProof(password, account, deviceId, responseBody)
+    if (!r.ok) throw new AppError(r.code, r.message)
+    return true
+  },
+  stableJson: shared.stableJson,
+  generateNonce: shared.generateNonce,
+
+  // ── 服务端独有 ───────────────────────────────────────────
   generateSignKey,
   generateToken,
-  sha256Hex,
-  hmacHex,
-  safeEqualHex,
-  buildRequestSignString,
-  signRequest,
-  verifyRequestSignature,
-  buildResponseSignString,
-  signResponseRaw,
-  verifyResponseSignature,
-  deriveLoginKey,
-  buildLoginProof,
-  verifyLoginProof,
-  stableJson,
+  buildResponseHeaders,
+  assertRequestSignature,
 }
