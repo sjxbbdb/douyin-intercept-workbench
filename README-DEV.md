@@ -214,13 +214,18 @@ douyin-intercept-workbench/
 
 ## 七、文档清单
 
+> **交付前自检**：运行 `node scripts/verify-handover.js`，会逐项校验文档到位情况、legacy 存档、三条红线覆盖、关键数值一致性、陈旧值残留与契约自检。
+> **测试入口**：`node test/run.js`（P0 骨架已可运行：L1 单元 / L2 契约 / L3 离线 DOM 全绿）。
+
 ### 根目录
 
 | 文件 | 说明 | 状态 |
 |---|---|---|
 | `README-DEV.md` | 本文件，开发总索引 | ✅ |
-| `AGENTS.md` | 项目红线与工程约定 | ⏳ 待重写 |
-| `README.md` | 面向使用者的说明 | ⏳ 待重写 |
+| `AGENTS.md` | 🔴 三条红线 + 14 条必须避免的误实现 + 完成定义 | ✅ |
+| `README.md` | 面向使用者（商家）的说明 | ✅ |
+| `package.json` | 仅声明 `ws`；engines ≥22.5 | ✅ |
+| `scripts/verify-handover.js` | 交付前终检脚本 | ✅ |
 
 ### `docs/` — 需求与架构
 
