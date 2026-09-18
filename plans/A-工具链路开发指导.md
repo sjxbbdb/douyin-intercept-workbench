@@ -147,33 +147,18 @@
 | `crypto/` | scrypt、HMAC 响应签名、`master_secret` 派生 `sign_key` | 只存 `key_epoch` 与 `sign_key_sha256`，不存 `sign_key` 明文 |
 | `admin/` | 管理后台（商家列表、下钻、充值、卡密、审计导出） | 必须复用同一套计费与策略口径 |
 
-### 3.3 `client/host/` — 主进程
+### 3.3~3.9 客户端各层（`client/host|core|platform|adapters|license|safety|ui`）
 
-`api.js`（本地 API，**绑 `127.0.0.1` + 会话令牌 + CORS 白名单**，修 D-6）、`scheduler.js`（任务调度、持有全部子句柄、幂等拒绝重复启动，修 D-13）、`store.js`（实例 JSON 读写的**唯一入口**：内存态 + 串行化写队列 + `.tmp-<pid>` → rename）、`instances.js`（实例注册与 `9222+N` 端口分配）。
+| 层 | 文件与职责 | 一边界 |
+|---|---|---|
+| `host/` | `api.js`（本地 API，**绑 `127.0.0.1` + 会话令牌 + CORS 白名单**，修 D-6）、`scheduler.js`（调度、持有全部子句柄、幂等拒绝重复启动，修 D-13）、`store.js`（实例 JSON 读写的**唯一入口**：内存态 + 串行化写队列 + `.tmp-<pid>` → rename）、`instances.js`（实例注册与 `9222+N` 端口分配） | 唯一允许碰盘的层 |
+| `core/` | `cdp.js`（**全项目唯一一份** CDP 客户端）、`browser-host.js`（独占 WS、标签页管理、重连、超时退避）、`ipc.js` | **不得出现任何抖音知识** |
+| `platform/` | `selectors.js`（**选择器唯一来源**，每条带 `key`/`css`/`lastVerifiedAt`/`confidence`/`fallbacks[]`）、`page-comment.js`、`page-live.js`、`page-profile.js`、`publish-verifier.js` | 不得直接读写文件 |
+| `adapters/` | `collect.js`（采集 + 关键词命中 + 去重键计算）、`reply-comment.js`、`reply-danmaku.js`、`send-dm.js`（含 `sec_uid` 提取失败 → `not_locatable` 跳过）。**薄编排层**：只把平台原语串成业务动作 | 不写选择器、不写频控 |
+| `license/` | `auth.js`（登录、`login_proof` 验签、设备 ID、令牌续期）、`heartbeat.js`（60 秒心跳、策略接收与 ack、命令执行）、`reporter.js`（明细与聚合上报、离线补报）、`sign.js`（HMAC 请求签名与**响应验签**） | 不得绕过 `shared/lib/` 自造协议常量 |
+| `safety/` | `guard.js`（日上限、最小间隔、活跃时段、观察期禁发、急停）、`similarity.js`（SimHash）、`circuit.js`（熔断状态机）、`audit.js`（本地审计落盘） | 独立模块，**不得散落在适配器里** |
+| `ui/` | 原生 DOM、无框架、无构建；统一设计 token（CSS 变量）、暗色系、快捷键（`Esc` 急停、`Ctrl+K` 命令面板、`1-9` 切面板）；近 7 日趋势用纯 CSS/Canvas（不引图表库） | 不得直连 CDP 或直接改数据文件 |
 
-### 3.4 `client/core/` — CDP 基础设施
-
-`cdp.js`（**全项目唯一一份** CDP 客户端封装）、`browser-host.js`（独占 WS、标签页管理、重连、超时退避）、`ipc.js`。
-
-### 3.5 `client/platform/` — 抖音平台知识
-
-`selectors.js`（**选择器唯一来源**，每条选择器带 `key` / `css` / `lastVerifiedAt` / `confidence` / `fallbacks[]`）、`page-comment.js`、`page-live.js`、`page-profile.js`、`publish-verifier.js`。
-
-### 3.6 `client/adapters/` — 业务适配器
-
-`collect.js`（采集 + 关键词命中 + 去重键计算）、`reply-comment.js`、`reply-danmaku.js`、`send-dm.js`（含 `sec_uid` 提取失败 → `not_locatable` 跳过）。适配器是**薄编排层**：只把平台原语串成业务动作，不写选择器、不写频控。
-
-### 3.7 `client/license/` — 与授权中心通信
-
-`auth.js`（登录、`login_proof` 验签、设备 ID、令牌续期）、`heartbeat.js`（60 秒心跳、策略接收与 ack、命令执行）、`reporter.js`（明细与聚合上报、离线补报）、`sign.js`（HMAC 请求签名与**响应验签**）。
-
-### 3.8 `client/safety/` — 安全护栏（独立模块，不散落在适配器里）
-
-`guard.js`（日上限、最小间隔、活跃时段、观察期禁发、急停）、`similarity.js`（SimHash）、`circuit.js`（熔断状态机）、`audit.js`（本地审计落盘）。
-
-### 3.9 `client/ui/` — 前端
-
-原生 DOM、无框架、无构建。统一设计 token（CSS 变量）、暗色系、快捷键（`Esc` 急停、`Ctrl+K` 命令面板、`1-9` 切面板）、近 7 日趋势用纯 CSS/Canvas（不引图表库）。
 
 ### 3.10 ⚠️ 跨层禁止事项（违反即视为缺陷，PR 应直接打回）
 
@@ -185,6 +170,8 @@
 6. 除 `host/store.js` 外，**任何模块不得 `fs.writeFileSync` 业务数据**（消灭 D-7 类竞态）。
 7. 任何地方**不得硬编码限额数值**（0/10/25/30/70/12600 等）；数值只能来自服务端下发的 `policy` / `tier_table`。
 8. `shared/lib/` 之外**不得新增跨端共享代码**；`shared/lib/` 不得 `require` 服务端或客户端目录。
+9. **全项目统一 `snake_case`**（含局部变量与函数名），模块文件名 `kebab-case.js`，类名 `PascalCase`，常量 `UPPER_SNAKE_CASE`。⚠️ 旧代码用 `camelCase`（`awemeId`/`commentId`），**在 `legacy/` 之外出现这类写法视为缺陷**。详见 `shared/开发规范.md` §1.1。
+10. **禁止空 `catch {}`**（本项目最贵的一次教训：旧代码去重历史写盘失败被静默吞掉，导致同一评论被重复回复且无人发现）。禁止用 `process.exit(1)` 作为顶层异常处理（进程退出后无人重启，直接违反 S-1）。详见 `shared/开发规范.md` §2.2、§2.6。
 
 ---
 
@@ -330,48 +317,13 @@ const billable = s.verdict === 'sent_confirmed'
 
 **设计意图**：把"发得像人"做成确定性代码，而不是散落在发送循环里的 `sleep`。
 
-#### 4.5.1 频控（按渠道独立限额 + 随机化间隔）
-
-- 三渠道独立计数、独立间隔、独立熔断窗口（`comment` / `live_danmaku` / `dm` 互不挤占）。
-- **为什么不能用固定间隔**：旧代码是 `10000 + rand(4000)`，每个周期都是整齐的 10–14 秒，这是最典型的机器人特征。要求改为**对数正态分布**（多数偏短、偶尔长间隔），并在每次点击/输入前插入 1–3 秒随机停顿模拟真人反应。命中弹幕到回复之间也要加人工量级的延迟，避免"秒回"特征。
-- 日上限用**本地自然日 + 服务端 `stats_tz_offset_minutes`(480)** 切分；跨零点时按 `sent_at_ms` 归属自然日。
-- 同一用户冷却：同一 `user_key_hash` 在 `N` 小时内（默认 24）只回复一次（对应验收标准 12）。
-
-#### 4.5.2 内容相似度（SimHash）
-
-- 发送前把渲染好的文案与**近期已发内容**（窗口建议最近 50 条 + 该规则模板池）比对。
-- 阈值来自策略 `content_similarity_max`：`comment`/`live_danmaku` 默认 0.85，`dm` 默认 0.75。
-- ⚠️ **超过阈值即拒绝**（0.85 = 相似度 > 85% 拒绝）。方向反了会变成"只发相似内容"，是灾难性缺陷。
-- 命中拒绝 → `verdict=skipped` 或 `failed` + `failure_reason=content_rejected`，并在 UI 提示商家补充文案。
-- 规则保存时校验：模板池**至少 5 条变体**（`FR-2.3.3`）。
-- 变量填充须自然：禁止用 `{随机1-9}` 生成 `"1"`/`"2"` 这种明显机器痕迹，应使用"这个""这款""它"等语言变体。
-
-#### 4.5.3 熔断状态机
-
-```
-                                                  ┌─────────────────────────────┐
-   正常 ──触发──► L1: 暂停 30 分钟 ──再触发──► L2: 暂停 1 小时 ──再触发──► L3: 停到次日 00:00(UTC+8)
-     ▲                    │                          │                          │
-     └────────────────────┴──────────────────────────┴──── 冷却结束 + 无新异常 ──┘
-```
-
-- 触发源：验证码/滑块出现、连续失败达阈值、平台风控拒绝（`platform_reject_count` 达 3）、失败率超阈值（`failure_rate_threshold=0.4`，窗口 `failure_rate_window=20`）。
-- 服务端 `circuit_breaker` 下发 `cooldown_ms=1800000`（30 分钟）与 `risk_code_cooldown_ms=86400000`（风控码 24 小时）。
-- 收到 `POLICY_CIRCUIT_OPEN(409)` 或 `commands:[{type:"circuit_break",cooldown_until_ms}]` → **60 秒内**停止全部发送，等 `cooldown_until_ms`。
-- UI 必须明确显示"当前处于第几级熔断、何时恢复"（验收标准 17 要求退避为 30 分钟级而非旧代码的 60 秒）。
-- 熔断期间**不影响历史明细补报**（已发生的事实照常受理与计费），只拒绝新发送。
-
-#### 4.5.4 急停开关
-
-- UI 顶部常驻按钮，快捷键 `Esc`。
-- 语义：**立即生效、不可被排队任务绕过**。实现上是"原子标志位 + 在发送链路的每个步骤入口检查"，而不是"等当前任务跑完"。
-- 急停同时是 `AGENTS.md` 红线之一：熔断与急停机制不可被关闭、不可被移除。
-
-#### 4.5.5 活跃时段
-
-- 默认 `08:00–23:00` 单一窗口，`tz_offset_minutes=480`；客户端只能调更短、不得新增窗口。
-- 每天随机起止（在窗口内抖动），夜间完全停发（验收标准 18）。
-- 时段外不发送但**照常采集**，命中计 `skipped`。
+| 护栏 | 实现要点 | ⚠️ 易错点 |
+|---|---|---|
+| **频控**（`guard.js`） | 三渠道独立计数、独立间隔、独立熔断窗口（`comment`/`live_danmaku`/`dm` 互不挤占）；日上限按**服务端 `stats_tz_offset_minutes`(480)** 切分自然日，跨零点按 `sent_at_ms` 归属；同一 `user_key_hash` 在 `N` 小时内（默认 24）只回复一次（验收标准 12） | **为什么不能用固定间隔**：旧代码是 `10000 + rand(4000)`，每个周期都是整齐的 10–14 秒，这是最典型的机器人特征。必须改为**对数正态分布**（多数偏短、偶尔长间隔），并在每次点击/输入前插入 1–3 秒随机停顿；弹幕命中到回复之间也要加人工量级延迟，避免"秒回" |
+| **内容相似度**（`similarity.js`） | 发送前把渲染好的文案与**近期已发内容**（建议最近 50 条 + 该规则模板池）做 SimHash 比对；阈值取策略 `content_similarity_max`（`comment`/`live_danmaku` 默认 0.85，`dm` 默认 0.75）；命中拒绝 → `verdict=skipped`/`failed` + `failure_reason=content_rejected`，UI 提示补充文案；规则保存时校验模板池**至少 5 条变体** | ⚠️ **超过阈值即拒绝**（0.85 = 相似度 > 85% 拒绝）。**方向反了会变成"只发相似内容"，是灾难性缺陷**（`AGENTS.md` §2.4）。另外禁止用 `{随机1-9}` 生成 `"1"`/`"2"` 这类明显机器痕迹，应使用"这个""这款""它"等语言变体 |
+| **熔断状态机**（`circuit.js`） | 递进：**L1 暂停 30 分钟 → L2 暂停 1 小时 → L3 停到次日 00:00(UTC+8)**；触发源为验证码/滑块出现、连续失败达阈值、平台风控拒绝（`platform_reject_count` 达 3）、失败率超 `failure_rate_threshold=0.4`（窗口 `failure_rate_window=20`）；服务端下发 `cooldown_ms=1800000` 与 `risk_code_cooldown_ms=86400000`；收到 `POLICY_CIRCUIT_OPEN(409)` 或 `commands:[circuit_break]` → **60 秒内**停止全部发送 | UI 必须明确显示"当前处于第几级熔断、何时恢复"（验收标准 17：退避必须是 **30 分钟级**，不是旧代码的 60 秒）。熔断期间**不影响历史明细补报**（已发生的事实照常受理与计费），只拒绝新发送 |
+| **急停**（`guard.js`） | UI 顶部常驻按钮，快捷键 `Esc`；语义是**立即生效、不可被排队任务绕过**——实现为"原子标志位 + 在发送链路每个步骤入口检查"，而不是"等当前任务跑完" | 急停与熔断机制**不可被关闭、不可被移除**（`AGENTS.md` 红线）。不得提供任何禁用开关或环境变量 |
+| **活跃时段**（`guard.js`） | 默认 `08:00–23:00` 单一窗口，`tz_offset_minutes=480`；客户端只能调更短、不得新增窗口；每天在窗口内随机起止 | 夜间完全停发（验收标准 18）；时段外**照常采集**，命中计 `skipped` 而非丢弃线索 |
 
 ### 4.6 CDP 层与 browser-host
 

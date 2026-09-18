@@ -27,7 +27,7 @@
 | 你的任务 | 必读（按顺序） |
 |---|---|
 | 任何任务 | ① `README-DEV.md` §二（三条红线）② 本文件全文 ③ `shared/开发规范.md` |
-| 客户端 CDP / DOM / 回复 | 上述 + `shared/术语与选型基准.md` §一（术语表）、`legacy/reply_worker.js`（行为规格对照） |
+| 客户端 CDP / DOM / 回复 | 上述 + `shared/已知陷阱与平台知识.md`（**写 DOM 代码前必读**）、`shared/术语与选型基准.md` §一（术语表）、`legacy/reply_worker.js`（行为规格对照） |
 | 服务端接口 / 计费 / 策略 | 上述 + `shared/protocol.md` 全文（尤其 §3/§4.6/§4.8/§5/§6） |
 | 前端界面 | 上述 + `docs/需求规格.md` FR-1/FR-4 + `protocol.md` §4.14（额度文案必须原样展示） |
 | 存储 / 队列 | 上述 + `shared/开发规范.md` §四/§五 + `docs/架构说明.md` §五 |
@@ -136,8 +136,9 @@ function judge_send({ captured_response, dom_stable_ms }) {
     return { verdict: 'failed', is_final: true, failure_reason: 'risk_control_rejected',
              evidence: { confirm_signal: 'none', risk_control_signal: 'empty_response' } }      // 不计费
   }
-  const status_code = JSON.parse(raw).status_code
-  if (status_code === 0) {
+  // ⚠️ 必须同时满足 HTTP 200 与 status_code:0；只匹配响应体是不够的
+  const status_code = JSON.parse(raw).status_code                  // 解析失败按 unknown 失败处理
+  if (captured_response.http_status === 200 && status_code === 0) {
     return { verdict: 'sent_confirmed', is_final: true,
              evidence: { confirm_signal: 'platform_response', platform_endpoint: 'comment/publish', platform_status_code: 0 } }
   }
@@ -145,6 +146,17 @@ function judge_send({ captured_response, dom_stable_ms }) {
            evidence: { confirm_signal: 'platform_response', platform_status_code: status_code } }  // 不计费
 }
 ```
+
+**必须用 CDP `Network` 域被动嗅探，不得用 `Fetch` 域**（`shared/已知陷阱与平台知识.md` §3.1）：
+
+```js
+cdp.on('Network.requestWillBeSent', on_req)      // 只看 POST 且 url.includes('comment/publish')
+cdp.on('Network.responseReceived', on_resp)      // 记录 http_status，并立刻 Network.getResponseBody
+// ...此处才执行 Enter 发送动作...
+cdp.off('Network.requestWillBeSent', on_req); cdp.off('Network.responseReceived', on_resp)
+```
+
+① `Fetch.enable` 会**拦截并暂停**请求，漏发 `Fetch.continueRequest` 会让商家真实页面永久挂起；`Network` 域是**纯监听**，不改变页面行为。② 监听**必须先于发送动作注册**，否则响应可能已到达而捕获不到。③ `Network.getResponseBody` 可能失败——**取失败要当作"未拿到平台响应"（`failed` + `unknown`），不得当作成功**。④ 匹配 `status_code` 的正则必须允许冒号两侧空白（`/"status_code"\s*:\s*0/`），不要简化成 `"status_code":0`。
 
 【自检方法】
 
@@ -212,7 +224,7 @@ node test/lint-forbidden-fields.js   # 期望 0 命中：comment_text/danmaku_te
 | `sent_suspected` | 无明确失败信号，也拿不到确认条件（编辑器消失属此类） | 否 |
 | `failed` | 有明确失败信号（平台错误码、**空响应**、发送按钮报错、超时元素未出现） | 否 |
 
-【如何自检】`grep -rn "ok: true" client/platform client/adapters` 应只在 `publish-verifier.js` 的 `sent_confirmed` 分支命中；跑 fixtures 中的"空响应"用例必须得到 `failed`。
+【如何自检】`grep -rn "ok: true" client/platform client/adapters` 应只在 `publish-verifier.js` 的 `sent_confirmed` 分支命中；`grep -rn "Fetch.enable" client/` 必须无输出（只能用 `Network` 域）；跑 fixtures 中的"空响应"用例必须得到 `failed`，另需两个用例：`http_status: 500 + status_code:0` → `failed`、`http_status: 200 + status_code:0` → `sent_confirmed`。
 
 ### 3.2 把日上限、最小间隔等安全数值硬编码在客户端
 
@@ -424,12 +436,13 @@ async function human_pause() { await sleep(1000 + Math.random() * 2000) }   // �
 | 6 | **是否图文帖（note 帖）** | URL 含 `/note/<id>` 即为图文帖，评论区是右侧浮层；不支持时标记 `note_post_panel_unsupported` 并跳过 | 按视频帖逻辑操作 → 全部失败 |
 | 7 | **URL 形态是否符合预期** | 抖音会把 `/video/<id>` 重定向到 `/jingxuan?modal_id=...`，判定逻辑要能识别两种形态 | URL 判定失败 → 误判"页面未打开" |
 | 8 | **搜索页是否用了新标签页** | 搜索页在长期复用标签里会退化（加载不出结果），**必须用新标签页**；用后关闭 | 搜索结果为空，误判"无数据" |
-| 9 | **平台响应是否已开始嗅探** | 发送**之前**就 `Network.enable` 并挂上 `requestWillBeSent`/`responseReceived` 监听，且监听 `comment/publish` | 发送后才发现没监听 → 拿不到证据 → 只能判 `sent_suspected`（不计费） |
-| 10 | **选择器是否来自注册表** | 只能从 `client/platform/selectors.js` 取，且带 `key` / `lastVerifiedAt` / `confidence` | 选择器散落 → 改版时要改 N 个文件（S-4 失败） |
+| 9 | **平台响应是否已开始嗅探** | 发送**之前**就 `Network.enable` 并挂上 `requestWillBeSent`/`responseReceived` 监听，且监听目标接口路径片段；**不得用 `Fetch.enable`** | 发送后才发现没监听 → 拿不到证据 → 只能判 `sent_suspected`（不计费）；用 `Fetch` 漏 continue 会让商家页面卡死 |
+| 10 | **选择器是否来自注册表** | 只能从 `client/platform/selectors.js` 取，且带 `key` / `lastVerifiedAt` / `confidence` / `notes` | 选择器散落 → 改版时要改 N 个文件（S-4 失败） |
 | 11 | **失败是否带 stage + reason** | 每步产出 `StepResult{ok, stage, reason}`；`selector_miss` 必须带选择器 key | 失败无法定位（S-3 失败），改版时无从下手 |
-| 12 | **是否用了 Enter 三段式按键** | `rawKeyDown` → `char` → `keyUp` 三段（旧代码已验证的必要形式），并有发送按钮兜底 | 单段按键在部分页面不触发提交 |
+| 12 | **是否用了 Enter 三段式按键** | `rawKeyDown` → `char` → `keyUp` 三段（旧代码已验证的必要形式），并有发送按钮兜底；**标签页必须在前台**（`Input.dispatchKeyEvent` 只对活动标签生效） | 单段按键在部分页面不触发提交；标签页不在前台则按键丢失 |
 | 13 | **标签页存活检查** | 操作前确认目标标签页仍存在；`tabFails ≥ 2` 时重建连接而非继续重试 | 在已关闭的标签页上操作 → 连续失败 → 误触熔断 |
 | 14 | **弹幕 `sec_uid` 是否被脱敏** | 直播弹幕 DOM 常把用户 ID 脱敏为 `*****`；取不到真实 `sec_uid` 时标记 `not_locatable` 并**计入跳过** | 拿 `*****` 去构造主页 URL → 私信必然失败 |
+| 15 | **该渠道的真实接口路径片段是否已确认** | `comment/publish` 已验证。**私信与直播弹幕的真实接口名 legacy 从未验证过**，必须先手工用 DevTools Network 面板发一条、记录路径片段与成功码字段 | 凭猜测写 `im/send` / `live/comment/send` → 判定永远为 false，看起来像风控，实际是自己写错了关键字，白耗真机验证配额 |
 
 **通用禁忌**：不要在 `Runtime.evaluate` 的表达式里拼接用户输入（XSS 式注入到页面上下文）；不要把 `data-e2e` 字符串写到 `selectors.js` 以外的文件；不要用 `document` 全局搜索代替可见性判定。
 
@@ -485,6 +498,7 @@ curl -sS http://127.0.0.1:18080/healthz                                  # 服�
 | # | 触发条件 | 为什么不能猜 |
 |---|---|---|
 | 1 | 需要**真实抖音账号**才能验证（DOM 定位、发送链路、风控表现） | 你没有账号，猜出来的实现无法验证；而"未验证"与"已完成"是两件事 |
+| 1b | 需要确认真实的**平台接口路径片段与成功码字段**（私信、直播弹幕 legacy 从未验证过） | 猜错会让成功判定永远为 false，看起来像风控，实际是关键字写错，白耗真机验证配额 |
 | 2 | 涉及**任何限额数值**（日上限、最小间隔、相似度阈值、活跃时段、等级天数） | 权威来源只有服务端 `tier_table`；写死或猜错即违反红线 1 |
 | 3 | 涉及**计费口径**（什么算成功、扣多少、失败怎么算、余额不足怎么处理） | 计费直接对应商家付款与厂商收入，猜错要退钱并失去信任 |
 | 4 | 需要**引入白名单外依赖** | 白名单只有 `ws`；引入需报备（`开发规范.md` §8.1） |

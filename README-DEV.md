@@ -63,32 +63,36 @@ verdict = sent_confirmed
 
 ## 三、仓库现状
 
+> ✅ **仓库根目录已整理干净**：旧代码已全部移入 `legacy/`（保留 git 历史），根目录只剩文档与四个目录。**P0 的第一步已完成。**
+
 ```
 douyin-intercept-workbench/
 ├── README-DEV.md              ← 本文件（开发总索引）
-├── AGENTS.md                  ← ⚠️ 待重写（旧版含已作废条款，见第四节）
-├── README.md                  ← 旧版说明，待重写
+├── AGENTS.md                  ← 🔴 三条红线与 14 条必须避免的误实现
+├── README.md                  ← 面向使用者的说明
 │
-├── docs/                      ← 内部文档（需求/架构/规范）
-├── shared/                    ← 双端共享契约与规范（事实源）
-├── plans/                     ← 两套开发方案
+├── docs/                      需求与架构
+├── shared/                    双端共享契约与规范（事实源）
+├── plans/                     两套开发方案
 │
-├── legacy/                    ← ⚠️ 待创建：原半成品源码只读存档（行为规格参考）
+├── legacy/                    ✅ 原半成品源码只读存档（37 项，行为规格参考）
+│   ├── reply_worker.js        旧评论回复 worker（CDP 发送链路，质量高）
+│   ├── live_dom_collector.js  旧直播弹幕采集
+│   ├── live_dm_worker.js      旧私信准备
+│   ├── pipeline.js            旧视频搜索 + 评论爬取
+│   ├── scan_comments.js / comment_worker.js / browser_session.js / qr_capture.js
+│   ├── reply_server/          旧 HTTP 服务 + 前端单文件
+│   ├── scrapling_bridge/      评论清洗（Python，可选）
+│   └── *.json                 旧运行数据模板
 │
-└── （以下为原半成品源码，散落在根目录，待整理）
-    reply_server/server.js     旧 HTTP 服务（8093 行 8090 端口，零鉴权）
-    reply_server/select.html   旧前端单文件（1661 行）
-    reply_worker.js            旧评论回复 worker（530 行，CDP 发送链路质量高）
-    live_dom_collector.js      旧直播弹幕采集（648 行）
-    live_dm_worker.js          旧私信准备（228 行）
-    pipeline.js / scan_comments.js / comment_worker.js / browser_session.js ...
+└── （待创建）license-server/ · client/ · test/
 ```
 
 ### 关于 `legacy/`
 
-原项目是**别人的半成品**，存在 14 项已确认缺陷（含硬编码绝对路径导致在非原作者机器上跑不通、队列竞态丢任务、控制台裸奔可被跨站调用等）。
+原项目是**别人的半成品**，存在 14 项已确认缺陷（含硬编码绝对路径导致在非原作者机器上跑不通、队列竞态丢任务、控制台裸奔可被跨站调用等）。完整清单见 `docs/需求规格.md` §七之二。
 
-**处置决定：完全重写。** 但——旧代码**不删除**，移入 `legacy/` 作为**只读行为规格参考**。
+**处置决定：完全重写。** 但——旧代码**不删除**，已移入 `legacy/` 作为**只读行为规格参考**。
 
 **为什么必须保留**：旧代码里含有用真账号在真页面上反复试错换来的**抖音 DOM 知识**（例如：页面上同时存在隐藏与可见两个 `comment-list`，只能用可见的那个；`scrollIntoView` 之后虚拟列表会重渲染，必须延迟再读按钮坐标否则拿到 0×0）。这些知识**无法凭空复现**，且每次试错都消耗真实账号风险。
 
@@ -97,6 +101,8 @@ douyin-intercept-workbench/
 1. 新实现的每个 DOM 交互原语，都要在 `legacy/` 中找到对应实现逐条对照
 2. 已提取的知识点见 `shared/已知陷阱与平台知识.md`（**写 DOM 代码前必读**）
 3. 离线回归测试见 `shared/测试策略.md`
+
+**⚠️ 硬约束**：`legacy/` **只读**，不得被任何生产代码 `require`。这是验收项之一。
 
 ---
 
