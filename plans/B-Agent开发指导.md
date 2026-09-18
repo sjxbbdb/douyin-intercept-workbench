@@ -47,8 +47,7 @@
 
 > ### ⚠️ B 不能跳过 A 的底座
 > ① Agent 调用的全部工具最终落到 `adapters/` 与 `safety/`；这些不存在，工具层无物可包。
-> ② 计费与审计口径（红线 2、红线 3）已由 A 的服务端契约固化；B 的每次决策要挂到同一套审计上，
-> 没有 A 就没有可挂载的审计通道。
+> ② 计费与审计口径（红线 2、红线 3）已由 A 的服务端契约固化；B 的每次决策要挂到同一套审计上，没有 A 就没有可挂载的审计通道。
 > ③ **只有 A 能回答"裸 CDP 驱动抖音这条路走不走得通"**（P2 验证门 G-1~G-5）。
 > B 用同一套 CDP 驱动，A 走不通则 B 一样走不通，且 B 还多一层成本。
 
@@ -66,38 +65,35 @@
 ### 2.1 分层关系
 
 ```
-╔══════════════════════════════════════════════════════════════════════════╗
-║  Agent 层（🆕 仅 B 有）—— 只产出「工具调用请求」与「汇报」，不产出发送动作    ║
-║  client/agent/runtime.js      循环：指令 → 规划 → 调工具 → 观察 → 汇报      ║
-║  client/agent/model-client.js 模型接入抽象（provider/model 可配）          ║
-║  client/agent/prompts/        系统提示词与版本管理（prompt_version）        ║
-║  client/agent/planner.js      决策记录构造与落盘（decision_id）             ║
-║  client/agent/context.js      每轮从落盘状态重建上下文                       ║
-║  client/agent/token-budget.js 单次交互 token 预算与熔断                     ║
-╚═════════════════════════════════╤════════════════════════════════════════╝
-                                  │ 结构化工具调用（JSON 参数）
-╔═════════════════════════════════▼════════════════════════════════════════╗
-║  工具层（🆕 仅 B 有）—— 是「包装」而非「重新实现」，内部只调既有模块         ║
-║  client/tools/registry.js     工具注册表：名称/描述/JSON Schema/权限级别     ║
-║  client/tools/  query-leads · get-stats · get-account-health              ║
-║                 analyze-comments · draft-replies                          ║
-║                 review-batch · approve-batch · explain-failure            ║
-║  client/tools/validate.js     ⚠️ 参数校验（不信任模型传参）                  ║
-║  client/tools/audit.js        ⚠️ 每次工具调用落审计                         ║
-╚═════════════════════════════════╤════════════════════════════════════════╝
-                                  │ 进程内调用（不经 HTTP 转发）
-╔═════════════════════════════════▼════════════════════════════════════════╗
-║  既有底座（方案 A 交付，B 零改动或微改）                                     ║
-║  client/adapters/  collect · reply-comment · reply-danmaku · send-dm      ║
-║  client/safety/    guard · similarity · circuit · audit                   ║
-║  client/core/      cdp.js（全项目唯一一份）· browser-host.js · ipc.js      ║
-║  client/platform/  selectors.js（唯一来源）· page-* · publish-verifier    ║
-║  client/license/   auth · heartbeat · reporter · sign                     ║
-║  client/host/      api · scheduler · store（单写者 + 原子写）· instances    ║
-╚═════════════════════════════════╤════════════════════════════════════════╝
-                                  │ CDP :9222+N
-                                  ▼
-                      商家本机专用 Chrome（已登录抖音账号）
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Agent 层（🆕 仅 B 有）—— 只产出「工具调用请求」与「汇报」，不产出发送动作    │
+│  client/agent/  runtime.js（循环：指令→规划→调工具→观察→汇报）              │
+│                 model-client.js（provider/model 可配）                    │
+│                 prompts/（系统提示词 + prompt_version）                    │
+│                 planner.js（决策记录 decision_id）· context.js（重建上下文）│
+│                 token-budget.js（预算与熔断）                              │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                    结构化工具调用（JSON 参数）│
+┌──────────────────────────────────▼───────────────────────────────────────┐
+│ 工具层（🆕 仅 B 有）—— 是「包装」而非「重新实现」，内部只调既有模块         │
+│  client/tools/  registry.js（工具清单唯一来源）· validate.js（参数校验）    │
+│                 audit.js（每次调用落审计）                                │
+│                 query-leads · get-stats · get-account-health             │
+│                 analyze-comments · draft-replies                         │
+│                 review-batch · approve-batch · explain-failure           │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                          进程内调用（不经 HTTP）│
+┌──────────────────────────────────▼───────────────────────────────────────┐
+│ 既有底座（方案 A 交付，B 零改动或微改）                                    │
+│  client/adapters/  collect · reply-comment · reply-danmaku · send-dm     │
+│  client/safety/    guard · similarity · circuit · audit                  │
+│  client/core/      cdp.js（全项目唯一一份）· browser-host.js · ipc.js     │
+│  client/platform/  selectors.js（唯一来源）· page-* · publish-verifier   │
+│  client/license/   auth · heartbeat · reporter · sign                    │
+│  client/host/      api · scheduler · store（单写者+原子写）· instances     │
+└──────────────────────────────────┬───────────────────────────────────────┘
+                          CDP :9222+N │
+                                      ▼   商家本机专用 Chrome（已登录抖音账号）
 ```
 
 ### 2.2 一次交互的完整时序
@@ -105,51 +101,28 @@
 用户说：**"帮我看看南京这边问价格的，挑几个回一下，别超过 10 个"**
 
 ```
-┌──────┐    ┌──────────┐    ┌─────────┐    ┌──────────┐    ┌────────────────┐
-│ 用户 │    │ 对话界面 │    │  Agent  │    │  工具层  │    │ 底座 adapters  │
-│      │    │ client/ui│    │ runtime │    │ client/  │    │ safety         │
-│      │    │          │    │         │    │ tools/   │    │ host/scheduler │
-└──┬───┘    └────┬─────┘    └────┬────┘    └────┬─────┘    └───────┬────────┘
-   │"…别超过10个"│               │              │                  │
-   ├────────────►│ POST /api/agent/chat         │                  │
-   │             ├──────────────►│              │                  │
-   │             │               │ ① 从落盘状态重建上下文（不依赖历史消息）
-   │             │               │ ② 模型推理 → T-03 get_account_health()
-   │             │               ├─────────────►├─────────────────►│ 读 policy.json
-   │             │               │◄─────────────┤◄─────────────────┤
-   │             │               │  {sending_enabled:true, remaining:{comment:28}}
-   │             │               │ ③ T-01 query_leads({intent:"price_inquiry",
-   │             │               │      region:"南京", limit:50})
-   │             │               ├─────────────►├─────────────────►│ 只读线索库(脱敏)
-   │             │               │◄─────────────┤  {total:17, leads:[…]}
-   │             │               │ ④ T-06 review_batch({max_items:10})
-   │             │               ├─────────────►│ ⚠️ 代码预筛：guard 额度/间隔、
-   │             │               │              │  similarity 去重、circuit 熔断、
-   │             │               │              │  排除 complaint / irrelevant
-   │             │               │              ├─────────────────►│
-   │             │               │◄─────────────┤◄─────────────────┤
-   │             │               │  {batch_id:"b-8f2a", items:[10 条，每条含
-   │             │               │   draft_options[3]、recommended_draft_id、
-   │             │               │   safety 全通过], expires_at_ms}
-   │             │               │ ⑤ 模型决策（一次推理覆盖整批 N 条）
-   │             │               │    approve / reject / skip + 选 draft_id
-   │             │               │ ⑥ T-07 approve_batch({batch_id, decisions})
-   │             │               ├─────────────►│ ⚠️ 独立重新执行全部安全校验：
-   │             │               │              │  draft_id ∈ 候选？批次过期？
-   │             │               │              │  额度/间隔/熔断？（不信任 Agent 审批）
-   │             │               │              ├─────────────────►│ 队列 → scheduler
-   │             │               │              │                  │ 逐条走完整护栏：
-   │             │               │              │                  │ send_id 发送前落盘
-   │             │               │              │                  │ publish-verifier
-   │             │               │              │                  │ 嗅探平台响应体
-   │             │               │◄─────────────┤◄─────────────────┤
-   │             │               │  {accepted, rejected, skipped, queued_send_ids, blocked[]}
-   │             │               │ ⑦ 落盘 decision_id（含 model / prompt_version /
-   │             │               │    policy_version / usage / latency_ms）
-   │             │◄──────────────┤ ⑧ 自然语言汇报
-   │◄────────────┤ "看了南京 17 条询价，挑了 7 条回复（已投递），3 条是投诉或
-   │ 汇报+可展开  │  无关内容没有回，1 条因为发送间隔限制没发出去。"
-   │ 的决策明细   │
+用户 → 对话界面(client/ui) → POST /api/agent/chat → Agent runtime(client/agent)
+
+① runtime 从落盘状态重建上下文（不依赖对话历史）
+② 模型推理 → T-03 get_account_health() → 工具层 → 底座读 policy.json
+   ← {sending_enabled:true, remaining:{comment:28}}   ✓ 确认可发送
+③ 模型推理 → T-01 query_leads({intent:"price_inquiry", region:"南京", limit:50})
+   ← {total:17, leads:[…]}    ⚠️ 用闭集枚举值查询，不是自己"理解"意图
+④ 模型推理 → T-06 review_batch({max_items:10}) → 工具层
+   ⚠️ 代码预筛（在工具层/底座完成）：guard 额度·间隔·时段·观察期；
+      similarity 内容相似度；circuit 熔断；排除 complaint / irrelevant（由代码排除）
+   ← {batch_id:"b-8f2a", items:[10 条，每条含 excerpt、intent、draft_options[3]、
+        recommended_draft_id、safety 全通过], expires_at_ms}
+⑤ 模型决策（一次推理覆盖整批 N 条）：approve / reject / skip + 选 draft_id
+⑥ T-07 approve_batch({batch_id, decisions})
+   ⚠️ 工具层与服务端【独立重新执行】全部安全校验，不信任 Agent 审批：
+      draft_id ∈ 本批次候选？批次过期？额度/间隔/熔断？
+   ↓ 通过项 → 队列 → host/scheduler 逐条走完整护栏：
+      send_id 发送前落盘 → publish-verifier 嗅探平台响应体判成功 → 审计双写
+   ← {accepted, rejected, skipped, queued_send_ids, blocked[]}
+⑦ 落盘 decision_id（model / prompt_version / policy_version / usage / latency_ms）
+⑧ 汇报："看了南京 17 条询价，挑了 7 条回复（已投递），3 条是投诉或无关内容没有回，
+        1 条因为发送间隔限制没发出去。"
 ```
 
 ### 2.3 数据流方向与职责边界
@@ -207,63 +180,33 @@
 
 const TOOLS = [
   {
-    name: 'get_account_health',
-    tier: 'readonly',            // readonly | generate | execute
-    danger: 0,                   // 0 只读 / 1 消耗推理 / 2 有副作用
-    description: '查询账号当前状态：等级、天数索引、各渠道今日剩余额度、是否熔断、是否观察期。'
-               + '这是判断"现在能不能干活"的唯一依据，不得自行推断。',
-    inputSchema: {
-      type: 'object',
-      properties: { instance_id: { type: 'string', description: '省略则用当前实例' } },
-      additionalProperties: false,
-    },
-    handler: require('./get-account-health'),
-  },
-  {
-    name: 'review_batch',
-    tier: 'readonly',
-    danger: 0,
-    description: '拉取系统预筛好的待发批次供审批。只返回已通过全部安全校验的候选。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        source_type: { type: 'string', enum: ['comment', 'live_danmaku', 'dm'] },
-        max_items: { type: 'integer', minimum: 1, maximum: 'SERVER_POLICY' },  // 上限由服务端策略定
-      },
-      additionalProperties: false,
-    },
-    handler: require('./review-batch'),
-  },
-  {
-    name: 'approve_batch',
-    tier: 'execute',
-    danger: 2,
+    name: 'approve_batch',                 // 危险度最高的一个，作为 schema 写法的范本
+    tier: 'execute',                       // readonly | generate | execute
+    danger: 2,                             // 0 只读 / 1 消耗推理 / 2 有副作用
     description: '提交审批结果。唯一的写入型执行工具。action 只有 approve/reject/skip。',
     inputSchema: {
       type: 'object',
       required: ['batch_id', 'decisions'],
       properties: {
         batch_id: { type: 'string' },
-        decisions: {
-          type: 'array',
-          items: {
-            type: 'object',
-            required: ['item_id', 'action'],
-            properties: {
-              item_id: { type: 'string' },
-              action: { type: 'string', enum: ['approve', 'reject', 'skip'] },
-              draft_id: { type: 'string' },
-              reason: { type: 'string', maxLength: 120 },
-            },
-            additionalProperties: false,
+        decisions: { type: 'array', items: {
+          type: 'object', required: ['item_id', 'action'],
+          properties: {
+            item_id: { type: 'string' },
+            action: { type: 'string', enum: ['approve', 'reject', 'skip'] },
+            draft_id: { type: 'string' },              // 必须是本批次候选之一
+            reason: { type: 'string', maxLength: 120 },
           },
-        },
+          additionalProperties: false,                 // ⚠️ 拒绝任何未声明字段
+        } },
       },
       additionalProperties: false,
     },
     handler: require('./approve-batch'),
   },
-  // …T-01 T-02 T-04 T-05 T-08 同理
+  // 其余 7 个同构：T-01 query_leads、T-02 get_stats、T-03 get_account_health、
+  // T-04 analyze_comments（lead_ids 最多 50）、T-05 draft_replies（max_per_lead 默认 3 上限 5）、
+  // T-06 review_batch（max_items 默认 10、上限由服务端策略定）、T-08 explain_failure
 ]
 
 module.exports = { TOOLS }
@@ -272,8 +215,7 @@ module.exports = { TOOLS }
 **schema 实现注意**：
 ① 依赖白名单只有 `ws`，**不能引入 `ajv`**。用约 80 行手写校验器 `client/tools/validate.js`，只支持本项目用到的子集：
 `type` / `required` / `enum` / `minimum` / `maximum` / `maxLength` / `items` / `additionalProperties`。
-② `maximum: 'SERVER_POLICY'` 是占位标记，实现时替换为**运行时从 `policy` 读取的值**，
-**绝不允许写成字面量**（红线 1；`AGENTS.md` §2.2）。
+② `review_batch.max_items` 的 `maximum` **不能写字面量**，必须运行时从 `policy` 读取（红线 1；`AGENTS.md` §2.2）。
 
 ### 3.3 ⚠️ 参数校验在工具层：不信任模型传参
 
@@ -281,21 +223,19 @@ module.exports = { TOOLS }
 **校验必须在工具层做，且校验失败一律拒绝执行，不做"容错修正"。**
 
 ```js
-// client/tools/validate.js（节选）
+// client/tools/validate.js（节选）—— 约 80 行，不引入 ajv
 'use strict'
 
 function validateArgs(schema, args) {
   const errors = []
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return { ok: false, errors: ['args 必须是对象'] }
-  }
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return { ok: false, errors: ['args 必须是对象'] }
   // ① 拒绝未声明字段：防止模型塞入 draft_text / send_now / daily_max 之类的越权字段
   if (schema.additionalProperties === false) {
     for (const k of Object.keys(args)) {
       if (!schema.properties || !(k in schema.properties)) errors.push('未知字段: ' + k)
     }
   }
-  // ② 逐字段类型与范围校验
+  // ② 逐字段类型与范围校验：type / enum / minimum / maximum / maxLength / integer
   for (const [name, spec] of Object.entries(schema.properties || {})) {
     const v = args[name]
     if (v === undefined) {
@@ -341,17 +281,11 @@ const store = require('../host/store')
 
 function recordToolCall({ tool, argsDigest, ok, code, latencyMs, promptVersion }) {
   return store.appendInstanceJson('tool_audit.json', {
-    ts_ms: Date.now(),
-    tool,                       // 工具名（闭集）
-    args_digest: argsDigest,    // ⚠️ 只存参数摘要，不存原文
-    ok,                         // 布尔
-    code: code || null,         // 阻断码或参数错误码
-    latency_ms: latencyMs,
-    prompt_version: promptVersion,
+    ts_ms: Date.now(), tool, args_digest: argsDigest,   // ⚠️ 只存参数摘要，不存原文
+    ok, code: code || null, latency_ms: latencyMs, prompt_version: promptVersion,
     // 绝不写入：评论原文、回复原文、昵称、sec_uid、任何完整 URL
   })
 }
-
 module.exports = { recordToolCall }
 ```
 
@@ -376,19 +310,14 @@ module.exports = { recordToolCall }
 client/agent/runtime.js
 
 ① 接收指令   从 client/host/api.js 收到 { session_id, user_text }
-      │
-② 重建上下文 ⚠️ 从落盘状态重建（agent_task.json / agent_batch.json / decision_log.jsonl），
-      │         不依赖对话历史
+② 重建上下文 ⚠️ 从落盘状态重建（agent_task.json / agent_batch.json / decision_log.jsonl），不依赖对话历史
 ③ 规划       组装 messages = [system(prompt_version), 状态摘要, 指令] → model-client.chat()
-      │
-④ 判定       模型返回 tool_call？ ├─ 是 → ⑤
-      │                            └─ 否 → ⑧ 直接汇报
+④ 判定       模型返回 tool_call？ ├─ 是 → ⑤ ；└─ 否 → ⑧ 直接汇报
 ⑤ 校验+执行  validateArgs → registry 分发 → 工具执行
-      │        ⚠️ 校验失败也回给模型一个结构化错误，让它自己纠正
+             ⚠️ 校验失败也回给模型一个结构化错误，让它自己纠正
 ⑥ 观察       把工具结果（已裁剪为最小必要字段）追加进 messages；round++
-      │        若 round > MAX_TOOL_ROUNDS → ⑧ 以 ROUND_LIMIT 结束
+             若 round > MAX_TOOL_ROUNDS → ⑧ 以 ROUND_LIMIT 结束
 ⑦ 回到 ③
-      │
 ⑧ 落盘+汇报 写 decision_log.jsonl → 生成汇报文本 → 返回前端
 ```
 
@@ -404,7 +333,7 @@ client/agent/runtime.js
 ```js
 // client/agent/runtime.js（节选）
 async function runInteraction({ sessionId, userText }) {
-  const ctx = await rebuildContextFromDisk(sessionId)   // ③ 的状态来源
+  const ctx = await rebuildContextFromDisk(sessionId)   // ② 的状态来源
   const startedAt = process.hrtime.bigint()
   let round = 0
   const budget = budgetFor(ctx)
@@ -413,11 +342,9 @@ async function runInteraction({ sessionId, userText }) {
     if (round >= MAX_TOOL_ROUNDS) return finish(ctx, 'ROUND_LIMIT')
     if (elapsedMs(startedAt) > MAX_WALL_CLOCK_MS) return finish(ctx, 'TIMEOUT')
     if (budget.exhausted()) return finish(ctx, 'BUDGET_EXHAUSTED')
-
     const reply = await modelClient.chat(ctx.messages)
     budget.consume(reply.usage)
     if (!reply.toolCall) return finish(ctx, 'DONE', reply.text)
-
     const verdict = tools.invoke(reply.toolCall, { promptVersion: ctx.promptVersion })
     ctx.messages.push(tools.asToolResult(reply.toolCall.id, verdict))
     round++
@@ -466,7 +393,7 @@ async function runInteraction({ sessionId, userText }) {
 ```js
 // client/agent/model-client.js
 'use strict'
-// ⚠️ 统一接口：任何 provider 都必须实现 chat() 与 describe()
+// ⚠️ 统一接口：任何 provider 都要实现 request/extractText/extractToolCall/extractUsage/extractVersion
 // 输入输出均为纯 JSON 可序列化对象，不含任何厂商特有类型
 async function chat({ messages, tools, temperature, maxTokens, timeoutMs }) {
   const cfg = require('../host/store').getAgentConfig()   // provider/base_url/model/api_key
@@ -478,15 +405,13 @@ async function chat({ messages, tools, temperature, maxTokens, timeoutMs }) {
   return {
     text: adapter.extractText(raw),
     toolCall: adapter.extractToolCall(raw),          // { id, name, args } 或 null
-    usage: { prompt_tokens: usage.input, completion_tokens: usage.output },  // ⚠️ 归一化厂商差异
+    usage: { prompt_tokens: usage.input, completion_tokens: usage.output },  // ⚠️ 归一化厂商字段差异
     model: { provider: cfg.provider, model: cfg.model, version: adapter.extractVersion(raw) },
     latency_ms: Number(process.hrtime.bigint() - t0) / 1e6,
   }
 }
-
 // 每个 adapter 只做三件事：拼请求体、发 HTTPS（内置 node:https）、把响应映射到统一结构
 const ADAPTERS = { /* 具体路径与字段名按实际接入的 API 文档填写 */ }
-
 module.exports = { chat }
 ```
 
@@ -506,31 +431,12 @@ module.exports = { chat }
 
 Agent 是**增值层**，不是必需层。任何一环故障都必须能退回方案 A 继续工作。
 
-```
-                  ┌────────────────────────────┐
-                  │ 正常运行：Agent 审批 + 发送 │
-                  └──────────────┬─────────────┘
-        ┌────────────────────────┼────────────────────────┐
-        ▼                        ▼                        ▼
-┌──────────────────┐  ┌──────────────────┐  ┌────────────────────────┐
-│ L1 模型服务不可用 │  │ L2 成本超预算     │  │ L3 运行时报错/循环超限  │
-│ 超时/鉴权失败/    │  │ 日预算耗尽        │  │ 工具异常/上下文异常     │
-│ 配额耗尽          │  │                  │  │                        │
-├──────────────────┤  ├──────────────────┤  ├────────────────────────┤
-│ 自动切「无 Agent  │  │ 关闭 T-04/T-05   │  │ 单次交互终止，状态落盘，│
-│ 审批模式」：       │  │ （LLM 生成能力）  │  │ 提示"本次未完成，进度  │
-│ 候选仍由代码预筛 + │  │ 只保留规则候选 +  │  │ 已保留。可继续，或到    │
-│ 规则选话术，人工   │  │ 人工在图形界面    │  │ 图形界面手动处理。"     │
-│ 在图形界面一键     │  │ 一键批量确认      │  │                        │
-│ 批量确认          │  │ → 等价于方案 A    │  │ → 不丢状态，不重复发送  │
-└──────────────────┘  └──────────────────┘  └────────────────────────┘
-        └────────────────────────┼────────────────────────┘
-                                 ▼
-              ┌────────────────────────────────────┐
-              │ 最终兜底：完整方案 A 图形界面       │
-              │ （保留原 UI，功能不缺失）           │
-              └────────────────────────────────────┘
-```
+| 级别 | 触发 | 降级行为 |
+|---|---|---|
+| **L1** | 模型服务不可用（超时/鉴权失败/配额耗尽） | 自动切「无 Agent 审批模式」：候选仍由代码预筛 + 规则选话术，**人工在图形界面一键批量确认** |
+| **L2** | 成本超预算（日预算耗尽） | 关闭 T-04/T-05（LLM 生成能力），只保留规则候选 + 人工审批 → **等价于方案 A** |
+| **L3** | Agent 运行时报错 / 循环超限 / 上下文异常 | 单次交互终止，状态落盘，提示"本次未完成，进度已保留。可继续，或到图形界面手动处理" → 不丢状态、不重复发送 |
+| **兜底** | 以上均不可用 | **完整方案 A 图形界面**（保留原 UI，功能不缺失） |
 
 **降级的三条硬性要求**：
 ① **不丢数据**——候选批次、`send_id`、任务状态都在盘上；降级后人工审批走**同一份** `batch_id`。
@@ -568,10 +474,9 @@ Agent 是**增值层**，不是必需层。任何一环故障都必须能退回�
 
     你不发送任何东西。你只审批系统已经替你筛好的队列。
 
-系统（代码）已经完成了这些事：
-  · 从评论区/直播间/私信里筛出值得回复的候选
-  · 对每条候选做完配额、间隔、时段、熔断、相似度等全部安全校验
-  · 从商家的话术池里为每条候选匹配好 1~3 条候选话术
+系统（代码）已经完成了这些事：从评论区/直播间/私信里筛出值得回复的候选；
+对每条候选做完配额、间隔、时段、熔断、相似度等全部安全校验；
+从商家的话术池里为每条候选匹配好 1~3 条候选话术。
 
 你做的事只有三件：
   1. 挑掉不该回复的（例如负面情绪、无关灌水、语义明显不合适的）
@@ -595,7 +500,7 @@ Agent 是**增值层**，不是必需层。任何一环故障都必须能退回�
 
 # 你的能力边界（硬约束）
 
-你**只能**通过提供的工具工作。你没有、也不会有以下能力：
+你只能通过提供的工具工作。你没有、也不会有以下能力：
   · 点击页面、输入文字、滚动页面、执行页面脚本（没有这类工具）
   · 修改每日上限、发送间隔、相似度阈值、活跃时段（没有这类工具）
   · 直接写一条话术并发送（没有这类工具）
@@ -604,45 +509,39 @@ Agent 是**增值层**，不是必需层。任何一环故障都必须能退回�
 
 具体约束：
   · approve 时必须给出 draft_id，且该 draft_id 必须来自本次 review_batch 返回的候选。
-    你**不能**自己写文案，**不能**改写候选文案，**不能**拼接候选文案。
+    你不能自己写文案，不能改写候选文案，不能拼接候选文案。
   · action 只有 approve / reject / skip 三种。没有"换一个目标"。
-  · 你**不能**把同一批次里的 draft_id 挪给另一条 item。
+  · 你不能把同一批次里的 draft_id 挪给另一条 item。
   · 批次有 expires_at_ms，过期后必须重新拉取，不要复用旧批次。
   · 你的审批不等于发送。系统会对每一条独立重新执行全部安全校验；
     被拦下的会出现在 blocked 里，那是最终事实，请如实汇报，不要重试。
 
 # 工作方法
 
-1. 先确认现在能不能干活。
-   在涉及发送的任务开始前，先调用 get_account_health。
+1. 先确认现在能不能干活。涉及发送的任务开始前先调用 get_account_health。
    如果 sending_enabled 为 false、collect_only 为 true，或 circuit.open 为 true，
-   **立即停止并如实告知商家**，不要继续调用审批工具。
+   立即停止并如实告知商家，不要继续调用审批工具。
 
-2. 用量化的意图值，不要自己"理解"意图。
-   线索的 intent 是之前由系统批量分析后入库的闭集值
+2. 用量化的意图值，不要自己"理解"意图。线索的 intent 是之前由系统批量分析后入库的闭集值
    （price_inquiry / feature_inquiry / purchase_intent / support_inquiry / complaint /
      irrelevant / unknown）。查询时用这些值，不要用自然语言描述去猜。
 
-3. 优先批量，不要逐条。
-   一次 review_batch 可以拿到一批候选，一次决策给出这一批的全部结果。
+3. 优先批量，不要逐条。一次 review_batch 可以拿到一批候选，一次决策给出这一批的全部结果。
    批量决策更省成本，也更一致。
 
-4. 投诉与无关内容不回复。
-   系统通常已经把 complaint 和 irrelevant 排除了；如果你仍然看到这类内容，
-   用 reject 并写清楚原因。绝不在负面评论下自动回复。
+4. 投诉与无关内容不回复。系统通常已经把 complaint 和 irrelevant 排除了；
+   如果你仍然看到这类内容，用 reject 并写清楚原因。绝不在负面评论下自动回复。
 
-5. 拿不准就 skip，不要 approve。
-   skip 的意思是"跳过，交给商家人工看"，它比误批安全得多。
+5. 拿不准就 skip，不要 approve。skip 的意思是"跳过，交给商家人工看"，它比误批安全得多。
 
-6. 遇到错误按类型处理。
+6. 遇到错误按类型处理：
    · 参数错误 → 用合法参数重试一次
    · 批次过期 → 重新拉取新批次
    · 策略类阻断（观察期/额度/熔断）→ 立即停止，如实告知
    · 安全类阻断（相似度/间隔/候选外文案）→ 如实汇报，绝不尝试绕过
    · 工具异常 → 汇报"工具执行失败"，不要猜测原因
 
-7. 不要为了完成任务而降低标准。
-   如果一批 10 条里有 8 条你都觉得不该回，就 reject 8 条。
+7. 不要为了完成任务而降低标准。如果一批 10 条里有 8 条你都觉得不该回，就 reject 8 条。
    少回几条没有损失，回错一条有真实风险。
 
 # 汇报格式
@@ -683,14 +582,12 @@ Agent 是**增值层**，不是必需层。任何一环故障都必须能退回�
 ```js
 // client/agent/prompts/index.js
 'use strict'
-const fs = require('node:fs')
-const path = require('node:path')
-const crypto = require('node:crypto')
+const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto')
 
 const PROMPT_VERSION = 'p-1.0.0'   // 语义化：主/次/修订
-// 主版本：角色或安全边界变更 → 必须重跑评估集 + 人工复核
-// 次版本：工作方法、汇报格式调整 → 必须重跑评估集
-// 修订：措辞微调 → 可只跑冒烟
+// 主版本（角色或安全边界变更）→ 必须重跑评估集 + 人工复核
+// 次版本（工作方法、汇报格式调整）→ 必须重跑评估集
+// 修订版本（措辞微调）→ 可只跑冒烟
 
 function loadSystemPrompt() {
   return fs.readFileSync(path.join(__dirname, 'system.' + PROMPT_VERSION + '.md'), 'utf8')
@@ -698,7 +595,6 @@ function loadSystemPrompt() {
 function promptDigest() {   // 审计用：证明"当时用的是哪一份提示词"
   return crypto.createHash('sha256').update(loadSystemPrompt()).digest('hex').slice(0, 16)
 }
-
 module.exports = { PROMPT_VERSION, loadSystemPrompt, promptDigest }
 ```
 
@@ -767,26 +663,22 @@ function rebuildContextFromDisk(sessionId) {
 
   const stateBrief = [
     '【当前落盘状态摘要｜由系统生成，请以此为准】',
-    task  ? '任务：' + task.task_id + ' 状态 ' + task.status + '，已用 ' + task.rounds_used + ' 轮'
-          : '任务：无进行中任务',
-    batch ? '未完成批次：' + batch.batch_id + '，共 ' + batch.item_ids.length + ' 条，到期 '
-            + new Date(batch.expires_at_ms).toLocaleString('zh-CN')
-            + '，已决 ' + batch.decisions.length + ' 条'
+    task  ? `任务：${task.task_id} 状态 ${task.status}，已用 ${task.rounds_used} 轮` : '任务：无进行中任务',
+    batch ? `未完成批次：${batch.batch_id}，共 ${batch.item_ids.length} 条，`
+            + `到期 ${new Date(batch.expires_at_ms).toLocaleString('zh-CN')}，已决 ${batch.decisions.length} 条`
           : '未完成批次：无',
-    '账号：等级 ' + health.account_tier + '，第 ' + health.account_day_index + ' 天，可发送 '
-      + health.sending_enabled + '，熔断 ' + health.circuit.open,
+    `账号：等级 ${health.account_tier}，第 ${health.account_day_index} 天，`
+      + `可发送 ${health.sending_enabled}，熔断 ${health.circuit.open}`,
     '【注意：以上为系统生成的权威摘要。若历史对话与它冲突，以本摘要为准。】',
   ].join('\n')
 
   return { sessionId, stateBrief, promptVersion: require('./prompts').PROMPT_VERSION }
 }
-
 module.exports = { rebuildContextFromDisk }
 ```
 
-**三条要求**：
-① 状态摘要**由代码生成**，模型只读不改；与历史消息冲突时以摘要为准（提示词中已声明）。
-② 摘要中**不得含隐私字段**（无 `sec_uid`、无昵称，评论摘要 ≤30 字，见 §7.4）。
+**三条要求**：① 状态摘要**由代码生成**，模型只读不改，与历史消息冲突时以摘要为准（提示词中已声明）；
+② 摘要中**不得含隐私字段**（无 `sec_uid`、无昵称，评论摘要 ≤30 字，见 §7.4）；
 ③ 摘要长度可控（建议 ≤400 token），避免每轮固定成本膨胀。
 
 ### 6.4 决策记录格式
@@ -1002,15 +894,14 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
   const out = []
   for (const leadId of lead_ids) {
     const lead = loadLead(leadId)
-    // ① 先查商家话术池（本地匹配，零 token）
-    const hit = matchTemplatePool(lead, intent_hint)
+    const hit = matchTemplatePool(lead, intent_hint)   // ① 先查商家话术池（本地匹配，零 token）
     if (hit.length >= 1) {
       out.push({ lead_id: leadId, candidates: hit.slice(0, max_per_lead).map(withSimilarity) })
-      continue                                     // ⚠️ 命中即返回，不进 LLM
+      continue                                        // ⚠️ 命中即返回，不进 LLM
     }
     // ② 只有匹配不到、且商家显式开启 generated，才调 LLM
     if (!require('../host/store').getAgentConfig().allow_generated_drafts) {
-      out.push({ lead_id: leadId, candidates: [] })  // 无候选 → 不进入审批
+      out.push({ lead_id: leadId, candidates: [] })   // 无候选 → 不进入审批
       continue
     }
     out.push(await llmDraftOne(lead, max_per_lead))
@@ -1026,12 +917,8 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 
 ```json
 // instances/<ID>/agent_config.json 片段
-{
-  "max_tokens_per_interaction": 120000,
-  "max_tokens_per_day": 2000000,
-  "max_rounds_per_interaction": 12,
-  "soft_warn_rounds": 8
-}
+{ "max_tokens_per_interaction": 120000, "max_tokens_per_day": 2000000,
+  "max_rounds_per_interaction": 12, "soft_warn_rounds": 8 }
 ```
 
 > ⚠️ 上表数值需按实际模型单价与定价空间反算填入（见评估集文档 §5.4）。
@@ -1057,34 +944,18 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 
 > **顺序已定稿（`plans/B-工具契约与粒度设计.md` §七），不得调整。上一步未通过，不进下一步。**
 
-### 第 0 步：前置检查（不写代码）
+**第 0 步 · 前置检查（不写代码）**：① 方案 A 已完成：`docs/需求规格.md` §九 的 23 条全部通过且 `node test/run.js` 全绿；
+② P2 验证门 G-1~G-5 全部通过（`shared/术语与选型基准.md` §5.2）；③ A 至少跑满 1 周，能导出真实评论以判断规则召回率。
+**未通过则停止**——B 建立在 A 之上，A 不稳则 B 必不稳。
 
-| 项 | 判据 |
-|---|---|
-| 方案 A 已完成 | `docs/需求规格.md` §九 的 23 条全部通过，`node test/run.js` 全绿 |
-| P2 验证门通过 | G-1~G-5 全部通过（`shared/术语与选型基准.md` §5.2） |
-| 有真实运行数据 | A 至少跑满 1 周，能导出真实评论以判断规则召回率 |
-
-**未通过则停止**：B 建立在 A 之上，A 不稳则 B 必不稳。
-
-### 第 1 步：只读工具（T-01 `query_leads`、T-02 `get_stats`、T-03 `get_account_health`）
-
-| 项 | 内容 |
-|---|---|
-| **目标** | 打通"Agent 能看数据"：用户问"今天回复了几条""现在能不能发"，Agent 能查到真实数字 |
-| **交付** | `registry.js` + 三个只读工具 + `validate.js` + `tool_audit.json` + 最小对话界面 |
-| **验证方式** | ① 单元测试：schema 校验（含未知字段拒绝）；② 真机问 5 个问题，数字与图形界面看板**逐项一致** |
-| **通过判据** | 1. 工具清单恰好 3 个，无任何写操作<br>2. `query_leads` 返回结构中**不含** `sec_uid`/昵称（代码断言）<br>3. `get_account_health` 数值与 `policy.json` 一致，非自行推算<br>4. 每次调用都产生一条 `tool_audit.json` 记录 |
-| **风险** | 低。无副作用、无推理成本 |
-
-### 第 2 步：`review_batch` + `approve_batch` —— ⭐ 核心闭环，**先不做 LLM 生成**
-
-| 项 | 内容 |
-|---|---|
-| **目标** | 验证整个方案 B 的**核心假设**：商家接受"审批式 Agent"这个交互形态，且系统稳定 |
-| **交付** | T-06 + T-07；`adapters/` 暴露 `listPendingCandidates()` / `enqueueApproved()`；候选由**纯规则**生成（话术池匹配 + 相似度检测），**不接 LLM 生成** |
-| **验证方式** | ① 构造边界用例，使 7 个阻断码各触发一次；② 真机跑一批真实候选，观察审批 → 发送 → 结果回报全链路；③ 断网/重启后批次仍可续 |
-| **通过判据** | 1. **手工篡改 Agent 提交的 `draft_id` 为候选外值，必须 `blocked`**<br>2. 同一 `batch_id` 重复提交 → 返回首次结果，**不重复发送**（幂等）<br>3. 观察期下 `review_batch` 返回空批次、`approve_batch` 返回 `POLICY_SENDING_DISABLED`<br>4. 7 个阻断码全部可被构造并正确返回<br>5. 发送仍走完整护栏：`send_id` 发送前落盘、平台响应体判成功、审计双写<br>6. **商家反馈"愿意用"** ← 这一条是核心假设的验证，不是技术判据 |
+| 步骤 | 目标 | 交付与验证 | 通过判据（未达标不进下一步） |
+|---|---|---|---|
+| **1. 只读工具**<br>T-01 `query_leads`、T-02 `get_stats`、T-03 `get_account_health` | 打通"Agent 能看数据"：问"今天回复了几条""现在能不能发"，能查到真实数字 | `registry.js` + 三个只读工具 + `validate.js` + `tool_audit.json` + 最小对话界面；① 单测 schema 校验（含未知字段拒绝）② 真机问 5 个问题与看板**逐项一致** | ① 工具清单恰好 3 个，无任何写操作<br>② `query_leads` 返回**不含** `sec_uid`/昵称（代码断言）<br>③ `get_account_health` 数值与 `policy.json` 一致，非自行推算<br>④ 每次调用产生一条审计记录<br>**风险：低**（无副作用、无推理成本） |
+| **2. `review_batch` + `approve_batch`**<br>⭐ 核心闭环，**先不做 LLM 生成** | 验证方案 B 的**核心假设**：商家接受"审批式 Agent"这个形态，且系统稳定 | T-06 + T-07；`adapters/` 暴露 `listPendingCandidates()` / `enqueueApproved()`；候选由**纯规则**生成（话术池匹配 + 相似度检测）；① 构造边界用例使 7 个阻断码各触发一次 ② 真机跑一批真实候选走全链路 ③ 断网/重启后批次可续 | ① **手工篡改 `draft_id` 为候选外值，必须 `blocked`**<br>② 同一 `batch_id` 重复提交返回首次结果，**不重复发送**<br>③ 观察期下 `review_batch` 空批次、`approve_batch` 返回 `POLICY_SENDING_DISABLED`<br>④ 7 个阻断码全部可构造并正确返回<br>⑤ 发送仍走完整护栏：`send_id` 发送前落盘、平台响应体判成功、审计双写<br>⑥ **商家反馈"愿意用"** ← 核心假设的验证，不是技术判据 |
+| **3. `analyze_comments`**<br>T-04，第一个 LLM 能力 | 引入语义意图识别，解决"贵不贵"与"多少钱"字面不同 | T-04 + 24h 缓存 + 意图闭集校验 + 评估集 V1（≥200 条）；跑评估集出准确率报告与混淆矩阵，与方案 A 规则做基线对比 | ① 意图分类**整体准确率 ≥ 85%**（评估集文档 §3.1）<br>② **`complaint` 召回率 ≥ 95%**（漏判为 `price_inquiry` 会导致在投诉下自动回复，风险最高）<br>③ 相对规则基线的召回增益**可量化**<br>④ 缓存命中时**零 token 消耗**（实测）<br>⑤ 未知意图一律落 `unknown`，不得自由文本<br>**风险：低**（只读分析） |
+| **4. 评估集与成本监控** | 建立"改提示词/换模型后能量化对比"的能力，并让成本可见 | `test/eval/` 评估集（脱敏 + 标注）+ 评估 runner + 成本看板；① 两版提示词跑同一评估集出可对比报告 ② 看板数字与账单核对一致 | ① 评估集已脱敏（**逐条人工确认无真实用户信息**）<br>② 误批率 **< 5%**<br>③ 每条回复摊薄 token 成本占单价 **< 15%**（评估集文档 §5.4）<br>④ 成本超预算时**自动降级可触发**（实测）<br>**风险：中**（评估集是纯成本，但没有它就无法安全地改提示词） |
+| **5. `draft_replies`**<br>T-05，最后做 | 话术池匹配不到时提供候选（默认关闭），提升覆盖率 | T-05 + `allow_generated_drafts` 开关 + 相似度检测强制 + 候选进池的复核流程；① 构造语义雷同但字面不同的内容验证拦截 ② 人工评审生成候选可用率 | ① `similarity_checked:false` 的候选**不出现**在任何 `draft_options` 中<br>② 未显式开启时**没有任何** `source:"generated"` 候选<br>③ 生成候选人工评审通过率 ≥ 70%（评估集文档 §3.2）<br>④ 未复核不得进入长期话术池<br>**风险：最高**（内容风控）——放最后就是因为它最可能出问题 |
+| **6. `explain_failure`**<br>T-08，随时可加 | 让 Agent 能回答"为什么没发出去" | 构造各 `failure_reason` 枚举各一次确认归因 | 归因码来自闭集（`shared/protocol.md` §7.4），**不返回自由文本作为唯一依据** |
 
 > ### 第 2 步"先不做 LLM 生成"的意义
 > 方案 B 有一个**与 LLM 能力无关**的假设：商家愿意接受"Agent 替我做审批"。
@@ -1099,41 +970,6 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 > **反过来做（先上 LLM 生成）的代价**：若形态最终不被接受，LLM 那部分工作全部作废，
 > 且期间已产生真实的内容风控风险与 token 支出。
 
-### 第 3 步：`analyze_comments`（T-04，第一个 LLM 能力）
-
-| 项 | 内容 |
-|---|---|
-| **目标** | 引入语义意图识别，解决"贵不贵"与"多少钱"字面不同的问题 |
-| **交付** | T-04 + 24h 缓存 + 意图闭集校验 + 评估集 V1（≥200 条） |
-| **验证方式** | 跑评估集，出意图分类准确率报告与混淆矩阵；与方案 A 的关键词规则做基线对比 |
-| **通过判据** | 1. 意图分类**整体准确率 ≥ 85%**（目标值，见评估集文档 §3.1）<br>2. **`complaint` 召回率 ≥ 95%**（漏判为 `price_inquiry` 会导致在投诉下自动回复，风险最高）<br>3. 相对规则基线的召回增益**可量化**<br>4. 缓存命中时**零 token 消耗**（实测）<br>5. 未知意图一律落 `unknown`，**不得自由文本** |
-| **风险** | 低（只读分析，不产生发送） |
-
-### 第 4 步：评估集与成本监控
-
-| 项 | 内容 |
-|---|---|
-| **目标** | 建立"改提示词/换模型后能量化对比"的能力，并让成本可见 |
-| **交付** | `test/eval/` 评估集（脱敏数据 + 标注）+ 评估 runner + 成本看板 |
-| **验证方式** | ① 用两版提示词跑同一评估集，能产出可对比报告；② 成本看板数字与实际 token 账单核对一致 |
-| **通过判据** | 1. 评估集已脱敏（**逐条人工确认无真实用户信息**）<br>2. 误批率（`approve` 后仍不该回的比例）**< 5%**<br>3. 每条回复的摊薄 token 成本已算出，且占单价比例 **< 15%**（见评估集文档 §5.4）<br>4. 成本超预算时**自动降级可触发**（实测） |
-| **风险** | 中。评估集建设是纯成本，但**没有它就无法安全地改提示词** |
-
-### 第 5 步：`draft_replies`（T-05，最后做）
-
-| 项 | 内容 |
-|---|---|
-| **目标** | 话术池匹配不到时提供候选（默认关闭），提升覆盖率 |
-| **交付** | T-05 + `allow_generated_drafts` 开关 + 生成候选的相似度检测强制 + 候选进池的复核流程 |
-| **验证方式** | ① 构造语义雷同但字面不同的生成内容，验证相似度检测拦截；② 人工评审生成候选的可用率 |
-| **通过判据** | 1. `similarity_checked:false` 的候选**不出现**在任何 `draft_options` 中<br>2. 商家未显式开启时，**没有任何** `source:"generated"` 候选<br>3. 生成候选的人工评审通过率 ≥ 70%（见评估集文档 §3.2）<br>4. 生成候选**未复核不得进入长期话术池** |
-| **风险** | **最高**（内容风控）。放最后就是因为它最可能出问题 |
-
-### 第 6 步：`explain_failure`（T-08，随时可加）
-
-目标：让 Agent 能回答"为什么没发出去"。验证：构造各 `failure_reason` 枚举各一次，确认正确归因。
-判据：归因码来自闭集（`shared/protocol.md` §7.4），**不返回自由文本作为唯一依据**。
-
 ---
 
 ## 十、与方案 A 的关系
@@ -1146,8 +982,7 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 | 原样复用（零改动） | `client/core/`、`client/platform/`、`client/license/`、`shared/lib/`、授权中心**全部**、接口契约 |
 | 需改造 | `client/safety/`（新增拦 Agent 越权）、`client/adapters/`（暴露预筛能力）、审计（扩展决策记录）、`client/ui/`（新增对话界面但**保留图形界面**）、看板（新增 Agent 指标） |
 | 全新 | Agent 运行时、工具封装层、提示词与版本管理、评估集与评估流程、决策记录与成本监控、对话界面 |
-| 增量工作量 | 约为方案 A 自身工作量的 **30%–50%** |
-| 迁移性质 | **增量式，不是重做** |
+| 增量工作量 | 约为方案 A 自身工作量的 **30%–50%**；迁移性质：**增量式，不是重做** |
 
 ---
 
@@ -1157,23 +992,22 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 
 | # | 交付物 | 路径 | 步骤 |
 |---|---|---|---|
-| 1 | 工具注册表与参数校验 | `client/tools/registry.js`、`validate.js` | 1 |
-| 2 | 八个工具实现 | `client/tools/*.js`（T-01~T-08） | 1/2/3/5/6 |
-| 3 | 工具审计 | `client/tools/audit.js` + `instances/<ID>/tool_audit.json` | 1 |
-| 4 | Agent 运行时 | `client/agent/runtime.js`、`model-client.js`、`planner.js`、`context.js`、`token-budget.js` | 1 |
-| 5 | 系统提示词与历史版本 | `client/agent/prompts/system.p-*.md`、`index.js` | 1 |
-| 6 | 决策记录 | `instances/<ID>/decision_log.jsonl` | 2 |
-| 7 | 任务与批次状态 | `instances/<ID>/agent_task.json`、`agent_batch.json` | 2 |
-| 8 | 对话界面 + 决策明细查看 | `client/ui/`（Agent 面板） | 1/2 |
-| 9 | 评估集与评估 runner | `test/eval/` | 4 |
-| 10 | 成本监控与告警 | `client/agent/token-budget.js` + 看板指标 | 4 |
-| 11 | 降级路径实现与验证记录 | `runtime.js`（降级分支）+ UI 状态提示 | 4 |
-| 12 | 本文档及三份配套文档 | `plans/B-*.md` | — |
+| 1 | 工具注册表 + 参数校验 + 工具审计 | `client/tools/registry.js`、`validate.js`、`audit.js` | 1 |
+| 2 | 八个工具实现（T-01~T-08） | `client/tools/*.js` | 1/2/3/5/6 |
+| 3 | Agent 运行时 | `client/agent/runtime.js`、`model-client.js`、`planner.js`、`context.js`、`token-budget.js` | 1 |
+| 4 | 系统提示词与历史版本 | `client/agent/prompts/system.p-*.md`、`index.js` | 1 |
+| 5 | 决策记录 + 工具审计落盘 | `instances/<ID>/decision_log.jsonl`、`tool_audit.json` | 1/2 |
+| 6 | 任务与批次状态 | `instances/<ID>/agent_task.json`、`agent_batch.json` | 2 |
+| 7 | 对话界面 + 决策明细查看 | `client/ui/`（Agent 面板） | 1/2 |
+| 8 | 评估集与评估 runner | `test/eval/` | 4 |
+| 9 | 成本监控与告警 | `client/agent/token-budget.js` + 看板指标 | 4 |
+| 10 | 降级路径实现与验证记录 | `runtime.js`（降级分支）+ UI 状态提示 | 4 |
+| 11 | 本文档及三份配套文档 | `plans/B-*.md` | — |
 
 ### 11.2 验收标准
 
 **通用验收**：`docs/需求规格.md` §九 的 23 条**全部仍然适用**（B 不得让任何一条失效）。
-其中与 B 最相关：第 3 条（余额归零停机）、第 5 条（达上限不发送）、第 15 条（相似度 >85% 拒绝）、
+与 B 最相关的五条：第 3 条（余额归零停机）、第 5 条（达上限不发送）、第 15 条（相似度 >85% 拒绝）、
 第 18 条（夜间不发送）、第 21 条（审计可导出）。
 
 **方案 B 特有的四条验收**：
@@ -1230,12 +1064,12 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 
 | # | 位置 | 问题 | 说明 |
 |---|---|---|---|
-| S-1 | `docs/架构说明.md` §七「积分协议」 | 仍写"计费触发 = 自动回复引擎运行态的挂钟时长""分段计费 36 分钟 = 0.5" | 该模型已作废：`shared/protocol.md` §8.1 已将 `protocol_version 1→2` 改为**按成功回复条数计费**，§6.1 明确"心跳与时长不参与计费" |
-| S-2 | `docs/架构说明.md` R-4 与 §五 | 半年套餐"4320 积分"、`plan.hours` 字段 | 与 `shared/protocol.md` §4.14 及 `docs/需求规格.md` FR-3.3 的 **12600**（= 70×180，运行时由 `tier_table` 推导）不一致；`hours` 已废弃、服务端恒返回 `null` |
-| S-3 | `docs/需求规格.md` D4 | "回复内容来源 = 关键词规则 + 话术模板库，**本期不接大模型**" | 该条是**方案 A 的范围界定**；方案 B 正是"接大模型"的增值升级。两者不矛盾，但需在 D4 注明"方案 B 另行评估"以免误读 |
-| S-4 | `docs/需求规格.md` §四 | 出现**两个 `NFR-1`**（依赖条目重复且措辞不同："保持零 npm 依赖" vs "允许极少量依赖（`ws`）"） | 后者才是定稿口径（`shared/术语与选型基准.md` §3.2）。建议删除前者 |
-| S-5 | `docs/架构说明.md` §八 目录 | 写 `shared/protocol.js`、`shared/errors.js` | 定稿目录为 `shared/lib/protocol.js`、`shared/lib/errors.js`（`shared/lib/` 是唯一允许双端共享的代码目录） |
-| S-6 | `docs/需求规格.md` FR-2.3.2 | 评论 20-30 条 / 弹幕 30-50 条 | 与 `shared/protocol.md` §4.6 `tier_table`（评论 10/25/30、弹幕 10/25/30）范围不一致。**以 `tier_table` 为唯一来源**（红线 1） |
+| S-1 | `docs/架构说明.md` §七 | 仍写"计费触发 = 自动回复引擎运行态的挂钟时长""分段计费 36 分钟 = 0.5" | 已作废：`shared/protocol.md` §8.1 已将 `protocol_version 1→2` 改为**按成功回复条数计费**，§6.1 明确"心跳与时长不参与计费" |
+| S-2 | `docs/架构说明.md` R-4 与 §五 | 半年套餐"4320 积分"、`plan.hours` 字段 | 与 `shared/protocol.md` §4.14 及 FR-3.3 的 **12600**（= 70×180，由 `tier_table` 实时推导）不一致；`hours` 已废弃、服务端恒返回 `null` |
+| S-3 | `docs/需求规格.md` D4 | "话术模板库…**本期不接大模型**" | 该条是**方案 A 的范围界定**；方案 B 正是"接大模型"的增值升级。两者不矛盾，但需在 D4 注明"方案 B 另行评估"以免误读 |
+| S-4 | `docs/需求规格.md` §四 | 出现**两个 `NFR-1`**（措辞不同："保持零 npm 依赖" vs "允许极少量依赖（`ws`）"） | 后者才是定稿口径（`shared/术语与选型基准.md` §3.2）。建议删除前者 |
+| S-5 | `docs/架构说明.md` §八 | 写 `shared/protocol.js`、`shared/errors.js` | 定稿目录为 `shared/lib/protocol.js`、`shared/lib/errors.js`（`shared/lib/` 是唯一允许双端共享的代码目录） |
+| S-6 | `docs/需求规格.md` FR-2.3.2 | 评论 20-30 条 / 弹幕 30-50 条 | 与 `shared/protocol.md` §4.6 `tier_table`（评论 10/25/30、弹幕 10/25/30）不一致。**以 `tier_table` 为唯一来源**（红线 1） |
 
 ---
 
@@ -1248,10 +1082,8 @@ async function draftReplies({ lead_ids, intent_hint, max_per_lead }) {
 | `plans/B-与方案A的差异说明.md` | 复用矩阵、改造清单、增量工作量、迁移路径 |
 | `plans/00-两方案对比与选型建议.md` | 两方案对比、选型建议、B 的两个特有风险 |
 | `README-DEV.md` · `AGENTS.md` | 开发总索引、三条红线、14 条必须避免的误实现 |
-| `shared/protocol.md` | 双端接口契约（认证 / 计费 / 策略 / 审计 / 错误码） |
-| `shared/术语与选型基准.md` | 术语、技术选型、目录结构、依赖白名单 |
-| `docs/需求规格.md` | 23 条验收标准、FR-2.3 安全体系、FR-4 看板口径、FR-6 责任边界 |
-| `docs/架构说明.md` | 分层、稳定指标 S-1~S-6、P2 验证门 |
+| `shared/protocol.md` · `shared/术语与选型基准.md` | 接口契约；术语、技术选型、目录结构、依赖白名单 |
+| `docs/需求规格.md` · `docs/架构说明.md` | 23 条验收标准与安全/看板/责任边界需求；分层、稳定指标 S-1~S-6、P2 验证门 |
 
 ---
 

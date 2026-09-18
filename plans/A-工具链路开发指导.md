@@ -321,7 +321,7 @@ const billable = s.verdict === 'sent_confirmed'
 |---|---|---|
 | **频控**（`guard.js`） | 三渠道独立计数、独立间隔、独立熔断窗口（`comment`/`live_danmaku`/`dm` 互不挤占）；日上限按**服务端 `stats_tz_offset_minutes`(480)** 切分自然日，跨零点按 `sent_at_ms` 归属；同一 `user_key_hash` 在 `N` 小时内（默认 24）只回复一次（验收标准 12） | **为什么不能用固定间隔**：旧代码是 `10000 + rand(4000)`，每个周期都是整齐的 10–14 秒，这是最典型的机器人特征。必须改为**对数正态分布**（多数偏短、偶尔长间隔），并在每次点击/输入前插入 1–3 秒随机停顿；弹幕命中到回复之间也要加人工量级延迟，避免"秒回" |
 | **内容相似度**（`similarity.js`） | 发送前把渲染好的文案与**近期已发内容**（建议最近 50 条 + 该规则模板池）做 SimHash 比对；阈值取策略 `content_similarity_max`（`comment`/`live_danmaku` 默认 0.85，`dm` 默认 0.75）；命中拒绝 → `verdict=skipped`/`failed` + `failure_reason=content_rejected`，UI 提示补充文案；规则保存时校验模板池**至少 5 条变体** | ⚠️ **超过阈值即拒绝**（0.85 = 相似度 > 85% 拒绝）。**方向反了会变成"只发相似内容"，是灾难性缺陷**（`AGENTS.md` §2.4）。另外禁止用 `{随机1-9}` 生成 `"1"`/`"2"` 这类明显机器痕迹，应使用"这个""这款""它"等语言变体 |
-| **熔断状态机**（`circuit.js`） | 递进：**L1 暂停 30 分钟 → L2 暂停 1 小时 → L3 停到次日 00:00(UTC+8)**；触发源为验证码/滑块出现、连续失败达阈值、平台风控拒绝（`platform_reject_count` 达 3）、失败率超 `failure_rate_threshold=0.4`（窗口 `failure_rate_window=20`）；服务端下发 `cooldown_ms=1800000` 与 `risk_code_cooldown_ms=86400000`；收到 `POLICY_CIRCUIT_OPEN(409)` 或 `commands:[circuit_break]` → **60 秒内**停止全部发送 | UI 必须明确显示"当前处于第几级熔断、何时恢复"（验收标准 17：退避必须是 **30 分钟级**，不是旧代码的 60 秒）。熔断期间**不影响历史明细补报**（已发生的事实照常受理与计费），只拒绝新发送 |
+| **熔断状态机**（`circuit.js`） | 递进：**L1 暂停 30 分钟 → L2 暂停 1 小时 → L3 停到次日 00:00(UTC+8)**（FR-2.3.5）。触发源为验证码/滑块出现、连续失败达阈值、平台风控拒绝（`platform_reject_count` 达 3）、失败率超 `failure_rate_threshold=0.4`（窗口 `failure_rate_window=20`）。服务端下发 `circuit_breaker.cooldown_ms=1800000`（对应 L1）与 `risk_code_cooldown_ms=86400000`（24 小时，对应 L3"停到次日"）；⚠️ **本地递进级别与服务端下发的 `cooldown_until_ms` 取较长者**（服务端是权威下限，本地递进不可因服务端给得短而回退到 L1）。收到 `POLICY_CIRCUIT_OPEN(409)` 或 `commands:[circuit_break]` → **60 秒内**停止全部发送 | UI 必须明确显示"当前处于第几级熔断、何时恢复"（验收标准 17：退避必须是 **30 分钟级**，不是旧代码的 60 秒）。熔断期间**不影响历史明细补报**（已发生的事实照常受理与计费），只拒绝新发送 |
 | **急停**（`guard.js`） | UI 顶部常驻按钮，快捷键 `Esc`；语义是**立即生效、不可被排队任务绕过**——实现为"原子标志位 + 在发送链路每个步骤入口检查"，而不是"等当前任务跑完" | 急停与熔断机制**不可被关闭、不可被移除**（`AGENTS.md` 红线）。不得提供任何禁用开关或环境变量 |
 | **活跃时段**（`guard.js`） | 默认 `08:00–23:00` 单一窗口，`tz_offset_minutes=480`；客户端只能调更短、不得新增窗口；每天在窗口内随机起止 | 夜间完全停发（验收标准 18）；时段外**照常采集**，命中计 `skipped` 而非丢弃线索 |
 
@@ -509,7 +509,7 @@ P2 完成后，**必须**用**真实抖音测试账号**（专门小号，不要
 | **CDP 层不稳定（标签页被关/Chrome 重启/网络抖动）** | 任务失败率虚高、假熔断 | ① 独占 WS + 存活检查 + 自动重建；② 任务退回 `queued` 而非 `failed`；③ 指数退避 1s/2s/4s…上限 60s；④ G-5 8 小时长稳、S-1 72 小时长稳 |
 | **客户端本地文件被篡改伪造余额** | 授权失效、收不到钱 | ① 余额只存服务端；② 所有响应 HMAC 验签，验签失败 fail-closed 停机；③ 影子额度只减不增；④ 验收标准 8 直接测试这一点 |
 | **`sec_uid` 取不到导致私信失效** | 部分弹幕线索无法私信 | 优先从弹幕数据帧/接口响应提取真实 `sec_uid`；提取不到时**跳过并计入"因风控跳过"统计**，标记 `not_locatable`，不报成功、不静默失败（FR-2.4） |
-| **基线文档缺失导致返工** | 影响 DOM 编码质量与测试设计 | 见本文 §9：`shared/已知陷阱与平台知识.md`、`测试策略.md`、`开发规范.md`、`安全与合规要求.md`、`AI协作开发指引.md` 当前不存在，需在 P0 补齐（至少补齐陷阱与测试策略两份） |
+| **基线文档与实现漂移** | 影响 DOM 编码质量与测试设计 | `shared/` 的 5 份规范已于文档阶段补齐（见 §9.1），但它们是**并行补齐**的，可能与 `legacy/` 实际实现有出入 | 在 P0-02/P0-04 之前通读 `已知陷阱与平台知识.md` 与 `测试策略.md` 并逐条与 `legacy/` 对照；**冲突时以 `legacy/` 的真实实现为准**，并回写文档修订记录 |
 
 ---
 
@@ -542,20 +542,22 @@ P2 完成后，**必须**用**真实抖音测试账号**（专门小号，不要
 
 以下是编写本文时**逐份核对**发现的问题。事实源之间出现冲突时，按 `README-DEV.md` 的裁定：**以 `docs/需求规格.md` 与 `shared/protocol.md` 为准**。请技术负责人先裁定下表，再让开发团队按裁定开工。
 
-### 9.1 事实源缺口（会直接影响编码质量）
+### 9.1 事实源状态（开工前核查一次）
 
-`README-DEV.md` §七 与"阅读路径"引用的文件，**截至本文编写时**在仓库中的实际状态如下（文档正在被并行补齐，请以 P0-01 的核查结果为准）：
+`README-DEV.md` §七 引用的文件在本仓库中**已全部存在**（编写本文期间文档被并行补齐，最新核查结果如下）。**开工前仍请执行一次核查命令**，确认没有回退：
 
-| 文件 | 状态 | 影响 | 建议 |
-|---|---|---|---|
-| `shared/开发规范.md` | ✅ 已存在 | — | 已确认全项目 `snake_case`（含局部变量与函数名）、单文件 ≤500 行、错误对象与 `STAGES` 定义 |
-| `shared/已知陷阱与平台知识.md` | ❌ 不存在 | **写 CDP 代码前必读的那份不存在**。抖音 DOM 知识目前只能从 `legacy/` 源码重新考古 | **P0 必补**（P0-03 的产出之一）；在此之前以 `AGENTS.md` §2.10/§2.11 与 `legacy/` 对照为准 |
-| `shared/测试策略.md` | ❌ 不存在 | 离线 fixtures 方案与长稳测试方法无据可依 | P0 必补（P0-02 需要它定义断言形式） |
-| `shared/安全与合规要求.md` | ❌ 不存在 | 红线展开与审计字段的完整定义缺失（`README-DEV.md` §二引用了它） | P1 前补 |
-| `shared/AI协作开发指引.md` | ❌ 不存在 | 智能体误实现清单缺失 | P0 补；可先以 `AGENTS.md` §2 的 14 条替代 |
-| `plans/00-两方案对比与选型建议.md`、`plans/B-*.md` | 🚧 部分存在 | 非本方案阻塞项 | 不阻塞 |
+| 文件 | 状态 | 与本方案的衔接 |
+|---|---|---|
+| `shared/开发规范.md` | ✅ 存在 | 全项目 `snake_case`（含局部变量与函数名）、单文件 ≤500 行、`STAGES`/`WORKBENCH_ERROR` 定义。**本文 §3.10 第 9/10 条与任务清单的 `stage`/`reason` 均以它为准** |
+| `shared/已知陷阱与平台知识.md` | ✅ 存在 | 写 CDP 代码前必读；P0-04 的选择器提取、P2-04/P2-05 的真机校正必须与它逐条对照 |
+| `shared/测试策略.md` | ✅ 存在 | 离线 fixtures 方案、G-1~G-5 验证门流程、72 小时长稳方法；P0-02、P0-05、P6-04 以它为准 |
+| `shared/安全与合规要求.md` | ✅ 存在 | 三条红线的完整展开、审计字段、隐私边界、责任划分 |
+| `shared/AI协作开发指引.md` | ✅ 存在 | 面向编码智能体的误实现清单与自检方法（与 `AGENTS.md` §2 的 14 条互补） |
+| `plans/00-两方案对比与选型建议.md`、`plans/B-*.md` | ✅ 存在 | 非本方案阻塞项 |
 
-核查命令（P0-01 执行）：
+> ⚠️ **优先级提醒**：`shared/已知陷阱与平台知识.md` 与 `shared/测试策略.md` 是**并行补齐**进来的。请在做 P0-04 与 P0-02 之前先通读它们，并核对它们与 `legacy/` 实际代码是否一致——**若两者冲突，以 `legacy/` 里的真实实现为准**（那是真账号试错换来的），并把差异记入文档修订。
+
+核查命令：
 
 ```bash
 ls -1 shared/ docs/ plans/
@@ -576,18 +578,18 @@ ls -1 shared/ docs/ plans/
 | 9 | `docs/需求规格.md` §六 目录规划与 `术语与选型基准.md` §四 目录结构完全不同 | 需求规格 §六：`license-server/lib/*.js`、`client/services/autoreply/`、`client/workers/`、`client/reply_server/`、服务端默认端口 8787 | 术语与选型基准 §四：`license-server/api|domain|store|crypto|admin`、`client/host|core|platform|adapters|license|safety|ui`；部署指南：应用 `127.0.0.1:18080` | **按 `术语与选型基准.md` §四**（它自称目录结构事实源）；需求规格 §六该节建议标注"已被取代" |
 | 10 | 旧包 README 的 Node 版本与端口 | `README.md`：Node **20 或更高**、控制台 8090 | `术语与选型基准.md`：Node **≥ 22.5**；部署指南/协议：服务端 `18080` | 按新口径（≥ 22.5）；`README.md` 属 P6 重写范围 |
 | 11 | `docs/架构说明.md` §三 的进程模型里出现 `task-runner` 与 `services/` | 架构说明 §三/§二：`browser-host`/`task-runner`/`platform` 三进程并列 | 术语与选型基准 §四 只有 `host/core/platform/adapters/license/safety/ui`；`需求规格.md` FR-5 又要求 `client/services/video_edit_service.js` 占位 | 本文按 `术语与选型基准.md` 的目录组织，把 `task-runner` 视为 `host/scheduler.js` 的逻辑角色；`services/` 占位建议改为 `client/adapters/video-edit.js`（需负责人裁定，否则 FR-5 的"预留接口"没有落点） |
-
 | 12 | `docs/需求规格.md` 仍保留"不推倒重来、复用旧 worker"的表述 | §六 末"迁移策略：**不推倒重来**…核心 CDP 逻辑原样保留"、§七"可原样复用" | `README-DEV.md` §三、`架构说明.md` §〇、`需求规格.md` §十 均已决定**完全重写** | **按完全重写**：旧代码进 `legacy/` 只读参考，新代码不得 `require` 它 |
 | 13 | 服务端审计/金额的表结构与类型口径 | `docs/部署指南-服务端.md` §5.4：`audit_event(occurred_at TEXT, credit_delta REAL)` 按 ISO8601 与浮点 | `shared/开发规范.md` §5.4 与 `protocol.md` §1.3：时间一律整数 Unix 毫秒（`_ms`）、金额一律整数 milli（`_milli`）、**禁止 REAL 存余额** | **按 `protocol.md` + `开发规范.md`**：部署指南 §5.4 的审计表 DDL 属 v1 遗留，需重写为 `send_log` + `audit_config_changes` + `policy_ack_log` |
-| 14 | 部署指南引用的 CLI 与协议能力不匹配 | §7.1：`policy set --set daily_total_max=120`、`plan set --credits 4500` | `protocol.md` §4.6：策略字段是 `limits.<source>.daily_max`；§4.14：`credits < min_plan_credit` → `PLAN_QUOTA_BELOW_MIN` | CLI 命令名可保留，但参数与默认值需按新结构重写（P5-05 的交付内容） |
+| 14 | 部署指南引用的 CLI 与协议能力不匹配 | §7.1：`policy set --set daily_total_max=120`、`plan set --credits 4500` | `protocol.md` §4.6：策略字段是 `limits.<source>.daily_max`；§4.14：`credits < min_plan_credit` → `PLAN_QUOTA_BELOW_MIN` | CLI 命令名可保留，但参数与默认值需按新结构重写（P5-02 的交付内容） |
+| 15 | 熔断递进级别与服务端冷却时长的关系未在任一份文档中写明 | `需求规格.md` FR-2.3.5：本地三级递进 **30 分钟 → 1 小时 → 停到次日** | `protocol.md` §4.1/§4.6：服务端仅下发 `circuit_breaker.cooldown_ms=1800000`、`risk_code_cooldown_ms=86400000`，`commands:[circuit_break]` 带 `cooldown_until_ms` | 本文裁定：**本地递进级别与服务端 `cooldown_until_ms` 取较长者**（服务端为权威下限），`cooldown_ms` 对应 L1、`risk_code_cooldown_ms` 对应 L3。已写入 §4.5 与任务 P2-07 |
 
 ### 9.3 开工前检查表
 
-- [ ] 技术负责人已对 §9.2 的 14 项冲突逐条裁定，并同步修改 `docs/部署指南-服务端.md` §3.3/§5.4/§7.2、`docs/架构说明.md` §七、`docs/需求规格.md` §四/§六/§七
-- [ ] P0 已排入缺失文档中最关键的两份（`已知陷阱与平台知识.md`、`测试策略.md`）
+- [ ] 技术负责人已对 §9.2 的 **15 项**冲突逐条裁定，并同步修改 `docs/部署指南-服务端.md` §3.3/§5.4/§7.1/§7.2、`docs/架构说明.md` §七、`docs/需求规格.md` §四/§六/§七
 - [ ] 已确认可用的**抖音测试小号**（P2 真机验证门 G-1~G-5 必需）
 - [ ] 已确认服务端部署机可访问，且 `sing-box` 全程 `active`
 - [ ] 已确认 Node ≥ 22.5 且 `node:sqlite` 可用：`node -e "const{DatabaseSync}=require('node:sqlite');console.log('ok')"`
+- [ ] 已读 `shared/已知陷阱与平台知识.md` 与 `shared/测试策略.md`（P0 起即需对照）
 
 ---
 

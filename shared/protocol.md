@@ -195,10 +195,10 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 ```json
 {"ok":true,"server_time_ms":1758096060000,"policy":{"policy_version":9,"account_tier":"warm_up","account_day_index":5,"sending_enabled":true,"…":"结构同 4.1"},
  "tier_table":[
-  {"tier":"observation","day_from":1,"day_to":3,"sending_enabled":false,"collect_only":true,"limits":{"comment":{"daily_max":0,"min_interval_ms":180000},"live_danmaku":{"daily_max":0,"min_interval_ms":90000},"dm":{"daily_max":0,"min_interval_ms":900000}}},
-  {"tier":"warm_up","day_from":4,"day_to":7,"sending_enabled":true,"collect_only":false,"limits":{"comment":{"daily_max":10,"min_interval_ms":180000},"live_danmaku":{"daily_max":10,"min_interval_ms":90000},"dm":{"daily_max":3,"min_interval_ms":900000}}},
-  {"tier":"ramp_up","day_from":8,"day_to":14,"sending_enabled":true,"collect_only":false,"limits":{"comment":{"daily_max":25,"min_interval_ms":120000},"live_danmaku":{"daily_max":25,"min_interval_ms":60000},"dm":{"daily_max":8,"min_interval_ms":600000}}},
-  {"tier":"stable","day_from":15,"day_to":null,"sending_enabled":true,"collect_only":false,"limits":{"comment":{"daily_max":30,"min_interval_ms":60000},"live_danmaku":{"daily_max":30,"min_interval_ms":30000},"dm":{"daily_max":10,"min_interval_ms":300000}}}],
+  {"tier":"observation","day_from":1,"day_to":3,"sending_enabled":false,"collect_only":true,"limits":{"comment":{"daily_max":0,"min_interval_ms":180000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":0,"min_interval_ms":90000,"content_similarity_max":0.85},"dm":{"daily_max":0,"min_interval_ms":900000,"content_similarity_max":0.75}}},
+  {"tier":"warm_up","day_from":4,"day_to":7,"sending_enabled":true,"collect_only":false,"limits":{"comment":{"daily_max":10,"min_interval_ms":180000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":10,"min_interval_ms":90000,"content_similarity_max":0.85},"dm":{"daily_max":3,"min_interval_ms":900000,"content_similarity_max":0.75}}},
+  {"tier":"ramp_up","day_from":8,"day_to":14,"sending_enabled":true,"collect_only":false,"limits":{"comment":{"daily_max":25,"min_interval_ms":120000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":25,"min_interval_ms":60000,"content_similarity_max":0.85},"dm":{"daily_max":8,"min_interval_ms":600000,"content_similarity_max":0.75}}},
+  {"tier":"stable","day_from":15,"day_to":null,"sending_enabled":true,"collect_only":false,"limits":{"comment":{"daily_max":30,"min_interval_ms":60000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":30,"min_interval_ms":30000,"content_similarity_max":0.85},"dm":{"daily_max":10,"min_interval_ms":300000,"content_similarity_max":0.75}}}],
  "min_interval_ms_range":{"comment":[60000,180000],"live_danmaku":[30000,90000],"dm":[300000,900000]},
  "daily_cap_total_by_tier":{"observation":0,"warm_up":23,"ramp_up":58,"stable":70},
  "stable_daily_max_total":70,"stable_daily_max_total_basis":"稳定期各渠道日上限之和，区间取上限：评论 30 + 弹幕 30（区间 25–30 取 30）+ 私信 10 = 70",
@@ -241,7 +241,7 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 | `sent_at_ms` / `source_type` | int / string | 是 | 发送发生时刻（已按 `clock_skew_ms` 校准到服务端时间轴）/ `comment`/`live_danmaku`/`dm`，**三者独立限额** |
 | `target_hash` / `user_key_hash`/`user_key_type` | string / string | 是 / 是 | 评论=`hmac(salt, video_id+"\|"+comment_id)`；弹幕=`hmac(salt, room_id+"\|"+msg_id)`；私信=`hmac(salt, conversation_id)` / 对方用户哈希与类型（见 7.3），**绝不上传原始 `sec_uid`** |
 | `content_hash` | string | 是 | `hmac(privacy_salt, reply_text)`，**绝不上传原文** |
-| `verdict` | string | 是 | `sent_confirmed`/`sent_confirmed_dom`/`sent_suspected`/`failed`/`skipped`（口径见 7.2） |
+| `verdict` | string | 是 | **发送尝试的判定，闭集仅四个值**：`sent_confirmed`/`sent_confirmed_dom`/`sent_suspected`/`failed`（口径见 7.2）。⚠️ **不含 `skipped`**——`skipped` 是"命中但**未发起回复**"（§7.1），没有 `send_id`、不产生 `send_log` 行，只在聚合上报的 `sources.<src>.skipped` 计数中体现。两者语义不同，不得混用 |
 | `is_final` | bool | 是 | 是否最终判定；`false` 表示后续可能升级为 `sent_confirmed` |
 | `evidence` | object | 是 | `confirm_signal` ∈ `platform_response`/`dom_stable`/`none`；`platform_endpoint` 为**闭集白名单** `comment/publish`、`comment/reply`、`im/send`、`live/comment/send`（禁止完整 URL 与域名） |
 | `failure_reason` | string\|null | 条件 | `verdict="failed"` 时必填（枚举见 7.4），其余必须为 `null` |
@@ -429,36 +429,70 @@ function settleSendBatch(acc, batch, nowMs) {
   const out = []
   db.exec('BEGIN IMMEDIATE')
   try {
-    for (const s of sortBySentAt(batch.sends)) {     // 严格按 sent_at_ms 升序
+    // ⚠️ 第一步：先确定整批的可计费集合，再统一结算。
+    //    计费基数是【条数】：一条成功回复 × unit。见 §6.1 公式与 §6.6 用例 2、8、9。
+    //    余额判定必须在循环外一次算定，否则批内前面的扣费会影响后面的判定。
+    const settled = sortBySentAt(batch.sends).map((s) => {
       const prev = findSend(acc.account_id, s.send_id)
-      if (prev) {                                    // 1) 幂等 / 冲突
-        if (prev.verdict === 'sent_confirmed') { out.push(result(s, 'duplicate', 0)); continue }
-        if (!isUpgrade(prev, s)) { out.push(reject(s, 'AUDIT_SEND_CONFLICT')); continue }
+      if (prev) {                                     // 1) 幂等 / 冲突
+        if (prev.verdict === 'sent_confirmed') return { s, action: 'duplicate' }
+        if (!isUpgrade(prev, s)) return { s, action: 'conflict' }
       }
-      const pol = verifyPolicy(acc, s)               // 2) 策略存证：先校验后计费；返回 POLICY_VIOLATION /
-      if (pol.code) { out.push(reject(s, pol.code)); continue }   // POLICY_VERSION_UNKNOWN / POLICY_ACK_REQUIRED / null
-      const quota = dayQuota(acc, s.source_type, s.sent_at_ms)    // 3) 当日额度（UTC+8，按来源独立；观察期 max=0）
+      const pol = verifyPolicy(acc, s)                // 2) 策略存证：先校验后计费
+      if (pol.code) return { s, action: 'reject', code: pol.code }
+      const quota = dayQuota(acc, s.source_type, s.sent_at_ms)   // 3) 当日额度（观察期 max=0）
       const overLimit = quota.max === 0 || quota.used >= quota.max
       if (overLimit) acc.audit_flags.push(quota.max === 0 ? 'tier_sending_disabled' : 'policy_daily_cap_exceeded')
       const billable = s.verdict === 'sent_confirmed' && s.evidence.confirm_signal === 'platform_response'
-                    && s.evidence.platform_status_code === 0 && !overLimit && !acc.insufficient   // 4) 计费资格
-      insertSendRow(acc, s, overLimit)               // 明细永远留痕（审计优先）
+                    && s.evidence.platform_status_code === 0 && !overLimit   // 4) 计费资格
+      return { s, action: 'settle', billable, overLimit }
+    })
+
+    // 5) 额度判定：按条数计算。affordable = 当前余额能全额支付的条数（不足一条按 0 计）。
+    //    !insufficient 保证"跨零点唯一一次透支"只发生一次（§6.6 用例 9）。
+    const toBill = settled.filter((x) => x.action === 'settle' && x.billable)
+    const canOverdraft = acc.balance_milli > 0 && !acc.insufficient
+    const affordable = Math.floor(Math.max(acc.balance_milli, 0) / unit) + (canOverdraft ? 1 : 0)
+
+    let billedCount = 0
+    for (const x of settled) {
+      const { s } = x
+      if (x.action === 'duplicate') { out.push(result(s, 'duplicate', 0)); continue }
+      if (x.action === 'conflict')  { out.push(reject(s, 'AUDIT_SEND_CONFLICT')); continue }
+      if (x.action === 'reject')    { out.push(reject(s, x.code)); continue }
+
+      // 6) 按 sent_at_ms 升序决定谁能被支付；超出的只留痕不扣费。
+      //    注意：透支那一条会令余额转负，这是【预期行为】（§6.6 用例 9）。
       let charged = 0
-      if (billable) {                                // 5) 扣费：跨零点那一条全额入账，其后只留痕不扣费
-        if (acc.balance_milli >= unit) { acc.balance_milli -= unit; charged = unit }
-        else if (!acc.insufficient) { acc.balance_milli -= unit; charged = unit; acc.insufficient = true }
-      }
-      const status = overLimit ? 'policy_exceeded' : charged > 0 ? 'billed'
-                   : billable ? 'unbilled_insufficient_credit' : 'not_billable'
+      if (x.billable && billedCount < affordable) { charged = unit; billedCount++ }
+      acc.balance_milli -= charged
+      if (charged > 0 && acc.balance_milli <= 0) acc.insufficient = true
+
+      insertSendRow(acc, s, x.overLimit)              // 明细永远留痕（审计优先）
+      const status = x.overLimit ? 'policy_exceeded' : charged > 0 ? 'billed'
+                   : x.billable ? 'unbilled_insufficient_credit' : 'not_billable'
       if (charged > 0) insertLedger(acc, s, charged, nowMs)
       out.push(result(s, status, charged))
     }
+
+    // 7) 自检：计费条数必须等于可计费条数中被支付的部分，且金额 = 条数 × unit
+    if (billedCount * unit !== toBill.slice(0, billedCount).length * unit) throw new Error('billing invariant violated')
     if (acc.balance_milli <= 0) acc.state = 'exhausted'         // 下一次心跳返回 402
     persist(acc); db.exec('COMMIT')
   } catch (e) { db.exec('ROLLBACK'); throw e }
   return out
 }
 ```
+
+> ⚠️ **本伪代码已修正（2026-09-18）**。修改前的版本存在**计费少收**缺陷：
+> - 旧写法在循环内逐条判断 `balance >= unit` 才扣费，导致**余额耗尽的条目被静默跳过，永不产生透支**，与 §6.6 用例 9（"跨零点唯一一次透支，余额变 -0.7"）矛盾；
+> - 旧写法的余额判定在循环内进行，批内先扣的条目会影响后续条目的可支付判定，与 §6.1"按条数计算"的公式口径不一致；
+> - 旧写法在 `unit` 非默认值时（`credit_per_reply` 可配 0.1–1000）行为更难预测。
+>
+> **三条自检**（实现后必须验证）：
+> 1. §6.6 用例 2：一批 10 条中 4 条可计费 → 恰好扣 `4 × unit`
+> 2. §6.6 用例 8：余额恰好够 3 条 → 前 3 条 `billed`，第 4 条起 `unbilled_insufficient_credit`
+> 3. §6.6 用例 9：余额剩 0.3 条来 1 条成功 → 该条全额入账，余额为负（`-0.7 × unit`），`state="exhausted"`
 
 ### 6.5 余额不足以支付一批上报：**建议部分扣费**
 **结论**：按 `sent_at_ms` 升序逐条结算，扣到余额耗尽为止；**跨越零点的那一条全额入账**（允许最多透支 `credit_per_reply_milli`，即一条），其后所有条目落 `send_log` 但 `billing_status="unbilled_insufficient_credit"`，不扣费、**充值后也不补扣**。
