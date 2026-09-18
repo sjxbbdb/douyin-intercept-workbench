@@ -1,5 +1,4 @@
 # 抖音截流工作台 — 客户端 ↔ 授权中心 接口契约
-
 - 契约版本 `protocol_version = 2`（前缀 `/api/v1/`；相对 v1 不兼容：计费模型整体替换）｜适用：license-server（厂商部署）与 client（商家本机）｜命名：**全篇 JSON 字段统一 `snake_case`**
 - 本文档是唯一权威口径。实现与本文冲突时以本文为准，并先改文档再改代码。
 
@@ -134,13 +133,9 @@
  "sign_key":"3d91ab...07fe","sign_key_expires_ms":1758700800000,"privacy_salt":"a41c9b...2d77","privacy_salt_version":1,
  "account":{"account_id":"acc_1001","display_name":"示例店铺","status":"active","plan_id":"plan_half_year","plan_expires_ms":1773676800000,"device_limit":1},
  "credit":{"balance_milli":61200000,"credit_per_reply_milli":1000,"updated_at_ms":1758096000000},
- "policy":{"policy_version":7,"account_tier":"observation","tier_started_ms":1758096000000,
-   "active_hours":{"tz_offset_minutes":480,"windows":[["09:00","12:00"],["14:00","22:30"]]},
-   "limits":{"comment":{"daily_max":30,"min_interval_ms":30000,"content_similarity_max":0.85},
-             "live_danmaku":{"daily_max":20,"min_interval_ms":45000,"content_similarity_max":0.85},
-             "dm":{"daily_max":3,"min_interval_ms":300000,"content_similarity_max":0.75,"new_conversation_daily_max":2}},
-   "circuit_breaker":{"failure_rate_threshold":0.4,"failure_rate_window":20,"platform_reject_threshold":3,"cooldown_ms":1800000,"risk_code_cooldown_ms":86400000},
-   "idle_pause_ms":7200000,"effective_from_ms":1758096000000,"expires_ms":1758700800000,"policy_hash":"5b2e...a10c"},
+ "policy":{"policy_version":7,"account_tier":"observation","tier_started_ms":1758096000000,"active_hours":{"tz_offset_minutes":480,"windows":[["09:00","12:00"],["14:00","22:30"]]},
+   "limits":{"comment":{"daily_max":30,"min_interval_ms":30000,"content_similarity_max":0.85},"live_danmaku":{"daily_max":20,"min_interval_ms":45000,"content_similarity_max":0.85},"dm":{"daily_max":3,"min_interval_ms":300000,"content_similarity_max":0.75,"new_conversation_daily_max":2}},
+   "circuit_breaker":{"failure_rate_threshold":0.4,"failure_rate_window":20,"platform_reject_threshold":3,"cooldown_ms":1800000,"risk_code_cooldown_ms":86400000},"idle_pause_ms":7200000,"effective_from_ms":1758096000000,"expires_ms":1758700800000,"policy_hash":"5b2e...a10c"},
  "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 340 条（评论 200 / 弹幕 120 / 私信 20）。半年套餐 61200 积分按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延。积分只对平台确认成功的回复扣减。","daily_cap_total":340,"valid_days":180,"credits":61200},
  "limits":{"heartbeat_interval_ms":60000,"grace_ms":86400000,"send_batch_interval_ms":300000,"send_batch_max":50,"audit_batch_max":500,"offline_send_grace_ms":900000,"offline_budget_ratio":0.5,"sign_ts_tolerance_ms":300000,"max_pending_sends":20000},
  "kicked_device_id":null,"min_client_version":"3.0.0","force_upgrade":false,"upgrade_url":"https://license.example.com/download","login_proof":"c81f...9ab3"}
@@ -160,10 +155,8 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 
 ### 4.3 `GET /api/v1/auth/me`（鉴权+签名，无请求体）
 ```json
-{"ok":true,"server_time_ms":1758096001000,
- "account":{"account_id":"acc_1001","display_name":"示例店铺","status":"active","plan_id":"plan_half_year","plan_expires_ms":1773676800000},
- "credit":{"balance_milli":61199000,"credit_per_reply_milli":1000,"used_today_milli":1000,"used_week_milli":7000,"used_month_milli":25000},
- "billing_state":"active",
+{"ok":true,"server_time_ms":1758096001000,"account":{"account_id":"acc_1001","display_name":"示例店铺","status":"active","plan_id":"plan_half_year","plan_expires_ms":1773676800000},
+ "credit":{"balance_milli":61199000,"credit_per_reply_milli":1000,"used_today_milli":1000,"used_week_milli":7000,"used_month_milli":25000},"billing_state":"active",
  "policy_summary":{"policy_version":7,"account_tier":"observation","daily_cap_total":53,"daily_used_total":1,"daily_remaining_total":52},
  "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"……"},"last_heartbeat_ms":1758095940000}
 ```
@@ -172,9 +165,8 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 ### 4.4 `GET /api/v1/client/bootstrap`（无需鉴权，**不签名**）
 参数：`client_version`（必填）、`protocol_version`（必填）、`os`、`account`（可选）。
 ```json
-{"ok":true,"server_time_ms":1758096000000,"protocol_version":2,"min_client_version":"3.0.0","latest_client_version":"3.1.0",
- "force_upgrade":false,"upgrade_url":"https://license.example.com/download","upgrade_notes":"新增发送明细审计上报",
- "server_status":"ok","maintenance":{"active":false,"starts_at_ms":null,"ends_at_ms":null},
+{"ok":true,"server_time_ms":1758096000000,"protocol_version":2,"min_client_version":"3.0.0","latest_client_version":"3.1.0","force_upgrade":false,
+ "upgrade_url":"https://license.example.com/download","upgrade_notes":"新增发送明细审计上报","server_status":"ok","maintenance":{"active":false,"starts_at_ms":null,"ends_at_ms":null},
  "limits":{"heartbeat_interval_ms":60000,"grace_ms":86400000,"send_batch_interval_ms":300000,"send_batch_max":50,"audit_batch_max":500,"offline_send_grace_ms":900000,"offline_budget_ratio":0.5,"sign_ts_tolerance_ms":300000,"max_pending_sends":20000}}
 ```
 `force_upgrade=true` 或 `client_version < min_client_version` → **必须停机**并展示升级页，不允许登录｜**错误码** `AUTH_INVALID_REQUEST` `SERVER_UNAVAILABLE`｜**幂等**：是。
@@ -214,10 +206,8 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 用于启动、`POLICY_VERSION_UNKNOWN`、收到 `reload_policy` 时按需拉取。
 ```json
 {"ok":true,"server_time_ms":1758096060000,"policy":{"policy_version":8,"account_tier":"warm_up","…":"结构同 4.1"},
- "tier_table":[{"tier":"observation","min_days":0,"limits":{"comment":{"daily_max":30,"min_interval_ms":30000},"live_danmaku":{"daily_max":20,"min_interval_ms":45000},"dm":{"daily_max":3,"min_interval_ms":300000}}},
-   {"tier":"warm_up","min_days":8,"limits":{"comment":{"daily_max":80,"min_interval_ms":30000},"live_danmaku":{"daily_max":50,"min_interval_ms":45000},"dm":{"daily_max":8,"min_interval_ms":240000}}},
-   {"tier":"ramp_up","min_days":15,"limits":{"comment":{"daily_max":150,"min_interval_ms":25000},"live_danmaku":{"daily_max":90,"min_interval_ms":40000},"dm":{"daily_max":15,"min_interval_ms":180000}}},
-   {"tier":"stable","min_days":31,"limits":{"comment":{"daily_max":200,"min_interval_ms":20000},"live_danmaku":{"daily_max":120,"min_interval_ms":30000},"dm":{"daily_max":20,"min_interval_ms":120000}}}],
+ "tier_table":[{"tier":"observation","min_days":0,"limits":{"comment":{"daily_max":30,"min_interval_ms":30000},"live_danmaku":{"daily_max":20,"min_interval_ms":45000},"dm":{"daily_max":3,"min_interval_ms":300000}}},{"tier":"warm_up","min_days":8,"limits":{"comment":{"daily_max":80,"min_interval_ms":30000},"live_danmaku":{"daily_max":50,"min_interval_ms":45000},"dm":{"daily_max":8,"min_interval_ms":240000}}},
+   {"tier":"ramp_up","min_days":15,"limits":{"comment":{"daily_max":150,"min_interval_ms":25000},"live_danmaku":{"daily_max":90,"min_interval_ms":40000},"dm":{"daily_max":15,"min_interval_ms":180000}}},{"tier":"stable","min_days":31,"limits":{"comment":{"daily_max":200,"min_interval_ms":20000},"live_danmaku":{"daily_max":120,"min_interval_ms":30000},"dm":{"daily_max":20,"min_interval_ms":120000}}}],
  "daily_cap_total_by_tier":{"observation":53,"warm_up":138,"ramp_up":255,"stable":340},"client_may_lower_only":true}
 ```
 **客户端只能调低，不能调高**；任一项高于当前 `policy` → 该次上报返回 `POLICY_VIOLATION`｜**幂等**：是。
@@ -245,12 +235,9 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 ```json
 {"batch_id":"b-2f1c9a4e6b70c35a1f8d2e4b6c0a9317","account_id":"acc_1001","device_id":"9f2c...0a93","session_id":"2c9a...7f10","seq":41,"protocol_version":2,"client_version":"3.0.0",
  "policy_snapshot":{"policy_version":8,"policy_hash":"5b2e...a10c","applied_limits":{"comment":{"daily_max":30,"min_interval_ms":30000},"…":"…"},"captured_at_ms":1758096060000},
- "sends":[{"send_id":"s-3f1c9a4e6b70c35a1f8d2e4b6c0a9317","sent_at_ms":1758096060120,"source_type":"comment","target_hash":"9c1f…e4d2","user_key_hash":"7ab3…91ce","user_key_type":"sec_uid","content_hash":"d41e…08ba",
-   "verdict":"sent_confirmed","is_final":true,
-   "evidence":{"confirm_signal":"platform_response","platform_endpoint":"comment/publish","platform_status_code":0,"observed_at_ms":1758096060320,"dom_stable_ms":0,"risk_control_signal":null},
-   "failure_reason":null,"attempt_seq":1,"applied_policy_version":8}]}
+ "sends":[{"send_id":"s-3f1c9a4e6b70c35a1f8d2e4b6c0a9317","sent_at_ms":1758096060120,"source_type":"comment","target_hash":"9c1f…e4d2","user_key_hash":"7ab3…91ce","user_key_type":"sec_uid","content_hash":"d41e…08ba","verdict":"sent_confirmed","is_final":true,
+   "evidence":{"confirm_signal":"platform_response","platform_endpoint":"comment/publish","platform_status_code":0,"observed_at_ms":1758096060320,"dom_stable_ms":0,"risk_control_signal":null},"failure_reason":null,"attempt_seq":1,"applied_policy_version":8}]}
 ```
-
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `send_id` | string | 是 | 客户端生成的全局唯一 ID（uuid v4 或 32 hex）。**幂等键与计费键**，必须在**发送前**生成并落盘 |
@@ -267,14 +254,11 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 
 ```json
 {"ok":true,"server_time_ms":1758096360000,"batch_id":"b-2f1c…9317",
- "results":[{"send_id":"s-3f1c…9317","accepted":true,"duplicate":false,"billing_status":"billed","charged_milli":1000,"reject_code":null},
-            {"send_id":"s-4a2d…77e1","accepted":true,"duplicate":false,"billing_status":"not_billable","charged_milli":0,"reject_code":null},
-            {"send_id":"s-5b3e…88f2","accepted":true,"duplicate":false,"billing_status":"policy_exceeded","charged_milli":0,"reject_code":"POLICY_DAILY_CAP_EXCEEDED"}],
+ "results":[{"send_id":"s-3f1c…9317","accepted":true,"duplicate":false,"billing_status":"billed","charged_milli":1000,"reject_code":null},{"send_id":"s-4a2d…77e1","accepted":true,"duplicate":false,"billing_status":"not_billable","charged_milli":0,"reject_code":null},{"send_id":"s-5b3e…88f2","accepted":true,"duplicate":false,"billing_status":"policy_exceeded","charged_milli":0,"reject_code":"POLICY_DAILY_CAP_EXCEEDED"}],
  "settlement":{"billed_count":1,"charged_milli":1000,"balance_milli":61188000,"unbilled_count":0,"over_limit_count":1,"state":"active","audit_flags":[]},
  "daily_quota":{"comment":{"max":30,"used":31,"remaining":0},"live_danmaku":{"max":20,"used":12,"remaining":8},"dm":{"max":3,"used":1,"remaining":2}},
  "commands":[{"type":"throttle","reason":"POLICY_DAILY_CAP","limits":{"comment":{"daily_max":30,"min_interval_ms":30000}}}]}
 ```
-
 | `billing_status` | 含义 | 是否扣费 |
 |---|---|---|
 | `billed` | 计费成功（`verdict=sent_confirmed` 且平台响应证据成立） | 是，`charged_milli = credit_per_reply_milli` |
@@ -310,12 +294,10 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 
 ### 4.11 `GET /api/v1/credit/balance`（鉴权+签名，参数 `refresh=1` 可选）
 ```json
-{"ok":true,"server_time_ms":1758096060000,
- "credit":{"balance_milli":61188000,"credit_per_reply_milli":1000,"replies_affordable":61188,"updated_at_ms":1758096060000},"billing_state":"active",
+{"ok":true,"server_time_ms":1758096060000,"credit":{"balance_milli":61188000,"credit_per_reply_milli":1000,"replies_affordable":61188,"updated_at_ms":1758096060000},"billing_state":"active",
  "used":{"today_milli":1000,"week_milli":7000,"month_milli":25000,"today_confirmed_count":1,"month_confirmed_count":25},
  "daily_quota":{"comment":{"max":30,"used":1,"remaining":29},"live_danmaku":{"max":20,"used":0,"remaining":20},"dm":{"max":3,"used":0,"remaining":3}},
- "plan":{"plan_id":"plan_half_year","plan_name":"半年套餐","valid_days":180,"expires_ms":1773676800000},
- "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"……"}}
+ "plan":{"plan_id":"plan_half_year","plan_name":"半年套餐","valid_days":180,"expires_ms":1773676800000},"quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"……"}}
 ```
 `replies_affordable = floor(balance_milli / credit_per_reply_milli)`，仅供展示｜**幂等**：是。
 
@@ -323,8 +305,7 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 参数：`from_ms`/`to_ms`（必填，跨度 ≤ 366 天）、`granularity`（`raw`/`hour`/`day`/`week`/`month`，默认 `day`）、`kind`（`usage,redeem,adjust,plan_grant`）、`limit`（默认 200，最大 1000）、`cursor`。
 ```json
 {"ok":true,"server_time_ms":1758096060000,"granularity":"day","tz_offset_minutes":480,
- "buckets":[{"bucket_start_ms":1758038400000,"usage_milli":1000,"redeem_milli":0,"adjust_milli":0,"net_milli":-1000},
-            {"bucket_start_ms":1758124800000,"usage_milli":2000,"redeem_milli":5000000,"adjust_milli":0,"net_milli":4998000}],
+ "buckets":[{"bucket_start_ms":1758038400000,"usage_milli":1000,"redeem_milli":0,"adjust_milli":0,"net_milli":-1000},{"bucket_start_ms":1758124800000,"usage_milli":2000,"redeem_milli":5000000,"adjust_milli":0,"net_milli":4998000}],
  "summary":{"usage_milli":3000,"redeem_milli":5000000,"adjust_milli":0,"net_milli":4997000,"confirmed_count":3},"entries":[],"next_cursor":null}
 ```
 `entries[]` 仅 `granularity=raw` 时填充：`{"entry_id":"le_…","kind":"usage","delta_milli":-1000,"balance_after_milli":61188000,"ref_send_id":"s-3f1c…9317","credit_per_reply_milli":1000,"settled_at_ms":1758096360000,"note":null}`。日/周/月边界按 `tz_offset_minutes` 划分（`week` 以周一为起点）；`net_milli = redeem + adjust + plan_grant - usage`｜**错误码** `AUTH_*` `CREDIT_LEDGER_NOT_FOUND`｜**幂等**：是。
@@ -340,17 +321,12 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 
 ### 4.14 `GET /api/v1/account/plan`（鉴权+签名）
 ```json
-{"ok":true,"server_time_ms":1758096060000,"credit_per_reply_milli":1000,"stable_daily_max_total":340,"min_plan_credit":61200,
- "plan_credit_formula":"stable_daily_max_total × valid_days × plan_credit_ratio",
- "quota_notice":{"headline":"套餐是预付额度，不等于无限发送",
-   "detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 340 条（评论 200 / 弹幕 120 / 私信 20）。半年套餐 61200 积分 = 按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延为额外发送量。积分只对平台确认成功的回复扣减，失败与被风控拒绝不扣费。",
-   "daily_cap_total":340,"daily_cap_detail":{"comment":200,"live_danmaku":120,"dm":20},"credits_per_day_at_cap":340,
-   "valid_days":180,"estimated_days_at_cap":180,"note":"安全上限会限制实际消耗速度，因此套餐按期而非按量承诺；额度按积分计量，有效期按 valid_days 计算。"},
- "plans":[{"plan_id":"plan_half_year","name":"半年套餐","valid_days":180,"credits":61200,"credits_milli":61200000,"price_cents":59900,"active":true,"hours":null},
-          {"plan_id":"plan_year","name":"年套餐","valid_days":365,"credits":124100,"credits_milli":124100000,"price_cents":99900,"active":true,"hours":null}],
+{"ok":true,"server_time_ms":1758096060000,"credit_per_reply_milli":1000,"stable_daily_max_total":340,"min_plan_credit":61200,"plan_credit_formula":"stable_daily_max_total × valid_days × plan_credit_ratio",
+ "quota_notice":{"headline":"套餐是预付额度，不等于无限发送","detail":"平台安全上限由服务端下发且客户端无法调高：稳定期每日最多 340 条（评论 200 / 弹幕 120 / 私信 20）。半年套餐 61200 积分 = 按每日上限连续用满 180 天折算；实际发送量受当日上限约束，未用完的额度不会顺延为额外发送量。积分只对平台确认成功的回复扣减，失败与被风控拒绝不扣费。",
+   "daily_cap_total":340,"daily_cap_detail":{"comment":200,"live_danmaku":120,"dm":20},"credits_per_day_at_cap":340,"valid_days":180,"estimated_days_at_cap":180,"note":"安全上限会限制实际消耗速度，因此套餐按期而非按量承诺；额度按积分计量，有效期按 valid_days 计算。"},
+ "plans":[{"plan_id":"plan_half_year","name":"半年套餐","valid_days":180,"credits":61200,"credits_milli":61200000,"price_cents":59900,"active":true,"hours":null},{"plan_id":"plan_year","name":"年套餐","valid_days":365,"credits":124100,"credits_milli":124100000,"price_cents":99900,"active":true,"hours":null}],
  "current":{"plan_id":"plan_half_year","expires_ms":1773676800000,"remaining_days":176,"credits_remaining_milli":61188000}}
 ```
-
 | 套餐字段 | 类型 | 说明 |
 |---|---|---|
 | `valid_days` | int | 有效期天数（业务期限），必填 |
@@ -420,7 +396,6 @@ function verifyResponse(resp) {          // 校验通过前不得解析 resp.raw
   return { ok: true, body: JSON.parse(resp.rawBody) }
 }
 ```
-
 ### 5.5 时间戳、防重放、轮换
 - **时间戳容忍窗口** `sign_ts_tolerance_ms = 300000`（±5 分钟）。超出 → `AUTH_TS_SKEW`(401)，客户端用 `server_time_ms` 重算 `clockSkewMs` 后**只重试一次**。
 - **防重放**：服务端表 `used_nonce(nonce PRIMARY KEY, account_id, ts_ms)`，TTL `nonce_ttl_ms = 600000`（10 分钟），定时清理；重复 nonce → `AUTH_REPLAY`。
@@ -453,7 +428,6 @@ function verifyResponse(resp) {          // 校验通过前不得解析 resp.raw
   原 verdict ∈ {sent_suspected, sent_confirmed_dom, failed} 且新 verdict = sent_confirmed 且带平台证据 → 接受升级，is_final=true，扣费一次
   新 verdict 为降级，或 source_type / sent_at_ms 与首次不一致    → AUDIT_SEND_CONFLICT(409)，拒绝并保留首次记录
 ```
-
 ### 6.4 伪代码
 ```js
 function settleSendBatch(acc, batch, nowMs) {
@@ -491,7 +465,6 @@ function settleSendBatch(acc, batch, nowMs) {
   return out
 }
 ```
-
 ### 6.5 余额不足以支付一批上报：**建议部分扣费**
 **结论**：按 `sent_at_ms` 升序逐条结算，扣到余额耗尽为止；**跨越零点的那一条全额入账**（允许最多透支 `credit_per_reply_milli`，即一条），其后所有条目落 `send_log` 但 `billing_status="unbilled_insufficient_credit"`，不扣费、**充值后也不补扣**。
 理由：① 这些发送已真实发生，是事实而非申请；全拒会让服务端永远缺少封号取证所需明细，统计与审计出现空洞。② 全拒会导致客户端无休止重试、`pending_sends.json`（上限 20000）被丢最旧，反而丢证据。③ 恰好允许一条透支使欠费上限清晰可预测（= 一条单价），且对商家有利。④ 未计费部分不补扣，杜绝"停机后还在扣钱""充值后被追溯补扣"的投诉。⑤ 响应用 `settlement.unbilled_count` + `commands:[pause_engine]` 明确告知已耗尽，客户端 ≤60 秒停机，闭环。

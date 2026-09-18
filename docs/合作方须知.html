@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>抖音自动回复助手 · 合作方须知</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+
+  :root {
+    --ink:      #12161d;
+    --ink-2:    #3a4351;
+    --ink-3:    #6a7484;
+    --line:     #e2e7ef;
+    --line-2:   #eef1f6;
+    --bg:       #f6f8fb;
+    --paper:    #ffffff;
+    --brand:    #1d4ed8;
+    --brand-2:  #e8355a;
+    --brand-bg: #f3f6ff;
+    --ok:       #0d7346;
+    --ok-bg:    #effaf4;
+    --warn:     #9a5b06;
+    --warn-bg:  #fff9ee;
+    --stop:     #ab1f2b;
+    --stop-bg:  #fff4f4;
+    --radius:   10px;
+    --shadow:   0 1px 2px rgba(18,22,29,.04), 0 6px 20px rgba(18,22,29,.055);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+            "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC",
+            "Noto Sans CJK SC", sans-serif;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0; font-family: var(--font); color: var(--ink);
+    background: var(--bg); font-size: 15.5px; line-height: 1.82;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  }
+
+  .shell { max-width: 880px; margin: 0 auto; padding: 0 22px 96px; }
+
+  /* ============ 文头 ============ */
+  .doc-head {
+    background: linear-gradient(155deg, #151a24 0%, #1e2533 60%, #232a3b 100%);
+    color: #fff; padding: 54px 22px 48px; position: relative; overflow: hidden;
+  }
+  .doc-head::after {
+    content: ""; position: absolute; inset: 0;
+    background: radial-gradient(circle at 88% 8%, rgba(29,78,216,.42), transparent 48%);
+    pointer-events: none;
+  }
+  .doc-head-inner { max-width: 880px; margin: 0 auto; position: relative; z-index: 1; }
+  .doc-head .kicker {
+    display: inline-block; font-size: 11.5px; letter-spacing: .24em;
+    font-weight: 700; color: #8fb0ff; text-transform: uppercase; margin-bottom: 18px;
+  }
+  .doc-head h1 {
+    font-size: clamp(25px, 4.6vw, 36px); line-height: 1.3;
+    margin: 0 0 12px; font-weight: 700; letter-spacing: -.01em;
+  }
+  .doc-head .sub { font-size: clamp(14px, 2vw, 16px); color: #aab4c6; margin: 0 0 30px; max-width: 36em; }
+  .doc-meta {
+    display: flex; flex-wrap: wrap; gap: 8px 26px; font-size: 12.5px;
+    color: #7d8798; padding-top: 22px; border-top: 1px solid rgba(255,255,255,.11);
+  }
+  .doc-meta b { color: #dfe6f2; font-weight: 600; }
+
+  /* ============ 导语卡 ============ */
+  .lead {
+    background: var(--paper); border-radius: var(--radius); box-shadow: var(--shadow);
+    border-top: 3px solid var(--brand); padding: 28px 32px; margin: -30px 0 44px;
+    position: relative; z-index: 2;
+  }
+  .lead .t {
+    font-size: 12px; font-weight: 700; letter-spacing: .14em;
+    color: var(--brand); margin-bottom: 14px;
+  }
+  .lead p { margin: 0 0 12px; color: var(--ink-2); }
+  .lead p:last-child { margin-bottom: 0; }
+  .lead b { color: var(--ink); }
+
+  /* ============ 章节 ============ */
+  section { margin-bottom: 46px; }
+  .sec-head { display: flex; align-items: baseline; gap: 13px; margin-bottom: 7px; }
+  .sec-num {
+    font-size: 12.5px; font-weight: 700; color: var(--brand);
+    letter-spacing: .1em; flex-shrink: 0; font-variant-numeric: tabular-nums;
+  }
+  h2 { font-size: clamp(20px, 3.2vw, 24px); margin: 0; font-weight: 700; letter-spacing: -.01em; line-height: 1.4; }
+  .sec-desc { color: var(--ink-3); font-size: 14px; margin: 0 0 20px; padding-left: 31px; }
+  h3 {
+    font-size: 16px; font-weight: 700; margin: 30px 0 11px;
+    padding-left: 12px; border-left: 3px solid var(--brand); line-height: 1.5;
+  }
+  p { margin: 0 0 13px; color: var(--ink-2); }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; color: var(--ink-2); }
+  li { margin-bottom: 7px; }
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: .88em; background: #f1f4f9; padding: 1.5px 6px;
+    border-radius: 4px; color: #2b3444;
+  }
+
+  /* ============ 卡片 ============ */
+  .card {
+    background: var(--paper); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 24px 30px; margin-bottom: 16px;
+  }
+  .card > :last-child { margin-bottom: 0; }
+  .card h4 { font-size: 15px; margin: 0 0 11px; font-weight: 700; }
+
+  /* ============ 表格 ============ */
+  .tw { overflow-x: auto; margin: 0 0 18px; border-radius: 9px; border: 1px solid var(--line); background: var(--paper); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 11px 15px; text-align: left; vertical-align: top; line-height: 1.68; }
+  th {
+    background: #f3f6fb; font-weight: 700; font-size: 12.5px; color: var(--ink-2);
+    letter-spacing: .03em; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { border-top: 1px solid var(--line-2); color: var(--ink-2); }
+  tbody tr:first-child td { border-top: none; }
+  td b, td strong { color: var(--ink); }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .c { text-align: center; }
+
+  /* ============ 能力对照（双栏） ============ */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+  .split-col { background: var(--paper); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .split-col .h {
+    padding: 13px 20px; font-size: 13.5px; font-weight: 700;
+    letter-spacing: .04em; border-bottom: 1px solid var(--line-2);
+  }
+  .split-col.can .h { background: var(--ok-bg); color: var(--ok); }
+  .split-col.cannot .h { background: var(--stop-bg); color: var(--stop); }
+  .split-col ul { margin: 0; padding: 16px 20px 16px 36px; font-size: 14px; }
+  .split-col li { margin-bottom: 9px; }
+  .split-col li:last-child { margin-bottom: 0; }
+  .split-col li b { color: var(--ink); }
+
+  /* ============ 徽标 ============ */
+  .tag {
+    display: inline-block; font-size: 11.5px; font-weight: 700;
+    padding: 2.5px 9px; border-radius: 5px; white-space: nowrap; line-height: 1.6;
+  }
+  .tag-ok   { background: var(--ok-bg);   color: var(--ok); }
+  .tag-warn { background: var(--warn-bg); color: var(--warn); }
+  .tag-stop { background: var(--stop-bg); color: var(--stop); }
+  .tag-no   { background: #f1f3f7; color: var(--ink-3); }
+
+  /* ============ 提示框 ============ */
+  .note { border-radius: 9px; padding: 17px 21px; margin: 0 0 17px; font-size: 14.5px; line-height: 1.8; }
+  .note > :last-child { margin-bottom: 0; }
+  .note .t { font-weight: 700; display: block; margin-bottom: 5px; font-size: 14px; }
+  .note-info { background: var(--brand-bg); border-left: 3px solid var(--brand); }
+  .note-info .t { color: var(--brand); }
+  .note-ok   { background: var(--ok-bg);   border-left: 3px solid var(--ok); }
+  .note-ok .t { color: var(--ok); }
+  .note-warn { background: var(--warn-bg); border-left: 3px solid var(--warn); }
+  .note-warn .t { color: var(--warn); }
+  .note-stop { background: var(--stop-bg); border-left: 3px solid var(--stop); }
+  .note-stop .t { color: var(--stop); }
+
+  /* ============ 责任块 ============ */
+  .resp { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+  .resp-col { border-radius: var(--radius); padding: 20px 24px; border: 1px solid var(--line); background: var(--paper); }
+  .resp-col.us { border-top: 3px solid var(--brand); }
+  .resp-col.them { border-top: 3px solid var(--brand-2); }
+  .resp-col h4 { margin: 0 0 12px; font-size: 14.5px; }
+  .resp-col.us h4 { color: var(--brand); }
+  .resp-col.them h4 { color: var(--brand-2); }
+  .resp-col ul { margin: 0; padding-left: 20px; font-size: 14px; }
+  .resp-col li { margin-bottom: 8px; }
+  .resp-col li:last-child { margin-bottom: 0; }
+
+  /* ============ 参数表 ============ */
+  .spec { background: var(--paper); border-radius: var(--radius); box-shadow: var(--shadow); padding: 24px 30px; }
+  .spec dl { display: grid; grid-template-columns: max-content 1fr; gap: 10px 24px; margin: 0; font-size: 14px; }
+  .spec dt { color: var(--ink-3); font-weight: 600; }
+  .spec dd { margin: 0; color: var(--ink-2); }
+
+  /* ============ 结尾 ============ */
+  .sign {
+    background: var(--paper); border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 30px 34px; margin-top: 40px;
+  }
+  .sign .t { font-size: 15px; font-weight: 700; margin-bottom: 14px; }
+  .sign .rows { display: grid; grid-template-columns: max-content 1fr; gap: 12px 20px; font-size: 14px; }
+  .sign .rows dt { color: var(--ink-3); }
+  .sign .rows dd { margin: 0; border-bottom: 1px dashed var(--line); padding-bottom: 4px; }
+
+  footer {
+    max-width: 880px; margin: 0 auto; padding: 30px 22px 0;
+    font-size: 12.5px; color: var(--ink-3); line-height: 1.8;
+    border-top: 1px solid var(--line); text-align: center;
+  }
+
+  /* ============ 打印 ============ */
+  @media print {
+    body { background: #fff; font-size: 10.8pt; line-height: 1.68; }
+    .shell { max-width: none; padding: 0; }
+    .doc-head { padding: 30px 0 26px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .doc-head-inner { max-width: none; }
+    .lead { margin: 0 0 24px; box-shadow: none; border: 1px solid var(--line); border-top: 3px solid var(--brand); }
+    .card, .spec, .sign, .split-col, .resp-col, .tw { box-shadow: none; }
+    section { margin-bottom: 22px; page-break-inside: avoid; }
+    .split, .resp { page-break-inside: avoid; }
+    .tw { page-break-inside: avoid; }
+    a { color: inherit; text-decoration: none; }
+    @page { margin: 13mm 12mm; }
+  }
+
+  @media (max-width: 620px) {
+    .split, .resp { grid-template-columns: 1fr; }
+    .lead, .card, .spec, .sign { padding-left: 20px; padding-right: 20px; }
+    .sec-desc { padding-left: 0; }
+    .spec dl { grid-template-columns: 1fr; gap: 3px 0; }
+    .spec dt { margin-top: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="doc-head">
+  <div class="doc-head-inner">
+    <span class="kicker">Partnership Brief</span>
+    <h1>抖音自动回复助手<br>合作方须知</h1>
+    <p class="sub">本文档面向采购本产品并向终端客户交付的合作方。请在做任何销售承诺之前完整阅读，尤其是第三章（能力边界）与第六章（责任划分）。</p>
+    <div class="doc-meta">
+      <span>版本 <b>v1.0</b></span>
+      <span>文档性质 <b>合作方须知 · 非终端用户手册</b></span>
+      <span>更新 <b>2026-09-18</b></span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <div class="lead">
+    <div class="t">先读这一页</div>
+    <p>本产品是一套<b>抖音评论、直播弹幕、私信的自动化回复工具</b>，采用「客户端 + 授权中心」两段式架构。你采购的是<b>授权与技术支持</b>，终端客户在你的渠道下获得账号与额度。</p>
+    <p><b>最重要的一点：本产品不能保证终端客户的抖音账号不被封禁。</b>任何声称"保证不封号"的说法都是不实承诺，一旦由你向客户做出，后果由你自行承担。</p>
+    <p>我们能做到的是：<b>用一套经过设计的节流与保护机制，把风险控制在一个合理的范围内</b>，并把"用了多少、发了什么、触发了什么限制"完整记录在案，供你在必要时举证。</p>
+  </div>
+
+  <!-- ============ 01 ============ -->
+  <section id="s1">
+    <div class="sec-head"><span class="sec-num">01</span><h2>产品定位</h2></div>
+    <p class="sec-desc">你要清楚自己在卖什么，才不会卖错、也不会被客户问倒。</p>
+
+    <div class="card">
+      <h4>它是什么</h4>
+      <p>一套本地运行的<b>抖音互动自动化工具</b>。运行在终端客户自己的 Windows 电脑上，通过驱动客户本机的 Chrome 浏览器，用<b>客户自己的抖音账号</b>完成评论回复、直播弹幕互动、私信触达，并把互动中出现的意向客户沉淀为线索名单。</p>
+      <p style="margin-bottom:0">它解决的是<b>重复劳动</b>问题：一个人工客服一天回不了几百条留言，工具可以。但它不解决"客户会不会买"的问题，那是话术和产品的事。</p>
+    </div>
+
+    <div class="card">
+      <h4>它的商业逻辑（这决定了你怎么卖）</h4>
+      <div class="note note-info" style="margin-bottom:0">
+        <span class="t">工具的价值来自"发得多"，而账号被封的原因也是"发得多"</span>
+        <p style="margin-bottom:0">这两个目标是<b>根本对立</b>的。所以本产品的定位是<b>「帮你控制节奏，让账号活得久」</b>——而不是"发得越多越好"。</p>
+      </div>
+      <p style="margin:16px 0 0"><b>这一点直接决定销售口径：</b>如果你把"发得多"当卖点，等于亲手把客户送进封号队列，而且后续客户投诉、退款、口碑损失都由你承担。<b>正确的卖点是"安全、可控、有数据、能长期稳定用"。</b></p>
+    </div>
+
+    <div class="card">
+      <h4>计费模型</h4>
+      <p style="margin-bottom:0">采用<b>按成功回复条数计费</b>：只有确认发送成功的回复才消耗额度，<b>失败、被平台拒绝、被系统拦截的一律不扣</b>。</p>
+    </div>
+    <div class="note note-ok">
+      <span class="t">这个计费模型对你是有利的，值得主动向客户说明</span>
+      它使我们的利益与客户的账号健康<b>完全一致</b>：账号被封 → 发不出去 → 我们也收不到钱。因此我们有动力帮客户把账号养住，而不是鼓励客户猛发。这是你在销售时区别于其他工具的有力说法。
+    </div>
+  </section>
+
+  <!-- ============ 02 ============ -->
+  <section id="s2">
+    <div class="sec-head"><span class="sec-num">02</span><h2>我们能提供什么</h2></div>
+    <p class="sec-desc">以下是你可以向客户承诺的部分——都是我们能实际交付并验证的。</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>能力</th><th>具体内容</th><th>可验证方式</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>三渠道自动回复</b></td>
+            <td>视频评论区回复、直播间弹幕回复、私信触达</td>
+            <td>真机演示</td>
+          </tr>
+          <tr>
+            <td><b>关键词触发</b></td>
+            <td>客户自行设置关键词与话术，命中即回复</td>
+            <td>客户自助配置</td>
+          </tr>
+          <tr>
+            <td><b>话术库与随机化</b></td>
+            <td>同一规则支持多条话术自动轮换，避免内容重复被判定为群发</td>
+            <td>真机演示</td>
+          </tr>
+          <tr>
+            <td><b>账号安全体系</b></td>
+            <td>新号观察期、分阶段放量、分渠道独立限额、相似内容拦截、活跃时段控制、异常熔断</td>
+            <td>界面可见，参数不可绕过</td>
+          </tr>
+          <tr>
+            <td><b>数据看板</b></td>
+            <td>截流总量、已回复人数、回复成功率、分渠道明细、失败原因分布、额度消耗趋势</td>
+            <td>界面可见</td>
+          </tr>
+          <tr>
+            <td><b>多账号支持</b></td>
+            <td>一个客户端可管理多个抖音账号，各账号独立运行、独立计数、独立限额</td>
+            <td>界面可见</td>
+          </tr>
+          <tr>
+            <td><b>授权与额度管理</b></td>
+            <td>账号开通、套餐发放、额度充值、充值码兑换</td>
+            <td>我方管理后台</td>
+          </tr>
+          <tr>
+            <td><b>完整操作留痕</b></td>
+            <td>每次发送的时间、渠道、结果、失败原因；配置变更记录；实际生效的策略快照</td>
+            <td><b>可按账号导出，供举证使用</b></td>
+          </tr>
+          <tr>
+            <td><b>安全策略持续更新</b></td>
+            <td>平台风控变化时，我方统一调整策略参数并下发，客户无需操作</td>
+            <td>服务端统一下发</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note note-info">
+      <span class="t">关于最后一项，这是一个应该被强调的卖点</span>
+      抖音的风控规则会持续变化。客户自己买的"一次性软件"在平台改版后就废了，而本产品的安全策略由我方在服务端维护并统一下发，<b>客户不需要做任何操作</b>。这意味着你交付的不是一个死软件，而是一个被持续维护的服务。
+    </div>
+  </section>
+
+  <!-- ============ 03 ============ -->
+  <section id="s3">
+    <div class="sec-head"><span class="sec-num">03</span><h2>能力边界</h2></div>
+    <p class="sec-desc">这一章是你必须向客户如实说明的部分。跳过它去销售，是后续纠纷的主要来源。</p>
+
+    <div class="split">
+      <div class="split-col can">
+        <div class="h">✓ 我们能做</div>
+        <ul>
+          <li><b>降低</b>账号被限制的概率</li>
+          <li>在达到风险阈值时<b>主动停止</b>发送</li>
+          <li>记录每一次发送与判定结果，<b>可举证</b></li>
+          <li>遇到验证码等异常时<b>停下并交还给你处理</b></li>
+          <li>把限额、间隔、话术随机化等保护机制<b>强置于客户端之上</b></li>
+          <li>平台规则变化时<b>持续更新</b>策略</li>
+          <li>失败发送<b>不计费</b></li>
+        </ul>
+      </div>
+      <div class="split-col cannot">
+        <div class="h">✕ 我们不能做</div>
+        <ul>
+          <li>不能<b>保证</b>账号不被封禁、限流</li>
+          <li>不能<b>绕过</b>验证码、滑块、平台风控</li>
+          <li>不能把客户的发送上限<b>调高到超出账号等级</b></li>
+          <li>不能保证回复一定带来转化</li>
+          <li>不能替代客户做内容与产品</li>
+          <li>不能为客户的<b>违规用途</b>提供支持</li>
+          <li>不能撤销平台已经做出的处罚</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>关于"封号"这件事，请如实告知客户</h3>
+    <div class="note note-stop">
+      <span class="t">任何批量触达行为都面临平台判定风险，这与使用哪款工具无关</span>
+      <p style="margin-bottom:0">
+        使用本产品<b>可以降低</b>风险，但<b>无法消除</b>账号被限制、封禁或内容被下架的可能性。<br>
+        因抖音平台判定、平台规则变更导致的账号处罚与业务损失，<b>我方不承担赔偿责任</b>。<br>
+        请你在向终端客户销售时，以书面或可留存的方式明确传达这一条。
+      </p>
+    </div>
+
+    <h3>技术参数与硬性限制</h3>
+    <div class="spec">
+      <dl>
+        <dt>运行环境</dt><dd>Windows 10 / 11（客户端）</dd>
+        <dt>运行依赖</dt><dd>Node.js 22.5 或更高版本</dd>
+        <dt>浏览器</dt><dd>Google Chrome（使用独立配置目录，不干扰客户日常浏览器）</dd>
+        <dt>数据存放</dt><dd><b>全部保存在客户本机</b>；我方服务器仅接收计数类数据与哈希标识，<b>不接收评论原文、回复内容原文与客户隐私字段</b></dd>
+        <dt>账号体系</dt><dd>账号由我方后台创建并下发，<b>终端客户不支持自助注册</b></dd>
+        <dt>额度模型</dt><dd>按成功回复条数计费，失败不计费</dd>
+        <dt>并发登录</dt><dd>同一账号默认允许 1 台设备在线</dd>
+        <dt>发送上限</dt><dd>由账号等级与服务端策略决定，<b>客户端不可调高</b>；详见第四章</dd>
+      </dl>
+    </div>
+  </section>
+
+  <!-- ============ 04 ============ -->
+  <section id="s4">
+    <div class="sec-head"><span class="sec-num">04</span><h2>安全机制与发送限额</h2></div>
+    <p class="sec-desc">这些参数为什么是硬性的，你需要理解，才能向客户解释清楚。</p>
+
+    <h3>账号等级与放量曲线</h3>
+    <div class="tw">
+      <table>
+        <thead><tr><th>阶段</th><th>时间</th><th class="c">评论回复/天</th><th class="c">私信/天</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><b>观察期</b></td><td class="num">第 1–3 天</td><td class="c num">0</td><td class="c num">0</td><td>只采集线索，不发送</td></tr>
+          <tr><td><b>预热期</b></td><td class="num">第 4–7 天</td><td class="c num">10</td><td class="c num">3</td><td>低量验证话术效果</td></tr>
+          <tr><td><b>爬坡期</b></td><td class="num">第 8–14 天</td><td class="c num">25</td><td class="c num">8</td><td>逐步放量</td></tr>
+          <tr><td><b>稳定期</b></td><td class="num">第 15 天起</td><td class="c num">30</td><td class="c num">10</td><td>正常运营</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note note-warn">
+      <span class="t">这套曲线不能关闭，也不能跳过</span>
+      新账号在没有信用记录的情况下大量发送，是封号最主要的原因。<b>这是一项保护措施，不是产品缺陷。</b>如果客户要求"跳过观察期直接开跑"，请明确拒绝并解释原因——你替他挡住的，正是他自己的损失。
+    </div>
+
+    <h3>为什么私信限额远低于评论</h3>
+    <div class="card">
+      <p style="margin-bottom:0">抖音对"向陌生人发送私信"的管控显著严于评论区互动，这是平台规则，任何工具都无法绕过。因此本产品对三个渠道采用<b>相互独立</b>的限额：</p>
+      <div class="tw" style="margin:14px 0 0">
+        <table>
+          <thead><tr><th>渠道</th><th class="c">日上限</th><th class="c">最小间隔</th></tr></thead>
+          <tbody>
+            <tr><td>评论区回复</td><td class="c num">20–30 条</td><td class="c num">60–180 秒</td></tr>
+            <tr><td>直播间弹幕回复</td><td class="c num">30–50 条</td><td class="c num">30–90 秒</td></tr>
+            <tr><td><b>陌生人私信</b></td><td class="c num"><b>5–10 条</b></td><td class="c num"><b>300–900 秒</b></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <h3>额度与日上限是两件事</h3>
+    <div class="note note-stop">
+      <span class="t">请在签单前就把这一条讲清楚，否则它一定会变成售后纠纷</span>
+      <p style="margin-bottom:0">
+        客户购买的套餐是<b>预付的回复条数</b>（例如半年套餐 4500 条）。<br>
+        但<b>每天能发多少条由账号等级与安全策略决定，不由套餐决定</b>。<br>
+        例：稳定期每天 30 条，半年理论上限约 30 × 180 = 5400 条。<br>
+        <b>「买了半年套餐」≠「半年内可以无限发」。</b>套餐到期后未使用的部分，按套餐规则处理。
+      </p>
+    </div>
+
+    <h3>系统自动执行、不需要客户干预的保护</h3>
+    <div class="tw">
+      <table>
+        <thead><tr><th>保护机制</th><th>作用</th><th class="c">可否调整</th></tr></thead>
+        <tbody>
+          <tr><td>分阶段放量</td><td>新号从零开始逐步提升发送量</td><td class="c"><span class="tag tag-stop">不可</span></td></tr>
+          <tr><td>分渠道限额</td><td>私信独立且更严格的限额</td><td class="c"><span class="tag tag-stop">不可</span></td></tr>
+          <tr><td>内容相似度拦截</td><td>两条内容过于相似时拒绝发送第二条</td><td class="c"><span class="tag tag-stop">不可</span></td></tr>
+          <tr><td>发送间隔随机化</td><td>避免固定节奏被识别为机器行为</td><td class="c"><span class="tag tag-ok">仅可调更慢</span></td></tr>
+          <tr><td>活跃时段控制</td><td>默认仅 08:00–23:00 工作</td><td class="c"><span class="tag tag-ok">仅可调更短</span></td></tr>
+          <tr><td>异常熔断</td><td>遇验证码、连续失败时递进暂停</td><td class="c"><span class="tag tag-stop">不可</span></td></tr>
+          <tr><td>全局急停</td><td>一键停止全部发送</td><td class="c"><span class="tag tag-ok">客户可主动使用</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 05 ============ -->
+  <section id="s5">
+    <div class="sec-head"><span class="sec-num">05</span><h2>合作方需要承担的义务</h2></div>
+    <p class="sec-desc">这些是你在渠道运营中必须做到的事。未履行而引发的问题，责任在渠道侧。</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>义务</th><th>具体要求</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><b>如实传达边界</b></td>
+            <td>向终端客户明确说明"不能保证不封号"、发送限额的原因、额度与日上限的区别。<b>不得做出产品能力之外的承诺</b></td>
+          </tr>
+          <tr>
+            <td><b>建议专用账号</b></td>
+            <td>建议客户使用专门注册的账号运营，不要使用主号。这是降低客户损失最有效的一条</td>
+          </tr>
+          <tr>
+            <td><b>不索取平台凭据</b></td>
+            <td>不得向客户索取抖音账号、密码、验证码，也不得代替客户处理平台验证</td>
+          </tr>
+          <tr>
+            <td><b>不协助绕过风控</b></td>
+            <td>不得引导客户规避平台验证、不得要求我方调高安全上限、不得传播规避方法</td>
+          </tr>
+          <tr>
+            <td><b>不做违规用途</b></td>
+            <td>不得将本产品用于违法、诈骗、赌博、色情内容，不得用于骚扰与恶意刷屏</td>
+          </tr>
+          <tr>
+            <td><b>不擅自转售授权</b></td>
+            <td>账号授权与你的渠道绑定，<b>不得转卖、出租、共享给约定范围外的第三方</b></td>
+          </tr>
+          <tr>
+            <td><b>保留沟通记录</b></td>
+            <td>与客户之间关于风险、限额、责任的沟通应有可留存的记录，以备争议时举证</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 06 ============ -->
+  <section id="s6">
+    <div class="sec-head"><span class="sec-num">06</span><h2>责任划分</h2></div>
+    <p class="sec-desc">清楚的边界对双方都是保护。以下是原则性划分。</p>
+
+    <div class="resp">
+      <div class="resp-col us">
+        <h4>我方负责</h4>
+        <ul>
+          <li>产品功能的可用性与正确性</li>
+          <li>授权中心的稳定运行与数据安全</li>
+          <li>安全策略的持续维护与更新</li>
+          <li>因软件缺陷导致的错误发送、错误计费，核实后处理</li>
+          <li>授权、额度、充值相关的账目准确</li>
+          <li>提供操作留痕，供渠道与客户举证</li>
+          <li>对渠道进行产品与安全口径的培训</li>
+        </ul>
+      </div>
+      <div class="resp-col them">
+        <h4>合作方负责</h4>
+        <ul>
+          <li>向客户如实传达产品能力与边界</li>
+          <li>客户话术内容与营销行为的合规性</li>
+          <li>客户账号的日常使用与安全管理</li>
+          <li>因渠道做出超范围承诺产生的纠纷</li>
+          <li>终端客户的售后服务与沟通</li>
+          <li>遵守本文档第五章的全部义务</li>
+          <li>平台规则变化时，配合向客户传达调整</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>免责与不可抗力</h3>
+    <div class="note note-stop">
+      <span class="t">请特别注意以下情形不在我方赔偿范围内</span>
+      <p style="margin-bottom:0">
+        ① 因抖音平台判定、风控策略调整、平台规则变更导致的账号限制、封禁、内容下架及业务损失；<br>
+        ② 因终端客户自行设置话术内容、超范围用途、违规操作导致的后果；<br>
+        ③ 因渠道方向客户做出超出本产品实际能力的承诺而产生的纠纷与赔付；<br>
+        ④ 因客户本机环境（系统、网络、浏览器配置）异常导致的运行故障；<br>
+        ⑤ 因不可抗力导致的服务中断。
+      </p>
+    </div>
+
+    <div class="note note-warn">
+      <span class="t">关于本节的说明</span>
+      本章为<b>原则性责任划分说明</b>，用于双方在合作中对齐认知，<b>不构成法律意见</b>。正式的权利义务以双方签署的合作协议为准，该协议请由你的法务或律师定稿。
+    </div>
+  </section>
+
+  <!-- ============ 07 ============ -->
+  <section id="s7">
+    <div class="sec-head"><span class="sec-num">07</span><h2>禁止用途</h2></div>
+    <p class="sec-desc">以下行为将导致授权被立即终止，且已支付费用不予退还。</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>禁止行为</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><b>违法违规内容</b></td><td>诈骗、赌博、色情、传销及其他违反法律法规的推广内容</td></tr>
+          <tr><td><b>骚扰与恶意刷屏</b></td><td>对同一对象的反复骚扰、无差别批量骚扰</td></tr>
+          <tr><td><b>冒充他人</b></td><td>冒充他人身份、官方账号、平台工作人员</td></tr>
+          <tr><td><b>规避平台风控</b></td><td>试图绕过验证、破解限制、伪造客户端数据</td></tr>
+          <tr><td><b>超出授权范围转售</b></td><td>转卖、出租、共享授权给约定范围外的第三方</td></tr>
+          <tr><td><b>逆向与篡改</b></td><td>对客户端进行逆向、破解额度校验、篡改留痕数据</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 08 ============ -->
+  <section id="s8">
+    <div class="sec-head"><span class="sec-num">08</span><h2>支持与服务</h2></div>
+    <p class="sec-desc">交付不是结束，持续维护是这类产品的核心价值。</p>
+
+    <div class="tw">
+      <table>
+        <thead><tr><th>服务项</th><th>内容</th><th class="c">方式</th></tr></thead>
+        <tbody>
+          <tr><td><b>部署支持</b></td><td>授权中心部署、客户端安装与环境排查</td><td class="c">远程</td></tr>
+          <tr><td><b>产品培训</b></td><td>功能使用、安全口径、销售话术边界</td><td class="c">远程 / 文档</td></tr>
+          <tr><td><b>策略更新</b></td><td>平台风控变化时统一调整并下发，客户无需操作</td><td class="c">自动</td></tr>
+          <tr><td><b>故障响应</b></td><td>功能不可用、发送异常、计费疑问的排查</td><td class="c">工单 / 远程</td></tr>
+          <tr><td><b>操作留痕导出</b></td><td>按账号导出完整操作与策略记录，供争议举证</td><td class="c">按需申请</td></tr>
+          <tr><td><b>客户端更新</b></td><td>功能迭代与兼容性修复</td><td class="c">版本发布</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note note-info">
+      <span class="t">以下诉求我方无法满足，请在销售环节提前说明</span>
+      <p style="margin-bottom:0">
+        ✕ 绕过平台验证、调高安全上限至超出账号等级<br>
+        ✕ 承诺"保证不封号"或提供任何形式的封号保证<br>
+        ✕ 代客户处理平台验证、索取客户平台凭据<br>
+        ✕ 为客户制作违规内容或提供违规用途的技术支持
+      </p>
+    </div>
+  </section>
+
+  <div class="sign">
+    <div class="t">合作确认</div>
+    <p style="font-size:14px;color:var(--ink-2)">开始销售前，请确认你已完整阅读并理解本文档，特别是第三章（能力边界）、第五章（合作方义务）与第六章（责任划分）。</p>
+    <dl class="rows">
+      <dt>合作方名称</dt><dd>&nbsp;</dd>
+      <dt>授权账号</dt><dd>&nbsp;</dd>
+      <dt>确认日期</dt><dd>&nbsp;</dd>
+      <dt>签署人</dt><dd>&nbsp;</dd>
+    </dl>
+  </div>
+
+</div>
+
+<footer>
+  抖音自动回复助手 · 合作方须知 v1.0 &nbsp;|&nbsp; 更新日期 2026-09-18<br>
+  本文档面向渠道合作方，非终端用户手册。正式权利义务以双方签署的合作协议为准。
+</footer>
+
+</body>
+</html>
