@@ -67,7 +67,6 @@ const ERROR_CODES = Object.freeze({
   CREDIT_REDEEM_CODE_DISABLED: 403,
   CREDIT_REDEEM_ALREADY_DONE: 200, // 幂等命中，属正常结果
   CREDIT_LEDGER_NOT_FOUND: 404,
-  CREDIT_INSUFFICIENT: 402,
 
   // ── 安全策略（红线 1）────────────────────────────────────
   // ⚠️ POLICY_VIOLATION 的含义是"客户端上报的配置比服务端策略更激进"
