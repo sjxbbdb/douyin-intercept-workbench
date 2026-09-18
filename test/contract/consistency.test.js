@@ -254,12 +254,16 @@ test('契约：客户端不得硬编码策略数值（红线 1）', () => {
 })
 
 // ---------- 4. 选择器唯一来源（S-4） ----------
-test('契约：data-e2e 只允许出现在 selectors.js', () => {
+test('契约：选择器字符串只允许出现在 selectors.js', () => {
   const offenders = []
   for (const dir of ['client', 'license-server', 'shared']) {
     for (const f of collectJsFiles(path.join(ROOT, dir))) {
       if (f.includes(path.join('platform', 'selectors.js'))) continue
-      const src = fs.readFileSync(f, 'utf8')
+      // ⚠️ 必须先剥掉注释再匹配。
+      //    否则"注释里写一句'本文件不得出现 data-e2e'"就会被判成违规——
+      //    而那句注释恰恰是在维护这条规则。踩过一次，代价是
+      //    解释"为什么说不能出现却出现了"的时间远超写规则本身。
+      const src = stripComments(fs.readFileSync(f, 'utf8'))
       if (/data-e2e|data-sec-uid|comment-list|comment-item/.test(src)) {
         offenders.push(path.relative(ROOT, f))
       }
@@ -268,11 +272,61 @@ test('契约：data-e2e 只允许出现在 selectors.js', () => {
   assert.deepStrictEqual(offenders, [], '选择器字符串散落在以下文件（违反 S-4）：\n' + offenders.join('\n'))
 })
 
+/**
+ * 剥掉 JS 源码里的注释（保留字符串字面量内容）。
+ *
+ * ⚠️ 不能简单地按行 `//` 切分——字符串里可能出现 `//`（例如 URL），
+ *    按行切会把代码误当注释删掉，造成**漏报**（这正是我们要防的方向）。
+ *    所以做一次真正的状态机扫描。
+ */
+function stripComments(src) {
+  let out = ''
+  let i = 0
+  const n = src.length
+  let mode = 'code' // code | line | block | squote | dquote | tquote
+
+  while (i < n) {
+    const c = src[i]
+    const c2 = src[i + 1]
+
+    if (mode === 'line') {
+      if (c === '\n') { mode = 'code'; out += c }
+      i += 1
+      continue
+    }
+    if (mode === 'block') {
+      if (c === '*' && c2 === '/') { mode = 'code'; i += 2; continue }
+      if (c === '\n') out += c // 保留换行，行号不漂移
+      i += 1
+      continue
+    }
+    if (mode === 'squote' || mode === 'dquote' || mode === 'tquote') {
+      out += c
+      if (c === '\\') { out += src[i + 1] || ''; i += 2; continue }
+      if ((mode === 'squote' && c === "'") || (mode === 'dquote' && c === '"') || (mode === 'tquote' && c === '`')) {
+        mode = 'code'
+      }
+      i += 1
+      continue
+    }
+
+    // mode === 'code'
+    if (c === '/' && c2 === '/') { mode = 'line'; i += 2; continue }
+    if (c === '/' && c2 === '*') { mode = 'block'; i += 2; continue }
+    if (c === "'") { mode = 'squote'; out += c; i += 1; continue }
+    if (c === '"') { mode = 'dquote'; out += c; i += 1; continue }
+    if (c === '`') { mode = 'tquote'; out += c; i += 1; continue }
+    out += c
+    i += 1
+  }
+  return out
+}
+
 // ---------- 5. 空 catch（AGENTS.md §2.8） ----------
 /**
  * 找出"体里没有任何处理逻辑"的 catch。
  *
- * ⚠️ 两个必须避开的坑（都实际踩过）：
+ * ⚠️ 三个必须避开的坑（前两个实际踩过）：
  *
  *   1. **不能简单用 /catch\s*\{\s*\}/** —— 那样会把
  *      `catch { /* 说明 *\/ corrupt++ }` 这种**有逻辑但带注释**的误报为空。
@@ -280,13 +334,17 @@ test('契约：data-e2e 只允许出现在 selectors.js', () => {
  *   2. **必须先剥离注释再扫描**。踩过的坑：源码注释里写着
  *      "旧代码用 try{}catch{} 静默吞掉写盘失败"，正则把这句**注释文字**
  *      当成了真的 catch，报出一个根本不存在的空 catch。
- *      剥离注释同时也避免注释里的花括号打乱配对。
+ *
+ *   3. **剥离注释不能用简单正则**。上一版用
+ *      `.replace(/\/\*[\s\S]*?\*\//g,' ')` + 行注释正则，在含大量块注释的
+ *      文件上会**漏判**（曾把 `browser-host.js` 里一个真实存在代码的
+ *      catch 报成空 catch）。原因是非贪婪块注释正则遇到嵌套的 `*` 与 `/`
+ *      组合时会提前结束，导致后续的花括号配对整体错位。
+ *      现在改用统一的状态机实现（与选择器扫描共用），它正确处理
+ *      字符串字面量、转义与块注释。
  */
 function findEmptyCatches(src) {
-  // 先剥离注释（保留长度无关，只需语义正确）
-  const code = src
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+  const code = stripComments(src)
 
   const hits = []
   const re = /catch\s*(?:\([^)]*\))?\s*\{/g

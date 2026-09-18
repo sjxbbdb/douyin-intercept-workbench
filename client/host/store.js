@@ -186,6 +186,59 @@ class Store {
       return { name: n, bytes: st.size, mtime_ms: st.mtimeMs }
     })
   }
+
+  // ── 独占锁文件 ─────────────────────────────────────────────
+  //
+  // ⚠️ 为什么锁文件也必须走 store：
+  //    客户端的硬约束是"**只有 host 主进程碰运行数据**"。浏览器独占锁
+  //    （`browser-host.lock`）就是运行数据的一部分——它决定"这个实例
+  //    有没有另一个进程正在驱动同一个 Chrome"。
+  //    若让 core/ 自己 writeFileSync，就等于开了第二个写盘点，
+  //    而"单写者"这条约束一旦有例外，后面每个人都会觉得自己的场景是例外。
+  //
+  // ⚠️ 独占性靠 `wx` 标志（操作系统级原子），不是"先查存在再写"——
+  //    后者两步之间有竞态，两个进程可以同时通过检查。
+
+  /**
+   * 原子地独占创建一个锁文件。
+   *
+   * @returns {{ok:true} | {ok:false, reason:'exists'|'error', code?:string, message?:string}}
+   */
+  createExclusive(name, content) {
+    const target = this.file(name)
+    try {
+      fs.writeFileSync(target, content, { encoding: 'utf8', flag: 'wx' })
+      return { ok: true }
+    } catch (e) {
+      if (e && e.code === 'EEXIST') return { ok: false, reason: 'exists' }
+      return { ok: false, reason: 'error', code: e && e.code, message: e && e.message }
+    }
+  }
+
+  /** 读取锁文件内容；不存在或损坏返回 null（把损坏的判定留给调用方）。 */
+  readLock(name) {
+    try {
+      const raw = fs.readFileSync(this.file(name), 'utf8')
+      return raw ? JSON.parse(raw) : null
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return null
+      // ⚠️ JSON 解析失败也返回 null，但调用方应据此判定"锁已损坏"并留痕。
+      //    这里不抛错是因为"锁损坏"本身是**预期内**的可恢复状态
+      //    （上次写入被中断），抛错会让程序根本起不来。
+      return null
+    }
+  }
+
+  /** 删除锁文件。文件不存在视为成功（幂等）。 */
+  removeLock(name) {
+    try {
+      fs.unlinkSync(this.file(name))
+      return { ok: true }
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return { ok: true, alreadyGone: true }
+      return { ok: false, code: e && e.code, message: e && e.message }
+    }
+  }
 }
 
 /** schema 迁移。当前均为 v1，占位以便将来扩展。 */
