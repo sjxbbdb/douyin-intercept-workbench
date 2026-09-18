@@ -141,7 +141,19 @@ function guard(channel, handler) {
       signature,
       nowMs,
     })
-    if (!sig.ok) throw new AppError(sig.code, sig.message, sig.detail)
+    if (!sig.ok) {
+      // ⚠️ AUTH_TS_SKEW 必须在 detail 里带回 `clock_skew_ms`。
+      //    原因：时间戳超容差时本请求在 guard 阶段就被拒，
+      //    此时 ctx.session 尚未写入 → 响应**无法签名** →
+      //    客户端拿不到 X-Lic-Server-Ts，无法按常规路径校准时钟。
+      //    结果是死锁：偏差 → 401 → 无法校准 → 继续 401。
+      //    客户端用客户端自己发的 client_time_ms 反推即可自愈，
+      //    服务端只需把这个值算出来告诉它。
+      const detail = sig.code === 'AUTH_TS_SKEW'
+        ? { ...(sig.detail || {}), clock_skew_ms: skewFromBody(ctx.body, nowMs) }
+        : sig.detail
+      throw new AppError(sig.code, sig.message, detail)
+    }
 
     if (channel !== null) {
       checkReplay(db, {
@@ -167,6 +179,18 @@ function guard(channel, handler) {
 
     return handler(ctx)
   }
+}
+
+/** 从请求体里取客户端自报时间，算出"客户端应该加多少毫秒"。
+ *
+ * ⚠️ 返回的是 `服务端时间 - 客户端时间`，客户端直接把它当成 clockSkewMs 用。
+ *    取不到时返回 0（客户端会因"偏差仍超容差"而不采纳）。
+ */
+function skewFromBody(body, nowMs) {
+  if (!body || typeof body !== 'object') return 0
+  const clientTime = Number(body.client_time_ms || body.wall_clock_ms)
+  if (!Number.isFinite(clientTime) || clientTime <= 0) return 0
+  return nowMs - clientTime
 }
 
 /** 清理过期 nonce 与旧序号计数（由定时任务调用）。 */

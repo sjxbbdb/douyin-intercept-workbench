@@ -59,7 +59,7 @@ function heartbeat(ctx) {
     recordConfigChange(db, {
       accountId: session.account_id,
       changeId: `hb-violation-${session.id}-${body.seq}`,
-      instanceId: String(body.instance_id || session.device_id || ''),
+      instanceId: instanceOf(body, session),
       changedAtMs: nowMs,
       source: 'user',
       actor: 'local_user',
@@ -80,7 +80,7 @@ function heartbeat(ctx) {
   if (appliedLimits && !violation) {
     ackPolicy(db, {
       accountId: session.account_id,
-      instanceId: String(body.instance_id || session.device_id || ''),
+      instanceId: instanceOf(body, session),
       policy,
       appliedLimitsJson: JSON.stringify(appliedLimits),
       nowMs,
@@ -167,7 +167,28 @@ function loadPlan(db, accountId) {
   return db.prepare('SELECT * FROM plan WHERE plan_id = ?').get(acc.plan_id) || null
 }
 
-/** 写 policy_ack_log。同 (account, instance, version) 已存在则只更新 last_seen。 */
+/**
+ * 写 policy_ack_log。同 (account, instance, version) 已存在则只更新 last_seen。
+ *
+ * ⚠️ `instance_id` 是表的 NOT NULL 分区键，但契约 §4.5 的心跳字段表里
+ *    **没有**这个字段——只有 `instances[]`。早期实现直接取 `body.instance_id`，
+ *    于是任何按契约实现（不传该字段）的客户端都会让这条 INSERT 抛
+ *    NOT NULL 约束错误，**ack 存证永远写不进去**，而红线 3 恰恰要求
+ *    这张表能回答"当时实际生效的策略是什么"。
+ *
+ *    因此这里做兜底推导，保证一定拿到一个稳定非空的键：
+ *      显式 instance_id → instances[] 首项 → device_id
+ */
+function instanceOf(body, session) {
+  const explicit = body && body.instance_id
+  if (explicit) return String(explicit)
+  const list = body && body.instances
+  if (Array.isArray(list) && list.length && list[0] && list[0].instance_id) {
+    return String(list[0].instance_id)
+  }
+  return String((body && body.device_id) || session.device_id || 'unknown')
+}
+
 function ackPolicy(db, { accountId, instanceId, policy, appliedLimitsJson, nowMs }) {
   db.prepare(`
     INSERT INTO policy_ack_log (
@@ -364,7 +385,7 @@ function auditConfigChanges(ctx) {
     recordConfigChange(db, {
       changeId: c.change_id,
       accountId: session.account_id,
-      instanceId: String(body.instance_id || session.device_id || ''),
+      instanceId: instanceOf(body, session),
       changedAtMs: Number(c.changed_at_ms || nowMs),
       source: c.source,
       actor: c.actor || 'local_user',
@@ -421,7 +442,7 @@ function usageReport(ctx) {
     ) VALUES (?,?,?,?,?,?,?,?)
   `).run(
     reportId, session.account_id,
-    String(body.instance_id || session.device_id || ''),
+    instanceOf(body, session),
     body.window_start_ms === undefined ? null : Number(body.window_start_ms),
     body.window_end_ms === undefined ? null : Number(body.window_end_ms),
     // ⚠️ 仅运营统计。契约：任何情况下不得换算成积分。

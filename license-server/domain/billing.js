@@ -192,12 +192,50 @@ function settleSendBatch(db, opts) {
       }))
     }
 
-    // ── 第二步：余额判定（循环外一次算定）────────────────────
-    // affordable = 当前余额能全额支付的条数 + 允许的一次透支
-    // ⚠️ 透支只在余额 > 0 且尚未进入 insufficient 时允许（§6.6 用例 9）
+    // ── 第二步：余额与配额的**可计费条数**上限（循环外一次算定）────
+    // ⚠️ 两条独立的闸门，取更小者。漏掉任何一条都是红线违规：
+    //
+    //   ① 余额闸门：`affordable = floor(balance/unit) + 一次透支`
+    //      透支只在余额 > 0 且尚未进入 insufficient 时允许（§6.6 用例 9）。
+    //
+    //   ② **当日策略上限闸门**（红线 1）：契约 §6.1 的计费资格第 ⑤ 条
+    //      要求"未超当日策略上限"才可计费。若只算余额不算配额，
+    //      商家会被**超出日上限发送的那部分**收费——而这些发送本身
+    //      就是平台风控的直接诱因，为它们收费既违反红线 1，
+    //      也会在纠纷中站不住脚。
+    //
+    //      早期实现只做了 ①，测试"31 条明细 vs 日上限 30"时
+    //      结果扣了 31 条的钱（多收 1 条）。所以这里显式算出
+    //      各渠道的"当日剩余可计费条数"，并对超出的部分标记
+    //      `policy_exceeded`（留痕、不计费、不占后续配额）。
     const billable = planned.filter((p) => p.action === 'settle' && p.billable)
     const canOverdraft = acc.balanceMilli > 0 && !acc.insufficient
-    const affordable = Math.floor(Math.max(acc.balanceMilli, 0) / unit) + (canOverdraft ? 1 : 0)
+    const balanceAffordable = Math.floor(Math.max(acc.balanceMilli, 0) / unit) + (canOverdraft ? 1 : 0)
+
+    // 按**渠道 + 自然日**分别为每条可计费明细分配额度（按 sent_at_ms 升序先到先得）。
+    // ⚠️ 键必须带自然日。只按渠道缓存会让"跨天补报"整批被算作同一天：
+    //    第 1 天用满 10 条后，第 2 天的 10 条会被误判为超限全部不计费——
+    //    表现为"补报的历史明细白发了"。§6.6 用例 7 专门覆盖这条。
+    const quotaLeft = new Map()
+    for (const p of billable) {
+      const src = p.s.source_type
+      const dayStart = dayStartMs(Number(p.s.sent_at_ms))
+      const key = `${src}@${dayStart}`
+      if (!quotaLeft.has(key)) {
+        const { max } = dailyMaxFor(accountDayIndex, src)
+        const used = usedQuota(db, accountId, src, Number(p.s.sent_at_ms), TZ_OFFSET_MINUTES)
+        quotaLeft.set(key, Math.max(0, max - used))
+      }
+      const left = quotaLeft.get(key)
+      if (left > 0) {
+        quotaLeft.set(key, left - 1)
+        p.quotaOk = true
+      } else {
+        p.quotaOk = false
+        p.overLimit = true
+        auditFlags.push('policy_daily_cap_exceeded')
+      }
+    }
 
     // ── 第三步：逐条结算（升序）──────────────────────────────
     let billedCount = 0
@@ -219,8 +257,9 @@ function settleSendBatch(db, opts) {
       }
 
       let charged = 0
-      if (p.action === 'settle' && p.billable) {
-        if (billedCount < affordable) {
+      const eligible = p.action === 'settle' && p.billable && p.quotaOk === true
+      if (eligible) {
+        if (billedCount < balanceAffordable) {
           charged = unit
           billedCount++
           balanceMilli -= unit
@@ -230,7 +269,7 @@ function settleSendBatch(db, opts) {
       const overLimit = p.overLimit === true
       const status = overLimit ? 'policy_exceeded'
         : charged > 0 ? 'billed'
-          : (p.action === 'settle' && p.billable) ? 'unbilled_insufficient_credit'
+          : eligible ? 'unbilled_insufficient_credit'
             : 'not_billable'
 
       if (p.upgrade) {

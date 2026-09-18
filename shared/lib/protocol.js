@@ -55,8 +55,73 @@ const TIER_DAY_BOUNDARIES = Object.freeze([
   { tier: 'stable',      day_from: 15, day_to: null },
 ])
 
+// ⚠️ 接口路径与头名放 shared：两端各写一份字符串字面量时，
+//    任何一次笔误都表现为"签名对不上"或"404"，排查成本极高。
+const PATHS = Object.freeze({
+  healthz: '/healthz',
+  bootstrap: `${API_PREFIX}/client/bootstrap`,
+  login: `${API_PREFIX}/auth/login`,
+  refresh: `${API_PREFIX}/auth/refresh`,
+  logout: `${API_PREFIX}/auth/logout`,
+  me: `${API_PREFIX}/auth/me`,
+  heartbeat: `${API_PREFIX}/heartbeat`,
+  policyCurrent: `${API_PREFIX}/policy/current`,
+  auditSends: `${API_PREFIX}/audit/sends`,
+  auditConfigChanges: `${API_PREFIX}/audit/config-changes`,
+  usageReport: `${API_PREFIX}/usage/report`,
+  creditBalance: `${API_PREFIX}/credit/balance`,
+  creditLedger: `${API_PREFIX}/credit/ledger`,
+  creditRedeem: `${API_PREFIX}/credit/redeem`,
+  accountPlan: `${API_PREFIX}/account/plan`,
+})
+
+/** 请求签名头（契约 §5.1） */
+const HEADERS = Object.freeze({
+  ts: 'X-Lic-Ts',
+  nonce: 'X-Lic-Nonce',
+  sign: 'X-Lic-Sign',
+  serverTs: 'X-Lic-Server-Ts',
+  /**
+   * ⚠️ `X-Lic-Unsigned` 是本项目补充的**可判定位**（契约 §5.2 的配套约定）：
+   *    身份类错误（401/403）发生在会话失效时，此时没有可用密钥，
+   *    服务端**只能**返回未签名响应。客户端若把"未签名"一律判为被篡改，
+   *    就会在 token 过期时误报安全事件并停机。故用本头显式区分：
+   *      · auth        → 身份问题，重新登录即可，**不算篡改**
+   *      · 缺失/其他   → fail-closed
+   */
+  unsigned: 'X-Lic-Unsigned',
+})
+
+/** `X-Lic-Unsigned` 的取值 */
+const UNSIGNED_REASONS = Object.freeze({
+  auth: 'auth',
+  noSession: 'no_session',
+})
+
+/** 序号通道（契约 §5.4）。各通道独立计数，避免心跳挤掉上报的序号。 */
+const SEQ_CHANNELS = Object.freeze(['heartbeat', 'usage', 'sends', 'config_audit'])
+
+/** 序号通道 → 接口路径 */
+const CHANNEL_PATH = Object.freeze({
+  heartbeat: PATHS.heartbeat,
+  usage: PATHS.usageReport,
+  sends: PATHS.auditSends,
+  config_audit: PATHS.auditConfigChanges,
+})
+
+/** 客户端状态（契约 §4.5 state 字段） */
+const ENGINE_STATES = Object.freeze(['running', 'paused', 'idle', 'stopped', 'error'])
+const BILLING_STATES = Object.freeze(['active', 'degraded', 'idle', 'exhausted', 'suspended'])
+
+/** 服务端下发的命令类型（契约 §4.5 commands[]） */
+const COMMAND_TYPES = Object.freeze([
+  'pause_engine', 'resume_engine', 'throttle', 'circuit_break',
+  'reload_policy', 'force_upgrade',
+])
+
 module.exports = {
-  PROTOCOL_VERSION, API_PREFIX,
+  PROTOCOL_VERSION, API_PREFIX, PATHS, HEADERS, UNSIGNED_REASONS,
+  SEQ_CHANNELS, CHANNEL_PATH, ENGINE_STATES, BILLING_STATES, COMMAND_TYPES,
   SOURCE_TYPES, VERDICTS, SOURCE_COUNTERS, CONFIRM_SIGNALS, FAILURE_REASONS,
   PLATFORM_ENDPOINTS, BILLING_STATUS, ACCOUNT_TIERS, TIER_DAY_BOUNDARIES,
   MS_PER_DAY, TZ_OFFSET_MINUTES,

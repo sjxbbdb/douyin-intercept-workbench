@@ -60,11 +60,21 @@ function bootstrap(ctx) {
     upgrade_url: config.upgradeUrl,
     maintenance: { active: config.maintenanceActive, message: config.maintenanceMessage },
     credit_per_reply_milli: config.creditPerReplyMilli,
+    // ⚠️ 这里的每一项都被客户端真实使用（心跳间隔、上报批量、离线宽限…）。
+    //    少一项不会立刻报错，而是**静默退回客户端默认值**——那就等于
+    //    服务端失去"远程降频"这个运维手段。故与契约 §4.4 的清单逐项对齐。
     limits: {
       heartbeat_interval_ms: 60000,
-      sign_ts_tolerance_ms: 300000,
+      grace_ms: 86400000,
+      send_batch_interval_ms: 300000,
+      send_batch_max: 50,
       audit_batch_max: 500,
       config_audit_batch_max: 200,
+      max_pending_sends: 20000,
+      offline_send_grace_ms: 900000,
+      offline_budget_ratio: 0.5,
+      sign_ts_tolerance_ms: 300000,
+      nonce_ttl_ms: 600000,
       max_body_bytes: 2 * 1024 * 1024,
     },
   }
@@ -140,7 +150,7 @@ function login(ctx) {
   }
 
   // ── 设备数上限（超限踢最早会话）
-  enforceDeviceLimit(db, acc, deviceId, nowMs, config.deviceLimit)
+  const deviceLimitResult = enforceDeviceLimit(db, acc, deviceId, nowMs, config.deviceLimit)
 
   // ── 签发令牌与会话密钥
   const token = generateToken()
@@ -215,7 +225,11 @@ function login(ctx) {
     min_client_version: config.minClientVersion,
     force_upgrade: compareVersion(body.client_version, config.minClientVersion) < 0,
     upgrade_url: config.upgradeUrl,
-    kicked_device_id: ctx.kickedDeviceId || null,
+    // ⚠️ 顶号提示必须真的带上。两台机器互相顶号时商家看到的
+    //    "另一台莫名其妙断了"只有靠这个字段才能解释清楚。
+    kicked_device_id: deviceLimitResult.kicked[0] || null,
+    kicked_device_ids: deviceLimitResult.kicked,
+    replaced_same_device: deviceLimitResult.replaced.length > 0,
     instance_id: instanceId,
   }
 
@@ -247,6 +261,11 @@ function recordLoginFailure(db, account, nowMs) {
  * 并发设备数上限。
  * ⚠️ 超限时踢**最早活跃**的会话（而不是最新的），保证当前登录成功。
  *    若踢不动（例如同设备重复登录），抛 AUTH_DEVICE_LIMIT。
+ *
+ * @returns {{limit:number, replaced:string[], kicked:string[]}}
+ *   ⚠️ 必须把结果返回给调用方。否则 `kicked_device_id` 永远是 null，
+ *      商家在两台机器上互相顶号时看不到任何解释——
+ *      表现为"另一台机器上的程序莫名其妙断了"。
  */
 function enforceDeviceLimit(db, acc, deviceId, nowMs, defaultLimit) {
   const limit = Number(acc.device_limit || defaultLimit || 1)
@@ -256,11 +275,15 @@ function enforceDeviceLimit(db, acc, deviceId, nowMs, defaultLimit) {
     ORDER BY last_seen_ms ASC
   `).all(acc.account_id, nowMs)
 
+  const replaced = []
+  const kicked = []
+
   // 同设备重复登录：直接吊销旧会话（不算新增设备）
   const sameDevice = live.filter((s) => s.device_id === deviceId)
   for (const s of sameDevice) {
     db.prepare('UPDATE device_session SET revoked_at_ms = ?, revoked_reason = ? WHERE id = ?')
       .run(nowMs, 'replaced_by_new_login', s.id)
+    replaced.push(s.device_id)
   }
 
   const others = live.filter((s) => s.device_id !== deviceId)
@@ -270,8 +293,11 @@ function enforceDeviceLimit(db, acc, deviceId, nowMs, defaultLimit) {
     for (let i = 0; i < need && i < others.length; i++) {
       db.prepare('UPDATE device_session SET revoked_at_ms = ?, revoked_reason = ? WHERE id = ?')
         .run(nowMs, 'kicked_by_device_limit', others[i].id)
+      kicked.push(others[i].device_id)
     }
   }
+
+  return { limit, replaced, kicked }
 }
 
 /** 当前全局策略版本。取 policy 表中全局行的版本，默认 1。 */

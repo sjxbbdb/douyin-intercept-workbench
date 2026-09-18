@@ -72,6 +72,17 @@ function sendSigned(res, { session, requestNonce, status, payload, pathWithQuery
     headers['X-Lic-Unsigned'] = status === 401 || status === 403
       ? 'auth'          // 身份问题：客户端应重新登录
       : 'no_session'    // 其他：不应出现在受保护接口的正常路径上
+
+    // ⚠️ 未签名响应也带 `X-Lic-Server-Ts`。
+    //    它不是"签名"，只是服务端时间的声明，客户端**不会**据此放宽
+    //    任何真实性判定（业务响应一律必须验签）。
+    //    但它解决一个真实死锁：
+    //      · 登录响应是未签名的（密钥就在响应体里），客户端**唯一**能
+    //        获得服务端时间的时机就是这里；
+    //      · 没有它，本机时钟偏差 > 5 分钟的客户端会在第一次签名请求时
+    //        收到 AUTH_TS_SKEW，而那条 401 同样未签名 → 拿不到时间 →
+    //        无法自愈，表现为"登录成功但什么都做不了"。
+    headers[HEADER_SERVER_TS] = String(nowMs)
   }
 
   res.writeHead(status, headers)
