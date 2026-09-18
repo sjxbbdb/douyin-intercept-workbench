@@ -1,0 +1,30 @@
+{
+  "name": "douyin-intercept-workbench",
+  "version": "3.0.0",
+  "private": true,
+  "description": "抖音自动回复工作台：客户端（Windows）+ 授权中心（Linux 服务端）。帮助商家自动回复抖音视频评论、直播间弹幕与私信，并将意向客户沉淀为线索名单。",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "main": "client/host/main.js",
+  "scripts": {
+    "test": "node test/run.js",
+    "test:unit": "node test/run.js L1",
+    "test:contract": "node test/run.js L2",
+    "test:dom": "node test/run.js L3",
+    "verify": "node scripts/verify-handover.js",
+    "check": "node --check client/host/main.js && node --check license-server/server.js",
+    "server": "node license-server/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "comments": {
+    "依赖白名单": "本项目仅允许 ws 一个第三方依赖，理由见 shared/术语与选型基准.md §3.2。引入任何其他依赖必须先报备。",
+    "明确不引入": "puppeteer-core / playwright —— 会给浏览器打自动化指纹（navigator.webdriver），且默认启动全新浏览器上下文，用不上商家 Chrome 里已扫码登录的抖音账号。详见 shared/术语与选型基准.md §3.3。",
+    "engines": "Node >= 22.5 是硬要求：服务端使用内置 node:sqlite（22.5 引入）。客户端启动时必须自检版本并给出明确提示，不得直接崩溃。",
+    "version": "3.0.0 与契约的 min_client_version 默认值一致（shared/protocol.md §1.4）。",
+    "分发方式": "推荐随包内置 node_modules/ws，使商家保持「解压即用」，无需安装 npm 环境。启动脚本需做依赖自检：缺失时给出明确提示而非崩溃。"
+  }
+}
