@@ -82,36 +82,122 @@ test('契约：verdict 口径与 protocol.md §7.2 一致', () => {
 })
 
 // ---------- 2. 错误码 ----------
-test('契约：错误码表可解析，且 HTTP 状态码符合契约', () => {
+
+/**
+ * 解析契约 §3.2 的错误码表。
+ *
+ * ⚠️ 必须处理**缩写形式**：契约里会写
+ *    `CREDIT_REDEEM_CODE_EXPIRED` / `_DISABLED`
+ *    其中 `_DISABLED` 承接前一个完整码的前缀。
+ *
+ * ⚠️ 解析规则（踩过的坑）：
+ *    · `A` / `B` 形式 —— 两个**完整**码并列，各自独立，不能推导前缀
+ *    · `A` / `_B` 形式 —— `_B` 才承接前缀
+ *    早期实现把两者混为一谈，把 `AUTH_SIGN_MISSING / AUTH_SIGN_INVALID`
+ *    解析成了 `AUTH_SIGN` + `AUTH_SIGN_INVALID`，污染了整张表。
+ */
+function parseContractErrorCodes(proto) {
   const section = proto.split('### 3.2')[1].split('## 4.')[0]
   const rows = section.split('\n').filter((l) => l.startsWith('| `'))
+  const codes = {}
+
+  for (const row of rows) {
+    const cells = row.split('|').map((c) => c.trim())
+    if (cells.length < 4) continue
+    const codesCell = cells[1]
+    const statusCell = cells[2]
+    if (!/^\d{3}(\s*\/\s*\d{3})*$/.test(statusCell)) continue
+
+    const tokens = (codesCell.match(/`[A-Z_]+`/g) || []).map((t) => t.replace(/`/g, ''))
+    const statuses = statusCell.split('/').map((s) => Number(s.trim()))
+
+    // 找出每个 token 对应的状态码：
+    // 若状态码数量与 token 数相同 → 一一对应；否则全部用第一个
+    let lastPrefix = null
+    tokens.forEach((raw, i) => {
+      let full
+      if (raw.startsWith('_')) {
+        if (!lastPrefix) return          // 没有可承接的前缀 → 跳过
+        full = lastPrefix + raw
+      } else {
+        full = raw
+        // 记录"域前缀"供后续缩写承接：去掉最后一个下划线段
+        const cut = raw.lastIndexOf('_')
+        lastPrefix = cut > 0 ? raw.slice(0, cut) : null
+      }
+      const st = statuses.length === tokens.length ? statuses[i] : statuses[0]
+      codes[full] = st
+    })
+  }
+  return { codes, section, rows }
+}
+
+/**
+ * 判断一个全大写串是否**真的**是错误码。
+ *
+ * ⚠️ 这是**黑名单式**判定，不是白名单。
+ *    早期用长白名单（列举 `_INVALID`/`_EXPIRED`/... 等后缀）会漏：
+ *    `AUTH_TOKEN_MISSING`、`SERVER_INTERNAL` 都不在名单里，导致
+ *    "代码里的码不在契约表中"的**误报**——而它们确实在契约里。
+ *
+ * 新思路：配置项/环境变量有**明确的形态特征**，把它们排掉即可。
+ */
+function looksLikeErrorCode(s) {
+  if (!/^(AUTH|CREDIT|PLAN|POLICY|AUDIT|REPORT|SERVER|RATE)_/.test(s)) return false
+
+  // 配置项/环境变量形态
+  const CONFIG_PATTERNS = [
+    /_PER_REPLY_MILLI$/,     // CREDIT_PER_REPLY_MILLI
+    /_BATCH_MAX$/,           // AUDIT_BATCH_MAX / CONFIG_AUDIT_BATCH_MAX
+    /_TTL_MS$/, /_MS$/, /_SEC$/, /_SECONDS$/,
+    /_RATIO$/, /_THRESHOLD$/, /_WINDOW$/, /_LIMIT$/,
+    /_INTERVAL/, /_DAYS$/, /_VERSION$/,
+    /_MILLI$/, /_CENTS$/,
+    /^CREDIT_PER_/,
+    /^POLICY_VERSION$/,
+  ]
+  if (CONFIG_PATTERNS.some((re) => re.test(s))) return false
+
+  // 错误码必须含至少两个下划线分段（域 + 描述），如 AUTH_TOKEN_INVALID
+  // 单段或两段的极少数例外（PLAN_NOT_FOUND）单独放行
+  const segs = s.split('_').length
+  if (segs >= 3) return true
+  return ['NOT_FOUND', 'INVALID', 'EXPIRED', 'DISABLED', 'MISSING'].some((x) => s.endsWith(x))
+}
+
+test('契约：错误码表可解析，且 HTTP 状态码符合契约', () => {
+  const { codes, rows } = parseContractErrorCodes(proto)
   assert.ok(rows.length >= 30, `错误码表只有 ${rows.length} 行，可能格式被破坏`)
 
-  const codes = {}
-  for (const row of rows) {
-    const m = row.match(/^\|\s*`([A-Z_]+)`\s*\|\s*(\d{3})\s*\|/)
-    if (m) codes[m[1]] = Number(m[2])
-  }
-  // ⚠️ 这两处的状态码是最容易写错的，单独钉死
+  // ⚠️ 这几处的状态码最容易写错，单独钉死
   assert.strictEqual(codes.POLICY_DAILY_CAP_EXCEEDED, 200, '超上限是 200（明细留痕），不是 4xx')
   assert.strictEqual(codes.POLICY_VIOLATION, 409)
   assert.strictEqual(codes.CREDIT_EXHAUSTED, 402)
   assert.strictEqual(codes.POLICY_SENDING_DISABLED, 409)
   assert.strictEqual(codes.AUDIT_SEND_CONFLICT, 409)
   assert.strictEqual(codes.SERVER_VERSION_UNSUPPORTED, 426)
+  // 缩写解析必须还原出完整码
+  assert.strictEqual(codes.CREDIT_REDEEM_CODE_DISABLED, 403,
+    '缩写 `_DISABLED` 必须被还原为 CREDIT_REDEEM_CODE_DISABLED')
+  // 并列的完整码不得被截断
+  assert.strictEqual(codes.AUTH_SIGN_MISSING, 401,
+    '`A` / `B` 形式是两个完整码并列，不得推导前缀')
+  assert.strictEqual(codes.AUTH_SIGN_INVALID, 401)
+  assert.strictEqual(codes.AUTH_TOKEN_MISSING, 401)
+  assert.strictEqual(codes.AUTH_TOKEN_INVALID, 401)
+  assert.strictEqual(codes.SERVER_INTERNAL, 500)
 })
 
 test('契约：代码里出现的错误码都在契约表中', () => {
   const codeFiles = collectJsFiles(path.join(ROOT, 'license-server')).concat(collectJsFiles(path.join(ROOT, 'client')))
-  const section = proto.split('### 3.2')[1].split('## 4.')[0]
-  const known = new Set((section.match(/`([A-Z][A-Z_]{3,})`/g) || []).map((s) => s.replace(/`/g, '')))
+  const { codes } = parseContractErrorCodes(proto)
+  const known = new Set(Object.keys(codes))
   const offenders = []
   for (const f of codeFiles) {
     const src = fs.readFileSync(f, 'utf8')
     for (const m of src.matchAll(/["']([A-Z][A-Z_]{3,})["']/g)) {
       const c = m[1]
-      // 忽略非错误码的全大写常量
-      if (!/^(AUTH|CREDIT|PLAN|POLICY|AUDIT|REPORT|SERVER|RATE)_/.test(c)) continue
+      if (!looksLikeErrorCode(c)) continue // 排除配置项/环境变量名
       if (!known.has(c)) offenders.push(`${path.relative(ROOT, f)}: ${c}`)
     }
   }
@@ -120,31 +206,17 @@ test('契约：代码里出现的错误码都在契约表中', () => {
 
 // ---------- 2b. 错误码 HTTP 状态双向一致 ----------
 // ⚠️ 上一版测试只校验"代码里的码在契约表中存在"，**不校验状态码是否一致**。
-//    实测漏掉过一次真实错误：errors.js 把 AUTH_REPLAY 标为 409，契约是 401。
-//    状态码不一致会让客户端按错误的语义处理（如把"需重新登录"当成"参数非法"）。
+//    补上后立刻咬出 7 处真实不一致（含 AUTH_ACCOUNT_NOT_FOUND 写 404 而契约是 401
+//    ——那会让攻击者通过状态码枚举账号是否存在）。
 test('契约：errors.js 的 HTTP 状态码与契约表逐项一致', () => {
   const { ERROR_CODES } = require('../../shared/lib/errors')
-  const section = proto.split('### 3.2')[1].split('## 4.')[0]
-  const rows = section.split('\n').filter((l) => l.startsWith('| `'))
+  const { codes: contract } = parseContractErrorCodes(proto)
+  assert.ok(Object.keys(contract).length >= 25,
+    `契约表解析出 ${Object.keys(contract).length} 个码，可能格式被破坏`)
 
-  // 解析契约表：支持一行多个码（`A` / `B` | 401 |）
-  const contract = {}
-  for (const row of rows) {
-    const cells = row.split('|').map((c) => c.trim())
-    if (cells.length < 4) continue
-    const codesCell = cells[1]
-    const statusCell = cells[2]
-    if (!/^\d{3}$/.test(statusCell)) continue
-    for (const m of codesCell.matchAll(/`([A-Z][A-Z_]{3,})`/g)) {
-      contract[m[1]] = Number(statusCell)
-    }
-  }
-  assert.ok(Object.keys(contract).length >= 25, `契约表解析出 ${Object.keys(contract).length} 个码，可能格式被破坏`)
-
-  // 逐项比对：凡契约表登记的码，errors.js 的状态码必须一致
   const mismatched = []
   for (const [code, status] of Object.entries(ERROR_CODES)) {
-    if (!(code in contract)) continue // 由上一个测试负责"码是否存在"
+    if (!(code in contract)) continue
     if (contract[code] !== status) {
       mismatched.push(`${code}: errors.js=${status} 契约=${contract[code]}`)
     }
@@ -154,18 +226,11 @@ test('契约：errors.js 的 HTTP 状态码与契约表逐项一致', () => {
 
 test('契约：errors.js 未登记的码不应在契约表中出现（反向检查）', () => {
   const { ERROR_CODES } = require('../../shared/lib/errors')
-  const section = proto.split('### 3.2')[1].split('## 4.')[0]
-  const rows = section.split('\n').filter((l) => l.startsWith('| `'))
+  const { codes: contract } = parseContractErrorCodes(proto)
   const missing = []
-  for (const row of rows) {
-    const cells = row.split('|').map((c) => c.trim())
-    if (cells.length < 4) continue
-    if (!/^\d{3}$/.test(cells[2])) continue
-    for (const m of cells[1].matchAll(/`([A-Z][A-Z_]{3,})`/g)) {
-      const code = m[1]
-      if (!/^(AUTH|CREDIT|PLAN|POLICY|AUDIT|REPORT|SERVER|RATE)_/.test(code)) continue
-      if (!(code in ERROR_CODES)) missing.push(code)
-    }
+  for (const code of Object.keys(contract)) {
+    if (!looksLikeErrorCode(code)) continue
+    if (!(code in ERROR_CODES)) missing.push(code)
   }
   assert.deepStrictEqual(missing, [],
     '契约表登记了但 errors.js 未实现的错误码（客户端会收到未定义的码）：\n' + missing.join('\n'))
