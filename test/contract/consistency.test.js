@@ -118,6 +118,59 @@ test('契约：代码里出现的错误码都在契约表中', () => {
   assert.deepStrictEqual(offenders, [], '发现契约表之外的错误码：\n' + offenders.join('\n'))
 })
 
+// ---------- 2b. 错误码 HTTP 状态双向一致 ----------
+// ⚠️ 上一版测试只校验"代码里的码在契约表中存在"，**不校验状态码是否一致**。
+//    实测漏掉过一次真实错误：errors.js 把 AUTH_REPLAY 标为 409，契约是 401。
+//    状态码不一致会让客户端按错误的语义处理（如把"需重新登录"当成"参数非法"）。
+test('契约：errors.js 的 HTTP 状态码与契约表逐项一致', () => {
+  const { ERROR_CODES } = require('../../shared/lib/errors')
+  const section = proto.split('### 3.2')[1].split('## 4.')[0]
+  const rows = section.split('\n').filter((l) => l.startsWith('| `'))
+
+  // 解析契约表：支持一行多个码（`A` / `B` | 401 |）
+  const contract = {}
+  for (const row of rows) {
+    const cells = row.split('|').map((c) => c.trim())
+    if (cells.length < 4) continue
+    const codesCell = cells[1]
+    const statusCell = cells[2]
+    if (!/^\d{3}$/.test(statusCell)) continue
+    for (const m of codesCell.matchAll(/`([A-Z][A-Z_]{3,})`/g)) {
+      contract[m[1]] = Number(statusCell)
+    }
+  }
+  assert.ok(Object.keys(contract).length >= 25, `契约表解析出 ${Object.keys(contract).length} 个码，可能格式被破坏`)
+
+  // 逐项比对：凡契约表登记的码，errors.js 的状态码必须一致
+  const mismatched = []
+  for (const [code, status] of Object.entries(ERROR_CODES)) {
+    if (!(code in contract)) continue // 由上一个测试负责"码是否存在"
+    if (contract[code] !== status) {
+      mismatched.push(`${code}: errors.js=${status} 契约=${contract[code]}`)
+    }
+  }
+  assert.deepStrictEqual(mismatched, [], '错误码 HTTP 状态与契约不一致：\n' + mismatched.join('\n'))
+})
+
+test('契约：errors.js 未登记的码不应在契约表中出现（反向检查）', () => {
+  const { ERROR_CODES } = require('../../shared/lib/errors')
+  const section = proto.split('### 3.2')[1].split('## 4.')[0]
+  const rows = section.split('\n').filter((l) => l.startsWith('| `'))
+  const missing = []
+  for (const row of rows) {
+    const cells = row.split('|').map((c) => c.trim())
+    if (cells.length < 4) continue
+    if (!/^\d{3}$/.test(cells[2])) continue
+    for (const m of cells[1].matchAll(/`([A-Z][A-Z_]{3,})`/g)) {
+      const code = m[1]
+      if (!/^(AUTH|CREDIT|PLAN|POLICY|AUDIT|REPORT|SERVER|RATE)_/.test(code)) continue
+      if (!(code in ERROR_CODES)) missing.push(code)
+    }
+  }
+  assert.deepStrictEqual(missing, [],
+    '契约表登记了但 errors.js 未实现的错误码（客户端会收到未定义的码）：\n' + missing.join('\n'))
+})
+
 // ---------- 3. 数值唯一来源 ----------
 test('契约：客户端不得硬编码策略数值（红线 1）', () => {
   const banned = [

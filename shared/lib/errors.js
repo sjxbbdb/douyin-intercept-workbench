@@ -25,20 +25,30 @@ const { FAILURE_REASONS, PLATFORM_ENDPOINTS } = require('./protocol')
 /** HTTP 状态码约定：业务结果用 200，真正的错误用 4xx/5xx。 */
 const ERROR_CODES = Object.freeze({
   // ── 认证与会话 ────────────────────────────────────────────
+  // ⚠️ 状态码必须与 shared/protocol.md §3.2 逐项一致，
+  //    test/contract/consistency.test.js 会双向校验。
   AUTH_INVALID_REQUEST: 400,
-  AUTH_ACCOUNT_NOT_FOUND: 404,
+  // ⚠️ 账号不存在的状态码是 **401 而非 404**。契约如此规定是为了
+  //    **不让攻击者通过状态码枚举出哪些账号存在**（用户枚举防护）。
+  //    响应文案统一为"账号或密码错误"。
+  AUTH_ACCOUNT_NOT_FOUND: 401,
   AUTH_PASSWORD_WRONG: 401,
   AUTH_ACCOUNT_LOCKED: 423,
   AUTH_ACCOUNT_DISABLED: 403,
   AUTH_ACCOUNT_EXPIRED: 403,
+  AUTH_FORBIDDEN: 403, // 无权访问该资源（与停用/到期同属 403）
   AUTH_DEVICE_LIMIT: 409,
+  AUTH_TOKEN_MISSING: 401,
   AUTH_TOKEN_INVALID: 401,
   AUTH_TOKEN_EXPIRED: 401,
   AUTH_TOKEN_REVOKED: 401,
-  AUTH_REPLAY: 409,
+  AUTH_REPLAY: 401,
   AUTH_SIGN_MISSING: 401,
   AUTH_SIGN_INVALID: 401,
-  AUTH_SIGN_EXPIRED: 401,
+  // ⚠️ 时间戳偏离用 AUTH_TS_SKEW（语义比"签名过期"更准）。
+  //    客户端收到后应用 server_time_ms 校准并**只重试一次**。
+  AUTH_TS_SKEW: 401,
+  AUTH_SIGN_KEY_UNKNOWN: 401,
 
   // ── 套餐 ──────────────────────────────────────────────────
   PLAN_NOT_FOUND: 404,
@@ -48,7 +58,9 @@ const ERROR_CODES = Object.freeze({
 
   // ── 积分与台账 ────────────────────────────────────────────
   CREDIT_EXHAUSTED: 402,
-  CREDIT_ACCOUNT_SUSPENDED: 403,
+  // ⚠️ 状态码是 402（Payment Required）而非 403。语义是"欠费超宽限期，账号停用"，
+  //    客户端应停机但**保留充值入口**。
+  CREDIT_ACCOUNT_SUSPENDED: 402,
   CREDIT_REDEEM_CODE_INVALID: 404,
   CREDIT_REDEEM_CODE_USED: 409,
   CREDIT_REDEEM_CODE_EXPIRED: 410,
@@ -70,10 +82,12 @@ const ERROR_CODES = Object.freeze({
 
   // ── 审计上报（红线 3）────────────────────────────────────
   AUDIT_SEND_INVALID: 400,
+  AUDIT_CONFIG_INVALID: 400, // 配置审计字段缺失/枚举非法/含禁用字段
   AUDIT_SEND_CONFLICT: 409,
   AUDIT_BATCH_TOO_LARGE: 413,
   REPORT_INVALID: 400,
   REPORT_PRIVACY_VIOLATION: 400,
+  REPORT_TOO_LARGE: 413, // 批量条数超上限，或请求体 > 2 MB
   REPORT_ID_REUSED: 409,
 
   // ── 限流 ──────────────────────────────────────────────────
@@ -82,8 +96,9 @@ const ERROR_CODES = Object.freeze({
   // ── 服务端自身 ────────────────────────────────────────────
   SERVER_VERSION_UNSUPPORTED: 426,
   SERVER_INTERNAL: 500,
-  SERVER_DB_BUSY: 503,
   SERVER_NOT_IMPLEMENTED: 501,
+  SERVER_DB_BUSY: 503,
+  SERVER_UNAVAILABLE: 503, // 维护中；客户端进入离线降级，明细囤本地后补报
 })
 
 

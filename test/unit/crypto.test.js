@@ -155,7 +155,7 @@ test('签名：缺少签名字段返回 AUTH_SIGN_MISSING', () => {
   assert.strictEqual(r.code, 'AUTH_SIGN_MISSING')
 })
 
-test('签名：时间戳超出 ±5 分钟容忍窗返回 AUTH_SIGN_EXPIRED', () => {
+test('签名：时间戳超出 ±5 分钟容忍窗返回 AUTH_TS_SKEW', () => {
   const key = S.generateSignKey()
   const now = Date.now()
   const req = { method: 'POST', path: '/p', body: {}, ts: now, nonce: 'n', seq: 1 }
@@ -164,7 +164,7 @@ test('签名：时间戳超出 ±5 分钟容忍窗返回 AUTH_SIGN_EXPIRED', () 
   // 时钟偏差 6 分钟 → 拒绝
   const r = S.verifyRequestSignature({ ...req, signKey: key, signature, nowMs: now + 6 * 60 * 1000 })
   assert.strictEqual(r.ok, false)
-  assert.strictEqual(r.code, 'AUTH_SIGN_EXPIRED')
+  assert.strictEqual(r.code, 'AUTH_TS_SKEW')
   assert.ok(r.detail.skew_ms > 0)
 
   // 偏差 4 分钟 → 通过（窗口内）

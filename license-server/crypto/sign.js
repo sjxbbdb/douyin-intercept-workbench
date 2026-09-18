@@ -87,7 +87,7 @@ function verifyRequestSignature({
   if (Math.abs(now - tsNum) > SIGN_TS_TOLERANCE_MS) {
     return {
       ok: false,
-      code: 'AUTH_SIGN_EXPIRED',
+      code: 'AUTH_TS_SKEW',
       message: '请求时间戳超出容忍窗口，请检查本机时钟',
       detail: { skew_ms: now - tsNum, tolerance_ms: SIGN_TS_TOLERANCE_MS },
     }
