@@ -22,15 +22,13 @@
 - 可选增强：客户端可用 `ws` 接收"立即停机/策略变更"推送，但**所有关键状态必须以 HTTPS 响应为准**，不得依赖推送。
 - **时间统一为 Unix 毫秒（int64，UTC 起算），所有时间字段以 `_ms` 结尾**。理由：需要大量整数比较与时间窗运算，ISO8601 会引入时区/解析歧义，`node:sqlite` 更适配整数；客户端展示时自行转本地时区。
 - 统计"自然日"边界由 `stats_tz_offset_minutes` 决定，**默认 480（UTC+8）**；策略日上限同样在该时区每日 00:00 重置。
-- **以服务端时间为准**：每个响应带 `server_time_ms`；客户端维护 `clock_skew_ms` 并在填写上报 `*_ms` 前校准，该值本身仅作诊断。客户端时长类字段必须用单调时钟计算（Node：`process.hrtime.bigint()`）。
-- 主版本在 URL 前缀 `/api/v1/`，仅在**不兼容变更**时递增；请求/响应均带 `protocol_version`(int)，高于服务端支持上限 → `SERVER_VERSION_UNSUPPORTED`；同一主版本内**只增不删**（§8）。
+- **以服务端时间为准**：每个响应带 `server_time_ms`；客户端维护 `clock_skew_ms` 并在填写上报 `*_ms` 前校准，该值本身仅作诊断。客户端时长类字段必须用单调时钟计算（Node：`process.hrtime.bigint()`）。 ｜ 主版本在 URL 前缀 `/api/v1/`，仅在**不兼容变更**时递增；请求/响应均带 `protocol_version`(int)，高于服务端支持上限 → `SERVER_VERSION_UNSUPPORTED`；同一主版本内**只增不删**（§8）。
 
 ### 1.4 默认配置项（服务端可配，此处为出厂默认值）
 
 | 配置键 | 默认值 | 含义 |
 |---|---|---|
-| `credit_per_reply` | `1`（`credit_per_reply_milli = 1000`） | **每条平台确认成功的回复**计费积分；0.1 ≤ x ≤ 1000，步进 0.1 |
-| `bill_dom_confirmed` | `false` | 仅凭 DOM 稳定判据（无平台响应）的确认是否计费；默认不计费 |
+| `credit_per_reply` / `bill_dom_confirmed` | `1`（`credit_per_reply_milli = 1000`） / `false` | **每条平台确认成功的回复**计费积分（0.1 ≤ x ≤ 1000，步进 0.1）/ 仅凭 DOM 稳定判据的确认是否计费（默认否） |
 | `heartbeat_interval_ms` / `heartbeat_timeout_ms` | `60000` / `180000` | 心跳间隔 / 判离线阈值（连续 3 次未收到） |
 | `send_batch_interval_ms` / `send_batch_max` / `audit_batch_max` / `config_audit_batch_max` | `300000` / `50` / `500` / `200` | 发送明细上报周期 5 分钟 / 常规单批 / 补报单批 / 配置审计单批上限 |
 | `offline_send_grace_ms` / `offline_budget_ratio` | `900000` / `0.5` | 断网后可按已知余额继续发送 15 分钟 / 影子额度比例 |
@@ -52,8 +50,7 @@
 客户端首启生成 `device_id`（16 字节 hex）持久化，重装视为新设备。登录时统计未失效会话数：未达 `device_limit`（默认 1）正常签发；已达上限则**踢掉最早创建的会话**（其调用返回 `AUTH_TOKEN_REVOKED`），响应带 `kicked_device_id`；异常仍无法落位 → `AUTH_DEVICE_LIMIT`(409)。被踢客户端**立即停止发送**、清除本地 token；**不得自动踢回**（避免活锁），须商家手工重新登录。
 
 ### 2.3 登录失败、密码存储与签名前置
-- 按账号维度计数：累计失败 `login_fail_limit`（5）次 → 锁定 `login_lock_ms`（10 分钟），期间任何密码都返回 `AUTH_ACCOUNT_LOCKED`(423) + `retry_after_ms`；登录成功清零。账号不存在/密码错误/已停用/已到期必须返回不同错误码（见 §3）。
-- 密码：`scrypt(N=16384, r=8, p=1, keylen=32, salt=16B 随机)`，存 `scrypt$N$r$p$salt_hex$hash_hex`，比较用 `timingSafeEqual`；**禁止明文/可逆加密**。**不提供注册接口**，账号由厂商后台创建。
+- 按账号维度计数：累计失败 `login_fail_limit`（5）次 → 锁定 `login_lock_ms`（10 分钟），期间任何密码都返回 `AUTH_ACCOUNT_LOCKED`(423) + `retry_after_ms`；登录成功清零。账号不存在/密码错误/已停用/已到期必须返回不同错误码（见 §3）。 ｜ 密码：`scrypt(N=16384, r=8, p=1, keylen=32, salt=16B 随机)`，存 `scrypt$N$r$p$salt_hex$hash_hex`，比较用 `timingSafeEqual`；**禁止明文/可逆加密**。**不提供注册接口**，账号由厂商后台创建。
 - 除 `POST /auth/login` 与 `GET /client/bootstrap` 外，**所有请求与响应都必须签名**。客户端收到带 token 的响应必须**先验签再解析业务字段**；验签失败一律按网络失败处理，**绝不认为余额充足、绝不认为策略放宽**（§5）。
 
 ## 3. 错误码总表
@@ -69,15 +66,12 @@
 | `AUTH_ACCOUNT_NOT_FOUND` | 401 | 账号不存在 | 提示"账号不存在，请联系客服开通" |
 | `AUTH_PASSWORD_WRONG` | 401 | 密码错误（带 `remaining_attempts`） | 提示剩余次数；不得自动重试 |
 | `AUTH_ACCOUNT_LOCKED` | 423 | 错误次数过多已锁定 | 按 `retry_after_ms` 倒计时，禁用登录 |
-| `AUTH_ACCOUNT_DISABLED` | 403 | 账号已停用 | 停机 + 提示联系客服 |
-| `AUTH_ACCOUNT_EXPIRED` | 403 | 账号/套餐已到期 | 停机 + 提示续费 |
-| `AUTH_TOKEN_MISSING` | 401 | 未带 token | 走续期/重登流程 |
-| `AUTH_TOKEN_INVALID` | 401 | token 无法识别 | 清本地 token，重新登录 |
+| `AUTH_ACCOUNT_DISABLED` / `AUTH_ACCOUNT_EXPIRED` | 403 | 账号已停用 / 账号或套餐已到期 | 停机 + 提示联系客服或续费 |
+| `AUTH_TOKEN_MISSING` / `AUTH_TOKEN_INVALID` | 401 | 未带 token / token 无法识别 | 走续期流程；仍失败则清本地 token 重新登录 |
 | `AUTH_TOKEN_EXPIRED` | 401 | 过期且超出续期窗口 | 必须重新输入密码登录 |
 | `AUTH_TOKEN_REVOKED` | 401 | 已被踢/登出/密码重置 | 停止发送，清 token，提示"已在其他设备登录" |
 | `AUTH_DEVICE_LIMIT` | 409 | 设备数超限且无法踢除 | 停止发送，提示联系客服 |
-| `AUTH_SIGN_MISSING` | 401 | 缺签名头 | 本地 bug；fail-closed 停机 |
-| `AUTH_SIGN_INVALID` | 401 | 签名不匹配 | 视为中间人攻击：清密钥、重新登录、停机 |
+| `AUTH_SIGN_MISSING` / `AUTH_SIGN_INVALID` | 401 | 缺签名头 / 签名不匹配 | 本地 bug 或中间人攻击：fail-closed 停机、清密钥并重新登录 |
 | `AUTH_SIGN_KEY_UNKNOWN` | 401 | 密钥已轮换且超出重叠窗口 | 重新登录获取新 `sign_key` |
 | `AUTH_TS_SKEW` | 401 | 时间戳偏离超过 5 分钟 | 用 `server_time_ms` 校准后**只重试一次** |
 | `AUTH_REPLAY` | 401 | nonce 重复或通道内序号回退 | 停止发送；重新登录重置会话后重试 |
@@ -87,30 +81,27 @@
 | `CREDIT_LEDGER_NOT_FOUND` | 404 | 流水查询范围无数据 | 展示空列表，不弹错误 |
 | `CREDIT_REDEEM_CODE_INVALID` | 404 | 卡密不存在 | 提示"卡密无效" |
 | `CREDIT_REDEEM_CODE_USED` | 409 | 卡密已被使用（带 `used_at_ms`） | 提示已使用时间 |
-| `CREDIT_REDEEM_CODE_EXPIRED` | 410 | 卡密已过期 | 提示联系客服换新 |
-| `CREDIT_REDEEM_CODE_DISABLED` | 403 | 卡密已作废或绑定其他账号 | 提示不可用，联系客服 |
+| `CREDIT_REDEEM_CODE_EXPIRED` / `CREDIT_REDEEM_CODE_DISABLED` | 410 / 403 | 卡密已过期 / 卡密已作废或绑定其他账号 | 提示联系客服换新 / 提示不可用，联系客服 |
 | `CREDIT_REDEEM_ALREADY_DONE` | 200 | 同 `request_id` 重复兑换（幂等命中） | 展示首次结果 |
 | `PLAN_NOT_FOUND` | 404 | 套餐不存在 | 展示错误，不重试 |
-| `PLAN_QUOTA_BELOW_MIN` | 400 | 发放积分低于 `min_plan_credit`（默认 61200） | 提示管理员调整套餐 |
+| `PLAN_QUOTA_BELOW_MIN` / `PLAN_INVALID_DURATION` | 400 | 发放积分低于 `min_plan_credit`（默认 61200）/ `valid_days` ≤ 0 或 > 3650 | 提示管理员调整套餐或修正时长 |
 | `PLAN_ALREADY_ACTIVE` | 409 | 同套餐已生效且未到期 | 提示剩余天数 |
-| `PLAN_INVALID_DURATION` | 400 | `valid_days` ≤ 0 或 > 3650 | 提示管理员修正 |
+
 | `POLICY_VIOLATION` | 409 | 上报的生效配置**高于**服务端策略 | 立即把本地上限降到服务端值并重新上报；**不得继续按高配发送** |
 | `POLICY_VERSION_UNKNOWN` | 409 | `applied_policy_version` 服务端无记录 | 拉 `GET /policy/current` 对齐后重报；该批不落账不计费 |
 | `POLICY_TIER_UNKNOWN` | 400 | 账号等级枚举非法或客户端伪造等级 | 只以服务端下发等级为准；停机告警 |
 | `POLICY_ACK_REQUIRED` | 409 | 未携带生效策略版本就上报发送明细 | 先发一次心跳完成策略 ack，再重报 |
 | `POLICY_DAILY_CAP_EXCEEDED` | 200 | 本批超出当日策略上限（`over_limit`） | 服务端接受明细但**超额部分不计费**；客户端立即降速 |
 | `POLICY_CIRCUIT_OPEN` | 409 | 账号处于熔断冷却期，禁止发送 | 停止发送，等 `cooldown_until_ms`；不上报新明细 |
-| `AUDIT_SEND_INVALID` | 400 | 发送明细字段缺失/枚举非法/含禁用字段 | 丢弃该条并记本地错误日志，不重试 |
+| `AUDIT_SEND_INVALID` / `AUDIT_CONFIG_INVALID` | 400 | 发送明细或配置审计字段缺失/枚举非法/含禁用字段 | 丢弃该条并记本地错误日志，不重试 |
 | `AUDIT_SEND_CONFLICT` | 409 | 同 `send_id` 内容冲突（降级/来源或时间不一致） | 丢弃该条；客户端 bug，立即告警 |
-| `AUDIT_CONFIG_INVALID` | 400 | 配置变更审计字段非法 | 丢弃该条 |
+
 | `AUDIT_BATCH_TOO_LARGE` | 413 | 批量条数超上限或请求体 > 2 MB | 拆小后重报 |
-| `REPORT_INVALID` | 400 | 聚合上报字段缺失/自相矛盾 | 丢弃该条并记日志 |
-| `REPORT_PRIVACY_VIOLATION` | 400 | 出现禁用字段（见 7.6） | 丢弃该条并立即修复客户端；不重试 |
+| `REPORT_INVALID` / `REPORT_PRIVACY_VIOLATION` | 400 / 400 | 聚合上报字段缺失/自相矛盾 / 出现禁用字段（见 7.6） | 丢弃该条并记日志 / 丢弃该条并立即修复客户端；不重试 |
 | `REPORT_TOO_LARGE` | 413 | 批量条数 > 500 或请求体 > 2 MB | 拆小后重报 |
 | `RATE_TOO_MANY_REQUESTS` | 429 | 通用限流 / 心跳间隔 < 30 秒 | 按 `retry_after_ms` 退避重试；心跳过快则忽略本次 |
 | `SERVER_INTERNAL` | 500 | 服务端异常 | 按网络失败处理，退避重试（1s/2s/4s，上限 60s） |
-| `SERVER_DB_BUSY` | 503 | SQLite 忙 | 1 秒后重试，最多 3 次 |
-| `SERVER_UNAVAILABLE` | 503 | 维护中/不可用 | 进入离线降级逻辑（见 9.3） |
+| `SERVER_DB_BUSY` / `SERVER_UNAVAILABLE` | 503 / 503 | SQLite 忙 / 维护中/不可用 | 1 秒后重试，最多 3 次 / 进入离线降级逻辑（见 9.3） |
 | `SERVER_VERSION_UNSUPPORTED` | 426 | 客户端协议/版本过低 | 立即停机并展示强制升级页与 `upgrade_url` |
 
 ## 4. 接口清单
@@ -177,11 +168,9 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 | 字段 | 类型 | 必填 | 说明 / 示例 |
 |---|---|---|---|
 | `account_id` / `device_id` | string | 是 | `"acc_1001"` / `"9f2c...0a93"` |
-| `session_id` | string | 是 | 本次进程启动生成（uuid v4），重启后变化 |
-| `seq` | int | 是 | 本 session 内自 1 递增，不得重复或回退 `1287` |
+| `session_id` / `seq` | string / int | 是 | 本次进程启动生成（uuid v4，重启后变化）/ 本 session 内自 1 递增、不得重复或回退 `1287` |
 | `client_version` / `protocol_version` | — | 是 | `"3.0.0"` / `2` |
-| `engine_state` | string | 是 | 任一实例在跑即 `running`（`running`/`paused`/`idle`/`stopped`/`error`） |
-| `online_seconds` | int | 是 | 本 session 在线秒数。**仅运营统计，明确不用于计费** `3600` |
+| `engine_state` / `online_seconds` | string / int | 是 / 是 | 任一实例在跑即 `running`（`running`/`paused`/`idle`/`stopped`/`error`） / 本 session 在线秒数。**仅运营统计，明确不用于计费** `3600` |
 | `monotonic_ms` / `wall_clock_ms` / `clock_skew_ms` | int | 是/是/否 | 单调时钟原值 / 墙上时间（仅参考） / 最近校准偏移 |
 | `applied_policy_version` / `applied_policy_hash` | int / string | 是 | 客户端**当前实际生效**的策略版本与哈希 `7` / `"5b2e...a10c"` |
 | `applied_limits` | object | 是 | 实际生效上限（可低于服务端值）：`{"comment":{"daily_max":10,"min_interval_ms":30000,"content_similarity_max":0.85,"active_hours_ok":true},"live_danmaku":{…},"dm":{…}}` |
@@ -221,8 +210,7 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 | `account_id`/`device_id`/`session_id`/`seq` | — | 是 | 标识；`seq` 同 session 内自 1 递增 |
 | `window_start_ms`/`window_end_ms` | int | 是 | 聚合窗口（默认 30 分钟），`end > start` |
 | `sources` | object | 是 | 三来源计数（见 7.2）：`{"comment":{"hits":12,"leads_new":11,"reply_attempts":10,"sent_confirmed":8,"sent_confirmed_dom":1,"sent_suspected":1,"failed":1,"skipped":1,"unique_users":7},"live_danmaku":{…},"dm":{…}}` |
-| `failure_reasons` | object | 是 | 失败原因 → 次数，无失败传 `{}` |
-| `unique_users_total` | int | 是 | 本窗口去重用户数（仅平台确认，见 7.4） |
+| `failure_reasons` / `unique_users_total` | object / int | 是 / 是 | 失败原因 → 次数，无失败传 `{}` / 本窗口去重用户数（仅平台确认，见 7.4） |
 | `policy_snapshot` | object | 是 | **实际生效策略快照**：`{"policy_version":8,"policy_hash":"…","applied_limits":{…},"captured_at_ms":…}` |
 | `client_version`/`protocol_version` | — | 是 | 版本 |
 
@@ -241,9 +229,8 @@ if (hmacHex(login_key, sha256Hex(stableStringify(body))) !== loginResponse.login
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `send_id` | string | 是 | 客户端生成的全局唯一 ID（uuid v4 或 32 hex）。**幂等键与计费键**，必须在**发送前**生成并落盘 |
-| `sent_at_ms` | int | 是 | 发送发生时刻（已按 `clock_skew_ms` 校准到服务端时间轴） |
-| `source_type` | string | 是 | `comment`/`live_danmaku`/`dm`，**三者独立限额** |
-| `target_hash` | string | 是 | 评论=`hmac(salt, video_id+"|"+comment_id)`；弹幕=`hmac(salt, room_id+"|"+msg_id)`；私信=`hmac(salt, conversation_id)` |
+| `sent_at_ms` / `source_type` | int / string | 是 | 发送发生时刻（已按 `clock_skew_ms` 校准到服务端时间轴）/ `comment`/`live_danmaku`/`dm`，**三者独立限额** |
+| `target_hash` | string | 是 | 评论=`hmac(salt, video_id+"\|"+comment_id)`；弹幕=`hmac(salt, room_id+"\|"+msg_id)`；私信=`hmac(salt, conversation_id)` |
 | `user_key_hash`/`user_key_type` | string | 是 | 对方用户哈希与类型（见 7.4），**绝不上传原始 `sec_uid`** |
 | `content_hash` | string | 是 | `hmac(privacy_salt, reply_text)`，**绝不上传原文** |
 | `verdict` | string | 是 | `sent_confirmed`/`sent_confirmed_dom`/`sent_suspected`/`failed`/`skipped`（口径见 7.3） |
@@ -401,8 +388,7 @@ function verifyResponse(resp) {          // 校验通过前不得解析 resp.raw
 - **防重放**：服务端表 `used_nonce(nonce PRIMARY KEY, account_id, ts_ms)`，TTL `nonce_ttl_ms = 600000`（10 分钟），定时清理；重复 nonce → `AUTH_REPLAY`。
 - **序号防重放**：`seq` 按 `(account_id, device_id, session_id, channel)` 记录 `max_seq`，`channel` ∈ `heartbeat`/`usage`/`sends`/`config_audit`，**各通道独立计数**；`seq ≤ max_seq` 且不在响应缓存内 → `AUTH_REPLAY`，新 `session_id` 允许 `seq` 从 1 重新开始。
 - **密钥轮换**：心跳/续期响应可带 `sign_key_next` + `sign_key_next_effective_ms`；客户端持久化后对 `ts ≥ sign_key_next_effective_ms` 的请求改用新密钥。服务端校验按 `next`（已生效）→ `current` → `prev` 顺序尝试，重叠窗口 10 分钟；三把都不匹配 → `AUTH_SIGN_KEY_UNKNOWN`，必须重新登录。
-- **批量上报的 nonce 纪律**：`/audit/sends` 与 `/usage/report` 频率高，**每次请求必须生成新 nonce**，复用会被判 `AUTH_REPLAY` 并触发安全告警。
-- **签名失败的客户端行为**：任何一次请求签名被拒或响应验签失败 → 记录安全事件、**立即进入暂停态**（fail-closed）、退避重试登录；禁止在验签失败时继续发送。
+- **批量上报的 nonce 纪律**：`/audit/sends` 与 `/usage/report` 频率高，**每次请求必须生成新 nonce**，复用会被判 `AUTH_REPLAY` 并触发安全告警。 ｜ **签名失败的客户端行为**：任何一次请求签名被拒或响应验签失败 → 记录安全事件、**立即进入暂停态**（fail-closed）、退避重试登录；禁止在验签失败时继续发送。
 
 ## 6. 计费算法规范（按成功回复条数）
 ### 6.1 计费公式
@@ -413,13 +399,11 @@ function verifyResponse(resp) {          // 校验通过前不得解析 resp.raw
 - **计费资格**（必须同时成立）：① `verdict="sent_confirmed"`；② `evidence.confirm_signal="platform_response"`；③ `evidence.platform_status_code=0`（`comment/publish` 等成功码，**空响应/风控响应不得标成功**）；④ 该 `send_id` 未被计费过；⑤ 未超当日策略上限。任一不成立 → `not_billable` 或 `policy_exceeded`，**不扣费**。
 - **不计费清单**（对商家有利，须写入客户端 UI 与客服话术）：失败、被平台风控拒绝、被跳过、未命中规则、`sent_suspected`（含"编辑器消失即成功"这类旧判据）、仅 DOM 判据确认且 `bill_dom_confirmed=false`、超出当日策略上限的发送、余额耗尽后的发送（`unbilled_insufficient_credit`，充值后不补扣）。
 - **心跳与时长不参与计费**：`online_seconds` 仅供运营统计（在线时长、活跃商家数），任何情况下不得换算成积分；v1 的按挂钟时长计费模型自 `protocol_version=2` 起作废。
-- **欠费停机语义 = 禁止发送**（不再是"停止计时"）：余额 ≤ 0 → 服务端拒绝心跳续期（HTTP 402 `CREDIT_EXHAUSTED`）→ 客户端 ≤60 秒进入暂停态，停止评论、弹幕、私信三类发送。
-
+- **欠费停机语义 = 禁止发送**（不再是"停止计时"）：余额 ≤ 0 → 服务端拒绝心跳续期（HTTP 402 `CREDIT_EXHAUSTED`）→ 客户端 ≤60 秒进入暂停态，停止评论、弹幕、私信三类发送。 
 ### 6.2 幂等与去重
 - 唯一索引 `send_log(account_id, send_id) UNIQUE`：同一 `send_id` 重复上报**永不重复扣费**，直接回放首次结果（`duplicate:true`）。
 - 客户端责任：`send_id` 必须在**发送动作发起前**生成并写入本地 `pending_sends.json`（先落盘再发送），保证进程崩溃后重发用的是同一个 ID。
-- 服务端责任：只认 `send_id`；**不得**按"内容相同/目标相同/时间相近"做二次去重（会误杀合法重试），也**不得**基于客户端汇总数字计费。
-- **批量上报的键序**：一批内按 `sent_at_ms` 升序串行结算；同批出现两条相同 `send_id` → 后者按幂等/冲突规则处理，不得重复计费。
+- 服务端责任：只认 `send_id`；**不得**按"内容相同/目标相同/时间相近"做二次去重（会误杀合法重试），也**不得**基于客户端汇总数字计费。 ｜ **批量上报的键序**：一批内按 `sent_at_ms` 升序串行结算；同批出现两条相同 `send_id` → 后者按幂等/冲突规则处理，不得重复计费。
 
 ### 6.3 判定升级（suspected → confirmed）
 ```
@@ -491,8 +475,7 @@ function settleSendBatch(acc, batch, nowMs) {
 
 ### 6.7 幂等与重算规则
 - **不可变账本**：`credit_ledger` 追加写（append-only），已落账条目不得 UPDATE/DELETE。
-- **重算**：`credit_per_reply` 变更只对变更 `effective_ms` 之后的明细生效，历史已落账不回溯；纠错由管理后台写反向 `adjust` 分录，`note` 记录原因与操作人。
-- **并发**：所有账务写在 `BEGIN IMMEDIATE` 事务内；SQLite 忙 → `SERVER_DB_BUSY`（客户端 1 秒后重试）。
+- **重算**：`credit_per_reply` 变更只对变更 `effective_ms` 之后的明细生效，历史已落账不回溯；纠错由管理后台写反向 `adjust` 分录，`note` 记录原因与操作人。 ｜ **并发**：所有账务写在 `BEGIN IMMEDIATE` 事务内；SQLite 忙 → `SERVER_DB_BUSY`（客户端 1 秒后重试）。
 - **对账**：服务端每日比对 `send_log` 明细与 `credit_ledger` 中 `kind='usage'` 的条数/金额，不一致写 `billing_reconcile_alert`。
 
 ## 7. 字段字典（口径定义）
@@ -523,12 +506,10 @@ function settleSendBatch(acc, batch, nowMs) {
 `sources.<src>.unique_users` = 本窗口该来源 `sent_confirmed` 对应的**去重用户数**（同窗口同一 `user_key_hash` 只算 1）；**只统计平台确认的成功**，疑似与 DOM 判据不计入，避免虚高。**已回复人数（看板定义）= `COUNT(DISTINCT user_key_hash WHERE verdict='sent_confirmed')`**，按查询区间与 `stats_tz_offset_minutes` 切分，展示必须标注"仅平台确认送达"。单列指标 `unique_users_confirmed_dom` 只做透明展示，不进入"已回复人数"。
 
 ### 7.5 `failure_reasons` 枚举（闭集）
-`rate_limited`（平台限流）、`login_expired`（登录态失效）、`element_timeout`（元素未出现）、`network_error`、`risk_control_rejected`（风控拒绝，含空响应）、`content_rejected`（内容被平台拒绝）、`blocked_by_target`（被拒收/拉黑）、`account_risk`（账号风控）、`unknown`。
-**`editor_dismissed_unconfirmed` 不是失败原因**——它对应 `sent_suspected`，禁止出现在 `failure_reasons` 里。未知键 → 拒绝整条上报（`REPORT_INVALID`）。约束 `sum(failure_reasons.values) == sum(sources.*.failed)`，违反记 `audit_flag:"failure_sum_mismatch"`。
+`rate_limited`（平台限流）、`login_expired`（登录态失效）、`element_timeout`（元素未出现）、`network_error`、`risk_control_rejected`（风控拒绝，含空响应）、`content_rejected`（内容被平台拒绝）、`blocked_by_target`（被拒收/拉黑）、`account_risk`（账号风控）、`unknown`。 **`editor_dismissed_unconfirmed` 不是失败原因**——它对应 `sent_suspected`，禁止出现在 `failure_reasons` 里。未知键 → 拒绝整条上报（`REPORT_INVALID`）。约束 `sum(failure_reasons.values) == sum(sources.*.failed)`，违反记 `audit_flag:"failure_sum_mismatch"`。
 
 ### 7.6 隐私边界（强约束）
-**允许上报**：计数、时长、枚举码、`*_hash`、策略版本与上限值、`platform_endpoint` 白名单值、技术性错误摘要。
-**禁止上报**（出现即 `REPORT_PRIVACY_VIOLATION`，整条拒绝）：`comment_text`、`danmaku_text`、`reply_text`、`nickname`、`sec_uid`、`uid`、`phone`、`avatar_url`、`conversation_id`/`room_id`/`video_id`/`comment_id` 原文、任何完整 URL、任何可反查用户的内容片段。
+**允许上报**：计数、时长、枚举码、`*_hash`、策略版本与上限值、`platform_endpoint` 白名单值、技术性错误摘要。 **禁止上报**（出现即 `REPORT_PRIVACY_VIOLATION`，整条拒绝）：`comment_text`、`danmaku_text`、`reply_text`、`nickname`、`sec_uid`、`uid`、`phone`、`avatar_url`、`conversation_id`/`room_id`/`video_id`/`comment_id` 原文、任何完整 URL、任何可反查用户的内容片段。
 白名单优先：服务端按字段白名单校验，未知字段丢弃并记审计（向前兼容）；禁用字段直接拒绝整条。
 
 ### 7.7 看板指标 ↔ 服务端字段
@@ -552,8 +533,7 @@ function settleSendBatch(acc, batch, nowMs) {
 | `headline` | string | 一句话结论，默认 `"套餐是预付额度，不等于无限发送"` |
 | `detail` | string | 完整说明：三来源日上限数值、套餐折算天数、额度不顺延、失败不计费 |
 | `daily_cap_total` / `daily_cap_detail` | int / object | 当前等级三来源日上限合计 / 分来源明细 |
-| `credits_per_day_at_cap` / `valid_days` / `estimated_days_at_cap` | int | 按日上限用满每天的积分消耗 / 套餐有效天数 / 按日上限估的可用天数 = `credits / credits_per_day_at_cap` |
-| `estimated_days_at_current_rate` | int | 按最近 7 日实际日均消耗估算的可用天数 |
+| `credits_per_day_at_cap` / `valid_days` / `estimated_days_at_cap` / `estimated_days_at_current_rate` | int | 按日上限用满每天的积分消耗 / 套餐有效天数 / 按日上限估的可用天数 = `credits / credits_per_day_at_cap` / 按最近 7 日实际日均消耗估算的可用天数 |
 | `note` | string | 默认 `"安全上限会限制实际消耗速度，因此套餐按期而非按量承诺"` |
 
 客户端必须原样展示 `headline` + `detail`；`estimated_days_at_current_rate` 必须与实际消耗一起展示，避免商家误判。
@@ -583,8 +563,7 @@ function settleSendBatch(acc, batch, nowMs) {
 
 ## 9. 完整交互时序
 ### 9.1 场景一：首次登录（含策略下发与 ack）
-1. `GET /client/bootstrap` → 校验版本与维护窗口；`force_upgrade=true` 则停机展示升级页，结束。
-2. `POST /auth/login`：服务端 scrypt 校验密码 → 设备数检查（超限则踢最早会话）→ 写 `device_session` → 冻结 `policy v7`（observation 等级）→ 计算 `quota_notice` → 返回 `token`/`sign_key`/`privacy_salt`/`credit`/`policy`/`quota_notice`/`limits`/`login_proof`。
+1. `GET /client/bootstrap` → 校验版本与维护窗口；`force_upgrade=true` 则停机展示升级页，结束。 2. `POST /auth/login`：服务端 scrypt 校验密码 → 设备数检查（超限则踢最早会话）→ 写 `device_session` → 冻结 `policy v7`（observation 等级）→ 计算 `quota_notice` → 返回 `token`/`sign_key`/`privacy_salt`/`credit`/`policy`/`quota_notice`/`limits`/`login_proof`。
 3. 客户端用 `PBKDF2(password)` 校验 `login_proof`，失败则拒绝登录且**不落盘**任何凭据。
 4. 采纳 `policy v7` 写入本地 `policy.json` 并记录 `policy_hash`；原子落盘 `token`/`sign_key`/`privacy_salt`/`device_id`/`clock_skew_ms`；初始化影子额度 `local_budget = floor(balance_milli / credit_per_reply_milli)`。
 5. `POST /auth/refresh` 立即静默续期（旧 token 保留 5 分钟在途宽限）→ 拿到 `token'`/`sign_key'`。
@@ -592,37 +571,29 @@ function settleSendBatch(acc, batch, nowMs) {
 7. 验签通过 → 启动采集与自动回复引擎；定时器：心跳 60s / 发送明细上报 5min / 聚合上报 30min；首次展示套餐页必须含 `quota_notice.headline` + `detail`。
 
 ### 9.2 场景二：正常运行与按条计费（含策略调低）
-1. `t=0` 引擎启动，本地上限 = `min(policy v7, 用户自定义)`；用户把 comment 降到 10/日 → 写审计 `{field:"limits.comment.daily_max", old:"30", new:"10", source:"user", applied:true}`。
-2. `t=1` HB `seq=1 {online_seconds:60, applied_limits{comment.daily_max:10}, daily_used{comment:0}}` → `200 {state:"active", daily_quota{comment{max:30,used:0,remaining:30}}, policy_changed:false}`（服务端额度按策略 30 计，客户端自限 10 属"只能调低"合规）。
+1. `t=0` 引擎启动，本地上限 = `min(policy v7, 用户自定义)`；用户把 comment 降到 10/日 → 写审计 `{field:"limits.comment.daily_max", old:"30", new:"10", source:"user", applied:true}`。 2. `t=1` HB `seq=1 {online_seconds:60, applied_limits{comment.daily_max:10}, daily_used{comment:0}}` → `200 {state:"active", daily_quota{comment{max:30,used:0,remaining:30}}, policy_changed:false}`（服务端额度按策略 30 计，客户端自限 10 属"只能调低"合规）。
 3. `t=2` 发送评论回复 #1：**发起前**生成 `send_id=s-aaaa` 并落盘 `pending_sends.json`；平台响应 `comment/publish {status_code:0}` → `verdict=sent_confirmed`，evidence 完整（暂存本地）。
 4. `t=3` 发送私信 #1：平台返回**空响应** → `verdict=failed`、`evidence{confirm_signal:"none", risk_control_signal:"empty_response"}`、`failure_reason=risk_control_rejected` → **不计费**。
 5. `t=6` 到达上报周期 → `POST /audit/sends {batch_id:b-1, sends:[s-aaaa, s-bbbb], policy_snapshot:{v7,...}}` → `200 {results:[{s-aaaa, billed, 1000}, {s-bbbb, not_billable, 0}], settlement:{billed_count:1, charged_milli:1000, balance_milli:61199000}, daily_quota:{comment{max:30,used:1,remaining:29}, dm{max:3,used:1,remaining:2}}}`；客户端删除已 ACK 明细，`local_budget -= 1`。
 6. `t=11` 用户想把 comment 调到 200/日（高于策略 30）→ 本地拦截并写审计 `{old:"10", new:"200", source:"user", applied:false, reject_code:"POLICY_VIOLATION"}` ← **"主动调高且被拒"的证据**。
 7. `t=31` HB `seq=31` → `200 {policy{policy_version:8, account_tier:"warm_up", comment.daily_max:80}, policy_changed:true}`；客户端 60 秒内切换，本地上限 = `min(80, 用户设置 10) = 10`，写审计 `{old:"30", new:"80", source:"server_policy", actor:"license_server", applied:true}`。
 8. `t=32` HB `seq=32 {applied_policy_version:8, applied_policy_hash:"…"}` → `200 {policy_changed:false}`，ack 完成，`policy_ack_log` 记录 v8。
-9. `t=36` `POST /usage/report` → `200 {reconciliation:{detail_confirmed:1, reported_confirmed:1, match:true}}`。
-10. 本小时实际消耗：**1.0 积分**（1 条平台确认成功；1 条风控失败 0 积分）。
+9. `t=36` `POST /usage/report` → `200 {reconciliation:{detail_confirmed:1, reported_confirmed:1, match:true}}`。 10. 本小时实际消耗：**1.0 积分**（1 条平台确认成功；1 条风控失败 0 积分）。
 
 ### 9.3 场景三：断网 3 小时后恢复（补报大量 sendId）
-1. `t=0` 正常；最后一次成功心跳 `seq=100`，已知 `balance=61199000` → `local_budget=61199`。
-2. `t=1` 网络中断：心跳按退避重试（1s/2s/4s/8s…上限 60s），不阻断本地运行；发送明细只写本地 `pending_sends.json`（上限 `max_pending_sends=20000`，超出丢最旧并告警）；影子额度按 `last_known_balance` 初始化 `local_budget = floor(61199000/1000) × 0.5 = 30599` ← **只减不增，绝不凭空增加**。
+1. `t=0` 正常；最后一次成功心跳 `seq=100`，已知 `balance=61199000` → `local_budget=61199`。 2. `t=1` 网络中断：心跳按退避重试（1s/2s/4s/8s…上限 60s），不阻断本地运行；发送明细只写本地 `pending_sends.json`（上限 `max_pending_sends=20000`，超出丢最旧并告警）；影子额度按 `last_known_balance` 初始化 `local_budget = floor(61199000/1000) × 0.5 = 30599` ← **只减不增，绝不凭空增加**。
 3. `t=16` 离线超过 `offline_send_grace_ms`(15min) → 进入 `degraded`：允许继续发送但每条尝试都扣 `local_budget`；影子额度耗尽 → 立即暂停（本地 fail-closed）。
-4. `t=180` 恢复联网（离线 180 分钟，期间尝试 420 条，其中 398 条平台确认成功）：① `GET /client/bootstrap` → 用 `server_time_ms` 重算 `clock_skew_ms`；② `POST /heartbeat (seq=101, pending_send_count=420, applied_policy_version=8)` → `200 {state:"active", policy_changed:true(v9, comment 100/日), daily_quota{...}}`（服务端此刻不知道离线期间发生了什么，余额仍显示 61199000）；③ 客户端 60 秒内切换策略 v9 并在下一次心跳 ack；④ `POST /usage/report`（聚合，30 分钟窗口拆成 6 条）；⑤ 补报明细 `POST /audit/sends` × N 批（每批 ≤ `audit_batch_max=500`，按 `sent_at_ms` 升序）→ 逐批返回 `{results:[{billed,1000}×…, {not_billable}×22(失败/疑似), {policy_exceeded}×若干], settlement:{billed_count, charged_milli, balance_milli}}`，服务端按每条 `sent_at_ms` 所属自然日核算额度与计费，**风控拒绝不计费、超额不计费、同 `send_id` 重发不重复扣费**；⑥ 客户端逐条删除已 ACK 明细，用响应 `balance_milli` 重算 `local_budget`（此处才允许刷新）；⑦ 若某批余额耗尽：剩余条目返回 `unbilled_insufficient_credit` + `commands[pause_engine]` → 客户端 ≤60 秒停机（见 9.4）。
-5. 若离线超过 `grace_ms`(24h) 仍未恢复：客户端进入暂停态（停止发送），只保留本地采集与心跳重试。
+4. `t=180` 恢复联网（离线 180 分钟，期间尝试 420 条，其中 398 条平台确认成功）：① `GET /client/bootstrap` → 用 `server_time_ms` 重算 `clock_skew_ms`；② `POST /heartbeat (seq=101, pending_send_count=420, applied_policy_version=8)` → `200 {state:"active", policy_changed:true(v9, comment 100/日), daily_quota{...}}`（服务端此刻不知道离线期间发生了什么，余额仍显示 61199000）；③ 客户端 60 秒内切换策略 v9 并在下一次心跳 ack；④ `POST /usage/report`（聚合，30 分钟窗口拆成 6 条）；⑤ 补报明细 `POST /audit/sends` × N 批（每批 ≤ `audit_batch_max=500`，按 `sent_at_ms` 升序）→ 逐批返回 `{results:[{billed,1000}×…, {not_billable}×22(失败/疑似), {policy_exceeded}×若干], settlement:{billed_count, charged_milli, balance_milli}}`，服务端按每条 `sent_at_ms` 所属自然日核算额度与计费，**风控拒绝不计费、超额不计费、同 `send_id` 重发不重复扣费**；⑥ 客户端逐条删除已 ACK 明细，用响应 `balance_milli` 重算 `local_budget`（此处才允许刷新）；⑦ 若某批余额耗尽：剩余条目返回 `unbilled_insufficient_credit` + `commands[pause_engine]` → 客户端 ≤60 秒停机（见 9.4）。 5. 若离线超过 `grace_ms`(24h) 仍未恢复：客户端进入暂停态（停止发送），只保留本地采集与心跳重试。
 
 ### 9.4 场景四：余额耗尽停机（语义 = 禁止发送）
-1. `t=0` `balance_milli = 300`（不足 1 条）；`t=1` HB `seq=N` → `200 active`（余额仍 > 0）。
-2. `t=2` 发送评论回复 → 平台确认成功 → `send_id=s-zzzz` 入 `pending_sends.json`。
+1. `t=0` `balance_milli = 300`（不足 1 条）；`t=1` HB `seq=N` → `200 active`（余额仍 > 0）。 2. `t=2` 发送评论回复 → 平台确认成功 → `send_id=s-zzzz` 入 `pending_sends.json`。
 3. `t=6` `POST /audit/sends {sends:[s-zzzz]}`：余额 300 < 1000 → 按 §6.5 跨零点那一条**全额入账**（唯一允许的一条透支）→ `balance_milli = 300-1000 = -700 ≤ 0` → `state="exhausted"`；响应 `200 {results:[{s-zzzz, billed, 1000}], settlement:{billed_count:1, charged_milli:1000, balance_milli:-700, state:"exhausted", unbilled_count:0}, commands:[{type:"pause_engine", reason:"CREDIT_EXHAUSTED"}]}`。
 4. 客户端 ≤60 秒内：停止评论/弹幕/私信三类发送（`engine_state → paused`）、不再发起任何 `send`、UI 弹窗"积分不足，请联系客服充值"（同时展示 `quota_notice.headline`）。
-5. `t=7` HB `seq=N+1` → **402** `{ok:false, code:"CREDIT_EXHAUSTED", detail:{balance_milli:-700, credit_per_reply_milli:1000}, sign}`；客户端验签通过 → 维持暂停态，每 5 分钟退避重试心跳。
-6. 采集仍在本地继续（只读不发送），计数照常累加但不产生新 `send`。
+5. `t=7` HB `seq=N+1` → **402** `{ok:false, code:"CREDIT_EXHAUSTED", detail:{balance_milli:-700, credit_per_reply_milli:1000}, sign}`；客户端验签通过 → 维持暂停态，每 5 分钟退避重试心跳。 6. 采集仍在本地继续（只读不发送），计数照常累加但不产生新 `send`。
 7. 充值后（管理后台手工充值 或 `POST /credit/redeem`）→ `200 {balance_milli:5000300}` → 下一次心跳 ← `200 {state:"active", commands:[{type:"resume_engine"}]}` → 恢复发送；**余额耗尽期间未计费的明细不被补扣**。
 8. fail-closed 补充规则：以下任一成立时必须停止发送，不等待用户确认——a) 距上次成功心跳 > `offline_send_grace_ms` 且影子额度已耗尽；b) 任意一次响应验签失败；c) 收到 `POLICY_CIRCUIT_OPEN` 或 `circuit_break` 命令（按 `cooldown_until_ms` 等待）；d) 收到 `SERVER_VERSION_UNSUPPORTED`/`AUTH_TOKEN_REVOKED`/`AUTH_ACCOUNT_DISABLED`/`AUTH_ACCOUNT_EXPIRED`。
 
 ### 9.5 场景五：策略收紧与熔断（服务端主动干预）
-1. `t=0` 服务端风控发现该账号近 20 条发送失败率 45% > `failure_rate_threshold`(0.4)。
-2. `t=1` HB 响应携带 `{policy:{policy_version:10, limits:{comment:{daily_max:30, min_interval_ms:60000},…}}, policy_changed:true, circuit_breaker:{open:true, cooldown_until_ms:t+1800000, trigger:"failure_rate"}, commands:[{type:"circuit_break", cooldown_until_ms:…, reason:"failure_rate"}, {type:"throttle", limits:{comment:{daily_max:30, min_interval_ms:60000}}, reason:"POLICY_DAILY_CAP"}]}`；客户端 ≤60 秒内停止全部发送、切到新策略，写审计 `{field:"limits.comment.daily_max", old:"100", new:"30", source:"server_policy", applied:true}`。
+1. `t=0` 服务端风控发现该账号近 20 条发送失败率 45% > `failure_rate_threshold`(0.4)。 2. `t=1` HB 响应携带 `{policy:{policy_version:10, limits:{comment:{daily_max:30, min_interval_ms:60000},…}}, policy_changed:true, circuit_breaker:{open:true, cooldown_until_ms:t+1800000, trigger:"failure_rate"}, commands:[{type:"circuit_break", cooldown_until_ms:…, reason:"failure_rate"}, {type:"throttle", limits:{comment:{daily_max:30, min_interval_ms:60000}}, reason:"POLICY_DAILY_CAP"}]}`；客户端 ≤60 秒内停止全部发送、切到新策略，写审计 `{field:"limits.comment.daily_max", old:"100", new:"30", source:"server_policy", applied:true}`。
 3. `t=31` 冷却结束 → HB 响应 `circuit_breaker.open=false`、`commands:[{type:"resume_engine"}]` → 恢复发送。
-4. 若客户端在熔断期间上报新发送明细 → `409 POLICY_CIRCUIT_OPEN` 整批拒绝（但**已发生的**历史明细补报不受影响）。
-5. 若客户端把 `comment.daily_max` 上报为 200（高于策略 30）→ `409 POLICY_VIOLATION {detail:{source_type:"comment", field:"daily_max", reported:200, allowed:30, policy_version:10}}`；客户端必须降回 30 并重新 ack，否则后续上报持续被拒。
+4. 若客户端在熔断期间上报新发送明细 → `409 POLICY_CIRCUIT_OPEN` 整批拒绝（但**已发生的**历史明细补报不受影响）。 5. 若客户端把 `comment.daily_max` 上报为 200（高于策略 30）→ `409 POLICY_VIOLATION {detail:{source_type:"comment", field:"daily_max", reported:200, allowed:30, policy_version:10}}`；客户端必须降回 30 并重新 ack，否则后续上报持续被拒。
