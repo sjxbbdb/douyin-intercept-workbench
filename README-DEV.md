@@ -3,8 +3,57 @@
 > **本文件是唯一的入口。** 无论你是人类开发者还是 AI 编码智能体，请先读完本文件，再按「阅读路径」进入具体文档。
 >
 > **仓库**：https://github.com/sjxbbdb/douyin-intercept-workbench（private）
-> **交接日期**：2026-09-18
-> **当前状态**：**文档阶段已基本完成，尚未开始写业务代码**（`legacy/` 之外无新实现）
+> **最近更新**：2026-09-18（P1–P5 实现完成）
+> **当前状态**：**代码已成形并可启动，尚未做真机验证**。见下面第三节的"现在到底完成到什么程度"。
+
+---
+
+## 〇、⚠️ 先看这一段：现在到底完成到什么程度
+
+**别被"文档齐全"误导——先看代码与自动化验证的真实状态。**
+
+### 已经可以跑的
+
+| 能力 | 状态 | 怎么验证 |
+|---|---|---|
+| 授权中心服务端（登录/心跳/计费/审计/策略/卡密） | ✅ 代码完成，集成测试覆盖 | `node scripts/smoke-server.js` |
+| 客户端授权链路（登录自证、心跳、明细上报、离线补报） | ✅ 代码完成，端到端测试覆盖 | `node test/run.js L4` |
+| 客户端本地控制台（界面 + 127.0.0.1 API + 四道安全门） | ✅ 代码完成，**未在浏览器里渲染验证** | `node scripts/boot-client-smoke.js`、`node scripts/ui-check.js` |
+| CDP 层（每实例一条独占 WS、重连、响应嗅探） | ✅ 代码完成，离线测试覆盖 | `node test/unit/client-core.test.js` |
+| 发送链路（评论 / 弹幕 / 私信三条） | ✅ 代码完成，**未真机验证** | `node test/unit/client-adapters.test.js` |
+| 安全护栏（限额/相似度/熔断/时序/审计） | ✅ 代码完成，测试覆盖 | `node test/unit/client-safety.test.js` |
+| 厂商管理 CLI（开号/充值/卡密/策略/审计导出） | ✅ 代码完成 | `node license-server/cli.js --help` |
+
+**一次性跑完全部自动化验证**：
+
+```bash
+node test/run.js                  # 560 项：L1 单元 / L2 契约 / L3 离线 DOM / L4 集成
+node scripts/smoke-server.js      # 服务端冒烟（真实 HTTP + 真实签名）
+node scripts/boot-client-smoke.js # 客户端启动冒烟（装配 + 控制台 + 四道安全门）
+node scripts/ui-check.js          # 界面结构与接口契约（30 项）
+node scripts/verify-handover.js   # 交付终检（文档/数值/契约自检）
+```
+
+### ⚠️ 还没做、且**必须做**的
+
+1. **真机验证（P2 验证门 G-1~G-6）** —— 需要**一个真实的抖音测试账号**。
+   所有涉及抖音页面操作的能力（采集、回复评论、回复弹幕、发私信）
+   **目前只是"代码完成"**，按 `AGENTS.md` §6 的完成定义，
+   **未在真实账号上验证过之前不得声明完成**。
+   最容易在真机上出问题的地方按风险排序：
+   - `client/platform/selectors.js` 的选择器是否还有效（全部 `liveVerifiedAt: null`）
+   - 能否稳定嗅探到 `comment/publish`、`live/comment/send`、`im/send` 的响应体
+     （**这是计费的唯一依据**，抓不到就一条都不计费）
+   - 专用 Chrome 的登录态能否被复用（不能被判成自动化浏览器）
+2. **界面在真实浏览器里的渲染** —— 结构与契约已静态校验，但 DOM 构建、
+   快捷键（Esc / 1-9 / Ctrl+K）、`?token=` 首屏到 sessionStorage 的路径
+   都还没在浏览器里跑过。
+3. **72 小时长稳测试**（功能冻结后才能做）。
+4. **老板要拍的板**：合作方须知的业务性质（经销 / OEM / 分站）、定价、
+   测试账号到位时间。
+
+> 交付给下一位开发者的建议起手式：**先要一个抖音测试账号，跑通 P2 验证门**。
+> 在那之前，任何"采集/回复已经能用"的说法都是不成立的。
 
 ---
 
@@ -63,7 +112,7 @@ verdict = sent_confirmed
 
 ## 三、仓库现状
 
-> ✅ **仓库根目录已整理干净**：旧代码已全部移入 `legacy/`（保留 git 历史），根目录只剩文档与四个目录。**P0 的第一步已完成。**
+> ✅ **仓库根目录已整理干净**：旧代码已全部移入 `legacy/`（保留 git 历史）。
 
 ```
 douyin-intercept-workbench/
@@ -74,18 +123,34 @@ douyin-intercept-workbench/
 ├── docs/                      需求与架构
 ├── shared/                    双端共享契约与规范（事实源）
 ├── plans/                     两套开发方案
+├── scripts/                   验证脚本（终检 / 两套冒烟 / 界面契约）
+├── test/                      分层测试（L1 单元 / L2 契约 / L3 离线 DOM / L4 集成）
 │
-├── legacy/                    ✅ 原半成品源码只读存档（37 项，行为规格参考）
-│   ├── reply_worker.js        旧评论回复 worker（CDP 发送链路，质量高）
-│   ├── live_dom_collector.js  旧直播弹幕采集
-│   ├── live_dm_worker.js      旧私信准备
-│   ├── pipeline.js            旧视频搜索 + 评论爬取
-│   ├── scan_comments.js / comment_worker.js / browser_session.js / qr_capture.js
-│   ├── reply_server/          旧 HTTP 服务 + 前端单文件
-│   ├── scrapling_bridge/      评论清洗（Python，可选）
-│   └── *.json                 旧运行数据模板
+├── license-server/            授权中心（Linux，厂商侧）
+│   ├── server.js              入口
+│   ├── cli.js                 管理命令（开号 / 充值 / 卡密 / 策略 / 审计导出）
+│   ├── config.js  api/  domain/  store/  crypto/
 │
-└── （待创建）license-server/ · client/ · test/
+├── client/                    客户端（Windows，商家侧）
+│   ├── 启动.cmd / 停止.cmd     商家双击即可（含 Node 版本与依赖自检）
+│   ├── config.js              配置（路径/端口/Chrome 探测）
+│   ├── host/                  主进程：唯一写盘者 + 调度器 + 本地 API
+│   ├── core/                  CDP 基础设施（cdp.js / browser-host.js / ipc.js）
+│   ├── platform/              抖音平台知识（★ selectors.js 是选择器唯一来源）
+│   ├── adapters/              业务适配器（采集 / 评论 / 弹幕 / 私信 / outbox）
+│   ├── license/               与授权中心通信（登录 / 心跳 / 上报 / 隐私）
+│   ├── safety/                安全护栏（限额 / 相似度 / 熔断 / 时序 / 审计）
+│   └── ui/                    本地控制台前端（原生 DOM，无构建）
+│
+└── legacy/                    ✅ 原半成品源码只读存档（行为规格参考）
+    ├── reply_worker.js        旧评论回复 worker（CDP 发送链路，质量高）
+    ├── live_dom_collector.js  旧直播弹幕采集
+    ├── live_dm_worker.js      旧私信准备
+    ├── pipeline.js            旧视频搜索 + 评论爬取
+    ├── scan_comments.js / comment_worker.js / browser_session.js / qr_capture.js
+    ├── reply_server/          旧 HTTP 服务 + 前端单文件
+    ├── scrapling_bridge/      评论清洗（Python，可选）
+    └── *.json                 旧运行数据模板
 ```
 
 ### 关于 `legacy/`
@@ -216,7 +281,8 @@ douyin-intercept-workbench/
 ## 七、文档清单
 
 > **交付前自检**：运行 `node scripts/verify-handover.js`，会逐项校验文档到位情况、legacy 存档、三条红线覆盖、关键数值一致性、陈旧值残留与契约自检。
-> **测试入口**：`node test/run.js`（P0 骨架已可运行：L1 单元 / L2 契约 / L3 离线 DOM 全绿）。
+> **测试入口**：`node test/run.js`（560 项：L1 单元 / L2 契约 / L3 离线 DOM / L4 集成）。
+> **两套冒烟**：`node scripts/smoke-server.js`（服务端）、`node scripts/boot-client-smoke.js`（客户端启动）。
 
 ### 根目录
 
@@ -227,6 +293,9 @@ douyin-intercept-workbench/
 | `README.md` | 面向使用者（商家）的说明 | ✅ |
 | `package.json` | 仅声明 `ws`；engines ≥22.5 | ✅ |
 | `scripts/verify-handover.js` | 交付前终检脚本 | ✅ |
+| `scripts/smoke-server.js` | 服务端冒烟（真实 HTTP + 真实签名） | ✅ |
+| `scripts/boot-client-smoke.js` | 客户端启动冒烟（装配 + 控制台 + 四道安全门） | ✅ |
+| `scripts/ui-check.js` | 界面结构与接口契约校验（30 项） | ✅ |
 
 ### `docs/` — 需求与架构
 
