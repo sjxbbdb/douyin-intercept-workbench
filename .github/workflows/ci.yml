@@ -1,0 +1,65 @@
+name: v4 CI
+
+on:
+  push:
+    branches: [main, 'rewrite/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Linux server build and tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  integration:
+    name: Linux cross-module integration
+    needs: server
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            desktop/package-lock.json
+      - run: npm ci --prefix server
+      - run: npm ci --prefix desktop
+      - run: npm run build --prefix server
+      - run: npm run check --prefix desktop
+      - run: npm test --prefix desktop
+      - run: node scripts/verify-integration.mjs
+
+  desktop:
+    name: Windows desktop check and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+        working-directory: desktop
+      - run: npm run check
+        working-directory: desktop
+      - run: npm test
+        working-directory: desktop

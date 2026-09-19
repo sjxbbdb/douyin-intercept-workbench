@@ -12,6 +12,7 @@
     "test:server": "npm --prefix server test",
     "check:desktop": "npm --prefix desktop run check",
     "test:desktop": "npm --prefix desktop test",
+    "verify:integration": "npm run check:server && node scripts/verify-integration.mjs",
     "build:desktop": "npm --prefix desktop run build",
     "test": "npm run test:server && npm run test:desktop",
     "check": "npm run check:server && npm run check:desktop",

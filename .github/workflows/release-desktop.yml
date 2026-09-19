@@ -1,0 +1,32 @@
+name: Desktop release artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build Windows portable and installer packages
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+        working-directory: desktop
+      - run: npm run check
+        working-directory: desktop
+      - run: npm run build:portable
+        working-directory: desktop
+      - run: npm run build:nsis
+        working-directory: desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: douyin-intercept-agent-windows
+          path: desktop/release/*
+          if-no-files-found: error
