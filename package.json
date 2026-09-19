@@ -17,7 +17,8 @@
     "check": "node --check client/host/main.js && node --check license-server/server.js",
     "server": "node license-server/server.js",
     "smoke:server": "node scripts/smoke-server.js",
-    "smoke:client": "node scripts/boot-client-smoke.js"
+    "smoke:client": "node scripts/boot-client-smoke.js",
+    "smoke:ui": "node scripts/ui-check.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
