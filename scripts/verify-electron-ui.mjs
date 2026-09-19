@@ -93,19 +93,6 @@ async function waitForPage(port) {
   throw new Error('Electron 页面未启动');
 }
 
-async function waitForTarget(port, predicate, label) {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    try {
-      const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1000) })).json();
-      const target = targets.find(predicate);
-      if (target) return target;
-    } catch {}
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
-  }
-  throw new Error(`等待 Electron 目标窗口超时：${label}`);
-}
-
 async function waitFor(cdp, expression, label, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -169,21 +156,7 @@ async function main() {
     assert.equal(await cdp.evaluate(`document.querySelector('#notice')?.hidden !== false`), true, '启动时不得出现 IPC 错误提示');
     await screenshot(cdp, '01-unauthorized');
     assert.equal(await cdp.evaluate('Boolean(document.querySelector("#login-form"))'), true);
-
-    const readonlyUrl = 'https://v.douyin.com/aNdCUl2rQAY/';
-    const openedUrl = await cdp.evaluate(`window.agentApi.openTarget(${JSON.stringify(readonlyUrl)})`);
-    const douyinTarget = await waitForTarget(electronPort, (target) => target.type === 'page' && target.webSocketDebuggerUrl && target.url.includes('douyin.com') && !target.url.startsWith('file:'), '抖音只读窗口');
-    const douyinCdp = new CdpClient(douyinTarget.webSocketDebuggerUrl);
-    await douyinCdp.connect();
-    await waitFor(douyinCdp, 'document.readyState === "complete"', '抖音页面加载');
-    const pageEvidence = await douyinCdp.evaluate(`(() => { const visible = (node) => { const rect = node.getBoundingClientRect(); const style = getComputedStyle(node); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const candidates = { commentNode: '[data-e2e="comment-item"], [data-e2e="comment-list"] [role="listitem"]', commentText: '[data-e2e="comment-text"]', commentAuthor: '[data-e2e="comment-author"]', commentId: '[data-comment-id]', replyInput: 'textarea, [contenteditable="true"]', sendButton: 'button', replyButton: 'button' }; const counts = Object.fromEntries(Object.entries(candidates).map(([key, selector]) => [key, Array.from(document.querySelectorAll(selector)).filter(visible).length])); const url = new URL(location.href); url.search = ''; url.hash = ''; return { finalUrl: url.href, title: document.title, readyState: document.readyState, bodyTextLength: document.body?.innerText?.length || 0, visibleCandidateCounts: counts }; })()`);
-    const canonicalOpenedUrl = new URL(String(pageEvidence.finalUrl)); canonicalOpenedUrl.search = ''; canonicalOpenedUrl.hash = '';
-    pageEvidence.openedUrl = canonicalOpenedUrl.href;
-    pageEvidence.checkedAt = new Date().toISOString();
-    writeFileSync(join(evidenceDir, 'douyin-readonly.json'), `${JSON.stringify(pageEvidence, null, 2)}\n`);
-    await screenshot(douyinCdp, '09-douyin-readonly');
-    await douyinCdp.close();
-    await cdp.evaluate('window.agentApi.closeTarget()');
+    await assert.rejects(() => cdp.evaluate(`window.agentApi.openTarget(${JSON.stringify('https://v.douyin.com/aNdCUl2rQAY/')})`), /请先登录并通过授权检查/);
 
     await click(cdp, '[data-view="settings"]');
     await waitFor(cdp, 'Boolean(document.querySelector("#endpoint-form"))', '设置页');
@@ -218,7 +191,7 @@ async function main() {
     await click(cdp, '[data-view="credits"]');
     await waitFor(cdp, 'Boolean(document.querySelector("#redeem-form"))', '积分页');
     await click(cdp, '[data-action="load-ledger"]');
-    await waitFor(cdp, `document.querySelector('#content')?.innerText.includes('admin_credit')`, '服务端积分流水');
+    await waitFor(cdp, `document.querySelector('#content')?.innerText.includes('管理员充值')`, '服务端积分流水类型');
     assert.equal(await cdp.evaluate(`document.querySelector('#content')?.innerText.includes('3')`), true);
     await screenshot(cdp, '05-a-ledger');
 
@@ -236,8 +209,13 @@ async function main() {
 
     await click(cdp, '[data-action="new-task"]');
     await fill(cdp, '#task-form input[name="businessContext"]', '输入中草稿');
-    await click(cdp, '#refresh');
-    await waitFor(cdp, 'Boolean(document.querySelector("#task-form"))', '刷新后保留任务草稿');
+    // Exercise the heartbeat IPC itself while the operator is still editing.
+    // Clicking the toolbar refresh intentionally rerenders the whole view, so
+    // it cannot prove that an asynchronous license/browser update preserves
+    // an in-progress form.
+    await cdp.evaluate(`document.querySelector('#task-form input[name="businessContext"]')?.focus()`);
+    await cdp.evaluate('window.agentApi.refreshLicense()');
+    await waitFor(cdp, 'Boolean(document.querySelector("#task-form"))', 'heartbeat 后保留任务草稿');
     assert.equal(await cdp.evaluate(`document.querySelector('#task-form input[name="businessContext"]')?.value`), '输入中草稿', '刷新/heartbeat 不得清空任务草稿');
     await click(cdp, '[data-action="cancel-task"]');
 

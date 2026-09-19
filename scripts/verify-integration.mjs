@@ -57,7 +57,7 @@ async function http(baseUrl, method, path, body, token) {
 }
 
 function event(id, text = '多少钱') {
-  return { id, source: 'video_comment', authorName: 'fixture-user', text, observedAt: Date.now() };
+  return { id, source: 'video_comment', roomId: 'https://www.douyin.com/video/fixture', authorId: 'fixture-author', authorName: 'fixture-user', text, observedAt: Date.now() };
 }
 
 function rule() {
@@ -240,7 +240,7 @@ async function main() {
       const user = users.get('c');
       const { client } = clients.get('c');
       const key = `draft-expired-${crypto.randomUUID()}`;
-      const payload = { event: event('c-expired'), businessContext: null, targetCustomer: null, replyInstructions: null, idempotencyKey: key };
+      const payload = { event: event('c-expired'), businessContext: '', targetCustomer: '', replyInstructions: 'fixture expired hold', idempotencyKey: key };
       const store = new Store(dbPath);
       try {
         store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), user.id, 'draft', key, hashPayload(payload), 'pending', Date.now() - 1000);
@@ -276,11 +276,11 @@ async function main() {
       assert.equal(JSON.stringify(engine.snapshot()).includes(desktop.credentials.token), false, 'TaskEngine snapshot 不得泄露 token');
       const task = engine.saveTask({ url: 'https://www.douyin.com/video/fixture', source: 'video', keywords: ['多少钱'], excludeKeywords: [], replyTemplate: '您好，请问您想了解哪个型号？', replyInstructions: 'fixture', decisionMode: 'ai', mode: 'manual', intervalMs: 1, dailyLimit: 10, maxActions: 10, status: 'paused' });
       await engine.setTaskStatus(task.id, 'running');
-      await engine.ingest([{ id: 'engine-event-1', source: 'video_comment', roomId: task.url, authorName: 'fixture-user', text: '多少钱', observedAt: new Date().toISOString() }]);
+      await engine.ingest([{ id: 'engine-event-1', source: 'video_comment', roomId: task.url, authorId: 'fixture-author', authorName: 'fixture-user', text: '多少钱', observedAt: Date.now() }]);
       let snapshot = engine.snapshot();
       const current = snapshot.events.find((item) => item.authorName === 'fixture-user' && item.text === '多少钱');
       assert.ok(current, `TaskEngine 应保存服务端生成对应的事件: tasks=${JSON.stringify(snapshot.tasks)} events=${JSON.stringify(snapshot.events)}`);
-      assert.equal(current.charged, 2, 'charged 必须保留服务端生成服务积分整数');
+      assert.equal(current.charged, 2, `charged 必须保留服务端生成服务积分整数: ${JSON.stringify(current)}`);
       assert.equal(current.status, 'awaiting_confirmation', '成功生成应进入待确认队列');
       assert.equal(snapshot.pending.length, 1, '成功生成应只入队一次');
       assert.equal(browser.sends.length, 0, 'manual 模式生成后不能自动触发浏览器发送');

@@ -2,7 +2,7 @@
 
 更新时间：2026-09-19
 分支：`rewrite/v4-agent`
-基准提交：`c575f38`
+记录提交：`980b150`
 
 ## 已完成
 
@@ -11,8 +11,9 @@
 - 根级 `git diff --check` 与 staged diff 检查通过。
 - 参考仓库在迁移前运行 `npm test`：L1 单元、L2 契约、L3 脱敏 DOM、L4 集成全部通过；入口明确说明 L5 真机与 L6 长稳不在其范围内。
 - 官方抖音能力资料已完成一手文档核对，结论见 [`reference-audit.md`](reference-audit.md)。
-- `server` TypeScript build 与 12 项服务端测试通过；`scripts/verify-integration.mjs` 已通过真实回环 HTTP + `desktop/src/lib/api-client.js` + `TaskEngine` 黑盒契约：管理员建号、桌面登录、赠额/兑换、生成扣分、幂等冲突、并发余额、AI hold、provider 失败释放、过期 hold、注销、过期/禁用/设备撤销、跨用户隔离和 `sent_unknown` 闸门。
-- 只读 Electron 页面检查已解析用户提供的分享链接到 `https://www.douyin.com/video/7682712994194722091`，记录标题、页面完成状态和可见候选匹配计数；当前页面出现抖音登录弹窗，候选评论节点 5 个，候选评论文本/作者节点 0 个，未执行登录、采集或发送。证据写入被忽略的本地目录。
+- `server` TypeScript build 与 12 项服务端测试通过。修正 fixture 的 `roomId`、`authorId` 和整数 `observedAt` 后，`scripts/verify-integration.mjs` 的 A/B、并发、provider 失败、过期 hold、AI hold 和 D 会话隔离场景通过；E TaskEngine 场景仍失败，因为 desktop 把 `rule` 放入服务端不接受的 `/v1/agent/draft` 请求体，事件记录为 `VALIDATION_ERROR`。当前不能把完整集成入口写成 PASS。
+- 独立 `scripts/verify-electron-login.mjs` 与完整 `scripts/verify-electron-ui.mjs` 已真实启动 Electron。UI 覆盖未授权浏览器操作拒绝、设置地址、错误登录、A 账号授权/积分流水/任务、聚焦表单 heartbeat 保留、退出后 B 账号空数据、回到 A 恢复数据；renderer 未显示密码或 token，截图写入被忽略的本地目录。
+- 只读 Electron 页面检查已解析用户提供的分享链接到 `https://www.douyin.com/video/7682712994194722091`，主文档经历 302→200 且 `didFailLoad` 为空；标题匹配用户提供的视频，页面出现抖音登录弹窗。可见候选节点为 `commentNode=9`、`commentText=0`、`commentAuthor=0`、`commentId=0`、`sendButton=13`、`replyButton=13`；候选节点不等于已采集评论，未执行登录、采集或发送。证据写入被忽略的本地目录，检查时间为 `2026-09-19T09:35:12Z`。
 - PR #1 合并了合作方独立 `probe/` 能力探索工具；合作方记录了视频搜索、评论采集/筛选和私信的实机探索，但该工具没有接入 `server/` 或 `desktop/`，也不改变当前授权和计费契约。PR 的 Linux server CI 成功；Windows desktop 和跨模块 CI 因基线缺少 `desktop/package-lock.json` 而未执行到桌面测试。该记录证明独立 probe 的探索路径，不等于本项目发行能力或服务端计费接线已通过。
 
 ## 当前环境
@@ -27,9 +28,11 @@
 
 ## 尚未通过的验收
 
-- 桌面三个入口脚本语法检查通过；`scripts/verify-electron-ui.mjs` 已真实启动 Electron 并覆盖未授权、设置地址、错误登录路径，但正确登录被桌面主进程的登录顺序问题阻断：当前实现先请求 `me`、后保存登录 token。启动首屏还需把 IPC 错误作为失败处理。桌面 worker 修复后必须重跑该脚本。
-- 桌面账号 A/B 的本地数据隔离、任务草稿在刷新/heartbeat 后保留、待确认卡完整展示作者/原评论/目标房间，以及暂停/停止/删除操作仍需真实 Electron 回归。
-- Linux 真实运行需在 WSL Ubuntu 或 GitHub Actions Ubuntu 完成；Windows 桌面包需在 Windows 实际启动并验证首次空态、登录、离线和错误状态。
+- `npm --prefix desktop run check` 通过，包含 15 项桌面基础测试；其中 JsonStore 的 revision/EXDEV fallback 测试通过。独立 `scripts/verify-electron-login.mjs` 已真实启动 Electron，在隔离临时 `userData` 中完成未授权空态和正确登录，renderer 未显示密码/token，错误日志未出现 `EXDEV`；匿名截图写入被忽略的本地目录。
+- 真实 Python sidecar `capabilities` 已通过独立进程 JSONL 检查；真实 desktop `ProbeClient` 已连接真实 `probe/sidecar.py` 完成离线 capabilities 请求；fake sidecar integration 已覆盖搜索、评论、blocked/unknown、噪声、无终态、超时、忙拒绝和切账号取消，当前通过。
+- 在新的 `AppData\Roaming` 临时目录中实测 JsonStore 写入、重启读取和清理通过，`originalAuthTouched=false`；这是实际文件系统检查，和 EXDEV fallback mock 单测分别记录。
+- 待确认卡完整展示作者/原评论/目标房间、暂停/停止/删除操作，以及已授权后的真实专用 Chrome 打开/搜索结果选择仍需独立 Electron fixture 回归；本脚本不把外部 Chrome 只读页面检查混入 UI 账号验收。
+- Linux 真实运行需在 WSL Ubuntu 或 GitHub Actions Ubuntu 完成；Windows 安装包仍需实际启动并验证首次空态、登录、离线和错误状态。
 - 视频搜索、评论采集与筛选、评论回复、直播互动和私信触达分别仍需按实际接入方式完成能力级真机验收；若采用官方 API，再单独完成对应资格核验。Electron 安装包、真实自动发送、真实支付和生产部署均未完成。
 
 ## 验收顺序
