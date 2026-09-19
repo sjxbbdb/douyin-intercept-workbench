@@ -19,7 +19,7 @@
 | Node | `v24.18.0` |
 | npm | `11.16.0` |
 | Python | `3.12.10` |
-| WSL | Ubuntu `24.04` 可见 |
+| WSL | Ubuntu `24.04` 可见；Node `18.19.1` / npm `9.2.0`，低于服务端要求，暂不能作为 v4 运行环境 |
 | Docker | 暂不可用：Docker Desktop Linux engine pipe 不存在 |
 
 ## 尚未通过的验收
