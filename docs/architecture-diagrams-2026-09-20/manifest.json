@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "date": "2026-09-20",
+  "purpose": "目标架构设计图索引；不代表现有实现已全部完成。",
+  "diagrams": [
+    { "id": "01-system-overview", "title": "系统总架构", "source": "sources/01-system-overview.mmd", "png": "images/01-system-overview.png", "svg": "images/01-system-overview.svg" },
+    { "id": "02-model-execution-boundary", "title": "模型判断与流程执行的边界", "source": "sources/02-model-execution-boundary.mmd", "png": "images/02-model-execution-boundary.png", "svg": "images/02-model-execution-boundary.svg" },
+    { "id": "03-flow-registry-versioning", "title": "固定流程库与版本管理架构", "source": "sources/03-flow-registry-versioning.mmd", "png": "images/03-flow-registry-versioning.png", "svg": "images/03-flow-registry-versioning.svg" },
+    { "id": "04-linux-authorization", "title": "Linux 授权端内部架构", "source": "sources/04-linux-authorization.mmd", "png": "images/04-linux-authorization.png", "svg": "images/04-linux-authorization.svg" },
+    { "id": "05-auth-expiry-renewal", "title": "账密分发、授权到期与续期恢复", "source": "sources/05-auth-expiry-renewal.mmd", "png": "images/05-auth-expiry-renewal.png", "svg": "images/05-auth-expiry-renewal.svg" },
+    { "id": "06-credit-settlement", "title": "积分与任务预算结算架构", "source": "sources/06-credit-settlement.mmd", "png": "images/06-credit-settlement.png", "svg": "images/06-credit-settlement.svg" },
+    { "id": "07-client-workbench", "title": "客户端操作面板架构", "source": "sources/07-client-workbench.mmd", "png": "images/07-client-workbench.png", "svg": "images/07-client-workbench.svg" },
+    { "id": "08-chat-execution-sequence", "title": "Agent 聊天、执行与结果判断时序", "source": "sources/08-chat-execution-sequence.mmd", "png": "images/08-chat-execution-sequence.png", "svg": "images/08-chat-execution-sequence.svg" },
+    { "id": "09-knowledge-talk-preparation", "title": "向量知识库与执行前话术准备", "source": "sources/09-knowledge-talk-preparation.mmd", "png": "images/09-knowledge-talk-preparation.png", "svg": "images/09-knowledge-talk-preparation.svg" },
+    { "id": "10-video-search-flow", "title": "找视频固定流程", "source": "sources/10-video-search-flow.mmd", "png": "images/10-video-search-flow.png", "svg": "images/10-video-search-flow.svg" },
+    { "id": "11-comment-area-business", "title": "评论区完整业务架构", "source": "sources/11-comment-area-business.mmd", "png": "images/11-comment-area-business.png", "svg": "images/11-comment-area-business.svg" },
+    { "id": "12-live-room-business", "title": "直播间完整业务架构", "source": "sources/12-live-room-business.mmd", "png": "images/12-live-room-business.png", "svg": "images/12-live-room-business.svg" },
+    { "id": "13-cross-module-composition", "title": "跨板块业务组合架构", "source": "sources/13-cross-module-composition.mmd", "png": "images/13-cross-module-composition.png", "svg": "images/13-cross-module-composition.svg" },
+    { "id": "14-multi-account-parallel", "title": "多账号并行执行架构", "source": "sources/14-multi-account-parallel.mmd", "png": "images/14-multi-account-parallel.png", "svg": "images/14-multi-account-parallel.svg" },
+    { "id": "15-run-lifecycle", "title": "单轮固定流程的生命周期", "source": "sources/15-run-lifecycle.mmd", "png": "images/15-run-lifecycle.png", "svg": "images/15-run-lifecycle.svg" },
+    { "id": "16-retry-recovery", "title": "异常重试、固化与人工后自动恢复", "source": "sources/16-retry-recovery.mmd", "png": "images/16-retry-recovery.png", "svg": "images/16-retry-recovery.svg" },
+    { "id": "17-action-ledger-idempotency", "title": "双渠道动作账本与防重复发送", "source": "sources/17-action-ledger-idempotency.mmd", "png": "images/17-action-ledger-idempotency.png", "svg": "images/17-action-ledger-idempotency.svg" },
+    { "id": "18-platform-collaborator-boundary", "title": "平台与协作者的开发边界", "source": "sources/18-platform-collaborator-boundary.mmd", "png": "images/18-platform-collaborator-boundary.png", "svg": "images/18-platform-collaborator-boundary.svg" },
+    { "id": "19-data-state-ownership", "title": "核心数据与状态归属", "source": "sources/19-data-state-ownership.mmd", "png": "images/19-data-state-ownership.png", "svg": "images/19-data-state-ownership.svg" },
+    { "id": "20-deployment-upgrade", "title": "部署、分发与升级架构", "source": "sources/20-deployment-upgrade.mmd", "png": "images/20-deployment-upgrade.png", "svg": "images/20-deployment-upgrade.svg" }
+  ]
+}

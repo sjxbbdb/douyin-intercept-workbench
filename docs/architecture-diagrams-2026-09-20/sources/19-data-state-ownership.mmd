@@ -1,0 +1,38 @@
+flowchart TB
+    Workspace["客户工作空间"]
+
+    subgraph Server["服务端权威数据"]
+        User["工作台账号与设备授权"]
+        License["授权期限与策略"]
+        Wallet["积分钱包与消费流水"]
+        Knowledge["知识集、文档与向量版本"]
+        Plans["流程决策与话术准备结果"]
+        Mirror["任务状态镜像与审计"]
+    end
+
+    subgraph Local["客户端执行数据"]
+        Account["抖音账号与本地浏览器绑定"]
+        Task["长期任务"]
+        Run["固定流程实例"]
+        Frozen["固化参数与双渠道回复计划"]
+        Checkpoint["当前步骤、游标与目标状态"]
+        Action["公开回复和私信动作账本"]
+    end
+
+    Workspace --> User
+    Workspace --> License
+    Workspace --> Wallet
+    Workspace --> Knowledge
+    Workspace --> Account
+
+    Account --> Task
+    Task --> Run
+    Plans --> Frozen
+    Run --> Frozen
+    Run --> Checkpoint
+    Run --> Action
+
+    Knowledge --> Plans
+    Plans --> Wallet
+    Checkpoint --> Mirror
+    Action --> Mirror

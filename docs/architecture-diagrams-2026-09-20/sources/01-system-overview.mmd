@@ -1,0 +1,45 @@
+flowchart TB
+    User["客户"]
+    Admin["平台运营者"]
+
+    subgraph Linux["Linux 服务端"]
+        Console["管理后台"]
+        Auth["账密、有效期与设备授权"]
+        Credits["积分、预算与消费账本"]
+        Decision["模型决策与结果判断"]
+        Preparation["知识检索与话术准备"]
+        Knowledge["客户知识库与向量数据库"]
+        Audit["审计与任务状态镜像"]
+
+        Console --> Auth
+        Console --> Credits
+        Decision --> Preparation
+        Preparation <--> Knowledge
+    end
+
+    subgraph Windows["可分发的 Windows Agent"]
+        UI["Agent 聊天与三个功能板块"]
+        Gate["计划校验与执行入口"]
+        Engine["确定性流程执行器"]
+        Accounts["多账号调度"]
+        Store["本地检查点与动作账本"]
+        Tools["协作者自动化工具"]
+
+        UI --> Gate
+        Gate --> Engine
+        Engine --> Accounts
+        Accounts --> Tools
+        Engine <--> Store
+    end
+
+    User --> UI
+    Admin --> Console
+
+    UI -->|自然语言目标| Decision
+    Decision -->|流程编号与准备好的参数| Gate
+    Engine -->|流程结束后返回结果| Decision
+
+    Auth --> Gate
+    Engine <-->|授权与计费校验| Credits
+    Engine --> Audit
+    Tools <--> Browser["各抖音账号的专用浏览器"]

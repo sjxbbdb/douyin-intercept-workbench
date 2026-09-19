@@ -1,0 +1,42 @@
+flowchart TB
+    subgraph Platform["我们负责"]
+        UI["客户端与聊天入口"]
+        Auth["授权、积分与预算"]
+        Decision["流程选择与执行前话术准备"]
+        Templates["固定流程模板"]
+        Engine["执行器、多账号调度与恢复"]
+        Ledger["检查点、去重与审计"]
+    end
+
+    subgraph Interface["共同约定的接口"]
+        Request["请求：账号、目标、参数、动作标识"]
+        Progress["进度：阶段与可恢复检查点"]
+        Response["结果：数据、错误、提交状态与恢复条件"]
+        Version["能力版本与兼容性声明"]
+    end
+
+    subgraph Collaborator["协作者负责"]
+        Search["视频搜索"]
+        Comments["视频评论采集"]
+        Live["直播评论采集"]
+        Public["评论与公屏回复"]
+        Private["私信发送"]
+        Probe["页面、登录与工具状态探测"]
+    end
+
+    UI --> Decision
+    Decision --> Templates
+    Auth --> Engine
+    Templates --> Engine
+    Engine <--> Ledger
+
+    Engine --> Request
+    Request --> Collaborator
+
+    Collaborator --> Progress
+    Collaborator --> Response
+    Collaborator --> Version
+
+    Progress --> Engine
+    Response --> Engine
+    Version --> Templates

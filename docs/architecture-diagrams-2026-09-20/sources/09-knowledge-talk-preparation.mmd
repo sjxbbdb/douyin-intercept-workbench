@@ -1,0 +1,30 @@
+flowchart TB
+    Source["产品资料、问答、话术与案例"]
+    Clean["整理、去重与内容检查"]
+    Version["建立知识版本"]
+    Index["分块与向量索引"]
+
+    Source --> Clean --> Version --> Index
+
+    Targets["采集流程返回的目标批次"]
+    Goal["客户目标与表达要求"]
+
+    Targets --> Retrieve["按客户、知识集和版本检索"]
+    Goal --> Retrieve
+    Index --> Retrieve
+
+    Retrieve --> Enough{"资料是否足够？"}
+    Enough -->|是| Generate["在流程边界生成两套话术"]
+    Enough -->|否| Fallback["使用预设且适用的话术或等待处理"]
+
+    Generate --> Validate["检查目标关联、内容和渠道"]
+    Fallback --> Validate
+
+    Validate --> Plan["固化逐目标回复计划"]
+    Plan --> Public["公开回复文案"]
+    Plan --> Private["私信文案"]
+    Plan --> Evidence["知识版本、目标标识与生成记录"]
+
+    Public --> Execute["固定回复流程"]
+    Private --> Execute
+    Evidence --> Execute

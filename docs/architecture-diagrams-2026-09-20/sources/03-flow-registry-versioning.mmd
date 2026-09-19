@@ -1,0 +1,24 @@
+flowchart TB
+    Developer["平台开发者维护流程"]
+    Templates["固定流程模板库"]
+
+    Developer --> Templates
+
+    Templates --> Search["视频搜索流程"]
+    Templates --> CommentCollect["评论采集筛选流程"]
+    Templates --> LiveCollect["直播评论采集流程"]
+    Templates --> CommentReply["评论回复后私信流程"]
+    Templates --> LiveReply["公屏回复后私信流程"]
+
+    Search --> Registry["流程注册表"]
+    CommentCollect --> Registry
+    LiveCollect --> Registry
+    CommentReply --> Registry
+    LiveReply --> Registry
+
+    Registry --> Contract["版本、参数结构、所需能力、结束条件"]
+    Contract --> Model["模型只能引用已有流程编号"]
+    Model --> Request["流程编号、版本与参数"]
+    Request --> Validator["固定规则校验"]
+    Validator --> Instance["生成独立流程实例"]
+    Instance --> Executor["执行对应版本的固定代码"]

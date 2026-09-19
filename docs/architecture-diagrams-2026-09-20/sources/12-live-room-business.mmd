@@ -1,0 +1,31 @@
+flowchart TB
+    Room["直播间与执行账号"]
+    Capture["按固定规则持续监听"]
+    Slice["按时间或数量形成批次"]
+    Queue["去重、有容量上限的事件队列"]
+
+    Room --> Capture --> Slice --> Queue
+
+    Queue --> Fresh{"批次仍在有效时间窗口内？"}
+    Fresh -->|否| Expire["过期处理，不集中补发"]
+    Fresh -->|是| Boundary["流程边界：模型判断与话术准备"]
+    Boundary --> Freeze["固化本批公屏与私信计划"]
+
+    subgraph Reply["固定回复流程：运行中不调用模型"]
+        Public["第一阶段：公屏回复"]
+        PublicState["记录每条公屏回复状态"]
+        Targets["按固定策略形成私信清单"]
+        Private["第二阶段：逐个私信"]
+        Result["返回本批结果"]
+
+        Public --> PublicState --> Targets --> Private --> Result
+    end
+
+    Freeze --> Public
+    Result --> Judge["模型判断"]
+
+    Judge -->|继续| Queue
+    Judge -->|结束任务| Stop["停止后续批次与监听"]
+    Judge -->|等待处理| Hold["保存任务状态"]
+
+    Expire --> Queue

@@ -1,0 +1,28 @@
+flowchart TB
+    Target["本批目标用户"]
+    PublicID["公开回复动作标识"]
+    PrivateID["私信动作标识"]
+
+    Target --> PublicID
+    Target --> PrivateID
+
+    PublicID --> PublicPhase["在公开回复阶段执行"]
+    PrivateID --> PrivatePhase["在私信阶段执行"]
+
+    PublicPhase --> Gate["统一动作校验"]
+    PrivatePhase --> Gate
+
+    Gate --> Existing{"该动作是否已有记录？"}
+    Existing -->|已完成| Skip["读取原结果，不重复执行"]
+    Existing -->|结果未知| Verify["核对已有结果或转人工"]
+    Existing -->|未执行| Reserve["持久化动作与目标预留"]
+
+    Reserve --> Start["记录开始执行"]
+    Start --> Tool["调用指定发送工具"]
+    Tool --> Result{"返回状态"}
+
+    Result -->|可靠结果已确认| Confirmed["记录已确认"]
+    Result -->|明确未提交或被拒绝| Failed["记录失败及是否允许后续重试"]
+    Result -->|证据不足或中途断连| Unknown["记录未知，不重新点击发送"]
+
+    Unknown --> Verify

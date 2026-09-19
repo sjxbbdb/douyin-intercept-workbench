@@ -1,0 +1,27 @@
+flowchart TD
+    Error["执行器检测到异常"]
+    Classify{"固定规则判断异常类型"}
+
+    Error --> Classify
+
+    Classify -->|可安全重试的短暂故障| Retry["最多重试三次<br/>间隔五秒、十五秒、三十秒"]
+    Retry --> Success{"是否恢复？"}
+    Success -->|是| Continue["继续原流程"]
+    Success -->|否，次数耗尽| Save["持久化现场与失败原因"]
+
+    Classify -->|登录、验证、授权或额度问题| Save
+    Classify -->|发送结果未知| Unknown["隔离该动作，禁止自动重发"]
+    Unknown --> Save
+
+    Save --> Notify["通知客户并显示处理入口"]
+    Notify --> Waiting["等待人工处理"]
+    Waiting --> Detect["轻量监测对应问题"]
+
+    Detect --> Check{"连续两次恢复检查通过？"}
+    Check -->|否| Waiting
+    Check -->|是| State{"任务是否仍允许自动恢复？"}
+
+    State -->|用户已暂停或停止| Keep["保持用户选择"]
+    State -->|允许恢复| Restore["核对账号、版本、授权与未决动作"]
+    Restore --> Resume["读取检查点，接续安全步骤"]
+    Resume --> Continue

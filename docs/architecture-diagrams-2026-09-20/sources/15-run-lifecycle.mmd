@@ -1,0 +1,30 @@
+stateDiagram-v2
+    state "待准备" as Preparing
+    state "待校验" as Validating
+    state "计划已固化" as Sealed
+    state "排队等待执行" as Queued
+    state "独立执行中" as Running
+    state "流程结果已保存" as Reported
+    state "等待模型判断下一轮" as Decision
+    state "固化等待人工" as Human
+    state "用户主动暂停" as Paused
+    state "已停止" as Stopped
+
+    [*] --> Preparing
+    Preparing --> Validating: 参数及所需话术准备完成
+    Validating --> Preparing: 返回可修正的问题
+    Validating --> Sealed: 校验通过
+    Sealed --> Queued
+    Queued --> Running: 获得账号与页面执行资源
+
+    Running --> Reported: 本轮完成或按规则结束
+    Reported --> Decision: 通知模型判断
+    Decision --> Preparing: 创建下一轮
+
+    Running --> Human: 固定恢复策略要求人工处理
+    Human --> Running: 修复后通过检查，接续原计划
+
+    Running --> Paused: 用户主动暂停
+    Paused --> Queued: 用户明确继续
+
+    Running --> Stopped: 用户停止或任务被撤销
