@@ -47,6 +47,68 @@ const CONSISTENCY = {
 const STALE = ['61200', '124100', 'daily_total_max', 'min_interval_comment_sec',
                'creditPerHour', 'min_days', 'client_too_old'];
 
+/**
+ * ⚠️ 本脚本要在**两种布局**下都能跑，因为这个仓库有两副面孔：
+ *
+ *   · **仓库布局**（开发时的样子）：
+ *       README-DEV.md / AGENTS.md / docs/ / shared/ / plans/ / legacy/ / client/…
+ *   · **交接包布局**（`node scripts/build-handover.js` 产出的样子）：
+ *       00-交付包说明-先读我.md / 01-先读这些/ / 02-需求与架构/ /
+ *       03-契约规范与平台知识/ / 04-开发方案与任务清单/ /
+ *       源码/{client,license-server,shared} / 旧代码-只读参考/ / test/ / scripts/
+ *
+ *   接手人拿到包后的第一件事就是跑本脚本（它在 `00-交付包说明-先读我.md`
+ *   的验证清单里）。如果它只认仓库布局，接手人会看到"缺失 16 份文档"
+ *   加"legacy 不存在"——而包里其实什么都不缺。
+ *   一个会在正确输入上报错的检查脚本，比没有检查更糟。
+ *
+ * 做法：对每个期望文件给出**候选路径列表**，命中任一即算在位。
+ */
+const PATH_ALIASES = {
+  'README-DEV.md': ['README-DEV.md', '01-先读这些/README-DEV.md'],
+  'AGENTS.md': ['AGENTS.md', '01-先读这些/AGENTS.md'],
+  'README.md': ['README.md', '01-先读这些/README.md'],
+  'docs/需求规格.md': ['docs/需求规格.md', '02-需求与架构/需求规格.md'],
+  'docs/架构说明.md': ['docs/架构说明.md', '02-需求与架构/架构说明.md'],
+  'docs/部署指南-服务端.md': ['docs/部署指南-服务端.md', '02-需求与架构/部署指南-服务端.md'],
+  'docs/合作方须知.html': ['docs/合作方须知.html', '02-需求与架构/合作方须知.html'],
+  'docs/抖音自动回复助手-合作方须知.pdf': [
+    'docs/抖音自动回复助手-合作方须知.pdf', '02-需求与架构/抖音自动回复助手-合作方须知.pdf',
+  ],
+  'shared/protocol.md': ['shared/protocol.md', '源码/shared/protocol.md', '03-契约规范与平台知识/protocol.md'],
+  'shared/术语与选型基准.md': ['shared/术语与选型基准.md', '源码/shared/术语与选型基准.md', '03-契约规范与平台知识/术语与选型基准.md'],
+  'shared/开发规范.md': ['shared/开发规范.md', '源码/shared/开发规范.md', '03-契约规范与平台知识/开发规范.md'],
+  'shared/安全与合规要求.md': ['shared/安全与合规要求.md', '源码/shared/安全与合规要求.md', '03-契约规范与平台知识/安全与合规要求.md'],
+  'shared/已知陷阱与平台知识.md': ['shared/已知陷阱与平台知识.md', '源码/shared/已知陷阱与平台知识.md', '03-契约规范与平台知识/已知陷阱与平台知识.md'],
+  'shared/测试策略.md': ['shared/测试策略.md', '源码/shared/测试策略.md', '03-契约规范与平台知识/测试策略.md'],
+  'shared/AI协作开发指引.md': ['shared/AI协作开发指引.md', '源码/shared/AI协作开发指引.md', '03-契约规范与平台知识/AI协作开发指引.md'],
+  'plans/00-两方案对比与选型建议.md': ['plans/00-两方案对比与选型建议.md', '04-开发方案与任务清单/00-两方案对比与选型建议.md'],
+  'plans/A-工具链路开发指导.md': ['plans/A-工具链路开发指导.md', '04-开发方案与任务清单/A-工具链路开发指导.md'],
+  'plans/A-分阶段任务清单.md': ['plans/A-分阶段任务清单.md', '04-开发方案与任务清单/A-分阶段任务清单.md'],
+  'plans/B-Agent开发指导.md': ['plans/B-Agent开发指导.md', '04-开发方案与任务清单/B-Agent开发指导.md'],
+  'plans/B-工具契约与粒度设计.md': ['plans/B-工具契约与粒度设计.md', '04-开发方案与任务清单/B-工具契约与粒度设计.md'],
+  'plans/B-评估集与成本模型.md': ['plans/B-评估集与成本模型.md', '04-开发方案与任务清单/B-评估集与成本模型.md'],
+  'plans/B-与方案A的差异说明.md': ['plans/B-与方案A的差异说明.md', '04-开发方案与任务清单/B-与方案A的差异说明.md'],
+  'plans/B-分阶段任务清单.md': ['plans/B-分阶段任务清单.md', '04-开发方案与任务清单/B-分阶段任务清单.md'],
+}
+
+/** 在候选路径里找第一个存在的，返回相对路径或 null。 */
+function resolveDoc(rel) {
+  const cands = PATH_ALIASES[rel] || [rel]
+  for (const c of cands) {
+    if (fs.existsSync(path.join(ROOT, c))) return c
+  }
+  return null
+}
+
+/** legacy 的两副面孔。 */
+function resolveLegacyDir() {
+  for (const c of ['legacy', '旧代码-只读参考']) {
+    if (fs.existsSync(path.join(ROOT, c))) return c
+  }
+  return null
+}
+
 function main() {
   let fail = 0;
   console.log('═'.repeat(72));
@@ -57,10 +119,12 @@ function main() {
   console.log('\n【1】文档到位情况');
   const missing = [];
   for (const [rel, desc] of EXPECTED) {
-    const p = path.join(ROOT, rel);
-    if (fs.existsSync(p)) {
-      const kb = (fs.statSync(p).size / 1024).toFixed(1);
-      console.log(`  ✓ ${rel.padEnd(44)} ${kb.padStart(8)} KB  ${desc}`);
+    const hit = resolveDoc(rel);
+    if (hit) {
+      const kb = (fs.statSync(path.join(ROOT, hit)).size / 1024).toFixed(1);
+      // 命中别名时把真实位置也打出来，避免"我以为它在 docs/ 其实在编号目录"
+      const shown = hit === rel ? rel : `${rel} → ${hit}`;
+      console.log(`  ✓ ${shown.padEnd(60)} ${kb.padStart(8)} KB  ${desc}`);
     } else {
       console.log(`  ✗ ${rel.padEnd(44)} ${'—'.padStart(8)}     ${desc}`);
       missing.push(rel);
@@ -70,8 +134,9 @@ function main() {
 
   // 2. legacy 存档
   console.log('\n【2】legacy/ 只读存档');
-  const legacyDir = path.join(ROOT, 'legacy');
-  if (fs.existsSync(legacyDir)) {
+  const legacyName = resolveLegacyDir();
+  const legacyDir = legacyName ? path.join(ROOT, legacyName) : null;
+  if (legacyDir) {
     let n = 0;
     (function walk(d) {
       for (const e of fs.readdirSync(d, { withFileTypes: true })) {
