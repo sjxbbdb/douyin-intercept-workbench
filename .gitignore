@@ -38,3 +38,10 @@ Thumbs.db
 # Local package manager caches
 .npm/
 .pnpm-store/
+
+# Python probe build/runtime output (keep Python source tracked)
+probe/.venv/
+probe/build/
+probe/dist/
+probe/*.sqlite3
+probe/*.sqlite3-*
