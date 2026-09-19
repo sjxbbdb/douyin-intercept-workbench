@@ -63,3 +63,13 @@ jobs:
         working-directory: desktop
       - run: npm test
         working-directory: desktop
+
+  probe:
+    name: Linux probe unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s probe/tests -p 'test_*.py'

@@ -5,6 +5,9 @@ desktop/node_modules/
 server/dist/
 desktop/dist/
 desktop/release/
+desktop/build/
+desktop/.builder-cache/
+release-local/
 
 # Local runtime state and credentials
 .env
@@ -41,6 +44,7 @@ Thumbs.db
 
 # Python probe build/runtime output (keep Python source tracked)
 probe/.venv/
+probe/.pyinstaller-venv/
 probe/build/
 probe/dist/
 probe/*.sqlite3

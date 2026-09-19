@@ -31,6 +31,7 @@
 - `npm --prefix desktop run check` 通过，包含 15 项桌面基础测试；其中 JsonStore 的 revision/EXDEV fallback 测试通过。独立 `scripts/verify-electron-login.mjs` 已真实启动 Electron，在隔离临时 `userData` 中完成未授权空态和正确登录，renderer 未显示密码/token，错误日志未出现 `EXDEV`；匿名截图写入被忽略的本地目录。
 - 真实 Python sidecar `capabilities` 已通过独立进程 JSONL 检查；真实 desktop `ProbeClient` 已连接真实 `probe/sidecar.py` 完成离线 capabilities 请求；fake sidecar integration 已覆盖搜索、评论、blocked/unknown、噪声、无终态、超时、忙拒绝和切账号取消，当前通过。
 - 在新的 `AppData\Roaming` 临时目录中实测 JsonStore 写入、重启读取和清理通过，`originalAuthTouched=false`；这是实际文件系统检查，和 EXDEV fallback mock 单测分别记录。
+- 候选 Windows 包已做隔离启动验收：portable 与 NSIS installer 均能启动到未授权空态，installer 可静默安装后启动；检查时移除了 `PATH` 与 `DOUYIN_PROBE_PYTHON`。但两个产物均缺少 `resources/probe/probe-agent.exe`，真实 sidecar capabilities 无法运行，按 fail-closed 判定候选包不通过。portable SHA-256 为 `E159893913F1D50096A5438004A6FD521B925C6F499DAAB3A8335A5EC4BBEC11`（2026-09-19 19:22:24，99,986,610 bytes），installer SHA-256 为 `C8943523780A451B4A0C103A96B8D93573187BCA86BBC07E8122EE1C3AED0EB0`（2026-09-19 19:20:05，111,397,015 bytes）。
 - 待确认卡完整展示作者/原评论/目标房间、暂停/停止/删除操作，以及已授权后的真实专用 Chrome 打开/搜索结果选择仍需独立 Electron fixture 回归；本脚本不把外部 Chrome 只读页面检查混入 UI 账号验收。
 - Linux 真实运行需在 WSL Ubuntu 或 GitHub Actions Ubuntu 完成；Windows 安装包仍需实际启动并验证首次空态、登录、离线和错误状态。
 - 视频搜索、评论采集与筛选、评论回复、直播互动和私信触达分别仍需按实际接入方式完成能力级真机验收；若采用官方 API，再单独完成对应资格核验。Electron 安装包、真实自动发送、真实支付和生产部署均未完成。
