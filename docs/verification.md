@@ -2,7 +2,7 @@
 
 更新时间：2026-09-19
 分支：`rewrite/v4-agent`
-记录提交：随本次验证里程碑提交
+记录提交：`ce9214b`
 
 ## 已完成
 
@@ -12,6 +12,7 @@
 - 参考仓库在迁移前运行 `npm test`：L1 单元、L2 契约、L3 脱敏 DOM、L4 集成全部通过；入口明确说明 L5 真机与 L6 长稳不在其范围内。
 - 官方抖音能力资料已完成一手文档核对，结论见 [`reference-audit.md`](reference-audit.md)。
 - `server` TypeScript build 与 12 项服务端测试通过。`scripts/verify-integration.mjs` 的 A/B、并发、provider 失败、过期 hold、AI hold、真实 `ApiClient→TaskEngine` pending/unknown 和 D 会话隔离场景通过；E 已修复并通过，集成入口报告 `Integration contract PASS`。
+- GitHub Actions `v4 CI` run `35442635346` 已成功：Ubuntu server build/tests、Ubuntu probe 21 项、Ubuntu 跨模块集成和 Windows desktop check/tests 全部通过；runner 只报告 actions 使用 Node 20 的弃用提示。
 - 独立 `scripts/verify-electron-login.mjs` 与完整 `scripts/verify-electron-ui.mjs` 已真实启动 Electron。UI 覆盖未授权浏览器操作拒绝、设置地址、错误登录、A 账号授权/积分流水/任务、聚焦表单 heartbeat 保留、退出后 B 账号空数据、回到 A 恢复数据；renderer 未显示密码或 token，截图写入被忽略的本地目录。
 - 只读 Electron 页面检查已解析用户提供的分享链接到 `https://www.douyin.com/video/7682712994194722091`，主文档经历 302→200 且 `didFailLoad` 为空；标题匹配用户提供的视频，页面出现抖音登录弹窗。可见候选节点为 `commentNode=9`、`commentText=0`、`commentAuthor=0`、`commentId=0`、`sendButton=13`、`replyButton=13`；候选节点不等于已采集评论，未执行登录、采集或发送。证据写入被忽略的本地目录，检查时间为 `2026-09-19T09:35:12Z`。
 - PR #1 合并了合作方独立 `probe/` 能力探索工具；合作方记录了视频搜索、评论采集/筛选和私信的实机探索，但该工具没有接入 `server/` 或 `desktop/`，也不改变当前授权和计费契约。PR 的 Linux server CI 成功；Windows desktop 和跨模块 CI 因基线缺少 `desktop/package-lock.json` 而未执行到桌面测试。该记录证明独立 probe 的探索路径，不等于本项目发行能力或服务端计费接线已通过。
