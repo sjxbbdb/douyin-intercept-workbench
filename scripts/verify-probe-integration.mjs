@@ -60,7 +60,8 @@ async function main() {
   assert.equal(search.videos[0].id, 'video-fixture-1');
   const comments = await a.client.request('collect_comments', { url: 'https://www.douyin.com/video/123' });
   assert.equal(comments.events[0].authorId, 'fixture-author');
-  assert.equal(Number.isSafeInteger(comments.events[0].observedAt), true, 'collect_comments observedAt must be an integer timestamp');
+  assert.equal(typeof comments.events[0].observedAt, 'string', 'collect_comments observedAt must preserve the sidecar ISO string');
+  assert.equal(Number.isNaN(Date.parse(comments.events[0].observedAt)), false, 'collect_comments observedAt must be parseable');
   const commentTarget = { id: 'comment-1', roomId: 'https://www.douyin.com/video/123', authorId: 'fixture-author', authorName: 'fixture-user', text: '多少钱' };
   const blocked = await withEnv(a.client, 'FAKE_SIDECAR_SEND_MODE', 'blocked', () => a.client.request('send_comment', { sendId: 'send-blocked', target: commentTarget, text: 'fixture', source: 'video' }));
   assert.equal(blocked.status, 'blocked');

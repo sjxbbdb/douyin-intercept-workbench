@@ -78,9 +78,9 @@ function handle(request) {
         : request.method === 'search'
     ? { status: 'ok', videos: [{ id: 'video-fixture-1', url: 'https://www.douyin.com/video/123', title: 'fixture video', author: 'fixture-author' }] }
     : request.method === 'collect_comments'
-      ? { status: 'ok', events: [{ id: 'comment-fixture-1', source: 'video', roomId: 'https://www.douyin.com/video/123', authorId: 'fixture-author', authorName: 'fixture-user', text: '多少钱', observedAt: Date.now() }] }
+      ? { status: 'ok', events: [{ id: 'comment-fixture-1', source: 'video', roomId: 'https://www.douyin.com/video/123', authorId: 'fixture-author', authorName: 'fixture-user', text: '多少钱', observedAt: new Date().toISOString() }] }
       : request.method === 'collect_live'
-        ? { status: 'ok', events: [{ id: 'live-fixture-1', source: 'live', roomId: 'https://live.douyin.com/123', authorId: 'fixture-author', authorName: 'fixture-user', text: '直播互动', observedAt: Date.now() }] }
+        ? { status: 'ok', events: [{ id: 'live-fixture-1', source: 'live', roomId: 'https://live.douyin.com/123', authorId: 'fixture-author', authorName: 'fixture-user', text: '直播互动', observedAt: new Date().toISOString() }] }
         : { status: mode === 'blocked' ? 'blocked' : mode === 'unknown' ? 'unknown' : 'failed', reason: `fixture-${mode}`, sendId, evidence: { accountId } };
 
   const complete = () => {
