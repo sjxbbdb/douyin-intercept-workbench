@@ -35,4 +35,4 @@ def redact_url(value):
             return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     except Exception:
         pass
-    return "<redacted-url>"\n
+    return "<redacted-url>"

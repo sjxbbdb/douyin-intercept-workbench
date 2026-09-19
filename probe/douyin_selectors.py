@@ -178,4 +178,4 @@ def registry_report():
     for key, meta in REGISTRY.items():
         live = meta["live_verified_at"] or "[未真机验证]"
         rows.append("%-16s confidence=%-6s live=%s  %s" % (key, meta["confidence"], live, meta["value"]))
-    return "\n".join(rows)\n
+    return "\n".join(rows)

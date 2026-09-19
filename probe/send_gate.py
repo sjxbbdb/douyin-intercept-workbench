@@ -251,4 +251,4 @@ class SendGate:
             out["reason"] = detail["reason"]
         if detail.get("evidence") is not None:
             out["evidence"] = detail["evidence"]
-        return out\n
+        return out
