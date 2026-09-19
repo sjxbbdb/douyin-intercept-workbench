@@ -4,6 +4,10 @@
 
 ## 预发行清单
 
+### 4.0.1 本地候选包
+
+4.0.1 修复后台授权刷新时新建/编辑任务表单被退回的问题：空表单失焦、重复刷新和自然 heartbeat 都保留草稿，保存成功后才返回列表，失败时保留输入。portable 与 NSIS installer 已在 Windows 构建，并通过隔离临时 `userData` 的登录、表单回归、正常退出和重启授权恢复验证。portable SHA-256 为 `E0432AE440693E802A28A6361B512A19C345F3BEEB3A3514C6F3C316371A63CA`；NSIS SHA-256 为 `EBA8A4AF1B715969DCAE0239DBAF73EBF1E5E365DE4690E997CB90CF6538C8E4`。启动器已更新为 4.0.1 portable 路径。
+
 - Linux 授权端：Ubuntu Actions 上 `npm ci`、`npm run build`、`npm test`，并完成临时 SQLite 健康检查。
 - Windows 桌面端：先构建并复制完整 sidecar onedir，再执行 `npm ci`、`npm run check`、`npm test`、portable 和 NSIS 构建；两个产物必须使用不同文件名并分别启动一次。
 - 源码 Electron UI 实际检查：临时随机 `userData`，不使用开发机默认 AppData；覆盖积分流水、错误态、账号切换和离线状态，截图和日志不得包含密码、token、兑换码或 provider key。

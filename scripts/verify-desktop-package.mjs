@@ -9,8 +9,10 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const release = join(root, 'desktop', 'release');
-const portable = join(release, '截流自动回复 Agent-4.0.0-x64-portable.exe');
-const installer = join(release, '截流自动回复 Agent-4.0.0-x64-installer.exe');
+const packageJson = JSON.parse(readFileSync(join(root, 'desktop', 'package.json'), 'utf8'));
+const packageVersion = packageJson.version;
+const portable = join(release, `截流自动回复 Agent-${packageVersion}-x64-portable.exe`);
+const installer = join(release, `截流自动回复 Agent-${packageVersion}-x64-installer.exe`);
 const evidenceDir = join(root, 'evidence-private', 'package');
 const reportPath = join(evidenceDir, 'latest-package-check.json');
 
@@ -78,6 +80,18 @@ function killTree(child) {
   if (!child?.pid) return;
   if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
   else child.kill('SIGTERM');
+}
+
+function hideProcessWindow(pid) {
+  if (process.platform !== 'win32' || !pid) return;
+  const script = `$type = Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);' -Name Win32ShowWindow -Namespace PackageVerify -PassThru; $root = ${Number(pid)}; $ids = [System.Collections.Generic.HashSet[int]]::new(); [void]$ids.Add($root); do { $added = $false; foreach ($p in Get-CimInstance Win32_Process | Where-Object { $ids.Contains([int]$_.ParentProcessId) }) { if ($ids.Add([int]$p.ProcessId)) { $added = $true } } } while ($added); $windows = foreach ($id in $ids) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; if ($p -and $p.MainWindowHandle -ne 0) { $before = [bool][User32.User32]::IsWindowVisible($p.MainWindowHandle); [PackageVerify.Win32ShowWindow]::ShowWindow($p.MainWindowHandle, 0) | Out-Null; $after = [bool][User32.User32]::IsWindowVisible($p.MainWindowHandle); [pscustomobject]@{ pid = $id; hidden = (-not $after); wasVisible = $before } } }; $windows | ConvertTo-Json -Compress`;
+  const psInit = "Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);' -Name User32 -Namespace User32 -PassThru | Out-Null;";
+  const command = `${psInit} ${script}`;
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', command], { encoding: 'utf8', windowsHide: true });
+  try {
+    const parsed = JSON.parse(String(result.stdout || '[]'));
+    return Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  } catch { return []; }
 }
 
 function observeChild(child) {
@@ -150,9 +164,13 @@ async function spawnPackage(executable, userData, port, envOverrides = {}) {
   let stderr = '';
   child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
   const page = await waitForPage(port);
+  const hiddenWindows = hideProcessWindow(child.pid);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+  const lateHiddenWindows = hideProcessWindow(child.pid);
+  const windowInfo = [...hiddenWindows, ...lateHiddenWindows].filter((item, index, items) => item?.hidden === true && items.findIndex((candidate) => candidate.pid === item.pid) === index);
   const cdp = new CdpClient(page.webSocketDebuggerUrl);
   await cdp.connect();
-  return { child, cdp, stderr: () => stderr };
+  return { child, cdp, stderr: () => stderr, windowInfo };
 }
 
 async function waitFor(cdp, expression, label, timeoutMs = 20_000) {
@@ -171,6 +189,24 @@ async function fill(cdp, selector, value) {
   assert.equal(ok, true, `package UI field missing: ${selector}`);
 }
 
+async function setFormValue(cdp, name, value) {
+  const ok = await cdp.evaluate(`(() => {
+    const node = document.querySelector(${JSON.stringify(`#task-form [name="${name}"]`)});
+    if (!node) return false;
+    const next = ${JSON.stringify(String(value))};
+    if (node instanceof HTMLSelectElement) node.value = next;
+    else {
+      const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      setter?.call(node, next);
+    }
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+    return node.value === next;
+  })()`);
+  assert.equal(ok, true, `package UI task field missing or rejected: ${name}`);
+}
+
 async function submit(cdp, selector) {
   const ok = await cdp.evaluate(`(() => { const form = document.querySelector(${JSON.stringify(selector)}); if (!form) return false; form.requestSubmit(); return true; })()`);
   assert.equal(ok, true, `package UI form missing: ${selector}`);
@@ -178,6 +214,138 @@ async function submit(cdp, selector) {
 
 async function readState(cdp) {
   return cdp.evaluate(`(() => ({ title: document.title, license: document.querySelector('#license-status')?.textContent || '', login: Boolean(document.querySelector('#login-form')), body: document.body?.innerText || '' }))()`);
+}
+
+async function enablePackageDiagnostics(cdp, windowInfo = []) {
+  await cdp.evaluate(`(() => {
+    window.__packageDiagnostics = { stateEvents: [], actions: [], windowInfo: ${JSON.stringify(windowInfo.filter((item) => item?.hidden === true).map((item) => ({ pid: item.pid, hidden: true })))} };
+    window.agentApi.onState((next) => {
+      const userId = next?.license?.user?.id;
+      window.__packageDiagnostics.stateEvents.push({
+        at: Date.now(),
+        licenseState: next?.license?.state || null,
+        userId: userId == null ? null : String(userId),
+        formPresent: Boolean(document.querySelector('#task-form')),
+        rendererState: typeof state === 'undefined' ? 'unavailable' : { view: state.view || null, editor: Boolean(state.taskEditor), editorUser: state.taskEditor?.license || null, licenseState: state.data?.license?.state || null },
+        activeView: document.querySelector('.nav-item.active')?.dataset?.view || null,
+        licenseHeader: document.querySelector('#license-status')?.textContent || ''
+      });
+    });
+    document.addEventListener('click', (event) => {
+      const node = event.target.closest?.('[data-action], #refresh, [data-view]');
+      if (!node) return;
+      window.__packageDiagnostics.actions.push({ at: Date.now(), type: 'click', action: node.dataset.action || node.id || node.dataset.view || null, isTrusted: event.isTrusted });
+    }, true);
+    document.addEventListener('submit', (event) => {
+      window.__packageDiagnostics.actions.push({ at: Date.now(), type: 'submit', action: event.target?.id || null, isTrusted: event.isTrusted });
+    }, true);
+    return true;
+  })()`);
+}
+
+async function writePackageDiagnostics(label, cdp, failure) {
+  try {
+    const diagnostics = await cdp.evaluate(`(() => ({
+      failure: ${JSON.stringify(failure)},
+      current: {
+        formPresent: Boolean(document.querySelector('#task-form')),
+        rendererState: typeof state === 'undefined' ? 'unavailable' : { view: state.view || null, editor: Boolean(state.taskEditor), editorUser: state.taskEditor?.license || null, licenseState: state.data?.license?.state || null },
+        activeView: document.querySelector('.nav-item.active')?.dataset?.view || null,
+        licenseHeader: document.querySelector('#license-status')?.textContent || '',
+        bodyHasEditor: Boolean(document.querySelector('.form-panel'))
+      },
+      diagnostics: window.__packageDiagnostics || null
+    }))()`);
+    mkdirSync(evidenceDir, { recursive: true });
+    writeFileSync(join(evidenceDir, `package-diagnostics-${label}.json`), `${JSON.stringify(diagnostics, null, 2)}\n`);
+  } catch {}
+}
+
+function sanitizeDiagnosticText(value) {
+  return String(value || '').replace(/(token|password|secret|key|authorization)=?[^\s]+/gi, '$1=[REDACTED]').replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED]').slice(0, 1000);
+}
+
+async function checkTaskEditorRegression(cdp, label, readStderr = () => '', windowInfo = []) {
+  await enablePackageDiagnostics(cdp, windowInfo);
+  await cdp.evaluate('document.querySelector("[data-action=\\"new-task\\"]")?.click()');
+  await waitFor(cdp, 'Boolean(document.querySelector("#task-form"))', `${label} new task editor`);
+
+  // An empty new form must survive the first focus/blur cycle.
+  await cdp.evaluate('(() => { const input = document.querySelector("#task-form [name=url]"); input.focus(); input.blur(); return Boolean(document.querySelector("#task-form")); })()');
+  assert.equal(await cdp.evaluate('Boolean(document.querySelector("#task-form"))'), true, `${label} empty editor lost on blur`);
+
+  const values = {
+    url: 'https://www.douyin.com/video/package-regression',
+    source: 'video',
+    contactMode: 'comment',
+    decisionMode: 'rule',
+    businessContext: '验证用本地测试商品',
+    targetCustomer: '验证用测试客户',
+    keywords: '价格，套餐',
+    excludeKeywords: '投诉，退款',
+    replyTemplate: '这是验证用人工回复模板。',
+    replyInstructions: '验证用话术要求，不调用生成。',
+    mode: 'manual',
+    intervalMs: '31000',
+    maxActions: '7',
+    dailyLimit: '9'
+  };
+  for (const [name, value] of Object.entries(values)) await setFormValue(cdp, name, value);
+
+  // Exercise the IPC directly three times, then exercise the visible refresh button.
+  await cdp.evaluate('window.__packageStateEvents = 0; window.agentApi.onState(() => { window.__packageStateEvents += 1; });');
+  await cdp.evaluate('(async () => { for (let i = 0; i < 3; i += 1) await window.agentApi.refreshLicense(); })()');
+  await waitFor(cdp, 'window.__packageStateEvents >= 3', `${label} repeated refreshLicense IPC`);
+  const beforeButtonRefresh = await cdp.evaluate('window.__packageStateEvents');
+  await cdp.evaluate('document.querySelector("#refresh")?.click()');
+  await waitFor(cdp, `window.__packageStateEvents >= ${beforeButtonRefresh + 1}`, `${label} refresh button`);
+  assert.equal(await cdp.evaluate('Boolean(document.querySelector("#task-form"))'), true, `${label} refresh discarded task editor`);
+  assert.equal(await cdp.evaluate('document.querySelector("#task-form [name=businessContext]")?.value'), values.businessContext, `${label} refresh discarded task values`);
+
+  // The production heartbeat is a 30s interval. Keep the editor open through a natural heartbeat.
+  const heartbeatStart = Date.now();
+  const eventBaseline = await cdp.evaluate('window.__packageStateEvents');
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 35_500));
+  const heartbeatElapsedMs = Date.now() - heartbeatStart;
+  const heartbeatEvents = await cdp.evaluate('window.__packageStateEvents - ' + eventBaseline);
+  assert.equal(heartbeatElapsedMs >= 35_000, true, `${label} heartbeat observation was shorter than 35s`);
+  assert.equal(heartbeatEvents >= 1, true, `${label} natural heartbeat emitted no state event`);
+  const editorAfterHeartbeat = await cdp.evaluate('Boolean(document.querySelector("#task-form"))');
+  if (!editorAfterHeartbeat) {
+    await writePackageDiagnostics(label, cdp, { phase: 'heartbeat', heartbeatElapsedMs, heartbeatEvents, stderr: sanitizeDiagnosticText(readStderr()) });
+  }
+  assert.equal(editorAfterHeartbeat, true, `${label} heartbeat discarded task editor`);
+
+  await submit(cdp, '#task-form');
+  await waitFor(cdp, 'window.agentApi.getState().then((next) => next.tasks.some((item) => item.businessContext === "验证用本地测试商品"))', `${label} save task state`);
+  await waitFor(cdp, '!document.querySelector("#task-form")', `${label} save task list`);
+  const saved = await cdp.evaluate('window.agentApi.getState()');
+  const task = saved.tasks.find((item) => item.businessContext === '验证用本地测试商品');
+  assert.ok(task, `${label} saved task missing`);
+  assert.equal(task.mode, 'manual', `${label} test task must remain manual`);
+  assert.equal(task.url, values.url, `${label} saved task URL mismatch`);
+  assert.equal(task.source, values.source, `${label} saved task source mismatch`);
+  assert.equal(task.contactMode, values.contactMode, `${label} saved task contact mode mismatch`);
+  assert.equal(task.decisionMode, values.decisionMode, `${label} saved task decision mode mismatch`);
+  assert.equal(task.businessContext, values.businessContext, `${label} saved task business context mismatch`);
+  assert.equal(task.targetCustomer, values.targetCustomer, `${label} saved task target customer mismatch`);
+  assert.deepEqual(task.keywords, ['价格', '套餐'], `${label} saved task keywords mismatch`);
+  assert.deepEqual(task.excludeKeywords, ['投诉', '退款'], `${label} saved task exclude keywords mismatch`);
+  assert.equal(task.replyTemplate, values.replyTemplate, `${label} saved task reply template mismatch`);
+  assert.equal(task.replyInstructions, values.replyInstructions, `${label} saved task reply instructions mismatch`);
+  assert.equal(task.intervalMs, Number(values.intervalMs), `${label} saved task interval mismatch`);
+  assert.equal(task.maxActions, Number(values.maxActions), `${label} saved task max actions mismatch`);
+  assert.equal(task.dailyLimit, Number(values.dailyLimit), `${label} saved task daily limit mismatch`);
+  await cdp.evaluate(`window.agentApi.setTaskStatus({ id: ${JSON.stringify(task.id)}, status: 'stopped' })`);
+  await waitFor(cdp, `window.agentApi.getState().then((next) => next.tasks.find((item) => item.id === ${JSON.stringify(task.id)})?.status === 'stopped')`, `${label} stop local test task`);
+  const stopped = await cdp.evaluate(`window.agentApi.getState().then((next) => next.tasks.find((item) => item.id === ${JSON.stringify(task.id)}))`);
+  assert.equal(stopped.status, 'stopped', `${label} test task must remain stopped`);
+
+  await cdp.evaluate(`document.querySelector('[data-action="edit-task"][data-id="${task.id}"]')?.click()`);
+  await waitFor(cdp, 'Boolean(document.querySelector("#task-form"))', `${label} edit task`);
+  assert.equal(await cdp.evaluate('document.querySelector("#task-form [name=businessContext]")?.value'), values.businessContext, `${label} edit task value mismatch`);
+  await cdp.evaluate('document.querySelector("[data-action=cancel-task]")?.click()');
+  await waitFor(cdp, '!document.querySelector("#task-form") && document.body.innerText.includes("验证用本地测试商品")', `${label} cancel edit`);
 }
 
 function readAuthSnapshot(userData) {
@@ -275,6 +443,7 @@ async function launchAndCheck(label, executable, auth = null) {
   const port = await freePort();
   let child;
   let cdp;
+  let windowInfo = [];
   let stderr = '';
   let readStderr;
   let restartChild;
@@ -283,7 +452,7 @@ async function launchAndCheck(label, executable, auth = null) {
   const exitMode = process.env.PACKAGE_EXIT_MODE || 'normal';
   let authResult = { tested: false, restarted: false, exitMode };
   try {
-    ({ child, cdp, stderr: readStderr } = await spawnPackage(executable, userData, port, auth ? { DOUYIN_LICENSE_API: auth.baseUrl } : {}));
+    ({ child, cdp, stderr: readStderr, windowInfo } = await spawnPackage(executable, userData, port, auth ? { DOUYIN_LICENSE_API: auth.baseUrl } : {}));
     let state;
     const stateDeadline = Date.now() + 20_000;
     while (Date.now() < stateDeadline) {
@@ -310,6 +479,7 @@ async function launchAndCheck(label, executable, auth = null) {
       await fill(cdp, '#login-form input[name="password"]', auth.password);
       await submit(cdp, '#login-form');
       await waitFor(cdp, `document.querySelector('#license-status')?.textContent.startsWith('已授权至')`, `${label} relogin`);
+      await checkTaskEditorRegression(cdp, label, readStderr, windowInfo);
       authResult.beforeStop = readAuthSnapshot(userData);
       authResult.shutdown = await closePackageWindow({ cdp, child, port, mode: exitMode });
       authResult.afterStop = readAuthSnapshot(userData);
@@ -320,7 +490,7 @@ async function launchAndCheck(label, executable, auth = null) {
       authResult.tested = true;
       authResult.restarted = true;
     }
-    return { label, userData, state, stderrLength: stderr.length, stderrPreview: stderr.slice(0, 500), sidecarProbe: { transport: sidecarProbe.transport, capabilityKeys: Object.keys(sidecarProbe.capability || {}).sort(), verified: sidecarProbe.verified }, auth: authResult };
+    return { label, userData, state, stderrLength: stderr.length, stderrPreview: sanitizeDiagnosticText(stderr), windowInfo: windowInfo.filter((item) => item?.hidden === true).map((item) => ({ pid: item.pid, hidden: true })), sidecarProbe: { transport: sidecarProbe.transport, capabilityKeys: Object.keys(sidecarProbe.capability || {}).sort(), verified: sidecarProbe.verified }, auth: authResult };
   } catch (error) {
     error.message = `${error.message}; auth=${JSON.stringify(authResult)}; currentAuth=${JSON.stringify(readAuthSnapshot(userData))}; packageUserData=${userData}; restartStderr=${readRestartStderr().slice(0, 1000)}`;
     throw error;

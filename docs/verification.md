@@ -6,6 +6,9 @@
 
 ## 已完成
 
+- 4.0.1 Windows 包回归：`desktop` check 16 项通过；portable 与 NSIS 均构建成功。实际包隔离验证覆盖新建空表单失焦、全字段填写、3 次 `refreshLicense` IPC、刷新按钮、35 秒自然 heartbeat、保存后列表、编辑/取消；任务保持 `manual/stopped`，未打开真实页面或调用生成/发送。portable 与 NSIS 均完成正常 `window.close()`、进程 `exitCode=0`、CDP 端口关闭和同一隔离 `userData` 重启授权恢复；随包 sidecar 五项能力与 installer `protocolVersion=1` 通过。源 Electron fixture 5 组回归通过；原 `344cb37` 可重现编辑器被后台状态更新退回，修复后后台刷新不保存草稿、保存成功才返回列表。
+- 4.0.1 产物 SHA-256：portable `E0432AE440693E802A28A6361B512A19C345F3BEEB3A3514C6F3C316371A63CA`；NSIS installer `EBA8A4AF1B715969DCAE0239DBAF73EBF1E5E365DE4690E997CB90CF6538C8E4`。本次验证报告保存在被忽略的 `evidence-private/package/latest-package-check.json`；4.0.0 历史哈希记录保持不变。
+
 - GitHub CLI 已登录并成功克隆私有参考仓库；旧实现已整体迁移到 `archive/v3/`，新根契约与旧运行时代码分离。
 - 根 `package.json`、`server/package.json`、`desktop/package.json` 均可被 Node JSON 解析。
 - 根级 `git diff --check` 与 staged diff 检查通过。

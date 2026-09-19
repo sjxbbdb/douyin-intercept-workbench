@@ -1,6 +1,6 @@
 {
   "name": "douyin-intercept-agent-desktop",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Windows desktop agent for licensed Douyin comment lead capture and reply workflows",
   "private": true,
   "main": "src/main.js",
@@ -12,6 +12,7 @@
     "start": "electron .",
     "test": "node test/run.js",
     "test:dom": "electron test/dom-fixture.js",
+    "test:task-editor": "node test/task-editor-launcher.js",
     "check": "node test/check-syntax.js && node test/run.js",
     "test:probe-runtime": "node test/check-probe-runtime.js",
     "test:probe-lifecycle": "node test/probe-bridge-lifecycle.js",

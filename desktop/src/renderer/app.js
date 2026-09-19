@@ -1,6 +1,6 @@
 'use strict';
 
-const state = { view: 'tasks', data: null, ledger: [], endpoint: '', draftUrl: '' };
+const state = { view: 'tasks', data: null, ledger: [], endpoint: '', draftUrl: '', taskEditor: null };
 const UNVERIFIED_CANDIDATE = { commentNode: '[data-e2e="comment-item"], [data-e2e="comment-list"] [role="listitem"]', commentText: '[data-e2e="comment-text"]', commentAuthor: '[data-e2e="comment-author"]', commentId: '[data-comment-id]', replyInput: 'textarea, [contenteditable="true"]', sendButton: 'button', replyButton: 'button' };
 const $ = (selector) => document.querySelector(selector);
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -10,6 +10,8 @@ const creditKind = (value) => ({ admin_credit: '管理员充值', redeem: '兑�
 const notify = (message, kind = 'info') => { const node = $('#notice'); node.textContent = message; node.dataset.kind = kind; node.hidden = false; window.setTimeout(() => { node.hidden = true; }, 5000); };
 const clientError = (error) => { const message = String(error?.message || '操作失败'); if (/IPC|sender|stack|Cannot|undefined|TypeError/i.test(message)) return '桌面状态暂时不可用，请稍后重试'; return message; };
 const call = async (action, ...args) => { try { const result = await action(...args); await refresh(); return result; } catch (error) { console.error('[desktop-ui]', error); notify(clientError(error), 'error'); throw error; } };
+const licenseIdentity = (license) => license?.user?.id || license?.user?.username || license?.user?.email || null;
+const openTaskEditor = (task = {}) => { state.taskEditor = { license: licenseIdentity(state.data?.license), submitting: false }; $('#content').innerHTML = taskForm(task); bind(); };
 
 async function refresh() {
   state.data = await window.agentApi.getState();
@@ -53,21 +55,76 @@ function renderLogs() { const logs = state.data?.logs || []; const events = stat
 function renderCredits() { const ledger = state.ledger || []; const prices = state.data?.license?.features?.prices || {}; return `<div class="toolbar"><div><p class="eyebrow">服务端台账</p><h2>积分</h2></div><button class="quiet" data-action="load-ledger">刷新台账</button></div><section class="credit-grid"><div class="metric"><small>当前余额</small><strong>${state.data?.license?.balance ?? '--'}</strong><span>由授权中心实时返回</span></div><div class="metric"><small>规则模板</small><strong>${prices.evaluateReplyPrice ?? '--'} 积分</strong><span>未命中不扣费</span></div><div class="metric"><small>Agent 意向判断</small><strong>${prices.draftPrice ?? '--'} 积分</strong><span>${state.data?.license?.features?.draft ? '按服务端生成结果计费' : '未配置，当前不可选'}</span></div></section><section class="redeem panel"><form id="redeem-form"><label>兑换码<input name="code" required placeholder="输入授权中心提供的兑换码"></label><button class="primary">兑换积分</button></form></section><section class="table-panel"><table><thead><tr><th>时间</th><th>类型</th><th>变化</th><th>余额</th></tr></thead><tbody>${ledger.length ? ledger.map((row) => `<tr><td>${escapeHtml(formatDate(row.createdAt))}</td><td>${escapeHtml(creditKind(row.kind))}</td><td>${escapeHtml(row.delta ?? '')}</td><td>${escapeHtml(row.balanceAfter ?? '')}</td></tr>`).join('') : `<tr><td colspan="4"><div class="empty-state"><h3>暂时没有台账</h3><p>登录后可从授权中心读取积分明细。</p></div></td></tr>`}</tbody></table></section>`; }
 function renderSettings() { const p = state.data?.selectorProfile || {}; return `<div class="toolbar"><div><p class="eyebrow">连接与校准</p><h2>设置</h2></div></div><section class="panel form-panel"><form id="endpoint-form" class="inline-form"><label>授权中心地址<input name="endpoint" type="url" value="${escapeHtml(state.endpoint)}" required></label><button class="primary">保存地址并重新登录</button></form><p class="helper">生产环境必须 HTTPS。修改地址会清除原地址绑定的登录会话。</p></section><section class="panel form-panel"><div class="section-heading"><div><p class="eyebrow">侧车检索</p><h2>按关键词找目标视频</h2><p class="muted">搜索只返回候选，不会自动创建任务或发送；请把确认过的 URL 作为任务目标。</p></div></div><form id="search-form" class="inline-form"><label>关键词<input name="keyword" maxlength="200" required placeholder="例如：我的世界暴雨末日"></label><label>最多结果<input name="maxVideos" type="number" min="1" max="100" value="20"></label><button class="quiet">搜索候选</button></form><div id="search-results" class="helper"></div></section><section class="panel form-panel"><div class="section-heading"><div><p class="eyebrow">选择器校准</p><h2>先打开目标页面，再探测可见节点</h2><p class="muted">可载入一组未验证候选，探测当前页面的可见匹配数和样例。保存前必须由你确认当前目标和回复控件。</p></div><div class="toolbar-actions"><button class="quiet" data-action="load-candidate">载入候选</button><button class="quiet" data-action="probe">探测当前页面</button></div></div><details><summary>高级适配配置</summary><form id="selector-form" class="form-grid"><label>评论节点 CSS<input name="commentNode" value="${escapeHtml(p.commentNode || '')}" placeholder="候选或自定义 CSS"></label><label>评论文本 CSS<input name="commentText" value="${escapeHtml(p.commentText || '')}"></label><label>作者 CSS<input name="commentAuthor" value="${escapeHtml(p.commentAuthor || '')}"></label><label>评论 ID CSS<input name="commentId" value="${escapeHtml(p.commentId || '')}"></label><label>回复输入框 CSS<input name="replyInput" value="${escapeHtml(p.replyInput || '')}"></label><label>发送按钮 CSS<input name="sendButton" value="${escapeHtml(p.sendButton || '')}"></label><label>视频评论回复按钮 CSS<input name="replyButton" value="${escapeHtml(p.replyButton || '')}"></label><div class="form-foot span-2"><button class="primary" type="submit">保存校准结果</button><span id="probe-result" class="helper">${p.verified ? `已记录 ${escapeHtml(p.verifiedAt)}` : '未校准'}</span></div></form></details></section>`; }
 
-function render() { renderHeader(); document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.view === state.view)); const licensed = state.data?.license?.state === 'authorized'; $('#content').innerHTML = (!licensed && state.view !== 'settings') ? renderLogin() : state.view === 'tasks' ? renderTasks() : state.view === 'leads' ? renderLeads() : state.view === 'logs' ? renderLogs() : state.view === 'credits' ? renderCredits() : renderSettings(); bind(); }
+function render() {
+  renderHeader();
+  document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.view === state.view));
+  const licensed = state.data?.license?.state === 'authorized';
+  const sameAccount = state.taskEditor?.license == null || state.taskEditor.license === licenseIdentity(state.data?.license);
+  if (state.taskEditor && licensed && sameAccount) return;
+  if (state.taskEditor && (!licensed || !sameAccount)) {
+    state.taskEditor = null;
+    state.draftUrl = '';
+  }
+  $('#content').innerHTML = (!licensed && state.view !== 'settings') ? renderLogin() : state.view === 'tasks' ? renderTasks() : state.view === 'leads' ? renderLeads() : state.view === 'logs' ? renderLogs() : state.view === 'credits' ? renderCredits() : renderSettings();
+  bind();
+}
 
 function formDataToTask(form) { const data = new FormData(form); const value = Object.fromEntries(data.entries()); return { ...value, keywords: value.keywords.split(/[，,\n]/).map((item) => item.trim()).filter(Boolean), excludeKeywords: value.excludeKeywords.split(/[，,\n]/).map((item) => item.trim()).filter(Boolean), intervalMs: Number(value.intervalMs), dailyLimit: Number(value.dailyLimit), maxActions: Number(value.maxActions) }; }
 function profileFromForm(form) { return Object.fromEntries(new FormData(form).entries()); }
 function bind() {
-  $('#nav').onclick = (event) => { const button = event.target.closest('[data-view]'); if (!button) return; state.view = button.dataset.view; document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item === button)); render(); };
+  $('#nav').onclick = (event) => { const button = event.target.closest('[data-view]'); if (!button) return; state.taskEditor = null; state.draftUrl = ''; state.view = button.dataset.view; document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item === button)); render(); };
   $('#refresh').onclick = () => call(window.agentApi.refreshLicense);
-  $('#content').onclick = async (event) => { const button = event.target.closest('[data-action]'); if (!button) return; const action = button.dataset.action; if (action === 'new-task') { state.draftUrl = ''; $('#content').innerHTML = taskForm(); bind(); return; } if (action === 'cancel-task') { state.view = 'tasks'; state.draftUrl = ''; render(); return; } if (action === 'edit-task') { const task = state.data.tasks.find((item) => item.id === button.dataset.id); $('#content').innerHTML = taskForm(task); bind(); return; } if (action === 'import-demo') { await call(window.agentApi.saveTask, { url: 'https://www.douyin.com/video/example', source: 'video', businessContext: '演示配置，不含真实数据', targetCustomer: '待配置', keywords: ['价格'], excludeKeywords: ['投诉'], replyTemplate: '这是演示模板，请先完成配置。', replyInstructions: '演示配置，不会自动发送', mode: 'manual', decisionMode: 'rule', intervalMs: 30000, dailyLimit: 20, maxActions: 20, status: 'stopped' }); notify('示例配置已导入，未创建演示评论或发送记录'); return; } if (action === 'search-open') { await call(window.agentApi.openTarget, button.dataset.url); notify('已在专用 Chrome 打开候选页面，请手动登录抖音'); return; } if (action === 'search-use') { state.draftUrl = button.dataset.url; state.view = 'tasks'; $('#content').innerHTML = taskForm({ url: button.dataset.url, source: 'video' }); bind(); return; } if (action === 'open-browser') { await call(window.agentApi.openTarget, button.dataset.url); notify('专用窗口已打开，请手动登录抖音'); return; } if (action === 'task-status') { await call(window.agentApi.setTaskStatus, { id: button.dataset.id, status: button.dataset.status }); return; } if (action === 'confirm') { await call(window.agentApi.confirmAction, button.dataset.id); return; } if (action === 'retry-draft') { await call(window.agentApi.retryDraft, button.dataset.eventKey); return; } if (action === 'load-ledger') { const response = await window.agentApi.getLedger(); state.ledger = Array.isArray(response) ? response : (response.entries || response.items || []); render(); return; } if (action === 'load-candidate') { const form = $('#selector-form'); for (const [key, value] of Object.entries(UNVERIFIED_CANDIDATE)) form.elements[key].value = value; notify('已载入未验证候选，请先探测并确认样例'); return; } if (action === 'probe') { const form = $('#selector-form'); const result = await call(window.agentApi.probeSelectors, profileFromForm(form)); if (result.transport === 'sidecar') { const entries = Object.entries(result.capability || {}).map(([key, item]) => `${key}：${item.implemented ? '已实现' : '未实现'}；自动资格 ${item.autoEligible === true ? '允许' : '未开放'}；验证来源 ${item.validation?.status || item.evidence || '未提供'}`); $('#probe-result').textContent = `外部专用 Chrome 运行组件：${result.verified ? '已实现' : '未声明'}；${entries.join(' ｜ ') || result.diagnostics || '无能力明细'}。页面送达仍须运行时平台响应确认。`; } else $('#probe-result').textContent = `当前可见匹配 评论 ${result.commentNode || 0}，输入框 ${result.replyInput || 0}，发送按钮 ${result.sendButton || 0}，样例 ${result.sample?.join(' / ') || '无'}`; return; } };
+  $('#content').onclick = async (event) => { const button = event.target.closest('[data-action]'); if (!button) return; const action = button.dataset.action; if (action === 'new-task') { state.draftUrl = ''; openTaskEditor(); return; } if (action === 'cancel-task') { state.taskEditor = null; state.view = 'tasks'; state.draftUrl = ''; render(); return; } if (action === 'edit-task') { const task = state.data.tasks.find((item) => item.id === button.dataset.id); openTaskEditor(task); return; } if (action === 'import-demo') { await call(window.agentApi.saveTask, { url: 'https://www.douyin.com/video/example', source: 'video', businessContext: '演示配置，不含真实数据', targetCustomer: '待配置', keywords: ['价格'], excludeKeywords: ['投诉'], replyTemplate: '这是演示模板，请先完成配置。', replyInstructions: '演示配置，不会自动发送', mode: 'manual', decisionMode: 'rule', intervalMs: 30000, dailyLimit: 20, maxActions: 20, status: 'stopped' }); notify('示例配置已导入，未创建演示评论或发送记录'); return; } if (action === 'search-open') { await call(window.agentApi.openTarget, button.dataset.url); notify('已在专用 Chrome 打开候选页面，请手动登录抖音'); return; } if (action === 'search-use') { state.draftUrl = button.dataset.url; state.view = 'tasks'; openTaskEditor({ url: button.dataset.url, source: 'video' }); return; } if (action === 'open-browser') { await call(window.agentApi.openTarget, button.dataset.url); notify('专用窗口已打开，请手动登录抖音'); return; } if (action === 'task-status') { await call(window.agentApi.setTaskStatus, { id: button.dataset.id, status: button.dataset.status }); return; } if (action === 'confirm') { await call(window.agentApi.confirmAction, button.dataset.id); return; } if (action === 'retry-draft') { await call(window.agentApi.retryDraft, button.dataset.eventKey); return; } if (action === 'load-ledger') { const response = await window.agentApi.getLedger(); state.ledger = Array.isArray(response) ? response : (response.entries || response.items || []); render(); return; } if (action === 'load-candidate') { const form = $('#selector-form'); for (const [key, value] of Object.entries(UNVERIFIED_CANDIDATE)) form.elements[key].value = value; notify('已载入未验证候选，请先探测并确认样例'); return; } if (action === 'probe') { const form = $('#selector-form'); const result = await call(window.agentApi.probeSelectors, profileFromForm(form)); if (result.transport === 'sidecar') { const entries = Object.entries(result.capability || {}).map(([key, item]) => `${key}：${item.implemented ? '已实现' : '未实现'}；自动资格 ${item.autoEligible === true ? '允许' : '未开放'}；验证来源 ${item.validation?.status || item.evidence || '未提供'}`); $('#probe-result').textContent = `外部专用 Chrome 运行组件：${result.verified ? '已实现' : '未声明'}；${entries.join(' ｜ ') || result.diagnostics || '无能力明细'}。页面送达仍须运行时平台响应确认。`; } else $('#probe-result').textContent = `当前可见匹配 评论 ${result.commentNode || 0}，输入框 ${result.replyInput || 0}，发送按钮 ${result.sendButton || 0}，样例 ${result.sample?.join(' / ') || '无'}`; return; } };
   const login = $('#login-form'); if (login) login.onsubmit = async (event) => { event.preventDefault(); const value = Object.fromEntries(new FormData(login).entries()); await call(window.agentApi.login, value); notify('登录成功'); };
-  const task = $('#task-form'); if (task) task.onsubmit = async (event) => { event.preventDefault(); await call(window.agentApi.saveTask, formDataToTask(task)); notify('任务已保存'); };
+  const task = $('#task-form');
+  if (task) task.onsubmit = async (event) => {
+    event.preventDefault();
+    const editor = state.taskEditor;
+    if (!editor || editor.submitting) return;
+    const submit = task.querySelector('button[type="submit"]');
+    editor.submitting = true;
+    if (submit) submit.disabled = true;
+    try {
+      await call(window.agentApi.saveTask, formDataToTask(task));
+      if (state.taskEditor === editor) {
+        state.taskEditor = null;
+        state.draftUrl = '';
+        render();
+        notify('任务已保存');
+      }
+    } catch (_error) {
+      // call() already reports the user-facing error; keep the draft in place.
+    } finally {
+      editor.submitting = false;
+      if (state.taskEditor === editor && submit) submit.disabled = false;
+    }
+  };
   const redeem = $('#redeem-form'); if (redeem) redeem.onsubmit = async (event) => { event.preventDefault(); await call(window.agentApi.redeem, new FormData(redeem).get('code')); notify('兑换结果已更新'); };
   const endpoint = $('#endpoint-form'); if (endpoint) endpoint.onsubmit = async (event) => { event.preventDefault(); await call(window.agentApi.setEndpoint, new FormData(endpoint).get('endpoint')); notify('地址已保存，请重新登录'); };
   const search = $('#search-form'); if (search) search.onsubmit = async (event) => { event.preventDefault(); const value = Object.fromEntries(new FormData(search).entries()); const result = await call(window.agentApi.searchTargets, { keyword: value.keyword, maxVideos: Number(value.maxVideos), scrollRounds: 2 }); $('#search-results').innerHTML = result.videos?.length ? result.videos.map((video) => `<p><strong>${escapeHtml(video.title || video.url)}</strong> <button class="quiet" data-action="search-open" data-url="${escapeHtml(video.url)}">在专用 Chrome 打开</button> <button class="quiet" data-action="search-use" data-url="${escapeHtml(video.url)}">带入新任务</button></p>`).join('') : '没有候选结果'; };
   const selectors = $('#selector-form'); if (selectors) selectors.onsubmit = async (event) => { event.preventDefault(); await call(window.agentApi.saveSelectors, profileFromForm(selectors)); notify('选择器已校准并保存'); };
 }
 
-window.agentApi.onState((next) => { state.data = next; const editing = $('#content')?.querySelector('input:focus, textarea:focus, select:focus'); if (editing) renderHeader(); else render(); });
+window.agentApi.onState((next) => {
+  const previousLicense = state.data?.license;
+  state.data = next;
+  const licensed = next?.license?.state === 'authorized';
+  const licenseChanged = Boolean(previousLicense) && (previousLicense.state !== next?.license?.state || licenseIdentity(previousLicense) !== licenseIdentity(next?.license));
+  const sameAccount = state.taskEditor?.license == null || state.taskEditor.license === licenseIdentity(next?.license);
+  if (licenseChanged || (state.taskEditor && (!licensed || !sameAccount))) {
+    render();
+    return;
+  }
+  if (state.taskEditor && licensed && sameAccount) {
+    renderHeader();
+    return;
+  }
+  if (state.taskEditor) {
+    render();
+    return;
+  }
+  const editing = $('#content')?.querySelector('input:focus, textarea:focus, select:focus');
+  if (editing) renderHeader();
+  else render();
+});
 refresh().catch((error) => { console.error('[desktop-ui] initial state', error); notify(clientError(error), 'error'); });
