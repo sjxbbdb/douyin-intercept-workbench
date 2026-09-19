@@ -80,6 +80,62 @@ function killTree(child) {
   else child.kill('SIGTERM');
 }
 
+function observeChild(child) {
+  if (!child) return Promise.resolve({ state: 'missing' });
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve({ state: 'exited', exitCode: child.exitCode, signalCode: child.signalCode });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (state, extra = {}) => { if (settled) return; settled = true; resolve({ state, ...extra }); };
+    child.once('exit', (exitCode, signalCode) => finish('exited', { exitCode, signalCode }));
+    child.once('close', (exitCode, signalCode) => finish('closed', { exitCode, signalCode }));
+    child.once('error', (error) => finish('error', { message: error.message }));
+  });
+}
+
+async function waitForObservedChild(observed, timeoutMs = 8_000) {
+  const timeout = new Promise((resolvePromise) => setTimeout(() => resolvePromise({ state: 'timeout' }), timeoutMs));
+  return Promise.race([observed, timeout]);
+}
+
+async function waitForPortClosed(port, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(500) });
+    } catch {
+      return true;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+  }
+  return false;
+}
+
+async function closePackageWindow({ cdp, child, port, mode }) {
+  const observed = observeChild(child);
+  if (mode === 'force') {
+    killTree(child);
+    const processState = await waitForObservedChild(observed);
+    const portClosed = await waitForPortClosed(port);
+    return { mode, processState, portClosed };
+  }
+  let windowClose = 'ack';
+  try {
+    await Promise.race([
+      cdp.evaluate('window.close()'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('window.close timeout')), 3_000))
+    ]);
+  } catch (error) {
+    // Closing the renderer can close the CDP socket before Runtime.evaluate
+    // returns. The process and port observations below are authoritative.
+    windowClose = error.message === 'window.close timeout' ? 'timeout' : 'connection_closed';
+  }
+  cdp.close();
+  const portClosed = await waitForPortClosed(port);
+  const processState = await waitForObservedChild(observed);
+  if (!portClosed) throw new Error(`normal close timeout: CDP port ${port} remained open`);
+  return { mode, windowClose, processState, portClosed };
+}
+
 function cleanEnv(extra = {}) {
   return { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path' && key !== 'DOUYIN_PROBE_PYTHON')), ...extra };
 }
@@ -224,6 +280,8 @@ async function launchAndCheck(label, executable, auth = null) {
   let restartChild;
   let restartCdp;
   let readRestartStderr = () => '';
+  const exitMode = process.env.PACKAGE_EXIT_MODE || 'normal';
+  let authResult = { tested: false, restarted: false, exitMode };
   try {
     ({ child, cdp, stderr: readStderr } = await spawnPackage(executable, userData, port, auth ? { DOUYIN_LICENSE_API: auth.baseUrl } : {}));
     let state;
@@ -236,7 +294,9 @@ async function launchAndCheck(label, executable, auth = null) {
     assert.equal(state.login, true, `${label} must start in an unauthorised login state: ${JSON.stringify(state)}`);
     stderr = readStderr();
     assert.equal(stderr.includes('无法启动') || stderr.includes('启动失败'), false, `${label} emitted startup failure: ${stderr}`);
-    let authResult = { tested: false, restarted: false };
+    const sidecarProbe = await cdp.evaluate('window.agentApi.probeSelectors({})');
+    assert.equal(sidecarProbe?.transport, 'sidecar', `${label} must route selector probe through packaged sidecar`);
+    assert.deepEqual(Object.keys(sidecarProbe?.capability || {}).sort(), ['live_capture', 'live_reply', 'private_reply', 'video_capture', 'video_reply'], `${label} sidecar capability keys`);
     if (auth) {
       await fill(cdp, '#login-form input[name="username"]', auth.username);
       await fill(cdp, '#login-form input[name="password"]', auth.password);
@@ -250,18 +310,19 @@ async function launchAndCheck(label, executable, auth = null) {
       await fill(cdp, '#login-form input[name="password"]', auth.password);
       await submit(cdp, '#login-form');
       await waitFor(cdp, `document.querySelector('#license-status')?.textContent.startsWith('已授权至')`, `${label} relogin`);
-      authResult.beforeRestart = readAuthSnapshot(userData);
-      cdp.close();
-      killTree(child);
-      await new Promise((resolvePromise) => child.once('exit', resolvePromise));
+      authResult.beforeStop = readAuthSnapshot(userData);
+      authResult.shutdown = await closePackageWindow({ cdp, child, port, mode: exitMode });
+      authResult.afterStop = readAuthSnapshot(userData);
       const restartPort = await freePort();
       ({ child: restartChild, cdp: restartCdp, stderr: readRestartStderr } = await spawnPackage(executable, userData, restartPort, { DOUYIN_LICENSE_API: auth.baseUrl }));
       await waitFor(restartCdp, `document.querySelector('#license-status')?.textContent.startsWith('已授权至')`, `${label} restart session`);
-      authResult = { tested: true, restarted: true };
+      authResult.afterBoot = readAuthSnapshot(userData);
+      authResult.tested = true;
+      authResult.restarted = true;
     }
-    return { label, userData, state, stderrLength: stderr.length, stderrPreview: stderr.slice(0, 500), auth: authResult, resourceProbeExists: existsSync(join(workDir, 'resources', 'probe', 'probe-agent.exe')) };
+    return { label, userData, state, stderrLength: stderr.length, stderrPreview: stderr.slice(0, 500), sidecarProbe: { transport: sidecarProbe.transport, capabilityKeys: Object.keys(sidecarProbe.capability || {}).sort(), verified: sidecarProbe.verified }, auth: authResult };
   } catch (error) {
-    error.message = `${error.message}; authBeforeRestart=${JSON.stringify(readAuthSnapshot(userData))}; packageUserData=${userData}; restartStderr=${readRestartStderr().slice(0, 1000)}`;
+    error.message = `${error.message}; auth=${JSON.stringify(authResult)}; currentAuth=${JSON.stringify(readAuthSnapshot(userData))}; packageUserData=${userData}; restartStderr=${readRestartStderr().slice(0, 1000)}`;
     throw error;
   } finally {
     cdp?.close();
@@ -314,6 +375,7 @@ async function main() {
     mkdirSync(evidenceDir, { recursive: true });
     writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
     assert.equal(results.find((item) => item.label === 'installer')?.installedResourceProbeExists, true, 'package must include probe-agent.exe before release');
+    assert.deepEqual(results.map((item) => item.sidecarProbe?.transport), ['sidecar', 'sidecar'], 'both package shapes must use sidecar IPC');
     assert.equal(report.sidecarCapability.result?.protocolVersion, 1, 'packaged sidecar capabilities must respond without Python');
     console.log(`Desktop package PASS; report=${reportPath}`);
   } finally {
