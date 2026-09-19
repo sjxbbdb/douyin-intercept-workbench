@@ -49,6 +49,7 @@ const AUDIT_KINDS = Object.freeze([
   'policy_applied',   // 实际生效的策略版本与生效值（红线 3 的核心）
   'circuit',          // 熔断的升级 / 降级 / 解除 / 服务端下发
   'emergency_stop',   // 急停开与关
+  'engine_state',     // 引擎启停/暂停/恢复（回答"当时为什么没在发"）
   'login',            // 登录 / 登出 / 令牌刷新
   'security_event',   // 验签失败、隐私拦截、跨端拒绝等
 ])
@@ -561,6 +562,36 @@ class AuditLog {
       emergencyStop: Boolean(on),
       reason: reason || null,
       actor: actor || 'local_user',
+    })
+  }
+
+  /**
+   * 引擎状态迁移（启动/停止/暂停/恢复/收到停机指令）。
+   *
+   * ⚠️ 为什么值得单列一类，而不是塞进 `circuit` 或只写日志：
+   *    红线 3 要求审计能回答"**为什么当时没在发**"。而这个问题的答案
+   *    往往就是"引擎被停了"，原因可能是用户按了停止、余额耗尽、
+   *    服务端下发停机指令、或凭据失效。只写日志的话，日志会滚动、
+   *    会被清理，而审计是留痕用的。
+   *
+   * ⚠️ `event` 是**闭集**。放行任意字符串等于放弃统计能力
+   *    （"engine_stoped" 与 "engine_stopped" 会变成两个不同的类别，
+   *     而这种拼写差异在统计里完全看不出来）。
+   *
+   * ⚠️ 与 `recordCircuit` 的分工：熔断的**级别变化**记在 `circuit`；
+   *    这里是"发送这个行为整体被允许与否"的迁移。两者会同时出现
+   *    （熔断触发 → 引擎暂停），这不是重复记录，而是两个不同的事实。
+   */
+  recordEngineState({ event, reason, actor, policyVersion, atMs } = {}) {
+    const EVENTS = ['engine_start', 'engine_stop', 'engine_pause', 'engine_resume']
+    if (!EVENTS.includes(event)) {
+      throw new AppError('AUDIT_SEND_INVALID', `未知引擎状态事件：${event}`, { allowed: EVENTS })
+    }
+    return this.append({
+      kind: 'engine_state', tsMs: atMs, event,
+      reason: reason || null,
+      actor: actor || 'system',
+      policyVersion: policyVersion === undefined ? null : Number(policyVersion),
     })
   }
 

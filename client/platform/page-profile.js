@@ -127,6 +127,11 @@ class ProfilePage {
    * 打开与某用户的私信会话。
    *
    * @param {string} profilePath 形如 `/user/MS4wLj...`
+   * @returns {Promise<{ok:boolean, url:string, conversationId:string|null}>}
+   *          ⚠️ `conversationId` 是**平台会话 ID**，用于契约 §4.8 的
+   *          `target_hash = hmac(salt, conversation_id)`。它是"位置"标识而不是
+   *          "人"的标识，与 `sec_uid` 不是一回事；取不到时返回 null，
+   *          由调用方退到 profilePath 作为哈希输入（口径写在 `send-dm.js` 里）。
    */
   async openConversation(profilePath, { timeoutMs = 20000 } = {}) {
     if (!profilePath || !USER_PATH_RE.test(profilePath)) {
@@ -149,6 +154,15 @@ class ProfilePage {
         var body=String(document.body?document.body.innerText:'').slice(0,20000);
         return {
           has_input: !!ready,
+          // ⚠️ 会话 ID 从**当前地址**里取，不从页面文本里猜。
+          //    链接里明明带着 conversation_id / cid 时它就是权威值；
+          //    取不到就老实返回 null（调用方有退路），
+          //    绝不能拿昵称、序号这类会漂移的东西当会话标识。
+          conversation_id: (function(){
+            var m=String(location.href||'').match(/[?&](?:conversation_id|cid)=([^&#]+)/i);
+            if(!m) return null;
+            try{ return decodeURIComponent(m[1]); }catch(e){ return m[1]; }
+          })(),
           requires_login: /\\u767b\\u5f55|\\u626b\\u7801\\u767b\\u5f55|\\u8bf7\\u5148\\u767b\\u5f55/.test(body),
           is_404: /\\u9875\\u9762\\u4e0d\\u5b58\\u5728|\\u627e\\u4e0d\\u5230\\u8be5\\u7528\\u6237/.test(body)
         };
@@ -166,7 +180,9 @@ class ProfilePage {
       if (state && state.is_404) {
         throw new WorkbenchError('NOT_LOCATABLE', '该用户主页不存在或已被封禁', { url })
       }
-      if (state && state.has_input) return { ok: true, url }
+      if (state && state.has_input) {
+        return { ok: true, url, conversationId: state.conversation_id || null }
+      }
       await sleep(700)
     }
     throw new WorkbenchError('ELEMENT_TIMEOUT', '私信输入框在预算时间内未出现', {
@@ -236,6 +252,46 @@ class ProfilePage {
       })
     }
     return r
+  }
+
+  /**
+   * 提交私信：**发送按钮为主路径，Enter 为兜底**（顺序与评论区/弹幕相反）。
+   *
+   * ⚠️⚠️ 为什么顺序必须反过来：私信的 Enter **没有可靠的"发送"语义**。
+   *    平台不同入口/不同版本的行为不一致——相当多的版本里 Enter 只是
+   *    **插入一个换行**。旧代码（legacy）在私信链路上踩过这个坑：
+   *    按了 Enter、输入框里的文字消失了（其实是换行后光标下移），
+   *    于是判定"发出去了"，而实际上那条私信**从来没发出去过**。
+   *    所以主路径是点「发送」按钮；只有按钮不在时，才退回 Enter 赌一次。
+   *
+   * ⚠️ 但**无论走哪条路径**，成功判定都只能来自 `im/send` 的响应体
+   *    （`publish-verifier.js` 的 `status_code === 0`）。
+   *    本方法返回的 `via` 只说明"我们点了什么"，**不是**成功证据。
+   *
+   * ⚠️ 每条路径都**只做一次**：不重按、不补点。重复提交有发出两条私信的风险，
+   *    而"给同一个人连发两条一模一样的私信"是骚扰，也是最容易被举报的行为。
+   *    实际有没有发出去，交给响应捕获判定。
+   *
+   * @returns {Promise<{via:'button'|'enter', reason?:string}>}
+   */
+  async submitMessage({ settleMs = 600 } = {}) {
+    const btn = await this.findSendButton()
+
+    if (btn && btn.ok) {
+      await this.host.clickAt(this.role, { x: btn.x, y: btn.y })
+      await sleep(settleMs)
+      return { via: 'button' }
+    }
+
+    // 兜底：Enter。⚠️ 留痕是必须的（AGENTS.md §2.8：不得静默吞掉分支）——
+    //    将来排查"私信发出去了但带了个换行"时，这条日志是唯一线索。
+    this.#log('warn', 'dm_send_button_missing_enter_fallback', {
+      selector: 'sendButton', reason: btn ? btn.reason : 'null',
+      hint: '部分版本 Enter 只插入换行而不发送；已记录以便区分"兜底成功"与"兜底失败"',
+    })
+    await this.host.pressEnter(this.role)
+    await sleep(settleMs)
+    return { via: 'enter', reason: btn ? btn.reason : 'null' }
   }
 
   async #evaluate(role, expression, { defaultValue, timeoutMs } = {}) {

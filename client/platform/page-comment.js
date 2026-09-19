@@ -401,13 +401,13 @@ class CommentPage {
           await sleep(1200)
           continue
         }
-        await this.host.click(this.role, { at: { x: tap.x, y: tap.y } })
+        await this.host.clickAt(this.role, { x: tap.x, y: tap.y })
         await sleep(1200)
         const btn2 = await this.#evaluate(findButton, { defaultValue: null })
         if (!btn2) { lastReason = 'reply_button_not_found_after_tap'; await sleep(1200); continue }
-        await this.host.click(this.role, { at: { x: btn2.x, y: btn2.y } })
+        await this.host.clickAt(this.role, { x: btn2.x, y: btn2.y })
       } else {
-        await this.host.click(this.role, { at: { x: btn.x, y: btn.y } })
+        await this.host.clickAt(this.role, { x: btn.x, y: btn.y })
       }
 
       // 等编辑器出现（平台动画约 300–800ms，留足冗余）
@@ -499,11 +499,15 @@ class CommentPage {
     }
 
     if (Array.isArray(p.plan) && p.plan.length) {
-      await this.host.type(this.role, null, null, { plan: p.plan })
+      // ⚠️ 必须**同时**传 expected 与 plan：plan 决定逐段节奏，
+      //    而 expected 是 core 做回读校验的比对基准（它按 expected 算
+      //    期望长度、判断内容是否真的进去了）。只传 plan 会让回读
+      //    校验退化成"期望为空"，于是输入丢失永远校不出来。
+      await this.host.typeText(this.role, expected, { plan: p.plan })
     } else {
       // 没有计划就一次性插入。⚠️ 这是**降级**路径：一次性插入的
       //    时间特征与真人差异最大，只应该在调用方明确要求时走。
-      await this.host.type(this.role, null, expected)
+      await this.host.typeText(this.role, expected)
     }
 
     // ── 回读校验 ─────────────────────────────────────────────
@@ -605,7 +609,7 @@ class CommentPage {
     }
 
     this.#log('info', 'submit_via_button_fallback', {})
-    await this.host.click(this.role, { at: { x: btn.x, y: btn.y } })
+    await this.host.clickAt(this.role, { x: btn.x, y: btn.y })
     await sleep(fallbackWaitMs)
     return { via: 'button' }
   }

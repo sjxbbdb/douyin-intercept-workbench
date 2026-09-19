@@ -398,7 +398,12 @@ test('契约：运行数据的 writeFileSync 只允许出现在 host/store.js', 
   for (const f of collectJsFiles(path.join(ROOT, 'client'))) {
     const rel = path.relative(path.join(ROOT, 'client'), f)
     if (ALLOWED.has(rel)) continue
-    if (fs.readFileSync(f, 'utf8').includes('writeFileSync')) offenders.push(path.relative(ROOT, f))
+    // ⚠️ 必须**剥掉注释**再匹配。否则一条写明"本文件不得 writeFileSync"
+    //    的说明性注释就会被判成违规——而那句注释恰恰是在维护这条规则。
+    //    （实际踩过：`client/core/browser-host.js` 头部解释"为什么锁文件
+    //      也要走 Store"时提到了这个 API 名，于是被判成第二个写盘点。）
+    const code = stripComments(fs.readFileSync(f, 'utf8'))
+    if (/\bwriteFileSync\s*\(/.test(code)) offenders.push(path.relative(ROOT, f))
   }
   assert.deepStrictEqual(offenders, [],
     '运行数据只能由 host/store.js 写入（单写者）：\n' + offenders.join('\n') +

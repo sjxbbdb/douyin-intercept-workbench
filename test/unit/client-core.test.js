@@ -52,6 +52,20 @@ class FakeWebSocket {
   send(text) {
     if (this.closed) throw new Error('socket 已关闭')
     this.sent.push(text)
+    /**
+     * ⚠️ 必须**异步**（宏任务，不是微任务）执行："同步"会让 reject 发生在
+     * 调用方挂 `.catch`/`await` 之前，reject 直接变成 unhandledRejection，
+     * Node 会把它当异常抛到 `socket.send` 的调用栈上（实测踩过）。
+     * 微任务也不够稳妥：`pump()` 里可能连续处理多条命令，只要有一条的
+     * promise 还没被挂上监听，就会漏一个未处理拒绝。
+     * 宏任务一拍与真实 WebSocket 语义一致（响应不可能在 send() 返回前到达）。
+     *
+     * 早期实现还只在"测试显式 waitFor 某条命令"时才处理帧，后果是任何
+     * 没被 wait 的命令（例如 `assert.rejects(cdp.send(...))` 直接等结果）
+     * 永远得不到应答，只能靠 15 秒命令超时兜底——既慢又会把"协议报错"
+     * 误判成"命令超时"。
+     */
+    if (this.onSend) setTimeout(this.onSend, 0)
   }
 
   close() {
@@ -66,9 +80,14 @@ class FakeWebSocket {
     this.emit('open')
   }
 
-  /** 注入一帧（服务端 → 客户端） */
+  /** 注入一帧（服务端 → 客户端）。⚠️ 真实 WS 是异步投递，这里也异步。 */
   push(obj) {
-    this.emit('message', Buffer.from(JSON.stringify(obj), 'utf8'))
+    this.emitAsync('message', Buffer.from(JSON.stringify(obj), 'utf8'))
+  }
+
+  /** 异步派发事件（与真实 WebSocket 的投递语义一致，见类头注释） */
+  emitAsync(name, arg) {
+    setTimeout(() => this.emit(name, arg), 0)
   }
 
   /** 模拟网络异常断开 */
@@ -83,12 +102,12 @@ class FakeWebSocket {
   }
 
   methods() {
-    return this.frames().map((f) => f.method)
+    return this.frames().filter((f) => typeof f.method === 'string').map((f) => f.method)
   }
 
-  lastId() {
-    const f = this.frames()
-    return f.length ? f[f.length - 1].id : null
+  /** 已发出的命令帧（带 method 的） */
+  commands() {
+    return this.frames().filter((f) => typeof f.method === 'string')
   }
 }
 
@@ -100,43 +119,98 @@ class FakeWebSocket {
  *   · 带 sessionId 的命令要按会话路由（会话未知则报 -32001）。
  * 这两条正是"一条浏览器级 WS 服务多个标签页"的核心，不能省。
  */
+/**
+ * sessionId 计数器必须是**模块级**的：每个 FakeCdpServer 实例对应一条连接，
+ * 而真实 Chrome 的 sessionId 是连接级唯一、跨连接不会重复。
+ * 实例级计数器会让"重连后拿到新 sessionId"这类断言永远失败（新旧都是 S1），
+ * 从而掩盖真正的回归（实测踩过）。
+ */
+let SESSION_SEQ = 0
+
 class FakeCdpServer {
-  constructor(ws) {
+  constructor(ws, opts = {}) {
     this.ws = ws
     this.sessions = new Map()
     this.attachedTargets = []
     this.sessionSeq = 0
     this.routes = new Map()
+    /** 已声明应答的方法名（未声明的方法**不自动应答**，见 #handle 末尾注释） */
+    this.declaredMethods = new Set()
     this.respondedIds = []
     this.targets = []
+    /** 未声明方法的记录（测试可断言其为空，用于发现"忘了声明"） */
+    this.undeclared = []
+    /** pump 处理过的方法名（排障用） */
+    this.pumped = []
+    this.onUndeclared = opts.onUndeclared || (() => {})
+    /** 自动应答：客户端每写出一帧就（异步）处理一次，测试无需手动 pump */
+    this.autoRespond = opts.autoRespond !== false
+    if (this.autoRespond) ws.onSend = () => this.pump()
   }
 
   route(method, fn) {
     this.routes.set(method, fn)
+    this.declaredMethods.add(method)
     return this
   }
 
-  /** 处理当前已收到的全部帧 */
+  /**
+   * 声明某方法返回什么结果（比 route 更省事）。
+   *
+   * ⚠️ 必须**在命令写出之前**声明：`pump()` 会应答它当时看到的所有命令，
+   *    事后再 push 一条响应已经晚了（那一条 pending 早被默认结果结算掉了）。
+   *    早期测试用"发命令 → 手工 push 响应"，在并发命令下必然踩这个坑。
+   */
+  serve(method, result, opts = {}) {
+    return this.route(method, (f, s) => {
+      if (opts.delayMs) {
+        setTimeout(() => s.ws.push({ id: f.id, result }), opts.delayMs)
+      } else {
+        s.ws.push({ id: f.id, result })
+      }
+      return 'handled'
+    })
+  }
+
+  /** 声明某方法返回 CDP 错误 */
+  serveError(method, error) {
+    return this.route(method, (f, s) => {
+      s.ws.push({ id: f.id, error })
+      return 'handled'
+    })
+  }
+
+  /** 处理当前已收到的全部帧（幂等：同一条命令只应答一次） */
   pump() {
     for (const f of this.ws.frames()) {
       if (this.respondedIds.includes(f.id)) continue
       this.respondedIds.push(f.id)
+      this.pumped.push(f.method)
       this.#handle(f, this.ws)
     }
   }
 
-  /** 等到客户端发出第 n 条命令（n 从 1 开始），然后处理它 */
-  waitFor(ws, n, timeoutMs = 1500) {
+  /**
+   * 等第 n 条**客户端发来的命令**出现，并处理它。
+   *
+   * ⚠️ 计数必须基于"命令帧"而不是"流里的第 n 条帧"：
+   *    测试经常手工 `ws.push({id, result})` 注入响应帧，那些帧也在
+   *    `sent`/`frames` 的视野里。早期实现按帧序号等待，结果把注入的
+   *    响应帧当成了"第 1 条命令"，于是永远等不到 Runtime.enable 被应答
+   *    ——表现为所有 CDP 测试在 waitReady 上超时 15 秒。
+   */
+  waitFor(ws, n, timeoutMs = 2000) {
     return new Promise((resolve, reject) => {
       const t0 = Date.now()
       const tick = () => {
-        if (ws.frames().length >= n) {
+        const commands = ws.frames().filter((f) => typeof f.method === 'string')
+        if (commands.length >= n) {
           this.pump()
-          const f = ws.frames()[n - 1]
+          const f = commands[n - 1]
           if (f) { resolve(f); return }
         }
         if (Date.now() - t0 > timeoutMs) {
-          reject(new Error(`等第 ${n} 条命令超时（当前 ${ws.frames().length} 条）`))
+          reject(new Error(`等第 ${n} 条客户端命令超时（当前 ${commands.length} 条：${commands.map((c) => c.method).join(',')}）`))
           return
         }
         setTimeout(tick, 5)
@@ -145,7 +219,95 @@ class FakeCdpServer {
     })
   }
 
+  /** 等待某个方法名的命令出现（比序号稳定，推荐） */
+  waitForMethod(ws, method, timeoutMs = 2000) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now()
+      const tick = () => {
+        const f = ws.frames().find((x) => x.method === method)
+        if (f) { this.pump(); resolve(f); return }
+        if (Date.now() - t0 > timeoutMs) {
+          reject(new Error(`等待命令 ${method} 超时（已发出：${ws.methods().join(',')}）`))
+          return
+        }
+        setTimeout(tick, 5)
+      }
+      tick()
+    })
+  }
+
+  /** 等待某个方法名的命令**累计出现 n 次**（比"第一个匹配"稳定） */
+  waitForMethodCount(ws, method, n, timeoutMs = 2000) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now()
+      const tick = () => {
+        const hits = ws.commands().filter((x) => x.method === method)
+        if (hits.length >= n) { this.pump(); resolve(hits[n - 1]); return }
+        if (Date.now() - t0 > timeoutMs) {
+          reject(new Error(`等待第 ${n} 次 ${method} 超时（当前 ${hits.length} 次；已发出：${ws.methods().join(',')}）`))
+          return
+        }
+        setTimeout(tick, 5)
+      }
+      tick()
+    })
+  }
+
+  /** 等某个角色的 attach 完成（ensureTab/attach 之后必须 pump 才会被应答） */
+  async attachRole(cdp, ws, role, targetId, nth = 1) {
+    const p = cdp.attach(role, targetId)
+    await this.waitForMethodCount(ws, 'Target.attachToTarget', nth)
+    // ⚠️ 必须 await attach 本身：waitForMethodCount 只保证"帧已发出并被处理"，
+    //    attach 的 promise 还要等一个微任务才会结算。直接 return p 会让调用方
+    //    拿到 undefined（实测踩过）。
+    const sessionId = await p
+    await this.waitReady(cdp, ws)
+    return sessionId
+  }
+
+  /**
+   * 等客户端连接**完全**就绪。
+   *
+   * ⚠️ 这里断言的不是"waitReady 返回了"，而是 `runtime_enabled &&
+   *    network_enabled` 都为 true。原因是域启用是**串行**的：
+   *    Runtime.enable 有响应之后才发 Network.enable。
+   *    早期实现只 pump 一次 / 只看 waitReady，导致：
+   *      · 第二条 enable 还没写完就进入测试体；
+   *      · 上一个用例的连接在**下一个用例**里才完成握手，
+   *        于是"残留 pending"之类的断言会看到别的用例的命令（实测踩过）。
+   *    这两个坑都表现为"莫名其妙超时 15 秒"，排查成本极高。
+   *
+   * ⚠️ 不断言 `pending_count === 0`：调用方自己发出的命令本来就在途，
+   *    把它算作"没就绪"会让 waitReady 与调用方互相等待。
+   */
+  async waitReady(cdp, ws, timeoutMs = 3000) {
+    const t0 = Date.now()
+    for (;;) {
+      this.pump()
+      const st = cdp.engineState
+      if (st.state === 'open' && st.runtime_enabled && st.network_enabled) return
+      if (Date.now() - t0 > timeoutMs) {
+        throw new Error(`等 CDP 就绪超时：${JSON.stringify({
+          state: st.state,
+          runtime: st.runtime_enabled,
+          network: st.network_enabled,
+          pending: st.pending_count,
+          commands: ws.commands().map((f) => f.method),
+        })}`)
+      }
+      await new Promise((r) => setTimeout(r, 5))
+    }
+  }
+
   #handle(f, ws) {
+    // ⚠️ 会话校验必须**先于**自定义路由与内建分支：否则"未知 sessionId
+    //    必须报 -32001"这类用例会被自定义应答顺手放过
+    //    （实测踩过：断言从"应当报错"变成"没有报错"）。
+    //    这也与真实 Chrome 一致：未知 sessionId 在协议层就被拒。
+    if (f.sessionId && !this.sessions.has(f.sessionId)) {
+      ws.push({ id: f.id, error: { code: -32001, message: `Session with given id not found: ${f.sessionId}` } })
+      return
+    }
     const custom = this.routes.get(f.method)
     if (custom) {
       const r = custom(f, this)
@@ -167,7 +329,8 @@ class FakeCdpServer {
           return
         }
         this.sessionSeq += 1
-        const sessionId = `S${this.sessionSeq}`
+        SESSION_SEQ += 1
+        const sessionId = `S${SESSION_SEQ}`
         this.sessions.set(sessionId, targetId)
         this.attachedTargets.push(targetId)
         if (!this.targets.some((t) => t.targetId === targetId)) {
@@ -192,15 +355,26 @@ class FakeCdpServer {
       case 'Target.activateTarget':
         ws.push({ id: f.id, result: {} })
         return
-      case 'Runtime.evaluate':
-        ws.push({ id: f.id, result: { result: { type: 'string', value: '"ok"' } } })
-        return
       default: {
-        if (f.sessionId && !this.sessions.has(f.sessionId)) {
-          ws.push({ id: f.id, error: { code: -32001, message: `Session with given id not found: ${f.sessionId}` } })
-          return
+        /**
+         * ⚠️ 未声明的方法**一律不应答**（保持挂起），并记录在 `undeclared` 里。
+         *
+         * 早期实现给未知方法回一个 `{}`，后果是：任何"我想让它超时/挂住"
+         * 的用例都会被 `pump()` 顺手应答掉（`pump` 会把当时看到的所有命令
+         * 都处理一遍），于是 `assert.rejects(..., 超时)` 直接变成
+         * "Missing expected rejection"。默认乱应答是**测试自己制造假阳性**
+         * 的经典形态。
+         *
+         * 这里也**不**回一条 -32601：那会把"我故意让它挂着"变成"协议报错"，
+         * 同样破坏超时语义。需要报错的用例请显式 `serveError`。
+         * 忘记声明的用例用 `assert.deepStrictEqual(server.undeclared, [])` 兜住。
+         */
+        // ⚠️ 会话校验已在 #handle 开头完成（见那里的说明），这里只处理
+        //    "方法未声明"与"故意不应答"两种情况。
+        if (!this.declaredMethods.has(f.method)) {
+          this.undeclared.push({ method: f.method, id: f.id })
         }
-        ws.push({ id: f.id, result: { echoed: f.method, sessionId: f.sessionId || null } })
+        // 故意不回，交由调用方的超时逻辑处理
       }
     }
   }
@@ -240,9 +414,106 @@ async function makeCdpReady(overrides = {}) {
 /** 打开连接并让构造时发出的 enable 帧得到应答 */
 async function connected(cdp, ws, server) {
   ws.open()
-  await server.waitFor(ws, 1)
-  await cdp.waitReady(1000)
+  await server.waitReady(cdp, ws)
   return server
+}
+
+/** 等某个角色的 attach 完成（ensureTab/attach 之后必须 pump 才会被应答） */
+async function attachRole(cdp, server, ws, role, targetId) {
+  const p = cdp.attach(role, targetId)
+  await server.waitForMethod(ws, 'Target.attachToTarget')
+  await server.waitReady(cdp, ws)
+  return p
+}
+/**
+ * 造一个"自动握手 + 自动应答"的 BrowserHost 依赖集。
+ *
+ * ⚠️ 为什么需要它：`BrowserHost.create` 内部会 `cdp.connect()` 并等就绪，
+ *    而 `Cdp` 只有在 socket **真正 open 并拿到 enable 响应**之后才算就绪。
+ *    如果注入的 socket 永远不 open，`create()` 会挂在 15 秒连接超时上
+ *    （实测踩过：四条 browser-host 用例全部 15s 超时）。
+ *
+ * 这里的桩：
+ *   · `on('open', fn)` 在第一拍后触发 open；
+ *   · 上层的 `sendText`（由 BrowserHost 注入）负责应答 enable 等基础设施命令。
+ */
+function makeHostSocket() {
+  const s = {
+    url: 'ws://127.0.0.1/fake',
+    sent: [],
+    closed: false,
+    _listeners: new Map(),
+    on(name, fn) {
+      if (!this._listeners.has(name)) this._listeners.set(name, [])
+      this._listeners.get(name).push(fn)
+      if (name === 'open' && !this._opened) {
+        this._opened = true
+        setTimeout(() => this.emit('open'), 0)
+      }
+      return this
+    },
+    emit(name, arg) {
+      for (const fn of [...(this._listeners.get(name) || [])]) fn(arg)
+    },
+    send(text) {
+      this.sent.push(text)
+      if (this.onSend) setTimeout(this.onSend, 0)
+    },
+    close() {
+      this.closed = true
+      this.emit('close', { code: 1000 })
+    },
+    open() { this._opened = true; this.emit('open') },
+    drop() { this.closed = true; this.emitAsync('close', { code: 1006 }) },
+    emitAsync(name, arg) { setTimeout(() => this.emit(name, arg), 0) },
+    push(obj) { this.emitAsync('message', Buffer.from(JSON.stringify(obj), 'utf8')) },
+    frames() { return this.sent.map((x) => JSON.parse(x)) },
+    commands() { return this.frames().filter((f) => typeof f.method === 'string') },
+    methods() { return this.commands().map((f) => f.method) },
+  }
+  return s
+}
+
+/** 浏览器级 socket 上必须自动应答的基础设施命令（其余按需 route） */
+function installHostInfra(socket, opts = {}) {
+  const routes = opts.routes || {}
+  /**
+   * ⚠️ 已应答的 id 必须存在一个**集合**里，不能往解析出来的帧对象上打标记：
+   * `frames()` 每次都重新 JSON.parse，标记丢在副本上，于是每来一帧就会把
+   * 之前所有帧**再应答一遍**。后果是 `Target.getTargets` 被塞回一堆重复
+   * 响应，`isTargetAlive` 读到过期结果 → 明明活着却判死/判活不定，
+   * 表现为随机的 15 秒命令超时（实测踩过）。
+   */
+  const answered = new Set()
+  socket.onSend = () => {
+    for (const f of socket.frames()) {
+      if (answered.has(f.id)) continue
+      answered.add(f.id)
+      if (routes[f.method]) { routes[f.method](f); continue }
+      if (f.method === 'Runtime.enable' || f.method === 'Network.enable' || f.method === 'Page.enable') {
+        socket.push({ id: f.id, result: {} })
+      } else if (f.method === 'Target.getTargets') {
+        socket.push({ id: f.id, result: { targetInfos: (opts.getTargets ? opts.getTargets() : [{ targetId: 'T1', type: 'page', url: 'about:blank', attached: true }]) } })
+      } else if (f.method === 'Target.attachToTarget') {
+        socket.push({ id: f.id, result: { sessionId: opts.sessionId || 'S1' } })
+      } else if (f.method === 'Target.activateTarget' || f.method === 'Target.closeTarget') {
+        socket.push({ id: f.id, result: {} })
+      }
+      // 其余方法故意不应答（由测试按需 route）
+    }
+  }
+  return socket
+}
+
+/** BrowserHost.create 的测试用依赖（真实 Store + 桩 socket + 桩 Chrome） */
+function hostDeps(socket, overrides = {}) {
+  return {
+    probePortImpl: async () => false,
+    getJsonImpl: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1/fake/devtools/browser/x', Browser: 'FakeChrome' }),
+    spawnImpl: () => ({ pid: 999999, on() {}, unref() {} }),
+    cdpFactory: (cdpOpts) => new Cdp({ ...cdpOpts, createSocket: () => socket }),
+    ...overrides,
+  }
 }
 
 function wait(ms) {
@@ -274,27 +545,29 @@ test('CDP：命令按 id 关联，且能处理乱序响应', async () => {
   const { cdp, sockets, ws } = await makeCdpReady()
   const w = ws()
   const server = new FakeCdpServer(w)
-  server.route('Test.alpha', (f) => { void f; return 'handled' })
+  // ⚠️ 乱序只能靠"延迟应答"来构造：先声明的慢、后声明的快。
+  server.serve('Test.alpha', { which: 'a' }, { delayMs: 60 })
+  server.serve('Test.beta', { which: 'b' }, { delayMs: 90 })
+  server.serve('Test.gamma', { which: 'c' })
   await connected(cdp, w, server)
 
   const pa = cdp.send('Test.alpha', { n: 1 })
   const pb = cdp.send('Test.beta', { n: 2 })
   const pc = cdp.send('Test.gamma', { n: 3 })
 
-  // 等三条命令都写出去
-  const frames = w.frames().filter((f) => f.method.startsWith('Test.'))
+  // 等三条命令都写出去（id 必须各不相同）
+  await server.waitFor(w, 3)
+  const frames = w.commands().filter((f) => f.method.startsWith('Test.'))
   assert.strictEqual(frames.length, 3, '三条命令都应写出')
-  const [fa, fb, fc] = frames
+  assert.strictEqual(new Set(frames.map((f) => f.id)).size, 3, '每条命令的 id 必须唯一')
 
-  // ⚠️ 故意乱序：先回第三条，再回第一条，最后第二条
-  w.push({ id: fc.id, result: { which: 'c' } })
-  w.push({ id: fa.id, result: { which: 'a' } })
-  w.push({ id: fb.id, result: { which: 'b' } })
-
+  // ⚠️ gamma 最快、beta 最慢 → 响应顺序与发送顺序不同，仍然必须正确配对
   assert.deepStrictEqual(await pc, { which: 'c' })
   assert.deepStrictEqual(await pa, { which: 'a' })
   assert.deepStrictEqual(await pb, { which: 'b' })
-  assert.strictEqual(cdp.pendingCount, 0)
+  await wait(20)
+  assert.deepStrictEqual(server.undeclared, [], '所有命令都应有明确应答声明')
+  assert.strictEqual(cdp.pendingCount, 0, '三条命令都应已结算')
   await cdp.close()
 })
 
@@ -302,19 +575,24 @@ test('CDP：CDP 协议级 error 转成带归因码的结构化错误', async () 
   const { cdp, sockets, ws } = await makeCdpReady()
   const w = ws()
   const server = new FakeCdpServer(w)
+  server.serveError('Runtime.evaluate', { code: -32000, message: 'Cannot find context' })
   await connected(cdp, w, server)
 
-  const p = cdp.send('Runtime.evaluate', { expression: '1' })
-  const f = await server.waitFor(w, 2)
-  w.push({ id: f.id, error: { code: -32000, message: 'Cannot find context' } })
-
-  await assert.rejects(p, (e) => {
+  /**
+   * ⚠️ 断言必须**紧接着** send 挂上，中间不能 await 任何东西。
+   * 踩过的坑：写成 `const p = send(); await wait(30); await assert.rejects(p)`
+   * —— 那 30ms 里 p 已经 reject 而无人接手，Node 判为未处理拒绝并把它当异常
+   * 抛出，测试以"抛出 CdpError"失败，而真正的断言根本没跑到。
+   * 这不是被测代码的问题，是测试自己制造的假失败。
+   */
+  await assert.rejects(cdp.send('Runtime.evaluate', { expression: '1' }), (e) => {
     assert.ok(e instanceof CdpError, '必须是 CdpError')
     assert.strictEqual(e.attribution, ATTRIBUTION.PROTOCOL_ERROR)
     assert.match(e.message, /Cannot find context/)
     assert.strictEqual(e.detail.method, 'Runtime.evaluate')
     return true
   })
+  assert.deepStrictEqual(server.undeclared, [], '所有命令都应有明确应答声明')
   assert.strictEqual(cdp.pendingCount, 0, '失败的 pending 条目必须被清掉')
   await cdp.close()
 })
@@ -329,8 +607,9 @@ test('CDP：命令超时以 cdp_cmd_timeout 拒绝，且不残留 pending 条目
   const server = new FakeCdpServer(w)
   await connected(cdp, w, server)
 
+  // 'Test.never' 没有声明应答 → 对端永远不回（这正是超时场景）
   const p = cdp.send('Test.never', {}, { timeoutMs: 60 })
-  await server.waitFor(w, 2)              // 确认命令真的写出去了（对端就是不应答）
+  const sent = await server.waitForMethod(w, 'Test.never') // 确认命令真的写出去了
   await assert.rejects(p, (e) => {
     assert.strictEqual(e.attribution, ATTRIBUTION.CMD_TIMEOUT)
     assert.match(e.message, /超时/)
@@ -340,7 +619,7 @@ test('CDP：命令超时以 cdp_cmd_timeout 拒绝，且不残留 pending 条目
   assert.strictEqual(cdp.pendingCount, 0, '⚠️ 超时后 pending 必须清零（旧代码的 promise 会永远悬着）')
 
   // 迟到的响应不能把已结算的 promise 再动一次（也不应抛）
-  w.push({ id: w.frames()[1].id, result: { late: true } })
+  w.push({ id: sent.id, result: { late: true } })
   await wait(20)
   assert.strictEqual(cdp.pendingCount, 0)
   await cdp.close()
@@ -349,7 +628,9 @@ test('CDP：命令超时以 cdp_cmd_timeout 拒绝，且不残留 pending 条目
 test('CDP：Page.navigate 默认拿到 30 秒超时，普通命令 15 秒', async () => {
   const { cdp, sockets, ws } = await makeCdpReady()
   const w = ws()
-  await connected(cdp, w, new FakeCdpServer(w))
+  const server = new FakeCdpServer(w)
+  server.serve('Page.navigate', { frameId: 'F1' })
+  await connected(cdp, w, server)
 
   assert.strictEqual(DEFAULT_COMMAND_TIMEOUT_MS, 15000)
   assert.strictEqual(NAVIGATE_TIMEOUT_MS, 30000)
@@ -363,10 +644,9 @@ test('CDP：Page.navigate 默认拿到 30 秒超时，普通命令 15 秒', asyn
   // ⚠️ 导航的方法级下限不得被全局调小（否则网络稍差就稳定误报失败）
   assert.strictEqual(resolveCommandTimeoutMs('Page.navigate', {}, { timeoutMs: 5000 }), 30000)
 
-  // 真发一条 navigate，验证用的就是 30 秒预算（40ms 内不应超时）
+  // 真发一条 navigate，走完整链路
   const p = cdp.send('Page.navigate', { url: 'about:blank' })
-  const f = await (new FakeCdpServer(w)).waitFor(w, 2)
-  w.push({ id: f.id, result: { frameId: 'F1' } })
+  const f = await server.waitForMethod(w, 'Page.navigate')
   const r = await p
   assert.strictEqual(r.frameId, 'F1')
   assert.strictEqual(f.method, 'Page.navigate')
@@ -392,29 +672,31 @@ test('CDP：Target.attachToTarget(flatten) 后命令按 sessionId 路由', async
   const { cdp, sockets, ws } = await makeCdpReady()
   const w = ws()
   const server = new FakeCdpServer(w)
+  server.serve('Runtime.evaluate', { result: { type: 'number', value: 2 } })
   await connected(cdp, w, server)
 
-  const sessionId = await cdp.attach('comment', 'TARGET-A')
+  const attachP = cdp.attach('comment', 'TARGET-A')
+  await server.waitForMethod(w, 'Target.attachToTarget')
+  const sessionId = await attachP
   assert.ok(sessionId, 'attach 必须返回 sessionId')
 
   // 会话级命令带 sessionId
   const p1 = cdp.send('Runtime.evaluate', { expression: '1+1' }, { role: 'comment' })
-  const f1 = await server.waitFor(w, 3)
+  const f1 = await server.waitForMethod(w, 'Runtime.evaluate')
   assert.strictEqual(f1.sessionId, sessionId, '按 role 解析出的命令必须带 sessionId')
-  w.push({ id: f1.id, result: { result: { type: 'number', value: 2 } } })
   const r1 = await p1
   assert.strictEqual(r1.result.value, 2)
 
   // 浏览器级命令不带 sessionId（Target.* 只能在浏览器级发）
   const p2 = cdp.send('Target.getTargets', {})
-  const f2 = await server.waitFor(w, 4)
+  const f2 = await server.waitForMethod(w, 'Target.getTargets')
   assert.strictEqual(f2.sessionId, undefined, '浏览器级命令不得带 sessionId')
-  server.pump()
   await p2
 
   // 未知会话必须报 -32001（证明服务端确实在按会话路由，不是我们自说自话）
   const p3 = cdp.send('Runtime.evaluate', { expression: '1' }, { sessionId: 'S-does-not-exist' })
   await assert.rejects(p3, /Session with given id not found/)
+  assert.deepStrictEqual(server.undeclared, [], '所有命令都应有明确应答声明')
 
   assert.strictEqual(cdp.sessionIdOf('comment'), sessionId)
   assert.strictEqual(cdp.targetIdOf('comment'), 'TARGET-A')
@@ -431,8 +713,12 @@ test('CDP：浏览器级事件与会话级事件都能分发，on() 返回可用
   const w = ws()
   const server = new FakeCdpServer(w)
   await connected(cdp, w, server)
-  const sessionId = await cdp.attach('comment', 'TARGET-A')
-  const otherSession = await cdp.attach('live', 'TARGET-B')
+
+  const sessionId = await server.attachRole(cdp, w, 'comment', 'TARGET-A')
+  assert.ok(sessionId, `第一次 attach 必须返回 sessionId（实际 ${sessionId}）`)
+  const otherSession = await server.attachRole(cdp, w, 'live', 'TARGET-B', 2)
+  assert.ok(otherSession, `第二次 attach 必须返回 sessionId（实际 ${otherSession}；已发送 ${JSON.stringify(w.methods())}）`)
+  assert.notStrictEqual(sessionId, otherSession, '两个角色必须是不同会话')
 
   const browserHits = []
   const sessionHits = []
@@ -445,9 +731,13 @@ test('CDP：浏览器级事件与会话级事件都能分发，on() 返回可用
   w.push({ method: 'Target.targetDestroyed', params: { targetId: 'T1' } })
   // 会话级事件（带 sessionId）→ 只有订阅了该会话的收到
   w.push({ method: 'Runtime.consoleAPICalled', params: { type: 'log' }, sessionId })
+  // ⚠️ 帧是异步投递的（与真实 WS 一致），断言前必须让出一拍
+  await wait(30)
 
-  assert.strictEqual(browserHits.length, 1)
+  assert.strictEqual(browserHits.length, 1, `浏览器级事件应恰好收到 1 次（实际 ${browserHits.length}；帧=${JSON.stringify(w.frames().filter((f) => f.method))}）`)
+  assert.ok(browserHits[0] && browserHits[0].p, '浏览器级事件应带 params')
   assert.strictEqual(browserHits[0].p.targetId, 'T1')
+  assert.ok(browserHits[0].meta, '监听器应拿到 meta')
   assert.strictEqual(browserHits[0].meta.sessionId, null, '浏览器级事件的 meta.sessionId 必须是 null')
   assert.strictEqual(sessionHits.length, 1, '订阅该会话的监听器必须收到')
   assert.strictEqual(sessionHits[0].type, 'log')
@@ -458,6 +748,7 @@ test('CDP：浏览器级事件与会话级事件都能分发，on() 返回可用
   offSession()
   w.push({ method: 'Target.targetDestroyed', params: { targetId: 'T2' } })
   w.push({ method: 'Runtime.consoleAPICalled', params: { type: 'log' }, sessionId: otherSession })
+  await wait(30)
   assert.strictEqual(browserHits.length, 1, '退订后不应再收到浏览器级事件')
   assert.strictEqual(sessionHits.length, 1, '退订后不应再收到会话级事件')
 
@@ -482,9 +773,10 @@ test('CDP：断线后重连，并**重新发出 Runtime.enable 与 Network.enabl
   const w1 = sockets[0]
   const s1 = new FakeCdpServer(w1)
   await connected(cdp, w1, s1)
-  await cdp.attach('comment', 'TARGET-A')
-  s1.pump()
-  await wait(20)
+  await s1.attachRole(cdp, w1, 'comment', 'TARGET-A')
+  /** 断线前的 sessionId —— 用来断言重连后**换过**了一次（而不是沿用旧值）。 */
+  const firstSession = cdp.sessionIdOf('comment')
+  assert.ok(firstSession, '断线前必须已建立会话，否则本用例的前提不成立')
 
   // 断线
   w1.drop()
@@ -498,37 +790,56 @@ test('CDP：断线后重连，并**重新发出 Runtime.enable 与 Network.enabl
   const w2 = sockets[1]
   assert.ok(w2 !== w1, '重连必须建立新连接')
   const s2 = new FakeCdpServer(w2)
+  s2.serve('Runtime.evaluate', { result: { type: 'number', value: 2 } })
   w2.open()
 
   // ⚠️⚠️ 核心断言：重连后**必须**重新 enable 这两个域。
   // 不做的话 Network 嗅探静默停止 → 每条回复都被判"未捕获平台响应"
   // → 按红线 2 只能记 failed/sent_suspected → 商家多发少算、且毫无报错。
-  const t1 = Date.now()
-  while (w2.frames().length < 2 && Date.now() - t1 < 2000) await wait(5)
+  await s2.waitFor(w2, 2)
+  await wait(20)
   s2.pump()
   assert.deepStrictEqual(w2.methods().slice(0, 2), ['Runtime.enable', 'Network.enable'],
     `重连后必须先重新启用这两个域（实际：${JSON.stringify(w2.methods())}）`)
 
   // 重新 attach 回原 targetId（targetId 跨连接稳定）
-  const t2 = Date.now()
-  while (w2.frames().length < 3 && Date.now() - t2 < 2000) await wait(5)
-  s2.pump()
-  await cdp.waitReady(500)
+  await s2.waitForMethod(w2, 'Target.attachToTarget')
+  // ⚠️ 等"帧发出"不等于等"响应落地"：响应是异步投递的，attach 的
+  //    sessionId 要等客户端处理完那帧才会写回角色记录。
+  //    少了这一步就会读到 sessionId=null，把正常流程误判成回归（实测踩过）。
+  await s2.waitReady(cdp, w2)
+  await wait(40)
   assert.deepStrictEqual(w2.methods().slice(0, 3),
     ['Runtime.enable', 'Network.enable', 'Target.attachToTarget'])
-  const attachFrame = w2.frames()[2]
+  const attachFrame = w2.commands()[2]
   assert.strictEqual(attachFrame.params.targetId, 'TARGET-A', '必须重新 attach 原 targetId')
   assert.strictEqual(attachFrame.params.flatten, true)
 
   // 重连后命令能正常走（会话已恢复）
+  //
+  // ⚠️ 必须按"第 N 次"取帧，不能用 `waitForMethod`（它返回**第一个**匹配）：
+  //    重连恢复期间可能已经有别的同名命令发出，取错了就会看到一条不带
+  //    sessionId 的旧帧，把"会话已恢复"误判成失败（实测踩过）。
+  const newSession = cdp.sessionIdOf('comment')
+  assert.ok(newSession, `重连后必须重新 attach 出新的 sessionId（实际 ${newSession}；w2 命令=${JSON.stringify(w2.methods())}；roles=${JSON.stringify([...cdp._sessions.entries()])}）`)
+  const beforeCount = w2.commands().filter((f) => f.method === 'Runtime.evaluate').length
   const p = cdp.send('Runtime.evaluate', { expression: '1+1' }, { role: 'comment' })
-  const t3 = Date.now()
-  while (w2.frames().length < 4 && Date.now() - t3 < 2000) await wait(5)
-  s2.pump()
+  const evalFrame = await s2.waitForMethodCount(w2, 'Runtime.evaluate', beforeCount + 1)
   const r = await p
   assert.strictEqual(r.result.value, 2)
-  assert.strictEqual(r.echoed, undefined)
-  assert.strictEqual(w2.frames()[3].sessionId, cdp.sessionIdOf('comment'), '重连后仍应使用新的 sessionId')
+  assert.strictEqual(evalFrame.sessionId, newSession,
+    `重连后的命令必须带新 sessionId（实际 ${evalFrame.sessionId}，期望 ${newSession}）`)
+  // ⚠️ 断言方式很重要：`sessionId` 是 FakeCdpServer 的**全局**计数器产物
+  //    （S1/S2/S3… 跨用例累加），所以写死 `=== 'S2'` 会因为前面用例多挂过
+  //    几次 attach 而随机失败——那是**测试自身的脆弱**，不是被测行为的问题。
+  //    真正要验的命题有两条，都不依赖具体编号：
+  //      ① 重连后确实**换过**一次 sessionId（旧的在断线时已失效）
+  //      ② 新值确实被记进了角色映射（否则命令会不带 sessionId 发出去）
+  const oldSession = firstSession
+  assert.ok(newSession !== oldSession,
+    `重连必须重新 attach：新 sessionId 不得沿用旧的（旧 ${oldSession}，新 ${newSession}）`)
+  assert.match(String(newSession), /^S\d+$/, 'sessionId 必须来自服务端的 attach 结果')
+  assert.strictEqual(cdp.sessionIdOf('comment'), newSession, '角色映射必须指向新会话')
 
   assert.ok(caps.includes('open'), '重连成功后状态应回到 open')
   await cdp.close()
@@ -554,9 +865,9 @@ test('CDP：socket 断开时在途命令被立即拒绝（不留悬空 promise�
   await connected(cdp, w, server)
 
   const p1 = cdp.send('Test.never1', {})
-  await server.waitFor(w, 2)
+  await server.waitForMethod(w, 'Test.never1')
   const p2 = cdp.send('Test.never2', {})
-  await server.waitFor(w, 3)
+  await server.waitForMethod(w, 'Test.never2')
   assert.strictEqual(cdp.pendingCount, 2)
 
   w.drop()
@@ -657,9 +968,7 @@ test('CDP：Runtime.evaluate 的页面异常转成结构化错误（不是裸字
     return 'handled'
   })
   await connected(cdp, w, server)
-  await cdp.attach('comment', 'TARGET-A')
-  server.pump()
-  await wait(10)
+  await server.attachRole(cdp, w, 'comment', 'TARGET-A')
 
   await assert.rejects(cdp.evaluate('comment', 'x()'), (e) => {
     assert.strictEqual(e.attribution, ATTRIBUTION.EVALUATE_EXCEPTION)
@@ -675,19 +984,22 @@ test('CDP：Runtime.evaluate 的页面异常转成结构化错误（不是裸字
 // cdp.js：分帧读取器（ipc 与 cdp 共用的边界逻辑）
 // ══════════════════════════════════════════════════════════════
 
-test('CDP：超长帧被丢弃并归因（不静默截断）', async () => {
+test('CDP：无法解析的帧被丢弃并归因，连接仍可用（不静默截断）', async () => {
   const { cdp, sockets, ws } = await makeCdpReady()
   const w = ws()
-  await connected(cdp, w, new FakeCdpServer(w))
+  const server = new FakeCdpServer(w)
+  await connected(cdp, w, server)
   const before = cdp.engineState.state
-  // 直接推一个超大字符串帧
-  w.emit('message', Buffer.from(JSON.stringify({ method: 'X', params: { big: 'y'.repeat(1024) } }), 'utf8'))
-  await wait(10)
+  // 直接推一个坏 JSON 帧
+  w.emitAsync('message', Buffer.from('{这不是 JSON}\n', 'utf8'))
+  await wait(20)
   assert.strictEqual(cdp.engineState.state, before, '坏帧不得改变连接状态')
-  const ok = await cdp.send('Target.getTargets', {})
-  assert.ok(ok, '坏帧之后连接仍应可用')
-  await cdp.close()
-})
+  // 坏帧之后连接必须仍可用（一次性坏帧不能毁掉整条通道）
+  const p = cdp.send('Target.getTargets', {})
+  await server.waitForMethod(w, 'Target.getTargets')
+  const ok = await p
+  assert.ok(ok)
+  await cdp.close()})
 
 // ══════════════════════════════════════════════════════════════
 // browser-host.js：纯函数与独占性
@@ -731,17 +1043,14 @@ test('browser-host：probePort 能区分"端口被占"与"端口空闲"', async 
 test('browser-host：同一实例第二个 host 必须被拒绝（进程内独占）', async () => {
   const t = tempInstance('dsh-host-lock-')
   const cfg = { instanceDir: t.instanceDir, chromeProfilePath: t.profilePath, debugPortBase: 19222, chromePath: '/fake/chrome' }
-  const hostDeps = {
-    probePortImpl: async () => false,
-    getJsonImpl: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:19222/devtools/browser/x', Browser: 'FakeChrome' }),
-    spawnImpl: () => ({ pid: 999999, on() {}, unref() {} }),
-    cdpFactory: () => new Cdp({ url: 'ws://127.0.0.1:19222/devtools/browser/x', createSocket: () => new FakeWebSocket('x') }),
-  }
-  const h1 = await host.BrowserHost.create({ config: cfg, ...hostDeps })
+  const sock = installHostInfra(makeHostSocket())
+  const deps = hostDeps(sock)
+  const h1 = await host.BrowserHost.create({ config: cfg, ...deps })
   try {
     assert.strictEqual(fs.existsSync(t.lockPath), true, '必须落独占锁文件')
+    assert.ok(sock.commands().some((f) => f.method === 'Runtime.enable'), '应已连上并启用域')
     await assert.rejects(
-      host.BrowserHost.create({ config: cfg, ...hostDeps }),
+      host.BrowserHost.create({ config: cfg, ...deps }),
       (e) => {
         assert.strictEqual(e.code, host.HOST_ATTRIBUTION.ALREADY_HOSTED)
         assert.match(e.message, /ipc/i, '错误信息必须告诉调用方改用 IPC')
@@ -754,8 +1063,9 @@ test('browser-host：同一实例第二个 host 必须被拒绝（进程内独�
   } finally {
     await h1.close()
   }
-  // 关闭后应能重新创建（锁与注册表都已释放）
-  const h2 = await host.BrowserHost.create({ config: cfg, ...hostDeps })
+  // 关闭后应能重新创建（锁与 store 登记都已释放）
+  const sock2 = installHostInfra(makeHostSocket())
+  const h2 = await host.BrowserHost.create({ config: cfg, ...hostDeps(sock2) })
   assert.strictEqual(fs.existsSync(t.lockPath), true)
   await h2.close()
   assert.strictEqual(fs.existsSync(t.lockPath), false, '关闭后必须释放锁')
@@ -816,10 +1126,7 @@ test('browser-host：损坏的锁文件按失效锁回收，但必须留痕（�
   const h = await host.BrowserHost.create({
     config: { instanceDir: t.instanceDir, chromeProfilePath: t.profilePath, debugPortBase: 19227, chromePath: '/fake/chrome' },
     logger,
-    probePortImpl: async () => false,
-    getJsonImpl: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:19227/devtools/browser/x' }),
-    spawnImpl: () => ({ pid: 999996, on() {}, unref() {} }),
-    cdpFactory: () => new Cdp({ url: 'ws://127.0.0.1:19227/devtools/browser/x', createSocket: () => new FakeWebSocket('x') }),
+    ...hostDeps(installHostInfra(makeHostSocket())),
   })
   try {
     assert.ok(logs.some((l) => l.e === 'browser_host_lock_corrupt'), '锁损坏必须留痕，不得静默回收')
@@ -855,24 +1162,26 @@ test('browser-host：端口被非 Chrome 程序占用时必须大声失败，不
 
 test('browser-host：tab 消失 → 抛可重排队错误（requeue=true，不是 failed）', async () => {
   const t = tempInstance('dsh-host-tab-')
-  const sockets = []
+  // ⚠️ 真实 Store（锁走 host/store.js）+ 桩 socket：socket 自己会 open，
+  //    避免 create() 卡在 15 秒连接超时上。
+  const state = { created: false, alive: true }
+  const sock = installHostInfra(makeHostSocket(), {
+    getTargets: () => (state.created && state.alive
+      ? [{ targetId: 'T1', type: 'page', url: 'about:blank', attached: true }]
+      : []),
+    routes: {
+      'Target.createTarget': (f) => {
+        state.created = true
+        state.alive = true
+        sock.push({ id: f.id, result: { targetId: 'T1' } })
+      },
+    },
+  })
   const h = await host.BrowserHost.create({
     config: { instanceDir: t.instanceDir, chromeProfilePath: t.profilePath, debugPortBase: 19225, chromePath: '/fake/chrome' },
-    probePortImpl: async () => false,
-    getJsonImpl: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:19225/devtools/browser/x', Browser: 'FakeChrome' }),
-    spawnImpl: () => ({ pid: 999998, on() {}, unref() {} }),
-    cdpFactory: () => new Cdp({
-      url: 'ws://127.0.0.1:19225/devtools/browser/x',
-      createSocket: () => { const s = new FakeWebSocket('x'); sockets.push(s); return s },
-    }),
+    ...hostDeps(sock),
   })
   try {
-    const w = sockets[0]
-    const server = new FakeCdpServer(w)
-    w.open()
-    await server.waitFor(w, 1)
-    await h.cdp.waitReady(500)
-
     // 未经 ensureTab 就操作：应报"可重排队"
     await assert.rejects(h.click('comment', '#x'), (e) => {
       assert.strictEqual(e.code, host.RETRYABLE_REQUEUE)
@@ -880,33 +1189,20 @@ test('browser-host：tab 消失 → 抛可重排队错误（requeue=true，不�
       return true
     })
 
-    // ensureTab 建页
-    const p = h.ensureTab('comment', 'about:blank', { initialWaitMs: 0, pollMax: 2 })
-    let f = await server.waitFor(w, 2)
-    assert.strictEqual(f.method, 'Target.createTarget')
-    w.push({ id: f.id, result: { targetId: 'T1' } })
-    // Target.getTargets（waitForTarget）
-    await wait(20)
-    server.pump()
-    f = w.frames().find((x) => x.method === 'Target.getTargets')
-    assert.ok(f, '必须等 target 出现在 Target.getTargets 里再 attach')
-    // Target.attachToTarget
-    await wait(40)
-    server.pump()
-    const attach = w.frames().find((x) => x.method === 'Target.attachToTarget')
-    assert.ok(attach, '必须 attach 到目标（flatten 模式，不开第二条 WS）')
-    assert.strictEqual(attach.params.flatten, true)
-    await wait(40)
-    server.pump()
-    const ensured = await p
+    // ensureTab 建页 → 必须走 createTarget → getTargets → attach(flatten)
+    const ensured = await h.ensureTab('comment', 'about:blank', { initialWaitMs: 0, pollMax: 3 })
     assert.strictEqual(ensured.targetId, 'T1')
+    const attach = sock.commands().find((f) => f.method === 'Target.attachToTarget')
+    assert.ok(attach, `必须 attach 到目标（实际命令：${sock.methods().join(',')}）`)
+    assert.strictEqual(attach.params.flatten, true, '必须用 flatten 模式（不开第二条 WS）')
     assert.strictEqual(host.hosts.get(host.hostKey(t.instanceDir, 19225)), h)
 
-    // 关键：**不得**出现第二个 WebSocket（那正是旧代码的缺陷）
-    assert.strictEqual(sockets.length, 1, '一个实例只能有一条 CDP WebSocket')
+    // ⚠️ 关键：一个实例**只能有一条** CDP WebSocket（旧代码 6 条互相争抢）
+    assert.strictEqual(sock.commands().filter((f) => f.method === 'Runtime.enable').length, 1,
+      '不得出现第二次 enable —— 那意味着开了第二条连接')
 
     // tab 被外部关掉 → 再操作必须 requeue
-    server.targets = []
+    state.alive = false
     await assert.rejects(h.evaluate('comment', '1+1'), (e) => {
       assert.strictEqual(e.code, host.RETRYABLE_REQUEUE)
       assert.strictEqual(e.requeue, true)
@@ -939,27 +1235,21 @@ test('browser-host：未知 IPC op 返回结构化错误而不是崩溃', async 
 
 test('browser-host：DOM 稳定判定的返回值钉死"不是 sent_confirmed"', async () => {
   const t = tempInstance('dsh-host-dom-')
-  const sockets = []
+  const sock = installHostInfra(makeHostSocket(), {
+    routes: {
+      'Runtime.evaluate': (f) => {
+        sock.push({
+          id: f.id,
+          result: { result: { type: 'string', value: JSON.stringify({ ok: true, visibleCount: 1, candidateCount: 1, sample: '固定文本' }) } },
+        })
+      },
+    },
+  })
   const h = await host.BrowserHost.create({
     config: { instanceDir: t.instanceDir, chromeProfilePath: t.profilePath, debugPortBase: 19226, chromePath: '/fake/chrome' },
-    probePortImpl: async () => false,
-    getJsonImpl: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:19226/devtools/browser/x' }),
-    spawnImpl: () => ({ pid: 999997, on() {}, unref() {} }),
-    cdpFactory: () => new Cdp({
-      url: 'ws://127.0.0.1:19226/devtools/browser/x',
-      createSocket: () => { const s = new FakeWebSocket('x'); sockets.push(s); return s },
-    }),
+    ...hostDeps(sock),
   })
   try {
-    const w = sockets[0]
-    const server = new FakeCdpServer(w)
-    server.route('Runtime.evaluate', (f) => {
-      w.push({ id: f.id, result: { result: { type: 'string', value: JSON.stringify({ ok: true, visibleCount: 1, candidateCount: 1, sample: '固定文本' }) } } })
-      return 'handled'
-    })
-    w.open()
-    await server.waitFor(w, 1)
-    await h.cdp.waitReady(500)
     h.cdp.registerSession('comment', 'T1', 'S1')
     h.roles.set('comment', 'T1')
 
@@ -968,6 +1258,51 @@ test('browser-host：DOM 稳定判定的返回值钉死"不是 sent_confirmed"',
     assert.strictEqual(r.verdict_hint, 'sent_confirmed_dom', '⚠️ DOM 稳定只能映射到 sent_confirmed_dom')
     assert.strictEqual(r.confirm_signal, 'dom_stable')
     assert.strictEqual(r.billable, false, '⚠️ DOM 判定不得计费（红线 2）')
+    assert.match(r.note, /不得作为 sent_confirmed/, '判定口径必须写在返回值里，防止上层图省事当成功')
+  } finally {
+    await h.close()
+    t.cleanup()
+  }
+})
+
+test('browser-host：响应游标单调递增，sinceCursor 优先于 sinceMs', async () => {
+  const t = tempInstance('dsh-host-cursor-')
+  const sock = installHostInfra(makeHostSocket(), {
+    routes: {
+      'Network.getResponseBody': (f) => { sock.push({ id: f.id, result: { body: '{"status_code":0}', base64Encoded: false } }) },
+    },
+  })
+  const h = await host.BrowserHost.create({
+    config: { instanceDir: t.instanceDir, chromeProfilePath: t.profilePath, debugPortBase: 19228, chromePath: '/fake/chrome' },
+    ...hostDeps(sock),
+  })
+  try {
+    assert.strictEqual(h.responseCursor(), 0, '空环游标应为 0')
+    const cursor0 = h.responseCursor()
+
+    // 注入一条"开始捕获之前"的响应 → 用 cursor0 划窗口时必须**看不到**它
+    sock.push({ method: 'Network.requestWillBeSent', params: { requestId: 'OLD', request: { url: 'https://x.invalid/old', method: 'POST' } } })
+    sock.push({ method: 'Network.responseReceived', params: { requestId: 'OLD', response: { url: 'https://x.invalid/old', status: 200 } } })
+    sock.push({ method: 'Network.loadingFinished', params: { requestId: 'OLD' } })
+    await wait(40)
+    assert.strictEqual(h.responseCursor(), 1, '捕获到 1 条后游标应变成 1')
+    assert.strictEqual(h.capturedResponses().length, 1)
+    await assert.rejects(
+      h.waitForResponse({ urlPattern: '/old', sinceCursor: cursor0 + 1, timeoutMs: 80 }),
+      (e) => {
+        // ⚠️ browser-host 会把 cdp 的归因码原样透传（cdp_cmd_timeout），
+        //    结构化的 detail 必须保留下来用于排障。
+        assert.strictEqual(e.code, ATTRIBUTION.CMD_TIMEOUT)
+        assert.strictEqual(e.detail.since_cursor, cursor0 + 1, '错误里必须带上游标，便于判断窗口是否划错')
+        return true
+      }
+    )
+
+    // ⚠️ stopResponseCapture 必须幂等：平台层在 finally 里盲调
+    const s1 = await h.stopResponseCapture()
+    const s2 = await h.stopResponseCapture()
+    assert.strictEqual(s2.already_stopped, true, '重复 stop 必须成功返回（幂等）')
+    assert.ok(s1.captured >= 1)
   } finally {
     await h.close()
     t.cleanup()
@@ -1029,47 +1364,53 @@ test('browser-host：waitForTarget 先固定等再轮询（legacy 的新建标�
 // ══════════════════════════════════════════════════════════════
 
 test('IPC：分片与粘连的帧都能正确重组（NDJSON 的核心）', async () => {
-  // ⚠️ 这里**手动**建两端（而不是用 createInProcessPair）：
-  //    要精确控制"字节怎么进流"，就必须自己拿 `up`（请求方向）与
-  //    `down`（响应方向）两个流，否则客户端写请求时会与被测的
-  //    手写字节混在同一个流上。
-  const up = new PassThrough()
-  const down = new PassThrough()
-  const seen = []
-  const server = ipc.createIpcServer({
-    input: up,
-    output: down,
-    onRequest: async (op, args) => { seen.push({ op, args }); return { ok: op } },
+  /**
+   * ⚠️ 分帧必须测在 `createFrameReader` 这一层，**不能**靠"往连接的
+   *    up 流里手写字节"：那是双向流，服务端和客户端**都**在监听同一个
+   *    流，手写的请求字节会被客户端自己的读端再吃一遍 → 同一请求处理两次。
+   *    这是测试构造错误，不是被测代码的缺陷（实测踩过）。
+   *    这里两层都测：分帧器单测 + 真实两端的往返。
+   */
+  const frames = []
+  const errors = []
+  const reader = ipc.createFrameReader({
+    maxFrameBytes: 4096,
+    onFrame: (m) => frames.push(m),
+    onError: (e) => errors.push(e),
   })
-  const client = ipc.createIpcClient({ input: down, output: up, timeoutMs: 1000 })
 
+  // 一条帧被拆成 3 段写入
+  const raw = JSON.stringify({ id: 101, op: 'split', args: { v: 'x'.repeat(50) } }) + '\n'
+  reader.push(raw.slice(0, 10))
+  reader.push(raw.slice(10, 30))
+  reader.push(raw.slice(30))
+  // 两条帧粘在一个 chunk 里
+  reader.push(JSON.stringify({ id: 102, op: 'joined_a', args: {} }) + '\n'
+    + JSON.stringify({ id: 103, op: 'joined_b', args: {} }) + '\n')
+  // 空行必须被忽略（写端可能插空行）
+  reader.push('\n')
+  // 半条帧留在缓冲里，不能提前投递
+  reader.push('{"id":104,"op":"partial"')
+
+  assert.strictEqual(errors.length, 0, `不应有分帧错误：${JSON.stringify(errors.map((e) => e.attribution))}`)
+  assert.deepStrictEqual(frames.map((f) => f.op), ['split', 'joined_a', 'joined_b'],
+    '分片与粘连都只应产生一条请求；空行不产生请求；半条帧不得提前投递')
+  assert.strictEqual(frames[0].args.v.length, 50, '被拆分的帧内容必须完整还原')
+  assert.ok(reader.stats().buffered > 0, '未闭合的半条帧应留在缓冲区里等后续字节')
+  assert.strictEqual(reader.stats().frames, 3)
+
+  // 补齐后半条 → 立刻投递
+  reader.push('}\n')
+  assert.deepStrictEqual(frames.map((f) => f.op), ['split', 'joined_a', 'joined_b', 'partial'])
+  assert.strictEqual(reader.stats().buffered, 0)
+
+  // 真实两端的往返（保证上面测的分帧器确实被两端用上）
+  const pair = ipc.createInProcessPair({ onRequest: async (op) => ({ echoed: op }), timeoutMs: 1000 })
   try {
-    // 一条帧被拆成 3 段写入
-    const raw = JSON.stringify({ id: 101, op: 'split', args: { v: 'x'.repeat(50) } }) + '\n'
-    up.write(raw.slice(0, 10))
-    up.write(raw.slice(10, 30))
-    up.write(raw.slice(30))
-    // 两条帧粘在一个 chunk 里
-    up.write(JSON.stringify({ id: 102, op: 'joined_a', args: {} }) + '\n'
-      + JSON.stringify({ id: 103, op: 'joined_b', args: {} }) + '\n')
-    // 空行必须被忽略（写端可能插空行）
-    up.write('\n')
-
-    const r1 = await client.request('split', { v: 'x'.repeat(50) })
-    assert.deepStrictEqual(r1, { ok: 'split' })
-    const r2 = await client.request('joined_a', {})
-    assert.deepStrictEqual(r2, { ok: 'joined_a' })
-    const r3 = await client.request('joined_b', {})
-    assert.deepStrictEqual(r3, { ok: 'joined_b' })
-
-    assert.deepStrictEqual(seen.map((s) => s.op), ['split', 'joined_a', 'joined_b'],
-      '分片与粘连都只应产生一条请求；空行不产生请求')
-    assert.strictEqual(server.stats().frames, 4, '只应有 4 条有效帧（空行不算）')
+    assert.deepStrictEqual(await pair.client.request('round_trip', {}), { echoed: 'round_trip' })
+    assert.strictEqual(pair.server.stats().frames, 1, '一次请求应恰好产生一条帧')
   } finally {
-    server.close()
-    await client.close()
-    up.destroy()
-    down.destroy()
+    await pair.close()
   }
 })
 

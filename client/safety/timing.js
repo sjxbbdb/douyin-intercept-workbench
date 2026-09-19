@@ -107,13 +107,28 @@ function resolveRng(rng) {
 
 /** 标准正态分布采样（Box–Muller）。 */
 function normalSample(rng) {
+  // ⚠️ 不能用 log(0)：rng 可能返回 0（`Math.random()` 在 2^53 次里会命中一次，
+  //    而测试里注入的确定源很可能**恒定返回 0**）。
+  //
+  // ⚠️⚠️ 重抽次数必须有上限。早期实现写的是 `while (u === 0) u = rng()`——
+  //    遇到恒定返回 0 的随机源时它会**永远循环**，而表现不是报错，
+  //    而是"程序卡住不响应"（本项目的 DM 用例就因此整个测试挂在
+  //    typingPlan 上，排查了半小时才定位到这两行）。
+  //    有限重抽 + 兜底极小值：语义上等价（把 0 视作"极小概率事件"），
+  //    但实际上不可能卡住。
   let u = 0
   let v = 0
-  // ⚠️ 不能用 log(0)：Math.random() 可能返回 0，必须重抽而不是让它变成 −Infinity。
-  while (u === 0) u = rng()
-  while (v === 0) v = rng()
+  for (let i = 0; i < NORMAL_RESAMPLE_LIMIT && u === 0; i++) u = rng()
+  for (let i = 0; i < NORMAL_RESAMPLE_LIMIT && v === 0; i++) v = rng()
+  if (!(u > 0)) u = NORMAL_EPSILON
+  if (!(v > 0)) v = NORMAL_EPSILON
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
 }
+
+/** 正态采样里 0 的重抽上限（超过就当作极小值处理）。 */
+const NORMAL_RESAMPLE_LIMIT = 8
+/** 0 的替代值。取 1e-12 使 log 得到约 -27.6，仍在合理量级内。 */
+const NORMAL_EPSILON = 1e-12
 
 /** 夹取到 [lo, hi]。 */
 function clamp(v, lo, hi) {

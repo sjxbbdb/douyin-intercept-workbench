@@ -42,6 +42,12 @@ function fakeHost(opts = {}) {
       return opts.evaluateResult
     },
     async click(role, arg) { this.calls.push({ op: 'click', role, arg }) },
+    // ⚠️ 平台层用的是坐标原语 `clickAt`（因为定位判据只能在页面里算，
+    //    算出来的是 rect 而不是选择器）。替身必须提供它，否则平台层
+    //    走到点击那一步会 TypeError —— 而那种失败会伪装成"选择器问题"。
+    async clickAt(role, at, o) { this.calls.push({ op: 'clickAt', role, at, o }) },
+    async typeText(role, text, o) { this.calls.push({ op: 'typeText', role, text, o }) },
+    async pressEnter(role) { this.calls.push({ op: 'pressEnter', role }) },
     async startResponseCapture(role, o) { this.calls.push({ op: 'startResponseCapture', role, o }) },
     async stopResponseCapture() { this.calls.push({ op: 'stopResponseCapture' }); return { ok: true } },
     async waitForResponse(o) {

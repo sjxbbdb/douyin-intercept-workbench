@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  client/ui/index.html —— 本地控制台的骨架。
+
+  ⚠️ 三条不可动摇的前端约束（plans/A-工具链路开发指导.md §3.3~3.9 的 `ui/` 行）：
+    1. **原生 DOM，无框架、无构建、无 CDN、无外部字体**。商家机器可能完全离线，
+       任何外部资源都会让面板在断网时变成白屏——而它恰恰是用来排障的。
+    2. **界面不做任何看板算术**。所有数字来自 `GET /api/state` 的 `dashboard`
+       （由 `shared/lib/stats.js` 的 `buildDashboard()` 算出）。
+       前端只负责"把返回的对象画出来"——包括把 `null` 画成 `—`（不是 0%，不是 100%）。
+    3. **不允许出现任何硬编码样例数字**（旧代码 D-14 的缺陷：看板挂着演示假数据）。
+       空态一律显示"暂无数据"。
+
+  ⚠️ 令牌不写在这个文件里：`app.js` 从 `location.search` 的 `?token=` 读取，
+     放进 sessionStorage，并附在每个 `/api/*` 请求上。页面本身不含任何数据，
+     所以它可以不带令牌被加载（否则首屏导航根本发不出去）。
+-->
+<title>抖音自动回复工作台 · 本地控制台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<!-- ══════════ 顶栏：永远可见 ══════════ -->
+<header class="topbar" id="topbar">
+  <div class="topbar-row">
+
+    <div class="brand">
+      <span class="brand-name">抖音自动回复工作台</span>
+      <span class="brand-sub" id="instance-label">实例 —</span>
+    </div>
+
+    <!-- 急停：不依赖任何接口状态，永远是本页面第一个可点的控件 -->
+    <button type="button" id="btn-emergency" class="btn-emergency" aria-pressed="false"
+            title="紧急停止所有发送（快捷键 Esc）。不受登录状态影响。">
+      <span class="btn-emergency-dot" aria-hidden="true"></span>
+      <span id="emergency-label">急停</span>
+    </button>
+
+    <div class="topbar-metrics">
+      <div class="metric">
+        <span class="metric-label">引擎</span>
+        <span class="metric-value" id="metric-engine">—</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">余额</span>
+        <span class="metric-value" id="metric-credit">—</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">可发</span>
+        <span class="metric-value" id="metric-affordable">—</span>
+      </div>
+      <div class="metric metric-wide">
+        <span class="metric-label">今日额度</span>
+        <span class="metric-value" id="metric-quota">—</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">待处理</span>
+        <span class="metric-value" id="metric-queue">—</span>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <button type="button" id="btn-palette" class="btn-ghost" title="命令面板（Ctrl+K）">Ctrl+K</button>
+      <span class="conn" id="conn-state" data-state="unknown">连接中…</span>
+    </div>
+  </div>
+
+  <!-- 额度文案：红线 1 要求**逐字**展示服务端下发的 headline -->
+  <div class="quota-notice" id="quota-notice" hidden>
+    <span class="quota-headline" id="quota-headline"></span>
+    <span class="quota-detail" id="quota-detail"></span>
+  </div>
+</header>
+
+<!-- 连接失败横幅：明确说"本地服务未响应"，而不是让数字静静地停在旧值上 -->
+<div class="banner banner-error" id="banner-offline" hidden>
+  <strong>本地服务未响应</strong>
+  <span id="banner-offline-detail">界面上的数字已停止更新，请不要把它们当作当前状态。</span>
+</div>
+
+<!-- 告警区（判定全部由 GET /api/state 的 alerts 给出，前端不自己判断） -->
+<div class="alerts" id="alerts"></div>
+
+<!-- ══════════ 面板导航 ══════════ -->
+<nav class="tabs" id="tabs" role="tablist" aria-label="功能面板"></nav>
+
+<main id="main">
+  <!-- 各面板由 app.js 在启动时构建到对应的 <section> 里 -->
+  <section class="panel" id="panel-dashboard" data-panel="dashboard" role="tabpanel"></section>
+  <section class="panel" id="panel-engine" data-panel="engine" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-queue" data-panel="queue" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-rules" data-panel="rules" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-limits" data-panel="limits" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-observe" data-panel="observe" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-credential" data-panel="credential" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-circuit" data-panel="circuit" role="tabpanel" hidden></section>
+  <section class="panel" id="panel-about" data-panel="about" role="tabpanel" hidden></section>
+</main>
+
+<!-- ══════════ 命令面板（Ctrl+K）══════════ -->
+<div class="overlay" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="命令面板">
+    <input type="text" id="palette-input" class="palette-input" autocomplete="off"
+           placeholder="输入以筛选动作…（↑↓ 选择，Enter 执行，Esc 关闭）">
+    <ul class="palette-list" id="palette-list"></ul>
+    <div class="palette-hint">Esc 关闭 · Enter 执行 · ↑↓ 移动</div>
+  </div>
+</div>
+
+<!-- 通用确认/输入对话框（原生 dialog 之外的最简实现，避免浏览器差异） -->
+<div class="overlay" id="modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h2 class="modal-title" id="modal-title"></h2>
+    <p class="modal-body" id="modal-body"></p>
+    <div class="modal-actions" id="modal-actions"></div>
+  </div>
+</div>
+
+<footer class="footer">
+  <span>本地控制台 · 仅监听回环地址</span>
+  <span class="footer-sep">·</span>
+  <span>快捷键：<kbd>1</kbd>–<kbd>9</kbd> 切换面板 · <kbd>Ctrl</kbd>+<kbd>K</kbd> 命令面板 · <kbd>Esc</kbd> 急停</span>
+  <span class="footer-sep">·</span>
+  <span id="footer-token">令牌：来自地址栏 ?token=</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

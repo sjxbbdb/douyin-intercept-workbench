@@ -122,6 +122,32 @@ module.exports = {
     fixture: 'live-room-desktop-01.html',
     notes: '⚠️ legacy live_dom_collector.js:349-357 是 7 个模糊匹配；模糊选择器标 low',
   },
+  liveSendButton: {
+    key: 'liveSendButton',
+    name: '直播间公屏的发送按钮',
+    channel: 'live_danmaku',
+    // ⚠️ 与评论区的 `sendButton` 是**两个**条目，不能复用。理由有三条：
+    //    ① 评论区那个的判据是"在含「回复中」的评论项内 + 品牌色 SVG"，
+    //       直播间根本没有"回复中"这个状态，套过去必然命中不到；
+    //    ② 直播间是**整页一个**公屏输入框，没有"发错到别的评论项"的风险，
+    //       所以判据可以退化成"可见 + 在 chatroom/danmaku 容器内"；
+    //    ③ 弹幕的**主路径是 Enter**，这个按钮只作单次兜底
+    //       （见 page-live.js 的 submitDanmaku）。分开写才能让
+    //       "兜底失效"与"主路径失效"在排障时区分得开。
+    //
+    //    confidence 标 medium 而不是 low：候选是结构性的（button 语义 +
+    //    文本为「发送」），不依赖品牌色；但**未在真机上验证过**，
+    //    所以 liveVerifiedAt 必须保持 null。
+    candidates: ['button', '[role="button"]', 'span', 'div'],
+    match: 'first',
+    required: false,
+    lastVerifiedAt: '2026-09-18',  // 离线 fixture 回归验证日期（可自动复跑：node test/run.js L3）
+    liveVerifiedAt: null,          // ⚠️ 未经【真机】验证：P2 验证门 G-4 完成后回填
+    verifiedBy: null,              // ⚠️ 真机验证人：P2 G-4 完成后回填
+    confidence: 'medium',
+    fixture: 'live-room-desktop-01.html',
+    notes: '兜底路径；弹幕主路径是 Enter（直播间公屏）。判据：去空白后 innerText 严格等于「发送」，且必须可见、且在 chatroom/danmaku 容器内',
+  },
   noteDetail: {
     key: 'noteDetail',
     name: '图文帖容器',

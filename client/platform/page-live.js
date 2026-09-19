@@ -230,6 +230,8 @@ class LivePage {
    * ⚠️ 与评论区不同，弹幕只有**一个**输入框，不存在"发错地方"的风险。
    *    但仍要确认它是**直播间公屏**的输入框，而不是私信或搜索框——
    *    判据是它所在的容器带 chatroom/danmaku 类特征。
+   *
+   * @returns {Promise<{ok:true, x:number, y:number}>} 失败时抛错（**不返回 ok:false**）
    */
   async focusInput() {
     const expr = `(function(){
@@ -248,7 +250,8 @@ class LivePage {
         if(!inChat(ed)) continue;
         ed.focus();
         var r=ed.getBoundingClientRect();
-        return {ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)};
+        return {ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2),
+                focused:(document.activeElement===ed)};
       }
       return {ok:false, reason:'chat_input_not_found'};
     })()`
@@ -260,6 +263,166 @@ class LivePage {
       })
     }
     return r
+  }
+
+  /**
+   * 向直播间公屏输入框输入文案，并**回读校验**。
+   *
+   * ⚠️ 与 `CommentPage.typeIntoEditor` 是**两份**实现，不能互相调用：
+   *    评论区的回读必须排除页面底部的**主评论输入框**（往那里输入会发出
+   *    一条顶级评论），直播间的公屏就是唯一那个输入框，没有这个陷阱，
+   *    但反过来它多了"必须是 chatroom/danmaku 容器内"的要求。
+   *    把两者合并只会让其中一边的判据被悄悄丢掉。
+   *
+   * ⚠️ 回读校验不是可选项（理由同评论区）：`Input.insertText` 与分块输入
+   *    都可能被页面的输入法/受控组件吞掉，而"输入丢了"的表现是
+   *    发出一条**空弹幕或半截弹幕**——比发不出去更糟，因为它真的发出去了、
+   *    真的会被计费，而且会在满屏弹幕里被所有观众看到。
+   *
+   * ⚠️ 也**不能**用 `Runtime.evaluate` 直接给输入框赋值：那样绕过真实输入事件，
+   *    React 类框架的受控组件不会更新内部 state，于是"页面上看得见文字、
+   *    提交时发出去的是空的"。所以必须走 browser-host 的真实键盘路径。
+   *
+   * @param {string} text
+   * @param {object} p
+   * @param {Array<{text:string, delayMs:number}>} [p.plan] 打字计划（来自 safety/timing.js）
+   */
+  async typeIntoInput(text, p = {}) {
+    const expected = String(text || '')
+    if (!expected) {
+      throw new WorkbenchError('CONTENT_TOO_SHORT', '弹幕文案为空，已拒绝发送')
+    }
+
+    if (Array.isArray(p.plan) && p.plan.length) {
+      await this.host.typeText(this.role, '', { plan: p.plan })
+    } else {
+      // 没有计划就一次性插入。⚠️ 这是**降级**路径：一次性插入的时间特征
+      //    与真人差异最大，只应该在调用方明确要求时走。
+      await this.host.typeText(this.role, expected)
+    }
+
+    // ── 回读校验 ─────────────────────────────────────────────
+    const readBack = await this.#evaluate(`(function(){
+      ${VISIBLE_JS}
+      function inChat(el){
+        var a=el, d=0;
+        while(a && d<6){ var c=((a.className||'')+'').toLowerCase();
+          if(c.indexOf('chatroom')>=0||c.indexOf('danmu')>=0||c.indexOf('chat')>=0) return true;
+          a=a.parentElement; d++; }
+        return false;
+      }
+      var eds=Array.from(document.querySelectorAll('[contenteditable=true],textarea'));
+      for(var i=0;i<eds.length;i++){
+        var ed=eds[i];
+        if(!__visible(ed)) continue;
+        if(!inChat(ed)) continue;
+        var v=(ed.value!==undefined && ed.value!==null) ? String(ed.value) : String(ed.innerText||ed.textContent||'');
+        return {ok:true, value:v};
+      }
+      return {ok:false, reason:'chat_input_not_found_after_typing'};
+    })()`, { defaultValue: { ok: false, reason: 'evaluate_failed' } })
+
+    if (!readBack || !readBack.ok) {
+      throw new WorkbenchError('ELEMENT_TIMEOUT',
+        '输入弹幕文案后找不到公屏输入框，无法确认内容是否写入', { selector: 'danmakuRow' })
+    }
+    if (normalizeForReadback(readBack.value) !== normalizeForReadback(expected)) {
+      // ⚠️ 不重试输入。输入不一致说明页面组件状态与我们的认知不同，
+      //    盲目重试可能造成"文字重复追加"——而重复追加的弹幕会直接发出去。
+      throw new WorkbenchError('ELEMENT_TIMEOUT',
+        '输入的弹幕文案与预期不一致（可能被页面组件吞掉），已中止本次发送以免发出半截弹幕',
+        { expected_length: expected.length, got_length: String(readBack.value || '').length })
+    }
+
+    return { ok: true, length: expected.length }
+  }
+
+  /**
+   * 提交弹幕：**Enter 为主路径**，发送按钮为**单次**兜底。
+   *
+   * ⚠️ 本方法的等待时间刻意压得很短（默认 2s + 1.2s）。理由：
+   *    `verifier.verify({timeoutMs})` 是在**调用方**里紧接着本方法执行的，
+   *    如果这里等 10 秒，平台的响应早就过去了，抓取窗口会被我们自己耗掉——
+   *    而弹幕**没有 DOM 回读可补救**（发出去就滚走了），
+   *    漏掉捕获窗口的表现就是"全部都变成 sent_suspected、一条都不计费"。
+   *    "输入框清空"只是**继续下一步**的判据，不是成功判据，
+   *    所以不值得为它多等。
+   *
+   * ⚠️ 按钮兜底**只点一次**。重复点击有发出两条弹幕的风险，而重复发言
+   *    是平台最容易识别的机器人特征。到底发出去没有，由
+   *    `publish-verifier.js` 从 `live/comment/send` 的响应体判定。
+   *
+   * @returns {Promise<{via:string, stillFilled:boolean}>}
+   */
+  async submitDanmaku({ enterWaitMs = 2000, fallbackWaitMs = 1200 } = {}) {
+    await this.host.pressEnter(this.role)
+    await sleep(enterWaitMs)
+
+    // Enter 是否生效？判据是**公屏输入框被清空**。
+    // ⚠️ 这只是"继续下一步"的判据，**绝不是成功判据**（见文件头说明）。
+    const stillFilled = await this.#evaluate(`(function(){
+      ${VISIBLE_JS}
+      function inChat(el){
+        var a=el, d=0;
+        while(a && d<6){ var c=((a.className||'')+'').toLowerCase();
+          if(c.indexOf('chatroom')>=0||c.indexOf('danmu')>=0||c.indexOf('chat')>=0) return true;
+          a=a.parentElement; d++; }
+        return false;
+      }
+      var eds=Array.from(document.querySelectorAll('[contenteditable=true],textarea'));
+      for(var i=0;i<eds.length;i++){
+        var ed=eds[i];
+        if(!__visible(ed)) continue;
+        if(!inChat(ed)) continue;
+        var v=(ed.value!==undefined && ed.value!==null) ? String(ed.value) : String(ed.innerText||ed.textContent||'');
+        return !!(v && String(v).replace(/\\s+/g,'')!=='');
+      }
+      return false;
+    })()`, { defaultValue: false })
+
+    if (!stillFilled) return { via: 'enter', stillFilled: false }
+
+    // ── 兜底：点一次发送按钮 ─────────────────────────────────
+    // ⚠️ 选择器来自 selectors.js 的 `liveSendButton`，**不得**在这里内联。
+    //    内联的后果是平台改版时只改 selectors.js 不生效——而"改一个文件就能
+    //    修好选择器失效"正是选择器集中这条约束的全部意义。
+    const { css: btnCss } = this.#css('liveSendButton')
+    const btn = await this.#evaluate(`(function(){
+      ${VISIBLE_JS}
+      function inChat(el){
+        var a=el, d=0;
+        while(a && d<6){ var c=((a.className||'')+'').toLowerCase();
+          if(c.indexOf('chatroom')>=0||c.indexOf('danmu')>=0||c.indexOf('chat')>=0) return true;
+          a=a.parentElement; d++; }
+        return false;
+      }
+      var cands=Array.from(document.querySelectorAll(${JSON.stringify(btnCss)}));
+      for(var i=0;i<cands.length;i++){
+        var e=cands[i];
+        if(e.children && e.children.length>1) continue;
+        var t=String(e.innerText||e.textContent||'').replace(/\\s+/g,'').trim();
+        if(t!=='\\u53d1\\u9001') continue;
+        if(!__visible(e)) continue;
+        if(!inChat(e)) continue;
+        var r=e.getBoundingClientRect();
+        return {ok:true, x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)};
+      }
+      return {ok:false, reason:'live_send_button_not_found'};
+    })()`, { defaultValue: { ok: false, reason: 'evaluate_failed' } })
+
+    if (!btn || !btn.ok) {
+      // ⚠️ 留痕但不抛错。抛错会让调用方走"异常路径"（保留 unknown + abort），
+      //    而这里的情况是"Enter 与按钮都没能提交"——输入框里的文字还在，
+      //    我们**确实不知道**到底发出去没有，交给响应捕获去判更准确。
+      this.#log('warn', 'live_send_button_not_found_enter_only', {
+        selector: 'liveSendButton', reason: btn ? btn.reason : 'null',
+      })
+      return { via: 'enter', stillFilled: true }
+    }
+
+    await this.host.clickAt(this.role, { x: btn.x, y: btn.y })
+    await sleep(fallbackWaitMs)
+    return { via: 'button', stillFilled: false }
   }
 
   async #evaluate(expression, { defaultValue, timeoutMs } = {}) {
@@ -284,12 +447,30 @@ function sleep(ms) {
   return new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref() })
 }
 
+/**
+ * 回读比对用的归一化。
+ *
+ * ⚠️ 比 `NORMALIZE_JS` **宽松得多**：只统一换行、不换行空格与首尾空白。
+ *    理由：回读的目的是"确认文字没丢"，而不是"确认逐字节相同"。
+ *    公屏输入框的 `innerText` 会把换行规范化、可能插入 `\u00a0`，
+ *    用它套 NORMALIZE_JS（那会删掉所有标点）反而会把"丢了标点"
+ *    这种真实差异掩盖掉。与 `page-comment.js` 的同名函数保持逐字一致。
+ */
+function normalizeForReadback(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim()
+}
+
 module.exports = {
   LivePage,
   CHANNEL,
   SYSTEM_MESSAGE_PREFIXES,
   UI_LABELS,
   isSystemMessage,
+  normalizeForReadback,
   NORMALIZE_JS,
   VISIBLE_JS,
 }

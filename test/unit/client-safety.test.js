@@ -632,6 +632,35 @@ test('时序：可复现的种子随机源', () => {
   assert.notDeepStrictEqual(seq1, Array.from({ length: 8 }, () => T.makeSeededRng(43)()))
 })
 
+// ⚠️ 回归测试：恒定返回 0 的随机源**不得**让任何时序函数卡死。
+//    这条是真踩过的坑：`normalSample` 里原本写的是
+//    `while (u === 0) u = rng()`（为了避免 log(0)），遇到恒定 0 就
+//    永远循环。表现不是报错，而是"测试/程序卡住不响应"，
+//    排查成本极高（当时整个 DM 用例挂在 typingPlan 上）。
+//    现在改为有限重抽 + 极小值兜底，本用例就是那道闸门。
+test('时序：退化的随机源（恒定 0 / 恒定 1）不得造成死循环', () => {
+  const zero = () => 0
+  const t0 = Date.now()
+
+  const plan = T.typingPlan('这个商品多少钱？可以私信我', { rng: zero })
+  assert.ok(plan.length > 0, '必须产出打字计划')
+  assert.strictEqual(plan.map((x) => x.text).join(''), '这个商品多少钱？可以私信我',
+    '拼接必须严格等于原文（块长为 1 也不能丢字符）')
+  for (const seg of plan) {
+    assert.ok(Number.isFinite(seg.delayMs), '停顿必须是有限数（不得出现 Infinity/NaN）')
+    assert.ok(seg.delayMs >= 0)
+  }
+
+  const iv = T.nextIntervalMs({ minMs: 1000, maxMs: 5000, rng: zero })
+  assert.ok(Number.isFinite(iv) && iv >= 1000 && iv <= 5000)
+
+  const one = () => 1 - Number.EPSILON
+  const iv2 = T.nextIntervalMs({ minMs: 1000, maxMs: 5000, rng: one })
+  assert.ok(Number.isFinite(iv2) && iv2 >= 1000 && iv2 <= 5000)
+
+  assert.ok(Date.now() - t0 < 3000, '这些调用必须秒级返回，不得卡住')
+})
+
 test('时序：interval 参数缺失或非法一律抛错（不内置默认间隔）', () => {
   assert.throws(() => T.nextIntervalMs({}), /minMs/)
   assert.throws(() => T.nextIntervalMs({ minMs: 0 }), /minMs/)
@@ -973,7 +1002,7 @@ test('审计：policy_applied 记录**实际生效值**而非服务端下发值�
   } finally { h.cleanup() }
 })
 
-test('审计：八类条目都能写，未知类型被拒', () => {
+test('审计：九类条目都能写，未知类型被拒', () => {
   const h = makeFixture()
   try {
     h.audit.recordSendAttempt({ sendId: 's-1', sourceType: 'comment', atMs: BASE })
@@ -993,14 +1022,21 @@ test('审计：八类条目都能写，未知类型被拒', () => {
       reason: 'risk_control_rejected', atMs: BASE + 4,
     })
     h.audit.recordEmergencyStop({ on: true, reason: '商家手动急停', atMs: BASE + 5 })
+    // ⚠️ engine_state 是后加的一类，存在的理由是红线 3 要能回答
+    //    "当时**为什么没在发**"——而答案往往是引擎被停了。
+    h.audit.recordEngineState({
+      event: 'engine_stop', reason: 'CREDIT_EXHAUSTED', actor: 'system', atMs: BASE + 5.5,
+    })
     h.audit.recordLogin({ event: 'login', ok: true, atMs: BASE + 6 })
     h.audit.recordSecurityEvent({ event: 'sign_verify_failed', atMs: BASE + 7 })
 
     const stats = h.audit.stats()
-    assert.strictEqual(stats.total, 8)
+    assert.strictEqual(stats.total, 9)
     for (const k of A.AUDIT_KINDS) {
       assert.strictEqual(stats.byKind[k], 1, `${k} 应各有一条`)
     }
+    // engine_state 的 event 也是闭集
+    assert.throws(() => h.audit.recordEngineState({ event: 'engine_stoped' }), /未知引擎状态事件/)
 
     // 未知类型 / 缺失类型一律拒绝（闭集）
     assert.throws(() => h.audit.append({ kind: 'nope', tsMs: BASE }), /未知的审计条目类型/)

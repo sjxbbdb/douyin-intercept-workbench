@@ -175,8 +175,17 @@ function toHostError(e, attribution, message) {
   if (e instanceof BrowserHostError) return e
   const code = (e && (e.attribution || e.code)) || attribution || 'browser_host_error'
   const err = new BrowserHostError(code, message || (e && e.message) || String(e), {
+    // ⚠️ 必须把内层错误的 detail 透传出去：例如 waitForResponse 超时时
+    //    detail 里带着 `since_cursor` 与 `recent_urls`，那是判断
+    //    "窗口划错了还是关键字写错了"的唯一线索（平台知识 §3.5）。
+    //    早期实现只留一句 message，排障时只能靠猜。
+    ...(e && e.detail && typeof e.detail === 'object' ? { cdp_detail: e.detail } : {}),
     cause: e && e.message ? e.message : undefined,
   })
+  // 保留结构化字段（把内层 detail 摊平到本层，调用方按需读取）
+  if (e && e.detail && typeof e.detail === 'object') {
+    err.detail = { ...e.detail, ...(err.detail || {}) }
+  }
   if (e && e.retryable !== undefined && err.retryable === false) err.retryable = Boolean(e.retryable)
   return err
 }
@@ -668,6 +677,18 @@ class BrowserHost {
    */
   #claimCrossProcess() {
     const store = this.#lockStore()
+    try {
+      this.#claimCrossProcessInner(store)
+    } catch (e) {
+      // ⚠️ 取锁失败必须把 store 的进程内登记放掉。
+      //    store.js 的 openStores 守卫会拒绝同一目录的第二次打开，
+      //    不释放的话"第一次启动失败"会变成"这个实例**永远**起不来"。
+      this.#releaseStore()
+      throw e
+    }
+  }
+
+  #claimCrossProcessInner(store) {
     const payload = JSON.stringify({
       pid: process.pid, port: this.debugPort, instance_dir: this.instanceDir, acquired_at_ms: this.deps.now(),
     })
@@ -716,6 +737,17 @@ class BrowserHost {
       }
     }
     throw new BrowserHostError(HOST_ATTRIBUTION.ALREADY_HOSTED, `无法取得实例独占锁：${this.lockPath}`)
+  }
+
+  /** 释放实例 Store（幂等）。 */
+  #releaseStore() {
+    if (!this._store) return
+    try {
+      this._store.close()
+    } catch (e) {
+      this._log('warn', 'store_close_failed', { message: e && e.message })
+    }
+    this._store = null
   }
 
   /**
@@ -1180,15 +1212,164 @@ class BrowserHost {
    * 在 `cdp.js#pressEnterKey` 里，不能省任何一段。
    */
   async pressEnter(role, opts = {}) {
+    return this.pressKey(role, 'Enter', opts)
+  }
+
+  /**
+   * 按一次按键（可参数化）。`pressEnter` 是本方法在 `key='Enter'` 时的别名。
+   *
+   * ⚠️ 必须先把标签页激活到前台：后台标签页收不到按键（平台知识 §2.4）。
+   * ⚠️ 激活失败**不得**被吞掉后继续按键——那会把"标签页不在前台"
+   *    误报成"被风控拦截"（旧代码缺陷 13）。
+   * Enter 的三段式细节见 `cdp.js#pressEnterKey`。
+   *
+   * @param {string} role
+   * @param {string} [key='Enter']
+   * @param {object} [opts] { timeoutMs, virtualKeyCode, text, code, requireForeground }
+   */
+  async pressKey(role, key = 'Enter', opts = {}) {
     await this.#resolveTarget(role)
-    // ⚠️ 必须在前台：后台标签页收不到 Enter（平台知识 §2.4）。
     const act = await this.activateTab(role)
-    if (!act.ok) {
+    if (!act.ok && opts.requireForeground !== false) {
       throw new BrowserHostError(HOST_ATTRIBUTION.ACTIVATE_FAILED,
-        `标签页未能激活到前台，Enter 会打空（这不是风控！）：${act.message}`, { role })
+        `标签页未能激活到前台，${key} 会打空（这不是风控！）：${act.message}`, { role, key })
     }
-    await this.cdp.pressEnterKey(role, opts)
-    return { ok: true, activated: true, atMs: this.deps.now() }
+    await this.cdp.pressEnterKey(role, { ...opts, key })
+    return { ok: true, key, activated: act.ok, atMs: this.deps.now() }
+  }
+
+  /**
+   * 在**绝对坐标**上派发一次真实鼠标点击（mouseMoved → mousePressed → mouseReleased）。
+   *
+   * ⚠️ 为什么需要它：平台层的定位判据（可见性 + 「回复中」祖先 + 排除主输入框）
+   *    只能在页面里算，算完得到的是 rect 而不是选择器。core 不得内联平台知识
+   *    （AGENTS.md §3），所以坐标必须能作为**参数**传进来。
+   *
+   * ⚠️ 仍然走 `Input.dispatchMouseEvent`，不用合成 `element.click()`：
+   *    合成点击 `isTrusted=false`、没有 pressed/released 间隔，是最容易
+   *    被识别为自动化的行为之一（且绕过真实命中测试）。
+   *
+   * @param {string} role
+   * @param {{x:number, y:number}} at 视口坐标（CSS 像素，与 getBoundingClientRect 同系）
+   * @param {object} [opts] { timeoutMs, requireForeground, clickCount, jitterMs }
+   * @returns {Promise<{ok:true, x:number, y:number}>}
+   */
+  async clickAt(role, at, opts = {}) {
+    if (!at || !Number.isFinite(at.x) || !Number.isFinite(at.y)) {
+      throw new BrowserHostError(HOST_ATTRIBUTION.BAD_ARGS, 'clickAt 需要 {x, y} 数值坐标')
+    }
+    const targetId = await this.#resolveTarget(role)
+    const act = await this.activateTab(role)
+    if (!act.ok && opts.requireForeground !== false) {
+      throw new BrowserHostError(HOST_ATTRIBUTION.ACTIVATE_FAILED,
+        `标签页未能激活到前台，坐标点击可能落空：${act.message}`, { role, targetId, at })
+    }
+    const x = Math.round(at.x)
+    const y = Math.round(at.y)
+    await this.cdp.dispatchMouseClick(role, x, y, {
+      jitterMs: Number.isFinite(opts.jitterMs)
+        ? Number(opts.jitterMs)
+        : jitter(CONST.CLICK_JITTER_MIN_MS, CONST.CLICK_JITTER_MAX_MS),
+      clickCount: opts.clickCount,
+      timeoutMs: opts.timeoutMs,
+    })
+    return { ok: true, x, y, activated: act.ok }
+  }
+
+  /**
+   * 对**当前已聚焦**的编辑器输入文本（不传选择器）。
+   *
+   * ⚠️ 与 `type(role, selector, ...)` 的分工：后者自己去找元素、检查可见性
+   *    并聚焦；本方法假定调用方**已经**把焦点放好了（平台层用 `clickAt`
+   *    点进内联编辑器）。内联回复框没有稳定选择器（判据是"所在评论项含
+   *    「回复中」"），所以那条链路只能走"坐标点击 + 无选择器输入"。
+   *
+   * ⚠️ 仍必须逐段用 `Input.dispatchKeyEvent`（type:'keyDown' 带 text），
+   *    **不能**用 `Input.insertText`：后者不产生键盘事件，DraftJS 类富文本
+   *    编辑器收不到输入。`opts.plan` 由 `client/safety/timing.js` 的
+   *    `typingPlan()` 生成，直接照用（这里不重复实现节奏逻辑）。
+   *
+   * ⚠️ `readBackSelector` 是**可选**的：编辑器无稳定选择器时，调用方可以
+   *    不传，此时不做回读（`verified` 为 undefined）。**但发送前的回读校验
+   *    不能因此被跳过**——平台层必须用别的判据（例如读活动元素文本）补上，
+   *    否则"输入丢失"会一路伪装成"发送失败"。
+   *
+   * @param {string} role
+   * @param {string} text
+   * @param {object} [opts] { plan, timeoutMs, readBackSelector, verify, segments }
+   * @returns {Promise<{ok:true, typed:string, typed_len:number, readBack?:string, verified?:boolean}>}
+   */
+  async typeText(role, text, opts = {}) {
+    await this.#resolveTarget(role)
+    await this.activateTab(role)
+    const full = String(text === undefined || text === null ? '' : text)
+    const plan = Array.isArray(opts.plan) && opts.plan.length
+      ? opts.plan
+      : defaultTypingPlan(full, { minPauseMs: opts.minPauseMs, maxPauseMs: opts.maxPauseMs, segments: opts.segments })
+
+    let typed = ''
+    for (let i = 0; i < plan.length; i++) {
+      const seg = plan[i]
+      const segText = String(seg && seg.text !== undefined ? seg.text : '')
+      if (segText) {
+        await this.cdp.send('Input.dispatchKeyEvent', {
+          type: 'keyDown', text: segText, unmodifiedText: segText, key: segText,
+        }, { role, timeoutMs: opts.timeoutMs })
+      }
+      typed += segText
+      const delay = Number(seg && seg.delayMs)
+      if (Number.isFinite(delay) && delay > 0 && i < plan.length - 1) await sleep(delay)
+    }
+
+    const out = { ok: true, typed, typed_len: typed.length, expected_len: full.length, plan_segments: plan.length }
+    if (opts.readBackSelector) {
+      const rb = await this.readText(role, opts.readBackSelector, { timeoutMs: opts.timeoutMs })
+      const actual = rb.text || ''
+      const verified = normalizeForCompare(full).length > 0
+        && normalizeForCompare(actual).includes(normalizeForCompare(full))
+      if (opts.verify !== false && !verified) {
+        throw new BrowserHostError(HOST_ATTRIBUTION.TYPE_VERIFY_FAILED,
+          '输入回读校验失败：编辑器内容与预期不一致（输入丢失）',
+          {
+            selector: opts.readBackSelector,
+            // ⚠️ 只回传长度与末尾片段，不回传原文（红线 3 隐私边界）。
+            expected_len: full.length, actual_len: actual.length,
+            actual_tail: actual.slice(-20), plan_segments: plan.length,
+          })
+      }
+      out.readBack = actual
+      out.verified = verified
+    }
+    return out
+  }
+
+  /**
+   * 把元素滚到视口中央（不点击）。
+   *
+   * ⚠️ 与 `scrollTo` 的分工：`scrollTo` 是"按 deltaY 滚 N 次"（用于
+   * 懒加载列表逐屏加载）；本方法是"把某个已知元素滚进视野并居中"
+   * （用于"评论已找到，把它挪到可点位置"）。二者不可互相替代：
+   * 用 deltaY 去凑一个具体元素的位置，在虚拟列表里永远不会稳定。
+   *
+   * ⚠️ 滚动之后**不能立刻读坐标**：虚拟列表会重渲染，同步读到的 rect
+   * 是 0×0（平台知识 §2.1）。因此这里滚完会等一次重渲染窗口，
+   * 调用方再取坐标时才可靠。
+   */
+  async scrollIntoView(role, selector, opts = {}) {
+    if (!selector) throw new BrowserHostError(HOST_ATTRIBUTION.BAD_ARGS, 'scrollIntoView 需要 selector')
+    await this.#resolveTarget(role)
+    const info = await this.evaluateJson(role, elementRectExpression(selector, {
+      scrollIntoView: true, needViewport: false,
+    }), { timeoutMs: opts.timeoutMs })
+    if (!info || !info.found) {
+      throw new BrowserHostError(HOST_ATTRIBUTION.ELEMENT_NOT_FOUND,
+        `scrollIntoView 未命中任何可见元素：${selector}`,
+        { selector, candidate_count: (info && info.candidateCount) || 0 })
+    }
+    if (opts.waitMs !== 0) {
+      await sleep(Number.isFinite(opts.waitMs) ? Number(opts.waitMs) : CONST.SCROLL_RERENDER_WAIT_MS)
+    }
+    return { ok: true, selector, meta: info }
   }
 
   /**
@@ -1197,8 +1378,15 @@ class BrowserHost {
    * @param {string} [p.selector] 滚动容器选择器（省略则自动找可滚容器）
    * @param {number} [p.deltaY]
    * @param {number} [p.times]
+   * @param {boolean} [p.intoView] 语义切换为"把该元素滚到可见并居中，不按 deltaY 滚"
    */
-  async scrollTo(role, { selector, deltaY = 2000, times = 1, waitMs = 0, timeoutMs } = {}) {
+  async scrollTo(role, { selector, deltaY = 2000, times = 1, waitMs = 0, timeoutMs, intoView = false } = {}) {
+    // ⚠️ intoView 是**另一种语义**，不是"滚一次"：它要求元素可见并居中，
+    //    且必须等一次虚拟列表重渲染。混进 deltaY 循环里会变成"滚 N 次
+    //    再居中"，把已加载的列表又滚走。
+    if (intoView) {
+      return this.scrollIntoView(role, selector, { timeoutMs, waitMs })
+    }
     await this.#resolveTarget(role)
     const times2 = Math.max(1, Math.min(Number(times) || 1, 200))
     const results = []
@@ -1233,19 +1421,49 @@ class BrowserHost {
     await this.#resolveTarget(role)
     if (clear) this.cdp.clearCapturedResponses()
     await this.cdp.enableResponseCapture(role)
+    this._captureStopped = false
     const markMs = this.deps.now()
+    const cursor = this.cdp.capturedResponses.length
     this._log('info', 'response_capture_started', {
-      role, url_patterns: urlPatterns, mark_ms: markMs, network_enabled: this.cdp.engineState.network_enabled,
+      role, url_patterns: urlPatterns, mark_ms: markMs, cursor,
+      network_enabled: this.cdp.engineState.network_enabled,
     })
-    return { markMs, urlPatterns, network_enabled: this.cdp.engineState.network_enabled, sessionId: this.cdp.sessionIdOf(role) }
+    return {
+      markMs, cursor, urlPatterns,
+      network_enabled: this.cdp.engineState.network_enabled,
+      sessionId: this.cdp.sessionIdOf(role),
+    }
   }
 
-  /** 结束捕获。⚠️ 会等在途的取体落地，避免留下未处理的拒绝。 */
+  /** 结束捕获。⚠️ 会等在途的取体落地，避免留下未处理的拒绝；幂等。 */
   async stopResponseCapture() {
+    // ⚠️ 幂等：重复调用必须成功返回。平台层的 try/finally 里常会盲调
+    //    （无论前面成不成功都要收尾），抛错会把"已经拿到的判定"一起吃掉，
+    //    而这条链路是红线 2 的判定链，绝不能因为收尾失败而丢结论。
+    if (this._captureStopped) {
+      return { drained: 0, captured: this.cdp.capturedResponses.length, already_stopped: true }
+    }
+    this._captureStopped = true
     const drained = await this.cdp.drainBodyFetches()
     const captured = this.cdp.capturedResponses.length
     this._log('info', 'response_capture_stopped', { inflight_body_fetches: drained, captured_count: captured })
     return { drained, captured }
+  }
+
+  /**
+   * 当前捕获环的**游标**（纯读取，不改任何状态）。
+   *
+   * ⚠️ 为什么需要游标而不是"时间戳 sinceMs"：判定链路关心的是
+   * "**这一次**发送之后有没有出现平台响应"，而时间戳受本地时钟回拨、
+   * 事件与取体的时间差影响；环的序号是严格单调的，不会出现
+   * "响应其实在游标之后，却因时间戳偏小被漏掉"。
+   * 平台层的 `beginCapture` → 发送 → `waitForResponse({sinceCursor})`
+   * 就靠它把窗口钉死。
+   *
+   * @returns {number} 已捕获条目的序号（0 表示环为空）
+   */
+  responseCursor() {
+    return this.cdp.capturedResponses.length
   }
 
   /**
@@ -1255,12 +1473,23 @@ class BrowserHost {
    * 属于 adapters（红线 2 的判定出口只有一个，放在适配器里）。
    * 本层保证的是"证据可得性"：拿到了就是拿到了，没拿到就明确报没拿到，
    * 并把最近捕获的 URL 一并回传（用于区分"真被风控"与"关键字写错"）。
+   *
+   * ⚠️ `sinceCursor` **优先于** `sinceMs`：游标严格单调，不受本地时钟
+   * 回拨与时序误差影响（见 `responseCursor()` 的说明）。
+   *
+   * @param {object} p
+   * @param {string|RegExp|Function} p.urlPattern URL 片段 / 正则 / 谓词
+   * @param {number} [p.timeoutMs]
+   * @param {number} [p.pollMs]
+   * @param {number} [p.sinceMs]     只接受该时刻之后捕获的响应
+   * @param {number} [p.sinceCursor] 只接受该游标之后捕获的响应（优先）
+   * @param {string} [p.role]        限定会话（多标签页时避免串台）
    */
-  async waitForResponse({ urlPattern, timeoutMs = 15000, pollMs = 100, sinceMs = 0, role = null } = {}) {
+  async waitForResponse({ urlPattern, timeoutMs = 15000, pollMs = 100, sinceMs = 0, sinceCursor, role = null } = {}) {
     if (!urlPattern) throw new BrowserHostError(HOST_ATTRIBUTION.BAD_ARGS, 'waitForResponse 需要 urlPattern')
     const sessionId = role ? this.cdp.sessionIdOf(role) : null
     try {
-      return await this.cdp.waitForResponse({ urlPattern, timeoutMs, pollMs, sinceMs, sessionId })
+      return await this.cdp.waitForResponse({ urlPattern, timeoutMs, pollMs, sinceMs, sinceCursor, sessionId })
     } catch (e) {
       throw toHostError(e, ATTRIBUTION.CMD_TIMEOUT)
     }
@@ -1368,14 +1597,7 @@ class BrowserHost {
     }
     // ⚠️ 必须释放 store 的进程内登记：store.js 的 openStores 守卫会拒绝
     //    同一目录的第二次打开，不释放就等于"关掉 host 后永远无法再启动"。
-    if (this._store) {
-      try {
-        this._store.close()
-      } catch (e) {
-        this._log('warn', 'store_close_failed', { message: e && e.message })
-      }
-      this._store = null
-    }
+    this.#releaseStore()
     if (hosts.get(this.key) === this) hosts.delete(this.key)
     return { closed: true, chrome_left_running: Boolean(this.chromePid) }
   }
@@ -1401,13 +1623,18 @@ class BrowserHost {
 //   wait_for            → { role, expression, timeoutMs, pollMs }
 //   wait_for_page_ready → { role, timeoutMs }
 //   click               → { role, selector, rounds }
+//   click_at            → { role, x, y, requireForeground }   ← 平台层坐标原语
 //   type                → { role, selector, text, plan, verify }
+//   type_text           → { role, text, plan, readBackSelector } ← 无选择器输入
 //   read_text           → { role, selector }
 //   press_enter         → { role }
-//   scroll_to           → { role, selector, deltaY, times }
+//   press_key           → { role, key }                       ← 可参数化按键
+//   scroll_to           → { role, selector, deltaY, times, intoView }
+//   scroll_into_view    → { role, selector }                  ← 滚到可见并居中
 //   start_capture       → { role, urlPatterns, clear }
 //   stop_capture        → {}
-//   wait_for_response   → { role, urlPattern, timeoutMs, sinceMs }
+//   response_cursor     → {}                                  ← 纯读取游标
+//   wait_for_response   → { role, urlPattern, timeoutMs, sinceMs, sinceCursor }
 //   captured_responses  → {}
 //   wait_for_node_stable→ { role, selector, stableMs, pollMs, timeoutMs }
 
@@ -1422,12 +1649,17 @@ const OPS = Object.freeze({
   wait_for: (host, a) => host.waitFor(a.role, a),
   wait_for_page_ready: (host, a) => host.waitForPageReady(a.role, a),
   click: (host, a) => host.click(a.role, a.selector, a),
+  click_at: (host, a) => host.clickAt(a.role, { x: a.x, y: a.y }, a),
   type: (host, a) => host.type(a.role, a.selector, a.text, a),
+  type_text: (host, a) => host.typeText(a.role, a.text, a),
   read_text: (host, a) => host.readText(a.role, a.selector, a),
   press_enter: (host, a) => host.pressEnter(a.role, a),
+  press_key: (host, a) => host.pressKey(a.role, a.key, a),
   scroll_to: (host, a) => host.scrollTo(a.role, a),
+  scroll_into_view: (host, a) => host.scrollIntoView(a.role, a.selector, a),
   start_capture: (host, a) => host.startResponseCapture(a.role, a),
   stop_capture: (host) => host.stopResponseCapture(),
+  response_cursor: (host) => host.responseCursor(),
   wait_for_response: (host, a) => host.waitForResponse(a),
   captured_responses: (host) => host.capturedResponses(),
   wait_for_node_stable: (host, a) => host.waitForNodeStable(a.role, a),

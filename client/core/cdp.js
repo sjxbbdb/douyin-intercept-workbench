@@ -285,6 +285,8 @@ class Cdp {
      * （红线 2：DOM 判断不算）。取体的时机见 `#onLoadingFinished`。
      */
     this._bodyRing = []
+    /** 已捕获条目的累计数（单调递增；环 shift 不会让它回退） */
+    this._bodySeq = 0
     /** requestId → { requestId, url, method, status, ... } */
     this._inflight = new Map()
     /** 正在取响应体的 promise（close/stop 时必须等它们落地，否则会产生未处理拒绝） */
@@ -334,9 +336,9 @@ class Cdp {
   }
 
   /** 监听器抛错绝不能打断协议处理（否则一个坏监听器会毁掉整条连接）。 */
-  _safeCall(handler, payload) {
+  _safeCall(handler, payload, meta) {
     try {
-      handler(payload)
+      handler(payload, meta)
     } catch (e) {
       this._log('error', 'cdp_listener_threw', {
         attribution: ATTRIBUTION.BAD_FRAME,
@@ -1196,6 +1198,7 @@ class Cdp {
       body_bytes: Buffer.byteLength(body, 'utf8'),
       base64_encoded: Boolean(r && r.base64Encoded),
       capturedAtMs: Date.now(),
+      sessionId: rec.sessionId || null,
       postData: rec.postData === undefined ? null : rec.postData,
     }
     this._pushBody(entry)
@@ -1203,8 +1206,16 @@ class Cdp {
   }
 
   _pushBody(entry) {
+    /**
+     * ⚠️ 每个条目带一个**单调递增的序号** `cursor`，而不是靠数组下标。
+     * 环满了会 shift 掉旧条目，下标会整体前移；序号不会。
+     * `waitForResponse({sinceCursor})` 依赖它把"这一次发送之后"的窗口钉死。
+     */
+    this._bodySeq += 1
+    entry.cursor = this._bodySeq
     this._bodyRing.push(entry)
     while (this._bodyRing.length > this.bodyRingSize) this._bodyRing.shift()
+    return entry.cursor
   }
 
   /**
@@ -1248,28 +1259,56 @@ class Cdp {
   }
 
   /**
+   * 当前捕获环的游标（纯读取）。
+   *
+   * ⚠️ 游标是**累计序号**（单调递增），不是数组下标：
+   * 环满了会丢最旧的条目，下标会整体前移导致"同一批响应算出不同窗口"。
+   * 用它划窗口比时间戳可靠：本地时钟回拨、事件与取体的时间差不影响它。
+   * "我们要证明的是**这一次发送之后**出现了平台响应"，窗口必须钉死。
+   */
+  get responseCursor() {
+    return this._bodySeq
+  }
+
+  /**
    * 等待一个匹配 `urlPattern` 的响应被完整捕获。
    *
    * ⚠️ 返回的是**原始证据**（状态码 + 响应体），本层**不做成功判定**：
    * "哪个字段等于 0 才算成功"是平台知识，属于 adapters。
    * 本层只保证"拿到了就是拿到了，没拿到就明确地说没拿到"。
+   *
+   * @param {object} p
+   * @param {string|RegExp|Function} p.urlPattern
+   * @param {number} [p.timeoutMs]
+   * @param {number} [p.pollMs]
+   * @param {number} [p.sinceMs]     只接受该时刻之后捕获的（与 sinceCursor 并存）
+   * @param {number} [p.sinceCursor] 只接受该游标之后捕获的（**优先于 sinceMs**）
+   * @param {string} [p.sessionId]   限定会话
    */
-  async waitForResponse({ urlPattern, timeoutMs = 15000, pollMs = 100, sinceMs = 0, sessionId = null } = {}) {
+  async waitForResponse({ urlPattern, timeoutMs = 15000, pollMs = 100, sinceMs = 0, sinceCursor, sessionId = null } = {}) {
     if (!urlPattern) throw new CdpError(ATTRIBUTION.BODY_UNAVAILABLE, 'waitForResponse 需要 urlPattern')
     const started = Date.now()
+    const requireCursor = Number.isFinite(sinceCursor) && sinceCursor >= 0 ? Number(sinceCursor) : null
     let polls = 0
     for (;;) {
       polls += 1
-      const hit = this._bodyRing.find((e) => e.capturedAtMs >= sinceMs
-        && (!sessionId || e.sessionId === sessionId)
-        && matchUrl(urlPattern, e.url))
+      const hit = this._bodyRing.find((e) => {
+        // ⚠️ sinceCursor 优先：它按**累计序号**划窗口，不受时钟与环回收影响。
+        if (requireCursor !== null) { if (Number(e.cursor || 0) <= requireCursor) return false }
+        else if (e.capturedAtMs < sinceMs) return false
+        if (sessionId && e.sessionId !== sessionId) return false
+        return matchUrl(urlPattern, e.url)
+      })
       if (hit) return { ...hit, polls, elapsedMs: Date.now() - started }
       if (Date.now() - started >= timeoutMs) {
         throw new CdpError(ATTRIBUTION.CMD_TIMEOUT, `等待平台响应超时（${timeoutMs}ms，已轮询 ${polls} 次）`, {
           url_pattern: String(urlPattern),
           polls,
           timeout_ms: timeoutMs,
+          since_cursor: requireCursor,
+          since_ms: sinceMs,
           captured_count: this._bodyRing.length,
+          cursor: this._bodySeq,
           // ⚠️ 只回传"最近捕获到的 URL 列表"，用于人工确认 urlPattern 是否写错。
           //    这是排查"是风控还是关键字写错"的关键区分（平台知识 §3.5）。
           recent_urls: this._bodyRing.slice(-5).map((e) => e.url),
