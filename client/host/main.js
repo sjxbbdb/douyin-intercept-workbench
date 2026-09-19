@@ -135,6 +135,11 @@ class Logger {
  * @param {string} [opts.instanceId]
  * @param {object} [opts.overrides] 配置覆盖（测试用）
  * @param {boolean} [opts.startApi] 是否起本地 API（默认 true）
+ * @param {boolean} [opts.listenApi] 是否真的监听端口（默认 true）
+ * @param {Function} [opts.spawnImpl] Chrome 启动替身（冒烟/测试注入）
+ * @param {Function} [opts.probePortImpl] 端口探测替身
+ * @param {Function} [opts.getJsonImpl] Chrome HTTP 端点替身
+ * @param {Function} [opts.cdpFactory] CDP 客户端替身
  */
 async function bootstrap(opts = {}) {
   // ── 1. 配置 ────────────────────────────────────────────────
@@ -217,14 +222,39 @@ async function bootstrap(opts = {}) {
   const collector = new Collector({ queue, state, logger })
 
   // ── 7. 平台层（需要端口，所以放在这里）────────────────────
-  // ⚠️ BrowserHost 接收**整个 config**（而不是逐个字段）：它需要
-  //    `instanceDir` / `chromeProfilePath` / `chromePath` / `debugPortBase`，
-  //    逐个传递只会在新增配置项时漏传，而漏传的表现是"浏览器起在了
-  //    错误的 profile 目录"——那会让商家看到一个未登录的浏览器。
+  // ⚠️ `BrowserHost.create` 要的是 `{ config, debugPort, logger }`——
+  //    config 必须是 `loadClientConfig()` 的**完整结果**（它要用
+  //    instanceDir / chromeProfilePath / chromePath / debugPortBase）。
+  //    早期版本把 config 展开成同级字段传进去，于是构造函数直接抛
+  //    "BrowserHost 需要 config"——而那条报错完全看不出是参数形状错了。
+  //    （这就是"接线错误在单测里看不出来"的典型：每层各自都绿。）
+  // ⚠️ 只把**确实提供**的替身放进去。
+  //    直接写 `spawnImpl: opts.spawnImpl` 会在未提供时传一个 `undefined`
+  //    给 `create()`，而它内部是 `opts.spawnImpl || spawn` —— 字面上看
+  //    `undefined || spawn` 仍然是 spawn，问题在于我们**覆盖**了 key，
+  //    一旦将来那行改成 `??`/存在性判断，或者换成解构默认值，
+  //    就会出现"明明没传替身却拿到了 undefined 实现"。
+  //    这里显式构造，行为不依赖下游的写法。
+  const hostDeps = {}
+  for (const k of ['spawnImpl', 'probePortImpl', 'getJsonImpl', 'cdpFactory']) {
+    if (typeof opts[k] === 'function') hostDeps[k] = opts[k]
+  }
+
   const browserHost = await BrowserHost.create({
-    ...config,
+    config,
     debugPort: alloc.debug_port,
     logger,
+    // ⚠️⚠️ 必须把**已有**的 store 交给它，否则它会自己 `new Store({dir})`——
+    //     而 `client/host/store.js` 有进程内单写者守卫，同一实例目录被打开
+    //     两次会直接抛错。这个缺陷的表现是"启动即崩"，报错信息是
+    //     "检测到同一实例目录被打开两次"，看上去像配置问题，
+    //     实际是接线问题（每层各自都对，拼起来才炸）。
+    //
+    //     顺带说明为什么锁文件要经 store：锁是运行数据的一部分
+    //     （它决定"有没有另一个进程在驱动同一个 Chrome"），
+    //     而"单写者"这条约束一旦有例外，后面每个模块都会觉得自己是例外。
+    storeFactory: () => store,
+    ...hostDeps,
   })
   const commentPage = new CommentPage({ host: browserHost, logger })
   const livePage = new LivePage({ host: browserHost, logger })

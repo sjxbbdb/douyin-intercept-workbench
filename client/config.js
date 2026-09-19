@@ -162,8 +162,12 @@ function loadClientConfig(opts = {}) {
 function validate(cfg) {
   const problems = []
 
-  if (!Number.isInteger(cfg.uiPort) || cfg.uiPort < 1 || cfg.uiPort > 65535) {
-    problems.push(`uiPort 非法：${cfg.uiPort}`)
+  // ⚠️ 允许 0：语义是"由操作系统分配一个空闲端口"。
+  //    商家日常不会用到它，但**自动化冒烟与测试必须能起服务而不撞端口**——
+  //    写死一个端口会让并行运行的冒烟脚本互相抢占（表现为随机的
+  //    EADDRINUSE，且只在同时跑两个脚本时才出现，最难查）。
+  if (!Number.isInteger(cfg.uiPort) || cfg.uiPort < 0 || cfg.uiPort > 65535) {
+    problems.push(`uiPort 非法：${cfg.uiPort}（0 表示由系统分配一个空闲端口）`)
   }
   if (!Number.isInteger(cfg.debugPortBase) || cfg.debugPortBase < 1 || cfg.debugPortBase > 65535) {
     problems.push(`debugPortBase 非法：${cfg.debugPortBase}`)

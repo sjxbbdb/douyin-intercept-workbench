@@ -15,7 +15,9 @@
     "test:dom": "node test/run.js L3",
     "verify": "node scripts/verify-handover.js",
     "check": "node --check client/host/main.js && node --check license-server/server.js",
-    "server": "node license-server/server.js"
+    "server": "node license-server/server.js",
+    "smoke:server": "node scripts/smoke-server.js",
+    "smoke:client": "node scripts/boot-client-smoke.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
