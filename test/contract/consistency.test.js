@@ -188,21 +188,88 @@ test('契约：错误码表可解析，且 HTTP 状态码符合契约', () => {
   assert.strictEqual(codes.SERVER_INTERNAL, 500)
 })
 
+/* ------------------------------------------------------------------
+ * 扫描"代码里出现的错误码是否都在契约表中"
+ *
+ * ⚠️ 这里的设计取向值得说明，因为**改过三次**，每次都是被误报逼出来的。
+ *
+ *  第一版：`/[A-Z][A-Z_]{4,}/` 全量匹配 → 把 `POLICY_VERSION`、
+ *          `CREDIT_PER_REPLY_MILLI` 这类**配置项/环境变量名**全判成错误码。
+ *          结果是"扫出一堆不存在的错误码"，而排查者会去改契约表——
+ *          方向完全错了。
+ *
+ *  第二版：加形态黑名单（`_MS$` / `_RATIO$` / `_MILLI$` …）把它们排掉。
+ *          黑名单天然会漏：新增一个 `RATE_LIMIT_LOGIN_PER_MIN`（环境变量）
+ *          就又误报了，而它的后缀 `_MIN` 当时不在名单里。
+ *          **每加一个环境变量就要改一次测试**，这种测试没人愿意维护。
+ *
+ *  第三版（当前）：改成**白名单**——只对 `shared/lib/errors.js` 里
+ *          **已登记**的错误码做校验。
+ *            ① 代码里出现的已登记码 → 必须在契约表里（否则两端会漂移）
+ *            ② 代码里出现的未登记全大写串 → **不再猜它是不是错误码**
+ *          这样环境变量、表名、枚举值都不会被误伤，而且
+ *          `ERROR_CODES` 本身就是权威清单——它由
+ *          `AppError` 的构造函数强制校验（未登记的码根本构造不出来）。
+ *
+ *  代价：如果有人在代码里**新造**一个错误码字面量但忘了登记，
+ *        本测试不会发现。这个代价是可接受的——因为那样的代码
+ *        一运行就会抛"未知错误码"，在第一次调用时就会暴露，
+ *        比让测试去猜一个字符串是不是错误码可靠得多。
+ * ------------------------------------------------------------------ */
 test('契约：代码里出现的错误码都在契约表中', () => {
-  const codeFiles = collectJsFiles(path.join(ROOT, 'license-server')).concat(collectJsFiles(path.join(ROOT, 'client')))
+  const { ERROR_CODES } = require('../../shared/lib/errors')
   const { codes } = parseContractErrorCodes(proto)
-  const known = new Set(Object.keys(codes))
-  const offenders = []
+  const contractTable = new Set(Object.keys(codes))
+  const registered = Object.keys(ERROR_CODES)
+
+  // ① 已登记的码必须都能在契约表里找到（这是真正会漂移的方向）
+  const unregisteredInContract = registered.filter((c) => !contractTable.has(c))
+  assert.deepStrictEqual(unregisteredInContract, [],
+    'shared/lib/errors.js 里有码没写进契约表：\n' + unregisteredInContract.join('\n'))
+
+  // ② 代码里**用到**的已登记码，必须与 errors.js 的登记一致
+  //    （防止有人手打错一个字母：`AUTH_TOKEN_INVALID` 打成 `AUTH_TOKEN_INVALD`
+  //     不会被上面的规则抓到，因为它不在 registered 里）
+  const codeFiles = collectJsFiles(path.join(ROOT, 'license-server'))
+    .concat(collectJsFiles(path.join(ROOT, 'client')))
+  const known = new Set(registered)
+  const nearMisses = []
   for (const f of codeFiles) {
     const src = fs.readFileSync(f, 'utf8')
     for (const m of src.matchAll(/["']([A-Z][A-Z_]{3,})["']/g)) {
       const c = m[1]
-      if (!looksLikeErrorCode(c)) continue // 排除配置项/环境变量名
-      if (!known.has(c)) offenders.push(`${path.relative(ROOT, f)}: ${c}`)
+      if (known.has(c)) continue
+      // ⚠️ 只报"**看起来像**已登记码、但差一两个字符"的（疑似手打错），
+      //    不报陌生的大写串（那可能是环境变量/表名/枚举，猜不得）。
+      const near = registered.find((r) => levenshtein(r, c) <= 2)
+      if (near) nearMisses.push(`${path.relative(ROOT, f)}: ${c}（是不是想写 ${near}？）`)
     }
   }
-  assert.deepStrictEqual(offenders, [], '发现契约表之外的错误码：\n' + offenders.join('\n'))
+  assert.deepStrictEqual(nearMisses, [],
+    '疑似把错误码打错了（差 1~2 个字符）：\n' + nearMisses.join('\n'))
 })
+
+/** 编辑距离。只用于"疑似打错"的近似匹配，长度都很短，直接 O(n·m) 即可。 */
+function levenshtein(a, b) {
+  if (a === b) return 0
+  const m = a.length
+  const n = b.length
+  if (m === 0) return n
+  if (n === 0) return m
+  let prev = Array.from({ length: n + 1 }, (_, j) => j)
+  for (let i = 1; i <= m; i++) {
+    const cur = [i]
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      )
+    }
+    prev = cur
+  }
+  return prev[n]
+}
 
 // ---------- 2b. 错误码 HTTP 状态双向一致 ----------
 // ⚠️ 上一版测试只校验"代码里的码在契约表中存在"，**不校验状态码是否一致**。

@@ -99,9 +99,10 @@
 | `AUDIT_SEND_CONFLICT` | 409 | 同 `send_id` 内容冲突（降级/来源或时间不一致） | 丢弃该条；客户端 bug，立即告警 |
 | `AUDIT_BATCH_TOO_LARGE` / `REPORT_TOO_LARGE` | 413 | 审计或聚合上报的批量条数超上限，或请求体 > 2 MB | 拆小后重报 |
 | `REPORT_INVALID` / `REPORT_PRIVACY_VIOLATION` | 400 | 聚合上报字段缺失/自相矛盾 / 出现禁用字段（见 7.5） | 丢弃该条并记日志 / 丢弃该条并立即修复客户端，不重试 |
-
+| `REPORT_ID_REUSED` | 409 | 同 `report_id` 但内容与首次不一致（幂等键被复用成不同窗口） | 换新 `report_id` 重报；客户端 bug，立即告警 |
 | `RATE_TOO_MANY_REQUESTS` / `SERVER_INTERNAL` | 429 / 500 | 通用限流 / 心跳间隔 < 30 秒 / 服务端异常 | 按 `retry_after_ms` 退避重试；心跳过快则忽略本次 / 按网络失败处理，退避重试（1s/2s/4s，上限 60s） |
 | `SERVER_DB_BUSY` / `SERVER_UNAVAILABLE` | 503 | SQLite 忙 / 维护中不可用 | 1 秒后重试最多 3 次 / 进入离线降级逻辑（见 9.3） |
+| `SERVER_NOT_IMPLEMENTED` | 501 | 接口已登记但服务端尚未实现（区别于 404：路径**存在**） | 不重试；提示用户该功能尚未开放 |
 | `SERVER_VERSION_UNSUPPORTED` | 426 | 客户端协议/版本过低 | 立即停机并展示强制升级页与 `upgrade_url` |
 
 ## 4. 接口清单
