@@ -82,6 +82,18 @@ function killTree(child) {
   else child.kill('SIGTERM');
 }
 
+function assertProductNotRunningBeforeInstall() {
+  if (process.platform !== 'win32') return;
+  const result = spawnSync('tasklist.exe', ['/FI', 'IMAGENAME eq 截流自动回复 Agent.exe', '/FO', 'CSV', '/NH'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) throw new Error(`无法只读检查现有产品进程，已拒绝安装验收: ${result.error?.message || result.stderr || `exit ${result.status}`}`);
+  // /FI already limits rows to the exact product image name; only parse the ASCII CSV row shape so CP936 output cannot hide a match.
+  const found = String(result.stdout || '').split(/\r?\n/).some((line) => /^"[^"]+","\d+"/.test(line.trim()));
+  if (found) throw new Error('检测到正在运行的“截流自动回复 Agent.exe”，已停止 NSIS 安装验收；未关闭任何进程');
+}
+
 function hideProcessWindow(pid) {
   if (process.platform !== 'win32' || !pid) return;
   const script = `$type = Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);' -Name Win32ShowWindow -Namespace PackageVerify -PassThru; $root = ${Number(pid)}; $ids = [System.Collections.Generic.HashSet[int]]::new(); [void]$ids.Add($root); do { $added = $false; foreach ($p in Get-CimInstance Win32_Process | Where-Object { $ids.Contains([int]$_.ParentProcessId) }) { if ($ids.Add([int]$p.ProcessId)) { $added = $true } } } while ($added); $windows = foreach ($id in $ids) { $p = Get-Process -Id $id -ErrorAction SilentlyContinue; if ($p -and $p.MainWindowHandle -ne 0) { $before = [bool][User32.User32]::IsWindowVisible($p.MainWindowHandle); [PackageVerify.Win32ShowWindow]::ShowWindow($p.MainWindowHandle, 0) | Out-Null; $after = [bool][User32.User32]::IsWindowVisible($p.MainWindowHandle); [pscustomobject]@{ pid = $id; hidden = (-not $after); wasVisible = $before } } }; $windows | ConvertTo-Json -Compress`;
@@ -336,10 +348,19 @@ async function checkTaskEditorRegression(cdp, label, readStderr = () => '', wind
   assert.equal(task.intervalMs, Number(values.intervalMs), `${label} saved task interval mismatch`);
   assert.equal(task.maxActions, Number(values.maxActions), `${label} saved task max actions mismatch`);
   assert.equal(task.dailyLimit, Number(values.dailyLimit), `${label} saved task daily limit mismatch`);
-  await cdp.evaluate(`window.agentApi.setTaskStatus({ id: ${JSON.stringify(task.id)}, status: 'stopped' })`);
-  await waitFor(cdp, `window.agentApi.getState().then((next) => next.tasks.find((item) => item.id === ${JSON.stringify(task.id)})?.status === 'stopped')`, `${label} stop local test task`);
-  const stopped = await cdp.evaluate(`window.agentApi.getState().then((next) => next.tasks.find((item) => item.id === ${JSON.stringify(task.id)}))`);
-  assert.equal(stopped.status, 'stopped', `${label} test task must remain stopped`);
+  await cdp.evaluate(`window.agentApi.setTaskStatus({ id: ${JSON.stringify(task.id)}, status: 'paused' })`);
+  await waitFor(cdp, `window.agentApi.getState().then((next) => next.tasks.find((item) => item.id === ${JSON.stringify(task.id)})?.status === 'paused')`, `${label} pause local test task`);
+  const paused = await cdp.evaluate(`window.agentApi.getState().then((next) => next.tasks.find((item) => item.id === ${JSON.stringify(task.id)}))`);
+  assert.equal(paused.status, 'paused', `${label} test task must remain paused`);
+  const emptyRecheck = await cdp.evaluate(`window.agentApi.recheckSkipped(${JSON.stringify(task.id)})`);
+  assert.deepEqual(emptyRecheck, { evaluated: 0, queued: 0, skipped: 0 }, `${label} empty paused manual task recheck result`);
+  const afterEmptyRecheck = await cdp.evaluate(`window.agentApi.getState()`);
+  const recheckTask = afterEmptyRecheck.tasks.find((item) => item.id === task.id);
+  assert.equal(recheckTask?.mode, 'manual', `${label} recheck fixture must remain manual`);
+  assert.equal(recheckTask?.status, 'paused', `${label} empty recheck must not resume task`);
+  assert.equal(afterEmptyRecheck.events.some((item) => item.taskId === task.id), false, `${label} empty recheck must not create events`);
+  assert.equal(afterEmptyRecheck.pending.some((item) => item.taskId === task.id), false, `${label} empty recheck must not create sends`);
+  assert.equal(afterEmptyRecheck.logs.some((item) => ['send_started', 'reply_attempted'].includes(item.type)), false, `${label} empty recheck must not create send records`);
 
   await cdp.evaluate(`document.querySelector('[data-action="edit-task"][data-id="${task.id}"]')?.click()`);
   await waitFor(cdp, 'Boolean(document.querySelector("#task-form"))', `${label} edit task`);
@@ -507,6 +528,7 @@ async function launchAndCheck(label, executable, auth = null) {
 
 async function installAndCheck(auth) {
   assert.equal(existsSync(installer), true, `installer artifact missing: ${installer}`);
+  assertProductNotRunningBeforeInstall();
   const workDir = mkdtempSync(join(tmpdir(), 'douyin-v4-installer-'));
   const installDir = join(workDir, 'installed');
   const result = spawnSync(installer, ['/S', `/D=${installDir}`], { windowsHide: true, stdio: 'pipe', encoding: 'utf8', timeout: 120_000 });

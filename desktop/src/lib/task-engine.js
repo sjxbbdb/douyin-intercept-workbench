@@ -56,7 +56,12 @@ class TaskEngine {
     task.updatedAt = now();
     const data = this.store.get();
     const index = data.tasks.findIndex((candidate) => candidate.id === task.id);
-    if (index >= 0) data.tasks[index] = { ...data.tasks[index], ...task };
+    if (index >= 0) {
+      const previous = data.tasks[index];
+      const changed = ['url', 'source', 'contactMode', 'businessContext', 'targetCustomer', 'keywords', 'excludeKeywords', 'replyTemplate', 'replyInstructions', 'mode', 'intervalMs', 'dailyLimit', 'maxActions', 'selectorProfileId', 'decisionMode'].some((key) => JSON.stringify(previous[key]) !== JSON.stringify(task[key]));
+      const invalidates = changed || previous.status !== task.status;
+      data.tasks[index] = { ...previous, ...task, generation: invalidates ? (previous.generation || 0) + 1 : previous.generation };
+    }
     else data.tasks.push({ ...task, createdAt: now(), actionsToday: 0, sendAttemptsToday: 0, generationToday: 0, actionDay: now().slice(0, 10), lastSendAt: null, generation: 0 });
     this.#log(data, 'task_saved', { taskId: task.id });
     this.store.set(data); this.#notify(); return task;
@@ -68,11 +73,14 @@ class TaskEngine {
     const data = this.store.get();
     const task = data.tasks.find((candidate) => candidate.id === taskId);
     if (!task) throw new Error('任务不存在');
-    if (status === 'running' && !activeLicense(this.license)) { task.status = 'license_required'; this.#log(data, 'task_blocked', { taskId, reason: 'license_required' }); this.store.set(data); this.#notify(); throw new Error('当前未授权，不能启动任务'); }
-    if (status === 'running' && typeof this.browser.isOpenFor === 'function' && !this.browser.isOpenFor(task.url)) { task.status = 'paused'; this.#log(data, 'task_blocked', { taskId, reason: 'target_not_open' }); this.store.set(data); this.#notify(); throw new Error('请先打开并登录当前任务的目标页面'); }
     if (!['running', 'paused', 'stopped'].includes(status)) throw new Error('不支持的任务状态');
+    if (status === 'running' && task.decisionMode === 'rule' && !task.keywords.length) throw new Error('规则模式至少需要一个关键词，当前配置不能启动任务');
+    if (status === 'running' && !activeLicense(this.license)) { task.status = 'license_required'; this.#log(data, 'task_blocked', { taskId, reason: 'license_required' }); this.store.set(data); this.#notify(); throw new Error('当前未授权，不能启动任务'); }
+    if (status === task.status) return task;
+    if (status === 'running' && typeof this.browser.isOpenFor === 'function' && !this.browser.isOpenFor(task.url)) { task.status = 'paused'; this.#log(data, 'task_blocked', { taskId, reason: 'target_not_open' }); this.store.set(data); this.#notify(); throw new Error('请先打开并登录当前任务的目标页面'); }
     if (status === 'running') for (const candidate of data.tasks) if (candidate.id !== taskId && candidate.status === 'running') { candidate.status = 'paused'; candidate.generation = (candidate.generation || 0) + 1; this.#log(data, 'task_paused', { taskId: candidate.id, reason: 'single_active_task' }); }
     task.status = status; task.generation = (task.generation || 0) + 1; if (status === 'running') this.#resetCounter(task);
+    const startSession = this.sessionEpoch; const startGeneration = task.generation;
     this.#log(data, `task_${status}`, { taskId }); this.store.set(data);
     if (status !== 'running') this.browser.stop?.();
     if (status === 'running') {
@@ -80,10 +88,13 @@ class TaskEngine {
       catch (error) {
         const failed = this.store.get();
         const current = failed.tasks.find((candidate) => candidate.id === task.id);
-        if (current?.status === 'running') current.status = 'offline';
-        this.#log(failed, 'task_offline', { taskId, reason: error.code || error.message });
-        this.store.set(failed); this.#notify();
-        throw error;
+        if (current?.status === 'running' && current.generation === startGeneration && this.sessionEpoch === startSession) {
+          current.status = 'offline';
+          this.#log(failed, 'task_offline', { taskId, reason: error.code || error.message });
+          this.store.set(failed); this.#notify();
+          throw error;
+        }
+        return current || task;
       }
     }
     this.#notify(); return task;
@@ -105,6 +116,67 @@ class TaskEngine {
       for (const event of events.slice(0, 100)) await this.#processEvent(task.id, event);
     }).catch((error) => { console.error('[task-engine] ingest failed', error); });
     return this.processing;
+  }
+
+  async recheckSkipped(taskId) {
+    const task = this.store.get().tasks.find((candidate) => candidate.id === taskId);
+    const context = task ? { session: this.sessionEpoch, api: this.apiEpoch, generation: task.generation || 0, status: task.status } : null;
+    const queued = this.processing.then(() => this.#recheckSkippedInner(taskId, context));
+    this.processing = queued.catch(() => undefined);
+    return queued;
+  }
+
+  async #recheckSkippedInner(taskId, context) {
+    if (!activeLicense(this.license)) throw new Error('当前未授权，不能重新判定');
+    await this.ensureLicense?.();
+    if (!activeLicense(this.license)) throw new Error('授权刷新失败，不能重新判定');
+    const first = this.store.get();
+    const task = first.tasks.find((candidate) => candidate.id === taskId);
+    if (!task) throw new Error('任务不存在');
+    if (task.mode !== 'manual' || task.decisionMode !== 'rule') throw new Error('仅支持手动规则任务重新判定');
+    if (!task.keywords.length) throw new Error('规则模式至少需要一个关键词，不能重新判定');
+    const capturedSession = context?.session;
+    const capturedApi = context?.api;
+    const capturedGeneration = context?.generation;
+    const capturedStatus = context?.status;
+    if (this.sessionEpoch !== capturedSession || this.apiEpoch !== capturedApi || task.generation !== capturedGeneration || task.status !== capturedStatus) return { evaluated: 0, queued: 0, skipped: 0, stopReason: 'context_changed', message: '任务配置、状态或授权会话已变化，未执行重新判定' };
+    const eligibleReasons = new Set(['local_no_keyword', 'local_exclude', 'generation_budget_exhausted', 'local_keywords_missing']);
+    const candidates = first.events.filter((event) => event.taskId === taskId && event.status === 'skipped' && eligibleReasons.has(event.reason) && this.#matchesRoom(task, event.roomId) && event.source === task.source && this.#neverSubmitted(event, first));
+    const result = { evaluated: 0, queued: 0, skipped: 0 };
+    for (const event of candidates) {
+      const currentData = this.store.get();
+      const currentTask = currentData.tasks.find((candidate) => candidate.id === taskId);
+      if (!activeLicense(this.license)) { result.stopReason = 'authorization_changed'; result.message = '授权已失效，已停止本次重新判定'; break; }
+      if (!currentTask || this.sessionEpoch !== capturedSession || this.apiEpoch !== capturedApi || currentTask.generation !== capturedGeneration || currentTask.status !== capturedStatus) { result.stopReason = 'context_changed'; result.message = '任务配置、状态或授权会话已变化，已停止本次重新判定'; break; }
+      const currentEvent = currentData.events.find((candidate) => candidate.eventKey === event.eventKey);
+      if (!currentEvent || currentEvent.status !== 'skipped' || !this.#neverSubmitted(currentEvent, currentData)) continue;
+      const localReason = this.#localSkipReason(currentTask, currentEvent.text);
+      if (localReason) { currentEvent.reason = localReason; this.store.set(currentData); result.skipped += 1; continue; }
+      if (!this.#withinBudget(currentTask)) { result.stopReason = 'generation_budget_exhausted'; result.message = `当前判定额度已用尽（${currentTask.generationToday ?? 0}/${currentTask.maxActions || currentTask.dailyLimit}），请手动编辑任务提高判定上限后再试`; break; }
+      const endpoint = this.api?.evaluate;
+      if (typeof endpoint !== 'function') { result.stopReason = 'evaluation_failed'; result.message = '授权中心未提供当前判定模式'; break; }
+      const idempotencyKey = safeIdempotencyKey(`draft:${currentEvent.eventKey}`);
+      const requestEvent = { id: currentEvent.id, source: currentEvent.source === 'live' ? 'live_comment' : 'video_comment', roomId: currentEvent.roomId, authorId: currentEvent.authorId || `anonymous:${crypto.createHash('sha256').update(`${currentEvent.authorName || ''}|${currentEvent.text || ''}`).digest('hex').slice(0, 24)}`, authorName: currentEvent.authorName || '未知用户', text: currentEvent.text, observedAt: Number.isSafeInteger(Number(currentEvent.observedAt)) ? Number(currentEvent.observedAt) : (Date.parse(currentEvent.observedAt) || Date.now()) };
+      const requestPayload = { event: requestEvent, rule: { keywords: currentTask.keywords, excludeKeywords: currentTask.excludeKeywords, replyTemplate: currentTask.replyTemplate }, idempotencyKey };
+      currentEvent.status = 'evaluating'; currentEvent.idempotencyKey = idempotencyKey; currentEvent.requestMethod = 'evaluate'; currentEvent.requestPayload = requestPayload; currentEvent.draftRequest = requestPayload; currentTask.generationToday = (currentTask.generationToday || 0) + 1;
+      currentData.tasks = currentData.tasks.map((candidate) => candidate.id === taskId ? currentTask : candidate);
+      this.store.set(currentData); this.#notify();
+      result.evaluated += 1;
+      try {
+        const draft = await endpoint.call(this.api, requestPayload);
+        const next = this.store.get(); const latestTask = next.tasks.find((candidate) => candidate.id === taskId); const latest = next.events.find((candidate) => candidate.eventKey === event.eventKey);
+        if (!latest || !latestTask || this.sessionEpoch !== capturedSession || this.apiEpoch !== capturedApi || latestTask.generation !== capturedGeneration || latestTask.status !== capturedStatus) { if (latest) { latest.status = 'evaluation_unknown'; latest.reason = 'recheck_context_changed'; this.store.set(next); } result.stopReason = 'context_changed'; result.message = '任务配置、状态或授权会话已变化，已停止本次重新判定'; break; }
+        this.#applyDraftResult(next, latestTask, latest, draft, currentEvent.eventKey); if (draft.matched === true && draft.reply) result.queued += 1; else result.skipped += 1; this.store.set(next); this.#notify();
+      } catch (error) {
+        const next = this.store.get(); const latest = next.events.find((candidate) => candidate.eventKey === event.eventKey); if (latest) { latest.status = 'evaluation_unknown'; latest.reason = error.code || error.message; this.store.set(next); } result.stopReason = 'evaluation_failed'; result.message = error.message || '判定结果未确认'; break;
+      }
+    }
+    this.#notify(); return result;
+  }
+
+  #neverSubmitted(event, data) {
+    if (event.requestPayload || event.draftRequest || event.idempotencyKey || event.actionId || event.sendId || event.sendStartedAt) return false;
+    return !data.pending.some((candidate) => candidate.eventKey === event.eventKey) && !data.logs.some((log) => log.detail?.eventKey === event.eventKey && ['send_started', 'reply_attempted'].includes(log.type));
   }
 
   async confirmAction(actionId) {
@@ -261,9 +333,9 @@ class TaskEngine {
 
   #upsertLead(data, task, event) { const key = `${task.id}:${event.authorName || ''}:${event.text}`; if (!data.leads.some((lead) => lead.key === key)) data.leads.push({ key, taskId: task.id, authorName: event.authorName || '未知用户', intent: event.intent, confidence: event.confidence, reason: event.reason, text: event.text, status: 'new', updatedAt: now() }); }
   #matchesRoom(task, roomId) { try { const target = new URL(task.url); const actual = new URL(roomId); return target.hostname === actual.hostname && target.pathname === actual.pathname; } catch (error) { return false; } }
-  #localSkipReason(task, content) { const value = String(content || '').toLowerCase(); if (!value) return 'empty'; if (task.excludeKeywords.some((keyword) => value.includes(keyword.toLowerCase()))) return 'local_exclude'; if (task.decisionMode === 'rule' && task.keywords.length && !task.keywords.some((keyword) => value.includes(keyword.toLowerCase()))) return 'local_no_keyword'; return null; }
+  #localSkipReason(task, content) { const value = String(content || '').toLowerCase(); if (!value) return 'empty'; if (task.decisionMode === 'rule' && !task.keywords.length) return 'local_keywords_missing'; if (task.excludeKeywords.some((keyword) => value.includes(keyword.toLowerCase()))) return 'local_exclude'; if (task.decisionMode === 'rule' && !task.keywords.some((keyword) => value.includes(keyword.toLowerCase()))) return 'local_no_keyword'; return null; }
   #withinBudget(task) { this.#resetCounter(task); const limit = task.maxActions || task.dailyLimit; return Number.isInteger(limit) && limit > 0 && (task.generationToday ?? task.actionsToday ?? 0) < limit; }
-  #sendBudgetReady(task) { this.#resetCounter(task); const limit = task.maxActions || task.dailyLimit; return Number.isInteger(limit) && limit > 0 && (task.sendAttemptsToday ?? task.actionsToday ?? 0) < limit; }
+  #sendBudgetReady(task) { this.#resetCounter(task); const limit = task.dailyLimit || task.maxActions; return Number.isInteger(limit) && limit > 0 && (task.sendAttemptsToday ?? task.actionsToday ?? 0) < limit; }
   #cooldownReady(task) { if (!task.lastSendAt || !task.intervalMs) return true; const stamp = Date.parse(task.lastSendAt); return Number.isFinite(stamp) && Date.now() - stamp >= task.intervalMs; }
   #resetCounter(task) { const day = now().slice(0, 10); if (task.actionDay !== day) { task.actionDay = day; task.actionsToday = 0; task.sendAttemptsToday = 0; task.generationToday = 0; } }
   #log(data, type, detail) { data.logs.push({ id: `log_${crypto.randomUUID()}`, type, at: now(), detail }); if (data.logs.length > 1000) data.logs = data.logs.slice(-1000); }

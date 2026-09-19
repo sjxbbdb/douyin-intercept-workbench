@@ -86,4 +86,73 @@ testAsync('stale evaluation cannot create a pending send after session invalidat
   assert.equal(store.get().pending.length, 0); assert.equal(store.get().events[0].status, 'evaluating');
 });
 
+testAsync('rule task with empty keywords cannot start and does not call evaluation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {} }));
+  const authStore = { getLicense: () => null, setLicense: () => {} }; let calls = 0;
+  const engine = new TaskEngine({ store, api: { evaluate: async () => { calls += 1; return {}; } }, authStore, browser: { start: () => {}, close: () => {} }, selectorProfile: {}, onStateChange: () => {} });
+  engine.setLicense({ user: { status: 'active', expiresAt: Date.now() + 60000 }, balance: 10 });
+  engine.saveTask({ url: 'https://www.douyin.com/video/1', keywords: [], excludeKeywords: [], replyTemplate: 'x', mode: 'manual', decisionMode: 'rule', maxActions: 2, status: 'paused' });
+  const task = store.get().tasks[0]; await assert.rejects(engine.setTaskStatus(task.id, 'running'), /至少需要一个关键词/);
+  assert.equal(calls, 0); assert.equal(store.get().tasks[0].status, 'paused');
+});
+
+testAsync('explicit recheck evaluates only eligible skipped events and queues without sending', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {} }));
+  const authStore = { getLicense: () => null, setLicense: () => {} }; let calls = 0;
+  const api = { evaluate: async (payload) => { calls += 1; assert.deepEqual(payload.rule.keywords, ['价格']); return { matched: true, reply: '欢迎咨询', charged: 0, balance: 10 }; } };
+  const engine = new TaskEngine({ store, api, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {}, ensureLicense: async () => {} });
+  engine.setLicense({ user: { status: 'active', expiresAt: Date.now() + 60000 }, balance: 10 });
+  engine.saveTask({ url: 'https://www.douyin.com/video/1', keywords: ['价格'], excludeKeywords: [], replyTemplate: 'x', mode: 'manual', decisionMode: 'rule', maxActions: 2, status: 'paused' });
+  const task = store.get().tasks[0]; store.update((d) => ({ ...d, events: [{ eventKey: 'video:key', id: 'e1', taskId: task.id, source: 'video', roomId: task.url, text: '价格多少', status: 'skipped', reason: 'local_no_keyword' }, { eventKey: 'video:done', id: 'e2', taskId: task.id, source: 'video', roomId: task.url, text: '价格', status: 'skipped', reason: 'local_no_keyword', requestPayload: { old: true } }] }));
+  const result = await engine.recheckSkipped(task.id); assert.deepEqual(result, { evaluated: 1, queued: 1, skipped: 0 }); assert.equal(calls, 1); assert.equal(store.get().pending.length, 1); assert.equal(store.get().tasks[0].generationToday, 1);
+  const second = await engine.recheckSkipped(task.id); assert.deepEqual(second, { evaluated: 0, queued: 0, skipped: 0 }); assert.equal(calls, 1);
+});
+
+testAsync('recheck quota stop preserves partial counts and later retry works after manual limit edit', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {} }));
+  const authStore = { getLicense: () => null, setLicense: () => {} }; let calls = 0;
+  const engine = new TaskEngine({ store, api: { evaluate: async () => { calls += 1; return { matched: true, reply: '回复', charged: 0, balance: 10 }; } }, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {}, ensureLicense: async () => {} });
+  engine.setLicense({ user: { status: 'active', expiresAt: Date.now() + 60000 }, balance: 10 });
+  engine.saveTask({ url: 'https://www.douyin.com/video/1', keywords: ['价格'], excludeKeywords: [], replyTemplate: 'x', mode: 'manual', decisionMode: 'rule', dailyLimit: 1, maxActions: 1, status: 'paused' });
+  let task = store.get().tasks[0]; store.update((d) => ({ ...d, events: [1, 2].map((n) => ({ eventKey: `video:q${n}`, id: `e${n}`, taskId: task.id, source: 'video', roomId: task.url, text: '价格', status: 'skipped', reason: 'generation_budget_exhausted' })) }));
+  const partial = await engine.recheckSkipped(task.id); assert.deepEqual(partial, { evaluated: 1, queued: 1, skipped: 0, stopReason: 'generation_budget_exhausted', message: '当前判定额度已用尽（1/1），请手动编辑任务提高判定上限后再试' }); assert.equal(calls, 1);
+  task = store.get().tasks[0]; engine.saveTask({ ...task, maxActions: 2, status: 'paused' }); const resumed = await engine.recheckSkipped(task.id); assert.equal(resumed.queued, 1); assert.equal(resumed.evaluated, 1); assert.equal(calls, 2);
+});
+
+testAsync('recheck queue recovers after one authorization refresh rejection', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {} }));
+  const authStore = { getLicense: () => null, setLicense: () => {} }; let refreshes = 0; let calls = 0;
+  const engine = new TaskEngine({ store, api: { evaluate: async () => { calls += 1; return { matched: false, charged: 0 }; } }, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {}, ensureLicense: async () => { refreshes += 1; if (refreshes === 1) throw new Error('temporary'); } });
+  engine.setLicense({ user: { status: 'active', expiresAt: Date.now() + 60000 }, balance: 10 }); engine.saveTask({ url: 'https://www.douyin.com/video/1', keywords: ['价格'], excludeKeywords: [], replyTemplate: 'x', mode: 'manual', decisionMode: 'rule', maxActions: 2, status: 'paused' });
+  const task = store.get().tasks[0]; store.update((d) => ({ ...d, events: [{ eventKey: 'video:r', id: 'r', taskId: task.id, source: 'video', roomId: task.url, text: '价格', status: 'skipped', reason: 'local_no_keyword' }] }));
+  await assert.rejects(engine.recheckSkipped(task.id), /temporary/); const result = await engine.recheckSkipped(task.id); assert.equal(result.evaluated, 1); assert.equal(calls, 1);
+});
+
+testAsync('daily send limit remains independent from maxActions', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {} }));
+  const authStore = { getLicense: () => null, setLicense: () => {} }; const browser = { close: () => {}, sendReply: async () => ({ status: 'unknown', reason: 'fixture' }) };
+  const engine = new TaskEngine({ store, api: {}, authStore, browser, selectorProfile: {}, onStateChange: () => {}, ensureLicense: async () => {} }); engine.setLicense({ user: { status: 'active', expiresAt: Date.now() + 60000 }, balance: 10 });
+  engine.saveTask({ url: 'https://www.douyin.com/video/1', keywords: ['价格'], excludeKeywords: [], replyTemplate: 'x', mode: 'manual', decisionMode: 'rule', dailyLimit: 1, maxActions: 5, status: 'running' }); const task = store.get().tasks[0];
+  store.update((d) => ({ ...d, tasks: d.tasks.map((t) => ({ ...t, generation: 1 })), events: [1, 2].map((n) => ({ eventKey: `video:s${n}`, id: `s${n}`, taskId: task.id, source: 'video', roomId: task.url, platformId: `p${n}`, text: '价格', status: 'awaiting_confirmation', actionId: `a${n}` })), pending: [1, 2].map((n) => ({ actionId: `a${n}`, sendId: `send${n}`, eventKey: `video:s${n}`, taskId: task.id, source: 'video', channel: 'comment', reply: 'x' })) }));
+  assert.equal((await engine.confirmAction('a1')).status, 'unknown'); await assert.rejects(engine.confirmAction('a2'), /本地发送上限/); assert.equal(store.get().tasks[0].sendAttemptsToday, 1);
+});
+
+testAsync('recheck cancels deferred authorization and evaluation contexts', async () => {
+  const make = (ensureLicense, evaluate) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {} }));
+    const authStore = { getLicense: () => null, setLicense: () => {} }; const engine = new TaskEngine({ store, api: { evaluate }, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {}, ensureLicense });
+    engine.setLicense({ user: { status: 'active', expiresAt: Date.now() + 60000 }, balance: 10 }); engine.saveTask({ url: 'https://www.douyin.com/video/1', keywords: ['价格'], excludeKeywords: [], replyTemplate: 'x', mode: 'manual', decisionMode: 'rule', maxActions: 2, status: 'paused' });
+    const task = store.get().tasks[0]; store.update((d) => ({ ...d, events: [{ eventKey: 'video:deferred', id: 'deferred', taskId: task.id, source: 'video', roomId: task.url, text: '价格', status: 'skipped', reason: 'local_no_keyword' }] })); return { engine, store, task };
+  };
+  let releaseEnsure; let ensureStarted = false; let calls = 0;
+  const first = make(() => { ensureStarted = true; return new Promise((resolve) => { releaseEnsure = resolve; }); }, async () => { calls += 1; return { matched: true, reply: '不应生成' }; });
+  const firstRun = first.engine.recheckSkipped(first.task.id); while (!ensureStarted) await Promise.resolve(); first.engine.saveTask({ ...first.task, keywords: ['新关键词'], status: 'paused' }); releaseEnsure(); const firstResult = await firstRun;
+  assert.equal(firstResult.stopReason, 'context_changed'); assert.equal(calls, 0); assert.equal(first.store.get().pending.length, 0);
+  let releaseEvaluate; let evaluateStarted = false;
+  const second = make(async () => {}, async () => { evaluateStarted = true; return new Promise((resolve) => { releaseEvaluate = resolve; }); });
+  const secondRun = second.engine.recheckSkipped(second.task.id); while (!evaluateStarted) await Promise.resolve(); second.engine.invalidate('account_switch'); releaseEvaluate({ matched: true, reply: '不应入队' }); const secondResult = await secondRun;
+  assert.equal(secondResult.stopReason, 'context_changed'); assert.equal(second.store.get().pending.length, 0);
+});
+
 Promise.all(pendingTests).then(() => console.log(`\n${passed} desktop tests passed`)).catch(() => { process.exitCode = 1; });

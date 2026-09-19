@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('agentApi', {
   getLedger: () => invoke('credits:ledger'),
   saveTask: (payload) => invoke('task:save', payload),
   setTaskStatus: (payload) => invoke('task:set-status', payload),
+  recheckSkipped: (taskId) => invoke('task:recheck-skipped', taskId),
   deleteTask: (taskId) => invoke('task:delete', taskId),
   confirmAction: (actionId) => invoke('reply:confirm', actionId),
   retryDraft: (eventKey) => invoke('reply:retry-draft', eventKey),

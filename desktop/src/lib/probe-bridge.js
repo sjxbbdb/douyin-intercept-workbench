@@ -30,6 +30,27 @@ class ProbeBridge {
     this.privateCapability = { verified: false, detail: '私信能力尚未验证' };
     this.launchPromise = null;
     this.remoteOwned = false;
+    this.lifecyclePromise = Promise.resolve();
+    this.lifecycleOperation = 0;
+    this.cancelGeneration = 0;
+    this.startOperation = null;
+    this.openPending = 0;
+  }
+
+  #enqueueLifecycle(work) {
+    const operation = ++this.lifecycleOperation;
+    const run = this.lifecyclePromise.then(() => work(operation), () => work(operation));
+    this.lifecyclePromise = run.catch(() => {});
+    return run;
+  }
+
+  async #waitForIdleOrThrow() {
+    if (await this.client.waitForIdle(3000)) return;
+    this.client.cancel();
+    if (await this.client.waitForIdle(3000)) return;
+    const error = new Error('侧车仍在执行上一个操作，请稍后重试');
+    error.code = 'SIDECAR_BUSY';
+    throw error;
   }
 
   async #launch() {
@@ -42,15 +63,26 @@ class ProbeBridge {
 
   async open(url) {
     const requested = targetUrl(url);
-    if (this.closePromise) await this.closePromise;
-    this.closed = false;
-    this.stop();
-    await this.client.waitForIdle();
-    await this.#launch();
-    const result = await this.client.request('open', { url: requested }, { timeoutMs: 60000 });
-    this.currentUrl = result.url ? targetUrl(result.url) : requested;
-    this.onStatus?.({ connected: true, collector: 'open', url: this.currentUrl, status: asStatus(result) });
-    return this.currentUrl;
+    const generation = this.cancelGeneration;
+    this.openPending += 1;
+    const promise = this.#enqueueLifecycle(async (operation) => {
+      if (generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+      if (this.closePromise) await this.closePromise;
+      if (generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+      this.closed = false;
+      this.#stopForTransition();
+      const epoch = this.lifecycleEpoch;
+      await this.#waitForIdleOrThrow();
+      if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+      await this.#launch();
+      if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+      const result = await this.client.request('open', { url: requested }, { timeoutMs: 60000 });
+      if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+      this.currentUrl = result.url ? targetUrl(result.url) : requested;
+      this.onStatus?.({ connected: true, collector: 'open', url: this.currentUrl, status: asStatus(result), operation });
+      return this.currentUrl;
+    }).finally(() => { this.openPending -= 1; });
+    return promise;
   }
 
   async search(keyword, maxVideos = 20, scrollRounds = 2) {
@@ -62,18 +94,43 @@ class ProbeBridge {
     try { const expected = new URL(url); const actual = new URL(this.currentUrl || ''); return expected.hostname === actual.hostname && expected.pathname === actual.pathname; } catch (error) { return false; }
   }
 
-  async start(_profile, source = 'video') {
-    if (this.closed) throw new Error('侧车已关闭，请重新打开浏览器会话');
-    this.lifecycleEpoch += 1;
-    this.source = source;
-    this.running = true;
-    try { await this.#probeCapability(source); } catch (error) { this.running = false; throw error; }
-    const epoch = ++this.collectEpoch;
-    await this.#collect(epoch);
-    this.#scheduleCollect(epoch);
+  start(_profile, source = 'video') {
+    if (this.startOperation && this.startOperation.source === source && this.startOperation.generation === this.cancelGeneration) return this.startOperation.promise;
+    if (this.running && this.source === source && this.openPending === 0) return;
+    const generation = this.cancelGeneration;
+    const promise = this.#enqueueLifecycle(async (operation) => {
+      if (generation !== this.cancelGeneration) return;
+      if (this.closed) throw new Error('侧车已关闭，请重新打开浏览器会话');
+      if (this.running) this.#stopForTransition();
+      const epoch = ++this.lifecycleEpoch;
+      this.source = source;
+      this.running = true;
+      try {
+        await this.#waitForIdleOrThrow();
+        if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) return;
+        await this.#probeCapability(source, () => epoch === this.lifecycleEpoch && generation === this.cancelGeneration);
+        if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) return;
+        const collectEpoch = ++this.collectEpoch;
+        await this.#collect(collectEpoch);
+        if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) return;
+        this.#scheduleCollect(collectEpoch);
+      } catch (error) {
+        if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) return;
+        this.running = false;
+        throw error;
+      }
+    });
+    this.startOperation = { source, generation, promise };
+    promise.finally(() => { if (this.startOperation?.promise === promise) this.startOperation = null; }).catch(() => {});
+    return promise;
   }
 
   stop() {
+    this.cancelGeneration += 1;
+    this.#stopForTransition();
+  }
+
+  #stopForTransition() {
     this.lifecycleEpoch += 1;
     this.running = false;
     this.collectEpoch += 1;
@@ -94,11 +151,13 @@ class ProbeBridge {
     this.privateCapability = { verified: privateReply.implemented === true, implemented: privateReply.implemented === true, autoEligible: privateReply.autoEligible === true, validation: privateReply.validation || null, evidence: privateReply.evidence || null, detail: privateReply.implemented === true ? '侧车已声明私信能力，发送结果仍须运行时核实' : '私信发送未声明' };
   }
 
-  async #probeCapability(source) {
+  async #probeCapability(source, isCurrent = () => true) {
     try {
       const result = await this.client.request('capabilities', {}, { timeoutMs: 20000 });
+      if (!isCurrent()) return;
       this.#setCapabilities(result?.capability || {}, source);
     } catch (error) {
+      if (!isCurrent()) return;
       this.capability = { verified: false, source, detail: error.message };
       this.sendCapability = { verified: false, source, detail: error.message };
       this.privateCapability = { verified: false, detail: error.message };
@@ -195,7 +254,7 @@ class ProbeBridge {
     this.closed = true;
     this.stop();
     this.currentUrl = null;
-    this.closePromise = (async () => {
+    this.closePromise = this.#enqueueLifecycle(async () => {
       let idle = await this.client.waitForIdle(3000);
       if (!idle) {
         this.client.cancel();
@@ -203,14 +262,11 @@ class ProbeBridge {
       }
       if (idle && this.remoteOwned) {
         try { await this.client.request('close', {}, { timeoutMs: 10000 }); } catch (error) { this.onStatus?.({ connected: false, collector: 'close_error', error: error.message }); }
-      } else {
-        if (!idle) this.onStatus?.({ connected: false, collector: 'close_timeout', error: '侧车操作未能在关闭前退出' });
-      }
+      } else if (!idle) this.onStatus?.({ connected: false, collector: 'close_timeout', error: '侧车操作未能在关闭前退出' });
       this.remoteOwned = false;
       this.launchPromise = null;
       this.onStatus?.({ connected: false, collector: 'closed' });
-      this.closePromise = null;
-    })();
+    }).finally(() => { this.closePromise = null; });
     return this.closePromise;
   }
 }

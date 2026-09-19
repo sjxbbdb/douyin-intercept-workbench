@@ -95,8 +95,14 @@ function handle(request) {
   else complete();
 }
 
-process.on('SIGTERM', () => finish(143));
-process.on('SIGINT', () => finish(130));
+function delayedFinish(code) {
+  const delayMs = Number(process.env.FAKE_SIDECAR_CANCEL_DELAY_MS || 0);
+  if (delayMs > 0) setTimeout(() => finish(code), delayMs);
+  else finish(code);
+}
+
+process.on('SIGTERM', () => delayedFinish(143));
+process.on('SIGINT', () => delayedFinish(130));
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on('line', (line) => {

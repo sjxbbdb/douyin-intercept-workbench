@@ -13,6 +13,7 @@ const { app, BrowserWindow } = require('electron');
 
 const root = path.resolve(__dirname, '..');
 const rendererArg = process.argv.find((value) => value.startsWith('--renderer='));
+const screenshotArg = process.argv.find((value) => value.startsWith('--screenshot='));
 const rendererPath = rendererArg ? path.resolve(valueAfterEquals(rendererArg)) : path.join(root, 'src', 'renderer', 'app.js');
 const rendererHead = process.argv.includes('--renderer-git-head');
 const rendererSource = rendererHead
@@ -31,7 +32,7 @@ function jsonScript(value) { return JSON.stringify(value).replace(/<\/script/gi,
 function makeState(overrides = {}) {
   return {
     license: { state: 'authorized', user: { id: 'u-one', expiresAt: Date.now() + 3600000 }, balance: 20, features: {} },
-    tasks: [{ id: 'task-existing', url: 'https://www.douyin.com/video/existing', source: 'video', contactMode: 'comment', decisionMode: 'rule', businessContext: '旧业务', targetCustomer: '旧客户', keywords: ['旧词'], excludeKeywords: ['旧排除'], replyTemplate: '旧模板', replyInstructions: '旧要求', mode: 'manual', intervalMs: 1111, dailyLimit: 7, maxActions: 8, status: 'paused' }],
+    tasks: [{ id: 'task-existing', url: 'https://www.douyin.com/video/existing', source: 'video', contactMode: 'comment', decisionMode: 'rule', businessContext: '旧业务', targetCustomer: '旧客户', keywords: ['旧词'], excludeKeywords: ['旧排除'], replyTemplate: '旧模板', replyInstructions: '旧要求', mode: 'manual', intervalMs: 1111, dailyLimit: 7, maxActions: 8, actionDay: new Date().toISOString().slice(0, 10), generationToday: 0, sendAttemptsToday: 0, status: 'paused' }],
     leads: [], events: [], logs: [], pending: [], selectorProfile: {}, browser: { connected: false, collector: 'closed', matchCount: 0 },
     ...overrides
   };
@@ -42,7 +43,7 @@ async function newFixture({ state = makeState(), searchVideos = [] } = {}) {
   // mock through a generated prelude instead.
   const mockPrelude = `
     let __state = ${jsonScript(state)};
-    const __calls = { save: [], login: [], refresh: 0, search: [] };
+    const __calls = { save: [], login: [], refresh: 0, search: [], recheck: [], confirm: [] };
     const __listeners = [];
     window.agentApi = {
       getState: async () => structuredClone(__state),
@@ -50,7 +51,7 @@ async function newFixture({ state = makeState(), searchVideos = [] } = {}) {
       logout: async () => ({ state: 'unauthorized' }),
       refreshLicense: async () => { __calls.refresh += 1; return structuredClone(__state.license); },
       getEndpoint: async () => ({ apiEndpoint: 'http://127.0.0.1:18080' }), setEndpoint: async () => ({}), getLedger: async () => [],
-      saveTask: async (value) => { __calls.save.push(value); return value; }, setTaskStatus: async () => ({}), deleteTask: async () => ({}), confirmAction: async () => ({}), retryDraft: async () => ({}), redeem: async () => ({}), openTarget: async () => ({}),
+      saveTask: async (value) => { __calls.save.push(value); return value; }, setTaskStatus: async () => ({}), deleteTask: async () => ({}), recheckSkipped: async (taskId) => new Promise((resolve) => setTimeout(() => { __calls.recheck.push(taskId); resolve({ evaluated: 1, queued: 1, skipped: 0 }); }, 20)), confirmAction: async (actionId) => { __calls.confirm.push(actionId); return {}; }, retryDraft: async () => ({}), redeem: async () => ({}), openTarget: async () => ({}),
       searchTargets: async (value) => { __calls.search.push(value); return { videos: ${jsonScript(searchVideos)} }; }, closeTarget: async () => ({}), probeSelectors: async () => ({}), saveSelectors: async () => ({}),
       onState: (callback) => { __listeners.push(callback); return () => {}; }
     };
@@ -121,7 +122,7 @@ async function testEditCancelNavigationAndSearch() {
 async function testSaveFailureAndSuccess() {
   const fixture = await newFixture();
   try {
-    await openNew(fixture); await setValue(fixture, '[name="url"]', 'https://www.douyin.com/video/save'); await setValue(fixture, '[name="replyTemplate"]', '保留内容');
+    await openNew(fixture); assert.equal(await fixture.get('document.body.textContent.includes("留空仍可保存草稿")'), true, 'empty rule keywords remain saveable as a draft'); await setValue(fixture, '[name="url"]', 'https://www.douyin.com/video/save'); await setValue(fixture, '[name="replyTemplate"]', '保留内容');
     await fixture.get('void (window.agentApi.saveTask = async () => { throw new Error("网络失败") })');
     await fixture.get('document.querySelector("#task-form").requestSubmit()'); await sleep(35);
     assert.equal(await fixture.get('!!document.querySelector("#task-form")'), true); assert.equal(await text(fixture, '[name="replyTemplate"]'), '保留内容');
@@ -129,6 +130,28 @@ async function testSaveFailureAndSuccess() {
     await fixture.get('document.querySelector("#task-form").requestSubmit()'); await sleep(35);
     await emit(fixture, { tasks: [makeState().tasks[0], { id: 'task-new', url: 'https://www.douyin.com/video/save' }] });
     assert.equal(await fixture.get('!!document.querySelector("#task-form")'), false, 'confirmed successful save may return to list');
+  } finally { await closeFixture(fixture); }
+}
+
+async function testTaskQuotaAndExplicitRecheck() {
+  const today = new Date().toISOString().slice(0, 10);
+  const task = { ...makeState().tasks[0], actionDay: today, generationToday: 14, maxActions: 20, sendAttemptsToday: 2, dailyLimit: 7 };
+  const fixture = await newFixture({ state: makeState({ tasks: [task], events: [{ id: 'event-1', taskId: task.id, reason: 'local_no_keyword', text: '无关评论' }], browser: { connected: true, collector: 'idle', matchCount: 100 } }) });
+  try {
+    assert.equal(await text(fixture, '#browser-status'), '抖音窗口已连接，本轮读取 100 条评论');
+    assert.equal(await fixture.get('document.body.textContent.includes("匹配 100")'), false, 'read count must not be presented as matches');
+    assert.equal(await fixture.get('document.body.textContent.includes("今日判定 14 / 20")'), true);
+    assert.equal(await fixture.get('document.body.textContent.includes("今日发送尝试 2 / 7")'), true);
+    assert.equal(await fixture.get('document.querySelector("th:nth-child(5)").textContent'), '今日额度');
+    assert.equal(await fixture.get('document.querySelector("tbody td:nth-child(5)").textContent.includes("0 / 20")'), false, 'old actionsToday/maxActions quota must not remain');
+    if (screenshotArg) fs.writeFileSync(valueAfterEquals(screenshotArg), (await fixture.win.webContents.capturePage()).toPNG());
+    assert.equal(await fixture.get('window.__fixture.calls.recheck.length'), 0, 'recheck must not run automatically');
+    await fixture.get('(() => { const b=document.querySelector("[data-action=recheck-skipped]"); b.click(); b.click(); })()'); await sleep(5);
+    assert.equal(await fixture.get('document.querySelector("[data-action=recheck-skipped]").textContent'), '筛选中…');
+    await sleep(35);
+    assert.equal(await fixture.get('window.__fixture.calls.recheck.length'), 1, 'rapid recheck clicks are coalesced');
+    assert.equal(await fixture.get('window.__fixture.calls.confirm.length'), 0, 'recheck must not send');
+    assert.equal(await text(fixture, '#notice'), '重新筛选完成：已判定 1 条，新增待确认 1 条，跳过 0 条');
   } finally { await closeFixture(fixture); }
 }
 
@@ -167,6 +190,7 @@ async function main() {
     await testEditorSurvivesStateUpdates(); console.log('PASS task editor survives unfocused state updates and refresh');
     await testEditCancelNavigationAndSearch(); console.log('PASS edit/cancel/navigation/search candidate flows');
     await testSaveFailureAndSuccess(); console.log('PASS save failure preserves draft and success returns to list');
+    await testTaskQuotaAndExplicitRecheck(); console.log('PASS task quota and explicit recheck UI evidence');
     await testUnauthorizedDoesNotLeakDraft(); console.log('PASS unauthorized transition clears visible draft');
     await testAccountRoundTrip(); console.log('PASS A-B-A account isolation clears draft');
   } finally { app.quit(); }

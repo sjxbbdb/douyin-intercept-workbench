@@ -63,6 +63,8 @@ jobs:
         working-directory: desktop
       - run: npm test
         working-directory: desktop
+      - run: npm run test:probe-lifecycle
+        working-directory: desktop
       - run: npm run test:task-editor
         working-directory: desktop
 

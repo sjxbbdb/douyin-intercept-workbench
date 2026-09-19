@@ -4,6 +4,10 @@
 
 ## 预发行清单
 
+### 4.0.2 本地候选包
+
+4.0.2 修正任务运行面板的本轮读取、近期事件与今日判定/发送尝试口径；规则任务支持显式重新筛选本地跳过评论，结果进入人工确认队列，不自动发送。当前 UI fixture 已验证额度分列、空关键词草稿提示、筛选中防重复和读取数不等于命中数。portable SHA-256 为 `C8A233F8F755FC31DA198074F5AC0D387FF295D86C37255363CAF7394B64AFD2`（106,976,656 bytes）；NSIS installer SHA-256 为 `914CAF62BBD8AD09F97F0BE2D80BED98D8A3084A64314F6084087821DC16BC06`（119,169,820 bytes）。
+
 ### 4.0.1 本地候选包
 
 4.0.1 修复后台授权刷新时新建/编辑任务表单被退回的问题：空表单失焦、重复刷新和自然 heartbeat 都保留草稿，保存成功后才返回列表，失败时保留输入。portable 与 NSIS installer 已在 Windows 构建，并通过隔离临时 `userData` 的登录、表单回归、正常退出和重启授权恢复验证。portable SHA-256 为 `E0432AE440693E802A28A6361B512A19C345F3BEEB3A3514C6F3C316371A63CA`；NSIS SHA-256 为 `EBA8A4AF1B715969DCAE0239DBAF73EBF1E5E365DE4690E997CB90CF6538C8E4`。启动器已更新为 4.0.1 portable 路径。

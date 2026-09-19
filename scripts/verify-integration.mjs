@@ -301,16 +301,38 @@ async function main() {
       await engine.setTaskStatus(task.id, 'paused');
       const ruleTask = engine.saveTask({ url: task.url, source: 'video', keywords: ['高意向'], excludeKeywords: [], replyTemplate: '规则回复 {{authorName}}', replyInstructions: 'fixture', decisionMode: 'rule', mode: 'manual', intervalMs: 0, dailyLimit: 10, maxActions: 10, status: 'paused' });
       await engine.setTaskStatus(ruleTask.id, 'running');
-      await engine.ingest([
-        { id: 'rule-no-match', source: 'video_comment', roomId: ruleTask.url, authorName: 'low-intent', text: '随便看看', observedAt: new Date().toISOString() },
-        { id: 'rule-match-after-no-match', source: 'video_comment', roomId: ruleTask.url, authorName: 'high-intent', text: '我有高意向，多少钱', observedAt: new Date().toISOString() },
-      ]);
+      const ledgerBeforeRule = await desktop.client.ledger();
+      await engine.ingest([{ id: 'rule-no-match', source: 'video_comment', roomId: ruleTask.url, authorName: 'low-intent', text: '随便看看', observedAt: new Date().toISOString() }]);
       snapshot = engine.snapshot();
       const noMatch = snapshot.events.find((item) => item.authorName === 'low-intent');
-      const laterMatch = snapshot.events.find((item) => item.authorName === 'high-intent');
       assert.equal(noMatch?.status, 'skipped', '规则不命中应被记录为 skipped');
+      assert.equal(noMatch?.reason, 'local_no_keyword', '规则不命中应明确记录 local_no_keyword');
+      assert.equal(snapshot.pending.length, 0, 'local_no_keyword 不得提交待确认事件');
+      assert.equal(browser.sends.length, 1, '重新判定前不得触发浏览器发送');
+
+      engine.saveTask({ ...ruleTask, keywords: ['随便'], status: 'running' });
+      const recheck = await engine.recheckSkipped(ruleTask.id);
+      assert.deepEqual(recheck, { evaluated: 1, queued: 1, skipped: 0 }, '编辑关键词后显式 recheck 应只评估原未命中事件');
+      snapshot = engine.snapshot();
+      assert.equal(snapshot.pending.length, 1, 'recheck 命中应进入唯一待确认队列');
+      assert.equal(browser.sends.length, 1, 'manual recheck 不得自动触发浏览器发送');
+      const ledgerAfterRule = await desktop.client.ledger();
+      assert.equal(ledgerAfterRule.balance, ledgerBeforeRule.balance - 1, '规则 recheck 命中只扣一次评估积分');
+      assert.equal(ledgerAfterRule.entries.length, ledgerBeforeRule.entries.length + 1, '规则 recheck 应只新增一条台账');
+
+      const secondRecheck = await engine.recheckSkipped(ruleTask.id);
+      assert.deepEqual(secondRecheck, { evaluated: 0, queued: 0, skipped: 0 }, '再次 recheck 不得重复评估已提交事件');
+      const ledgerAfterSecondRule = await desktop.client.ledger();
+      assert.equal(ledgerAfterSecondRule.balance, ledgerAfterRule.balance, '再次 recheck 不得重复扣费');
+      assert.equal(ledgerAfterSecondRule.entries.length, ledgerAfterRule.entries.length, '再次 recheck 不得新增台账');
+      assert.equal(browser.sends.length, 1, '再次 recheck 不得增加浏览器发送');
+
+      engine.saveTask({ ...ruleTask, keywords: ['高意向'], status: 'running' });
+      await engine.ingest([{ id: 'rule-match-after-no-match', source: 'video_comment', roomId: ruleTask.url, authorName: 'high-intent', text: '我有高意向，多少钱', observedAt: new Date().toISOString() }]);
+      snapshot = engine.snapshot();
+      const laterMatch = snapshot.events.find((item) => item.authorName === 'high-intent');
       assert.equal(laterMatch?.status, 'awaiting_confirmation', '规则不命中不能阻断后续高意向事件');
-      assert.equal(snapshot.pending.length, 1, '后续高意向事件应只入队一次');
+      assert.equal(snapshot.pending.length, 2, '后续高意向事件应只入队一次');
     });
 
     await check('D logout, expiry, disable, device revoke and isolation', async () => {
