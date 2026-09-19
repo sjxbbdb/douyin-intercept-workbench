@@ -4,6 +4,13 @@
 分支：`rewrite/v4-agent`
 记录提交：`ce9214b`
 
+## 4.0.3 验证记录
+
+- 4.0.3 源码回归：task-editor fixture 8 组通过（含长 URL 表格布局、客户端错误态），并在 1366/1080 视口及 pending 长链接截图中检查；桌面单元测试 22 项、ProbeBridge 生命周期和 `scripts/verify-probe-integration.mjs` 均通过。
+- 4.0.3 Windows 交付：portable 与 NSIS 均构建完成；portable 以 `PACKAGE_DIAG_ONLY=portable` 在显式绝对临时 `user-data-dir` 中通过未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出和重启授权检查。报告为被忽略的 `evidence-private/package/package-4.0.3-portable-diagnostic.json`。
+- 产物 SHA-256：portable `C969FC3F1387D3FC731B8A812E4F846E9622D2BDEDD781C93E335D76B1D170C1`（118,940,263 bytes）；NSIS `2B5E59C1127F0D8E9AC50EF6F3472185A8E6BC7DDD36A2A6CD96F0FB6FC830EB`（119,170,261 bytes）。NSIS 构建完成，未运行安装验收。
+- 未验证真实抖音页面、发送、NSIS 安装运行或生产部署；未启动真实 profile。4.0.2 `latest-package-check` 未作为本轮证据。
+
 ## 已完成
 
 - 4.0.2 源码 UI 验证：`desktop` task-editor fixture 6 组通过；覆盖本轮读取数不等于命中数、今日判定/发送尝试分列、重新筛选显式触发与快速点击合并、不自动确认发送。部分结果与跨日归零逻辑由源码实现，未在该 fixture 中单独断言。渲染截图保存在被忽略的 `evidence-private/ui-4.0.2/task-quota-ui-wrapped.png`。

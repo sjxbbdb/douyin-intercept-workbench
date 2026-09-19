@@ -61,6 +61,11 @@ class ProbeBridge {
     return this.launchPromise;
   }
 
+  #reportOpenFailure(error, message = error?.message || '页面打开失败') {
+    this.currentUrl = null;
+    this.onStatus?.({ connected: false, collector: 'open_error', url: null, matchCount: 0, error: message });
+  }
+
   async open(url) {
     const requested = targetUrl(url);
     const generation = this.cancelGeneration;
@@ -71,15 +76,41 @@ class ProbeBridge {
       if (generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
       this.closed = false;
       this.#stopForTransition();
+      this.currentUrl = null;
       const epoch = this.lifecycleEpoch;
-      await this.#waitForIdleOrThrow();
+      try {
+        await this.#waitForIdleOrThrow();
+      } catch (error) {
+        if (epoch === this.lifecycleEpoch && generation === this.cancelGeneration) this.#reportOpenFailure(error);
+        throw error;
+      }
       if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
-      await this.#launch();
-      if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
-      const result = await this.client.request('open', { url: requested }, { timeoutMs: 60000 });
+      let result;
+      let recovered = false;
+      while (!result) {
+        if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+        try {
+          await this.#launch();
+          if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+          result = await this.client.request('open', { url: requested }, { timeoutMs: 60000 });
+        } catch (error) {
+          if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
+          const recoverable = error?.code === 'target_not_found' || error?.code === 'browser_unavailable';
+          if (!recoverable || recovered) {
+            if (recoverable) {
+              error.message = '专用浏览器目标不可用，恢复失败，请重新打开浏览器会话';
+            }
+            this.#reportOpenFailure(error);
+            throw error;
+          }
+          recovered = true;
+          this.launchPromise = null;
+          this.remoteOwned = false;
+        }
+      }
       if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) throw new Error('页面打开操作已取消');
       this.currentUrl = result.url ? targetUrl(result.url) : requested;
-      this.onStatus?.({ connected: true, collector: 'open', url: this.currentUrl, status: asStatus(result), operation });
+      this.onStatus?.({ connected: true, collector: 'open', url: this.currentUrl, matchCount: 0, error: null, status: asStatus(result), operation });
       return this.currentUrl;
     }).finally(() => { this.openPending -= 1; });
     return promise;

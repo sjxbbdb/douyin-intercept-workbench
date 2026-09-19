@@ -4,6 +4,12 @@
 
 ## 预发行清单
 
+### 4.0.3 本地候选包
+
+4.0.3 修复长 URL 在任务表格中的布局挤压，以及浏览器 owned target 失效后的恢复路径。portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录构建；portable 通过 `PACKAGE_DIAG_ONLY=portable` 隔离验收。portable SHA-256 为 `C969FC3F1387D3FC731B8A812E4F846E9622D2BDEDD781C93E335D76B1D170C1`（118,940,263 bytes）；NSIS SHA-256 为 `2B5E59C1127F0D8E9AC50EF6F3472185A8E6BC7DDD36A2A6CD96F0FB6FC830EB`（119,170,261 bytes）。报告见被忽略的 [`package-4.0.3-portable-diagnostic.json`](../evidence-private/package/package-4.0.3-portable-diagnostic.json)。NSIS 构建完成，未运行安装验收。
+
+portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出（`exitCode=0`、CDP 端口关闭）和同一隔离 userData 重启授权恢复。未验证真实抖音页面、发送、NSIS 安装运行或生产部署；未启动真实 profile。
+
 ### 4.0.2 本地候选包
 
 4.0.2 修正任务运行面板的本轮读取、近期事件与今日判定/发送尝试口径；规则任务支持显式重新筛选本地跳过评论，结果进入人工确认队列，不自动发送。当前 UI fixture 已验证额度分列、空关键词草稿提示、筛选中防重复和读取数不等于命中数。portable SHA-256 为 `C8A233F8F755FC31DA198074F5AC0D387FF295D86C37255363CAF7394B64AFD2`（106,976,656 bytes）；NSIS installer SHA-256 为 `914CAF62BBD8AD09F97F0BE2D80BED98D8A3084A64314F6084087821DC16BC06`（119,169,820 bytes）。

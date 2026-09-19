@@ -18,6 +18,12 @@ if (!stateDir || !profileDir || port === undefined) {
 
 let finished = false;
 let timer = null;
+const fs = require('node:fs');
+fs.mkdirSync(stateDir, { recursive: true });
+const recoveryMarker = path.join(stateDir, 'fake-target-recovered');
+const openRecoveryCode = process.env.FAKE_SIDECAR_OPEN_ERROR_ONCE;
+const openAlwaysCode = process.env.FAKE_SIDECAR_OPEN_ERROR_ALWAYS;
+const tracePath = path.join(stateDir, 'fake-trace.jsonl');
 
 function finish(code = 0) {
   if (finished) return;
@@ -49,6 +55,23 @@ function handle(request) {
   const mode = (request.method.startsWith('send_') ? process.env.FAKE_SIDECAR_SEND_MODE : null) || process.env.FAKE_SIDECAR_MODE || 'success';
   const sendId = typeof params.sendId === 'string' ? params.sendId : `fixture-${request.id}`;
   const accountId = path.basename(stateDir);
+  fs.appendFileSync(tracePath, `${JSON.stringify({ method: request.method })}\n`);
+
+  if (request.method === 'launch' && process.env.FAKE_SIDECAR_LAUNCH_ERROR) {
+    finalError(request.id, process.env.FAKE_SIDECAR_LAUNCH_ERROR, process.env.FAKE_SIDECAR_LAUNCH_ERROR);
+    return;
+  }
+
+  if (request.method === 'open' && openAlwaysCode) {
+    finalError(request.id, openAlwaysCode, openAlwaysCode);
+    return;
+  }
+  const priorOpens = fs.readFileSync(tracePath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter((entry) => entry.method === 'open').length - 1;
+  if (request.method === 'open' && (process.env.FAKE_SIDECAR_TARGET_LOST_AFTER_OPEN_ONCE === '1' && priorOpens >= 1 || process.env.FAKE_SIDECAR_TARGET_LOST_ONCE === '1' || openRecoveryCode) && !fs.existsSync(recoveryMarker)) {
+    fs.writeFileSync(recoveryMarker, '1');
+    finalError(request.id, openRecoveryCode || 'target_not_found', openRecoveryCode || 'owned browser target is unavailable');
+    return;
+  }
 
   if (mode === 'noise') {
     process.stdout.write('fixture noise is not JSON\n');
@@ -90,7 +113,9 @@ function handle(request) {
       finalError(request.id, 'invalid_fixture', `unknown fixture ${mode}`);
     }
   };
-  const delayMs = Number(process.env.FAKE_SIDECAR_DELAY_MS || 0);
+  const delayMs = request.method === 'launch' && fs.existsSync(recoveryMarker) && process.env.FAKE_SIDECAR_RECOVERY_DELAY_MS
+    ? Number(process.env.FAKE_SIDECAR_RECOVERY_DELAY_MS)
+    : Number(process.env.FAKE_SIDECAR_DELAY_MS || 0);
   if (delayMs > 0) timer = setTimeout(complete, delayMs);
   else complete();
 }

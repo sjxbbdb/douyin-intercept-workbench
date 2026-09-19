@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { cpSync, mkdirSync, mkdtempSync, rmSync } = require('node:fs');
+const { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } = require('node:fs');
 const { join } = require('node:path');
 const { tmpdir } = require('node:os');
 const { ProbeBridge } = require('../src/lib/probe-bridge');
@@ -12,6 +12,15 @@ const work = mkdtempSync(join(tmpdir(), 'douyin-v4-bridge-lifecycle-'));
 const runtime = join(work, 'runtime');
 mkdirSync(join(runtime, 'probe'), { recursive: true });
 cpSync(fixture, join(runtime, 'probe', 'sidecar.py'));
+function trace(account) {
+  const path = join(account, 'probe', 'fake-trace.jsonl');
+  return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line).method) : [];
+}
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 20)); }
+  assert.fail('timed out waiting for fixture trace');
+}
 
 async function main() {
   const env = { ...process.env, DOUYIN_PROBE_PYTHON: process.execPath, FAKE_SIDECAR_SEND_MODE: 'success' };
@@ -26,11 +35,12 @@ async function main() {
     env.FAKE_SIDECAR_SEND_MODE = 'unknown';
     env.FAKE_SIDECAR_DELAY_MS = '500';
     const send = bridge.sendReply('fixture', 'video', { sendId: 'lifecycle-send', id: 'comment-1', roomId: 'https://www.douyin.com/video/123', authorId: 'fixture-author', authorName: 'fixture-user', text: '多少钱' });
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await waitFor(() => trace(join(work, 'account-a')).filter((method) => method === 'send_comment').length === 1);
     bridge.stop();
     const result = await send;
     assert.equal(result.status, 'unknown');
     assert.equal(bridge.running, false, 'user stop must prevent collector resurrection');
+    assert.equal(trace(join(work, 'account-a')).filter((method) => method === 'send_comment').length, 1, 'unknown send must be issued once');
     await bridge.close();
     assert.equal(bridge.closed, true);
     await bridge.open('https://www.douyin.com/video/123');
@@ -69,6 +79,51 @@ async function main() {
     assert.equal(bridge2.isOpenFor('https://www.douyin.com/video/456'), true, 'queued start must run after open');
     assert.equal(bridge2.running, true, 'queued start must not be cancelled by open transition');
     await bridge2.close();
+
+    const recoveryAccount = join(work, 'account-recovery');
+    const recoveryEnv = { ...process.env, DOUYIN_PROBE_PYTHON: process.execPath, FAKE_SIDECAR_TARGET_LOST_AFTER_OPEN_ONCE: '1' };
+    const recoveryBridge = new ProbeBridge({ accountDir: recoveryAccount, port: 19324, cwd: runtime, resourcesPath: join(work, 'missing'), env: recoveryEnv });
+    try {
+      await recoveryBridge.open('https://www.douyin.com/video/first');
+      await recoveryBridge.open('https://www.douyin.com/video/recovered');
+      assert.equal(recoveryBridge.isOpenFor('https://www.douyin.com/video/recovered'), true, 'open must rebuild a lost owned target once');
+      assert.deepEqual(trace(recoveryAccount).filter((method) => method === 'launch'), ['launch', 'launch'], 'recovery must invoke a fresh launch');
+      await recoveryBridge.close();
+
+      const unavailableEnv = { ...process.env, DOUYIN_PROBE_PYTHON: process.execPath, FAKE_SIDECAR_OPEN_ERROR_ONCE: 'browser_unavailable' };
+      const unavailableBridge = new ProbeBridge({ accountDir: join(work, 'account-unavailable'), port: 19326, cwd: runtime, resourcesPath: join(work, 'missing'), env: unavailableEnv });
+      await unavailableBridge.open('https://www.douyin.com/video/unavailable');
+      assert.equal(unavailableBridge.isOpenFor('https://www.douyin.com/video/unavailable'), true, 'open must rebuild after owned browser becomes unavailable');
+      await unavailableBridge.close();
+
+      const failedRecoveryEnv = { ...process.env, DOUYIN_PROBE_PYTHON: process.execPath, FAKE_SIDECAR_OPEN_ERROR_ALWAYS: 'target_not_found' };
+      const failedStatuses = [];
+      const failedRecovery = new ProbeBridge({ accountDir: join(work, 'account-failed-recovery'), port: 19327, cwd: runtime, resourcesPath: join(work, 'missing'), env: failedRecoveryEnv, onStatus: (status) => failedStatuses.push(status) });
+      await assert.rejects(() => failedRecovery.open('https://www.douyin.com/video/failed'), /专用浏览器目标不可用，恢复失败/);
+      assert.equal(failedRecovery.currentUrl, null, 'failed recovery must clear currentUrl');
+      assert.equal(failedStatuses.at(-1)?.connected, false, 'failed recovery must report disconnected');
+      assert.equal(trace(join(work, 'account-failed-recovery')).filter((method) => method === 'launch').length, 2, 'permanent target failure must retry launch once');
+      await failedRecovery.close();
+
+      const cancelledAccount = join(work, 'account-cancel-recovery');
+      const cancelledRecoveryEnv = { ...process.env, DOUYIN_PROBE_PYTHON: process.execPath, FAKE_SIDECAR_TARGET_LOST_AFTER_OPEN_ONCE: '1', FAKE_SIDECAR_RECOVERY_DELAY_MS: '500' };
+      const cancelledRecovery = new ProbeBridge({ accountDir: cancelledAccount, port: 19325, cwd: runtime, resourcesPath: join(work, 'missing'), env: cancelledRecoveryEnv });
+      await cancelledRecovery.open('https://www.douyin.com/video/first');
+      const openingRecovery = cancelledRecovery.open('https://www.douyin.com/video/cancelled');
+      await waitFor(() => trace(cancelledAccount).filter((method) => method === 'launch').length >= 2);
+      cancelledRecovery.stop();
+      await assert.rejects(openingRecovery, /页面打开操作已取消/);
+      assert.equal(cancelledRecovery.currentUrl, null, 'cancelled recovery must not resurrect currentUrl');
+      await cancelledRecovery.close();
+
+      const mismatchAccount = join(work, 'account-mismatch');
+      const mismatch = new ProbeBridge({ accountDir: mismatchAccount, port: 19328, cwd: runtime, resourcesPath: join(work, 'missing'), env: { ...process.env, DOUYIN_PROBE_PYTHON: process.execPath, FAKE_SIDECAR_LAUNCH_ERROR: 'port_owner_mismatch' } });
+      await assert.rejects(() => mismatch.open('https://www.douyin.com/video/mismatch'));
+      assert.equal(trace(mismatchAccount).filter((method) => method === 'launch').length, 1, 'permission mismatch must not retry');
+      await mismatch.close();
+    } finally {
+      await recoveryBridge.close();
+    }
 
     let busyRequests = 0;
     busyBridge.client.child = { kill() {} };
