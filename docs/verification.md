@@ -2,7 +2,7 @@
 
 更新时间：2026-09-19
 分支：`rewrite/v4-agent`
-基准提交：`09c8cda`
+基准提交：`c575f38`
 
 ## 已完成
 
@@ -11,7 +11,8 @@
 - 根级 `git diff --check` 与 staged diff 检查通过。
 - 参考仓库在迁移前运行 `npm test`：L1 单元、L2 契约、L3 脱敏 DOM、L4 集成全部通过；入口明确说明 L5 真机与 L6 长稳不在其范围内。
 - 官方抖音能力资料已完成一手文档核对，结论见 [`reference-audit.md`](reference-audit.md)。
-- `server` TypeScript build 通过；`scripts/verify-integration.mjs` 已通过真实回环 HTTP + `desktop/src/lib/api-client.js` + `TaskEngine` 黑盒契约：管理员建号、桌面登录、赠额/兑换、生成扣分、幂等冲突、并发余额、AI hold、provider 失败释放、过期 hold、注销、过期/禁用/设备撤销、跨用户隔离和 `sent_unknown` 闸门。
+- `server` TypeScript build 与 12 项服务端测试通过；`scripts/verify-integration.mjs` 已通过真实回环 HTTP + `desktop/src/lib/api-client.js` + `TaskEngine` 黑盒契约：管理员建号、桌面登录、赠额/兑换、生成扣分、幂等冲突、并发余额、AI hold、provider 失败释放、过期 hold、注销、过期/禁用/设备撤销、跨用户隔离和 `sent_unknown` 闸门。
+- 只读 Electron 页面检查已解析用户提供的分享链接到 `https://www.douyin.com/video/7682712994194722091`，记录标题、页面完成状态和可见候选匹配计数；当前页面出现抖音登录弹窗，候选评论节点 5 个，候选评论文本/作者节点 0 个，未执行登录、采集或发送。证据写入被忽略的本地目录。
 
 ## 当前环境
 
@@ -25,7 +26,8 @@
 
 ## 尚未通过的验收
 
-- `server` build 与 4 个服务端测试通过；`desktop` 的三个入口脚本语法检查通过，但完整 check 仍被缺失的 `desktop/test/run.js` 阻塞，待桌面代理补齐测试后复跑。
+- 桌面三个入口脚本语法检查通过；`scripts/verify-electron-ui.mjs` 已真实启动 Electron 并覆盖未授权、设置地址、错误登录路径，但正确登录被桌面主进程的登录顺序问题阻断：当前实现先请求 `me`、后保存登录 token。启动首屏还需把 IPC 错误作为失败处理。桌面 worker 修复后必须重跑该脚本。
+- 桌面账号 A/B 的本地数据隔离、任务草稿在刷新/heartbeat 后保留、待确认卡完整展示作者/原评论/目标房间，以及暂停/停止/删除操作仍需真实 Electron 回归。
 - Linux 真实运行需在 WSL Ubuntu 或 GitHub Actions Ubuntu 完成；Windows 桌面包需在 Windows 实际启动并验证首次空态、登录、离线和错误状态。
 - Electron 安装包、真实抖音页面、官方开放平台资格、真实自动发送、真实支付和生产部署均未验证。
 
