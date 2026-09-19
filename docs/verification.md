@@ -12,10 +12,10 @@
 - 参考仓库在迁移前运行 `npm test`：L1 单元、L2 契约、L3 脱敏 DOM、L4 集成全部通过；入口明确说明 L5 真机与 L6 长稳不在其范围内。
 - 官方抖音能力资料已完成一手文档核对，结论见 [`reference-audit.md`](reference-audit.md)。
 - `server` TypeScript build 与 12 项服务端测试通过。`scripts/verify-integration.mjs` 的 A/B、并发、provider 失败、过期 hold、AI hold、真实 `ApiClient→TaskEngine` pending/unknown 和 D 会话隔离场景通过；E 已修复并通过，集成入口报告 `Integration contract PASS`。
-- GitHub Actions `v4 CI` run `35442755342`（提交 `69242ea`）已成功：Ubuntu server build/tests、Ubuntu probe 21 项、Ubuntu 跨模块集成和 Windows desktop check/tests 全部通过；runner 只报告 actions 使用 Node 20 的弃用提示。
+- GitHub Actions `v4 CI` run `35442755342`（提交 `69242ea`）已成功：Ubuntu server build/tests、Ubuntu 跨模块集成和 Windows desktop check/tests 全部通过；Ubuntu probe 运行 21 项测试，其中 17 项执行、4 项因未安装 Chrome/Edge 跳过；runner 只报告 actions 使用 Node 20 的弃用提示。本机 probe fixture 回归为 21/21 通过。
 - 独立 `scripts/verify-electron-login.mjs` 与完整 `scripts/verify-electron-ui.mjs` 已真实启动 Electron。UI 覆盖未授权浏览器操作拒绝、设置地址、错误登录、A 账号授权/积分流水/任务、聚焦表单 heartbeat 保留、退出后 B 账号空数据、回到 A 恢复数据；renderer 未显示密码或 token，截图写入被忽略的本地目录。
 - 只读 Electron 页面检查已解析用户提供的分享链接到 `https://www.douyin.com/video/7682712994194722091`，主文档经历 302→200 且 `didFailLoad` 为空；标题匹配用户提供的视频，页面出现抖音登录弹窗。可见候选节点为 `commentNode=9`、`commentText=0`、`commentAuthor=0`、`commentId=0`、`sendButton=13`、`replyButton=13`；候选节点不等于已采集评论，未执行登录、采集或发送。证据写入被忽略的本地目录，检查时间为 `2026-09-19T09:35:12Z`。
-- PR #1 合并了合作方独立 `probe/` 能力探索工具；合作方记录了视频搜索、评论采集/筛选和私信的实机探索，但该工具没有接入 `server/` 或 `desktop/`，也不改变当前授权和计费契约。PR 的 Linux server CI 成功；Windows desktop 和跨模块 CI 因基线缺少 `desktop/package-lock.json` 而未执行到桌面测试。该记录证明独立 probe 的探索路径，不等于本项目发行能力或服务端计费接线已通过。
+- PR #1 合入了合作方独立 `probe/` 能力探索工具；合作方记录了视频搜索、评论采集/筛选和私信的实机探索。当前 Python sidecar 已由 desktop 主进程通过 `ProbeClient` 调用，server 仍独立掌握授权、积分和计费契约；这些记录证明探索路径与本地运行组件，不等于真实平台发送或服务端生产接线已通过。
 
 ## 当前环境
 
@@ -34,11 +34,11 @@
 - 在新的 `AppData\Roaming` 临时目录中实测 JsonStore 写入、重启读取和清理通过，`originalAuthTouched=false`；这是实际文件系统检查，和 EXDEV fallback mock 单测分别记录。
 - 最终 Windows 包已完成隔离验收：portable 与 NSIS installer 均完成未授权空态、登录、退出、再次登录、`window.close()` 正常退出、同一 `userData` 重启恢复授权；正常退出时进程 `exitCode=0` 且 CDP 端口关闭。两种包都通过真实 `window.agentApi.probeSelectors({})` 走到随包 sidecar，并返回五项能力键。检查时移除了 `PATH` 与 `DOUYIN_PROBE_PYTHON`；installer 安装目录含 `resources/probe/probe-agent.exe`，真实 capabilities 返回 `protocolVersion=1`、无 stderr。最终 portable SHA-256 为 `1C4BBE416582E54561C0D75A39CFD83A1067F0F52E35609EBA8CAAF630F53232`（118,936,472 bytes），installer SHA-256 为 `81B671A89D8C8E2BD780E18E368BB151BEE933BFCF71291AD72F545817353275`（119,166,462 bytes），随包 sidecar SHA-256 为 `F1CF743F58F5310F28F4F2999119997322A0635538B067AEB630E209A4F6DACA`（1,958,494 bytes）。
 - 另以 `PACKAGE_EXIT_MODE=force` 对 portable 做独立强杀观察：终止前 `auth.json` 的 token 类型为 string 且有值，终止后文件保持，重启后会话回到未授权并清空本地授权显示。该结果仅记录强制终止路径，不能等同于正常退出失败；当前仍不把强杀后的会话恢复宣称为已支持。
-- Linux 授权端候选分发包已生成到本地忽略目录，内容为 `dist/`、`package.json`、`package-lock.json`、`.env.example`、运行时 Dockerfile/Compose、`DEPLOY.md` 和 `SHA256SUMS`；未包含 `node_modules`、数据库、账号或凭据。按 `node --env-file=.env` 流程临时执行生产依赖安装、编译产物 bootstrap、`/healthz`、停机重启读同一 SQLite 均通过；Docker daemon 不可用，因此未运行容器。该包只代表本地构建和启动验证，不代表生产部署。
+- Linux 授权端候选分发包已生成到本地忽略目录，内容为 `dist/`、`package.json`、`package-lock.json`、`.env.example`、运行时 Dockerfile/Compose、`DEPLOY.md` 和 `SHA256SUMS`；未包含 `node_modules`、数据库、账号或凭据。本机 Windows Node 按 `node --env-file=.env` 流程临时执行生产依赖安装、编译产物 bootstrap、`/healthz`、停机重启读同一 SQLite 均通过；Docker daemon 不可用，因此未运行容器。该包只代表本机流程验证，不代表真实 Linux 运行或生产部署。
 - Linux 包归档为 `linux-server-4.0.0.tar.gz`，压缩包内为清单 20 个文件加 `SHA256SUMS`，未带临时 `node_modules` 或 SQLite；归档 SHA-256 为 `216A5D6707BE1AB625D143737F981D2A370CCB88B1974CEA9123CB00E1DCADDF`，大小 36,260 bytes，生成时间 `2026-09-19 19:47:03`。
-- 待确认卡完整展示作者/原评论/目标房间、暂停/停止/删除操作，以及已授权后的真实专用 Chrome 打开/搜索结果选择仍需独立 Electron fixture 回归；本脚本不把外部 Chrome 只读页面检查混入 UI 账号验收。
-- Linux 真实运行已由本地临时分发包流程验证；GitHub Actions Ubuntu 仍作为持续验证环境。Docker daemon 不可用，因此未运行容器。
-- 视频搜索、评论采集与筛选、评论回复、直播互动和私信触达分别仍需按实际接入方式完成能力级真机验收；若采用官方 API，再单独完成对应资格核验。Electron 安装包、真实自动发送、真实支付和生产部署均未完成。
+- 待确认卡完整展示作者/原评论/目标房间、暂停/停止/删除操作，已有源码 Electron UI 检查；已授权后的真实专用 Chrome 打开和搜索结果选择仍需在平台页面上操作验证。本脚本不把外部 Chrome 只读页面检查混入 UI 账号验收。
+- 真实 Ubuntu 运行证据来自 GitHub Actions `35442755342` 的 server build/tests 和跨模块集成；本机分发包流程使用 Windows Node，不能替代 Ubuntu 或生产部署。Docker daemon 不可用，因此未运行容器。
+- 视频搜索、评论采集与筛选、评论回复、直播互动和私信触达分别仍需按实际接入方式完成能力级真机验收；若采用官方 API，再单独完成对应资格核验。真实自动发送、真实支付和生产部署仍未完成。
 
 ## 验收顺序
 

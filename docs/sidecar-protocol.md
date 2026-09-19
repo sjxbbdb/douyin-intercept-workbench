@@ -27,10 +27,11 @@
 | `doctor` | 检查运行时、浏览器和页面前置条件 | 否 |
 | `open` | 打开商家指定的目标页面 | 否 |
 | `search` | 执行视频搜索并返回可见结果 | 否 |
-| `collect_comments` | 采集可见评论并按规则筛选 | 否 |
+| `collect_comments` | 采集可见评论；规则匹配由服务端完成 | 否 |
 | `collect_live` | 采集可见直播互动 | 否 |
 | `send_private` | 在人工确认和授权闸门之后发送私信 | 是 |
 | `send_comment` | 在人工确认和授权闸门之后发送评论回复 | 是 |
+| `close` | 关闭本账号 sidecar 持有的浏览器和命令资源 | 否 |
 
 所有 `params` 都必须经过主进程 schema 校验。发送方法必须携带主进程生成的 `sendId`、实际 `target` 对象和实际待发送 `text`；`mode` 可以由 desktop 作为任务属性传入，但不是 sidecar 协议的必填字段。是否允许自动发送由桌面任务配置和授权闸门决定。积分扣减发生在服务端生成回复阶段，sidecar 不接收或修改余额、价格、charged 等计费事实。
 
@@ -55,13 +56,27 @@ sidecar 按事件顺序输出 JSONL，每行一个对象，且都带同一个 `i
 
 ## 取消、超时和恢复
 
-- renderer 只能请求主进程取消，不能直接操作 sidecar PID。主进程先写入取消标记并关闭 stdin；在有限宽限期后只杀死自己创建的 child process/tree。
+- renderer 只能请求主进程取消，不能直接操作 sidecar PID。主进程调用 ProbeClient 的 `cancel()`，立即杀死自己创建的 child，并等待 child 的 `close`；不得杀死其他 Chrome 或 sidecar。协议没有虚构的取消标记。
 - 超时统一由主进程计时。超时后的发送结果为 `unknown`，非发送操作可以为 `timeout`；两者都不得隐式重试。
 - 主进程重启后根据 `sendId` 恢复本地动作状态和生成请求幂等键；当前没有服务端发送查询 API，不能承诺查询平台发送状态。恢复动作不重新调用平台发送。
 - sidecar 的临时文件和浏览器 profile 必须位于账号作用域目录；退出时清理命令临时文件，但保留经脱敏的诊断摘要和幂等状态。
 
 ## 能力和发行开关
 
-`capabilities` 的 `result` 形状以实际 runtime worker 输出为准，主进程只校验必需字段并透传未知字段。官方 API 能力必须额外报告 scope/资格；浏览器能力报告专用账号、页面版本和可见结果证据。未达到对应能力的发行开关时，主进程拒绝调用发送方法，但可以保留探测、只读和离线 fixture。
+`capabilities` 的 `result.capability` 至少包含以下固定五键，且每项都必须有 `implemented`、`autoEligible`、`validation`：
+
+```json
+{
+  "result": {"capability": {
+    "video_capture": {"implemented": true, "autoEligible": true, "validation": {"status": "api_or_visible_dom", "delivery": "capture_only"}},
+    "private_reply": {"implemented": true, "autoEligible": true, "validation": {"status": "pr1_real_account_flow", "scope": "collaborator_account", "delivery": "unknown_without_bound_platform_response"}},
+    "video_reply": {"implemented": true, "autoEligible": false, "validation": {"status": "offline_dom_fixture", "delivery": "unknown"}},
+    "live_capture": {"implemented": true, "autoEligible": true, "validation": {"status": "offline_dom_fixture", "delivery": "capture_only"}},
+    "live_reply": {"implemented": true, "autoEligible": false, "validation": {"status": "offline_dom_fixture", "delivery": "unknown"}}
+  }}
+}
+```
+
+`implemented` 表示运行组件存在，`autoEligible` 表示是否允许任务自动发送，`validation` 记录证据来源和范围；能力探测不能把 `implemented` 显示成“已真机验证”。收集事件的 `observedAt` 可在 sidecar 内部使用 ISO 字符串，但 desktop 发往授权端前必须转换为有限的整数毫秒。`collect_comments` 和 `collect_live` 只采集，关键词、排除词和意向判断由服务端规则或 AI draft 完成。官方 API 能力必须额外报告 scope/资格；未达到对应能力的发行开关时，主进程拒绝自动发送，但可以保留探测、人工预检和离线 fixture。
 
 协议实现必须配套 fake sidecar 测试，覆盖正常 JSONL、无效响应、断进程、离线、切换账号、超时取消、`unknown` 不重试和两个账号的 state/profile 隔离。真实抖音验证另行记录，不能用 fake sidecar 结果替代。
