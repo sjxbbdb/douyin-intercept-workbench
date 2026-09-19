@@ -16,9 +16,10 @@ desktop/release/
 **/runtime/
 **/state/
 **/tokens/
-**/*token*
-**/*secret*
-**/*password*
+**/secrets/
+**/.token*
+**/*.token
+**/credentials.*
 **/evidence-private/
 **/test-state/
 
