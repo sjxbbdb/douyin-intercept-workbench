@@ -74,7 +74,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 15000
 /**
  * `Page.navigate` 的超时。⚠️ 导航天然慢一个量级（首字节 + 整页加载），
  * 用 15 秒会在网络稍差时稳定误报失败，而失败又被计入环境类失败。
- * plans/A-工具链路开发指导.md §4.6 明确"默认 15 秒，Page.navigate 30 秒"。
+ * 约定见 shared/开发规范.md：默认命令 15 秒，Page.navigate 30 秒。
  */
 const NAVIGATE_TIMEOUT_MS = 30000
 /** 导航重试时放大的超时（legacy reply_worker.js:130-138 的经验值 25s）。 */

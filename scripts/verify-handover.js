@@ -10,26 +10,31 @@ const EXPECTED = [
   ['README-DEV.md', '开发总索引'],
   ['AGENTS.md', 'AI 智能体入口（红线 + 误实现清单）'],
   ['README.md', '面向使用者的说明'],
-  ['docs/需求规格.md', '唯一验收依据'],
-  ['docs/架构说明.md', '目标架构与稳定指标'],
-  ['docs/部署指南-服务端.md', '服务端部署'],
-  ['docs/合作方须知.html', '渠道合作方文件（源）'],
+  // ── ① 平台层 ──────────────────────────────────────────────────
+  ['docs/项目章程.md', '定位锚点（①平台层）'],
+  ['docs/平台需求规格.md', '平台层唯一验收依据'],
+  ['docs/架构说明.md', '分层架构与稳定指标（①平台层）'],
+  ['docs/部署指南-服务端.md', '服务端部署（③运维层）'],
+  ['docs/合作方须知.html', '渠道合作方文件（源）（③运维层）'],
   ['docs/抖音自动回复助手-合作方须知.pdf', '渠道合作方文件（交付）'],
   ['shared/protocol.md', '双端接口契约'],
   ['shared/术语与选型基准.md', '术语与选型事实源'],
   ['shared/开发规范.md', '编码与工程规范'],
   ['shared/安全与合规要求.md', '三条红线完整展开'],
-  ['shared/已知陷阱与平台知识.md', '抖音 DOM 知识与踩坑'],
   ['shared/测试策略.md', '测试分层与真机验证'],
   ['shared/AI协作开发指引.md', '面向编码智能体'],
-  ['plans/00-两方案对比与选型建议.md', '选型决策'],
-  ['plans/A-工具链路开发指导.md', '方案 A 主文档'],
-  ['plans/A-分阶段任务清单.md', '方案 A 任务清单'],
-  ['plans/B-Agent开发指导.md', '方案 B 主文档'],
-  ['plans/B-工具契约与粒度设计.md', '方案 B 核心设计'],
-  ['plans/B-评估集与成本模型.md', '方案 B 评估与成本'],
-  ['plans/B-与方案A的差异说明.md', '方案 B 增量改动'],
-  ['plans/B-分阶段任务清单.md', '方案 B 任务清单'],
+  // ── ② 领域层 ──────────────────────────────────────────────────
+  ['docs/抖音工作流包需求规格.md', '抖音包需求（②领域层）'],
+  ['shared/已知陷阱与平台知识.md', '抖音 DOM 知识与踩坑（②领域层）'],
+  // ── 平台机制与迁移 ────────────────────────────────────────────
+  ['plans/ADR-001-Agent优先与框架选型.md', '定位修正与框架选型决策'],
+  ['plans/C-工作流包契约.md', '工作流包契约（可插拔性核心）'],
+  ['plans/D-重构迁移与验收.md', '迁移路径与验收'],
+  ['plans/B-Agent开发指导.md', 'Agent 层主文档'],
+  ['plans/B-工具契约与粒度设计.md', '工具粒度核心设计'],
+  ['plans/B-评估集与成本模型.md', '评估与成本模型'],
+  ['plans/B-与方案A的差异说明.md', 'Agent 层增量改动与降级路径'],
+  ['plans/B-分阶段任务清单.md', 'Agent 层任务清单'],
 ];
 
 // ── 一致性断言：这些数值/枚举必须在全体系保持一致 ──────────────
@@ -44,8 +49,20 @@ const CONSISTENCY = {
 };
 
 // ── 陈旧值：不应再出现（作废说明中的提及除外）────────────────────
-const STALE = ['61200', '124100', 'daily_total_max', 'min_interval_comment_sec',
+// ⚠️ 这里只放**本身就有语义**的标识符。裸数字不要放进来：
+//    `61200` 曾是"按小时计费"时代的单价（秒数），但"61200 毫秒"是
+//    一个完全正当的耗时值——把它当陈旧值扫描会误报
+//    （实测：`plans/C-工作流包契约.md` 的 `wall_ms: 61200` 被误判为硬伤）。
+//    数字类硬伤要连同**它的单位/字段名**一起匹配，见下方的 STALE_PAIRS。
+const STALE = ['daily_total_max', 'min_interval_comment_sec',
                'creditPerHour', 'min_days', 'client_too_old'];
+
+// 数字 + 上下文：只有出现在这些形式里才算硬伤。
+// 左侧一条就是当年真正的问题（`creditPerHour = 61200` 秒 = 17 小时/积分）。
+const STALE_PAIRS = [
+  ['61200', 'creditPerHour'],
+  ['124100', 'creditPerHour'],
+];
 
 /**
  * ⚠️ 本脚本要在**两种布局**下都能跑，因为这个仓库有两副面孔：
@@ -68,28 +85,31 @@ const PATH_ALIASES = {
   'README-DEV.md': ['README-DEV.md', '01-先读这些/README-DEV.md'],
   'AGENTS.md': ['AGENTS.md', '01-先读这些/AGENTS.md'],
   'README.md': ['README.md', '01-先读这些/README.md'],
-  'docs/需求规格.md': ['docs/需求规格.md', '02-需求与架构/需求规格.md'],
-  'docs/架构说明.md': ['docs/架构说明.md', '02-需求与架构/架构说明.md'],
-  'docs/部署指南-服务端.md': ['docs/部署指南-服务端.md', '02-需求与架构/部署指南-服务端.md'],
-  'docs/合作方须知.html': ['docs/合作方须知.html', '02-需求与架构/合作方须知.html'],
+  'docs/项目章程.md': ['docs/项目章程.md', '02-定位与需求/项目章程.md'],
+  'docs/平台需求规格.md': ['docs/平台需求规格.md', '02-定位与需求/平台需求规格.md'],
+  'docs/抖音工作流包需求规格.md': ['docs/抖音工作流包需求规格.md', '02-定位与需求/抖音工作流包需求规格.md'],
+  'docs/架构说明.md': ['docs/架构说明.md', '03-架构与运维/架构说明.md'],
+  'docs/部署指南-服务端.md': ['docs/部署指南-服务端.md', '03-架构与运维/部署指南-服务端.md'],
+  'docs/合作方须知.html': ['docs/合作方须知.html', '03-架构与运维/合作方须知.html'],
+  'docs/可复用资产审计.md': ['docs/可复用资产审计.md', '03-架构与运维/可复用资产审计.md'],
   'docs/抖音自动回复助手-合作方须知.pdf': [
-    'docs/抖音自动回复助手-合作方须知.pdf', '02-需求与架构/抖音自动回复助手-合作方须知.pdf',
+    'docs/抖音自动回复助手-合作方须知.pdf', '03-架构与运维/抖音自动回复助手-合作方须知.pdf',
   ],
-  'shared/protocol.md': ['shared/protocol.md', '源码/shared/protocol.md', '03-契约规范与平台知识/protocol.md'],
-  'shared/术语与选型基准.md': ['shared/术语与选型基准.md', '源码/shared/术语与选型基准.md', '03-契约规范与平台知识/术语与选型基准.md'],
-  'shared/开发规范.md': ['shared/开发规范.md', '源码/shared/开发规范.md', '03-契约规范与平台知识/开发规范.md'],
-  'shared/安全与合规要求.md': ['shared/安全与合规要求.md', '源码/shared/安全与合规要求.md', '03-契约规范与平台知识/安全与合规要求.md'],
-  'shared/已知陷阱与平台知识.md': ['shared/已知陷阱与平台知识.md', '源码/shared/已知陷阱与平台知识.md', '03-契约规范与平台知识/已知陷阱与平台知识.md'],
-  'shared/测试策略.md': ['shared/测试策略.md', '源码/shared/测试策略.md', '03-契约规范与平台知识/测试策略.md'],
-  'shared/AI协作开发指引.md': ['shared/AI协作开发指引.md', '源码/shared/AI协作开发指引.md', '03-契约规范与平台知识/AI协作开发指引.md'],
-  'plans/00-两方案对比与选型建议.md': ['plans/00-两方案对比与选型建议.md', '04-开发方案与任务清单/00-两方案对比与选型建议.md'],
-  'plans/A-工具链路开发指导.md': ['plans/A-工具链路开发指导.md', '04-开发方案与任务清单/A-工具链路开发指导.md'],
-  'plans/A-分阶段任务清单.md': ['plans/A-分阶段任务清单.md', '04-开发方案与任务清单/A-分阶段任务清单.md'],
-  'plans/B-Agent开发指导.md': ['plans/B-Agent开发指导.md', '04-开发方案与任务清单/B-Agent开发指导.md'],
-  'plans/B-工具契约与粒度设计.md': ['plans/B-工具契约与粒度设计.md', '04-开发方案与任务清单/B-工具契约与粒度设计.md'],
-  'plans/B-评估集与成本模型.md': ['plans/B-评估集与成本模型.md', '04-开发方案与任务清单/B-评估集与成本模型.md'],
-  'plans/B-与方案A的差异说明.md': ['plans/B-与方案A的差异说明.md', '04-开发方案与任务清单/B-与方案A的差异说明.md'],
-  'plans/B-分阶段任务清单.md': ['plans/B-分阶段任务清单.md', '04-开发方案与任务清单/B-分阶段任务清单.md'],
+  'shared/protocol.md': ['shared/protocol.md', '源码/shared/protocol.md', '04-契约规范与平台知识/protocol.md'],
+  'shared/术语与选型基准.md': ['shared/术语与选型基准.md', '源码/shared/术语与选型基准.md', '04-契约规范与平台知识/术语与选型基准.md'],
+  'shared/开发规范.md': ['shared/开发规范.md', '源码/shared/开发规范.md', '04-契约规范与平台知识/开发规范.md'],
+  'shared/安全与合规要求.md': ['shared/安全与合规要求.md', '源码/shared/安全与合规要求.md', '04-契约规范与平台知识/安全与合规要求.md'],
+  'shared/已知陷阱与平台知识.md': ['shared/已知陷阱与平台知识.md', '源码/shared/已知陷阱与平台知识.md', '04-契约规范与平台知识/已知陷阱与平台知识.md'],
+  'shared/测试策略.md': ['shared/测试策略.md', '源码/shared/测试策略.md', '04-契约规范与平台知识/测试策略.md'],
+  'shared/AI协作开发指引.md': ['shared/AI协作开发指引.md', '源码/shared/AI协作开发指引.md', '04-契约规范与平台知识/AI协作开发指引.md'],
+  'plans/ADR-001-Agent优先与框架选型.md': ['plans/ADR-001-Agent优先与框架选型.md', '05-平台机制与迁移/ADR-001-Agent优先与框架选型.md'],
+  'plans/C-工作流包契约.md': ['plans/C-工作流包契约.md', '05-平台机制与迁移/C-工作流包契约.md'],
+  'plans/D-重构迁移与验收.md': ['plans/D-重构迁移与验收.md', '05-平台机制与迁移/D-重构迁移与验收.md'],
+  'plans/B-Agent开发指导.md': ['plans/B-Agent开发指导.md', '05-平台机制与迁移/B-Agent开发指导.md'],
+  'plans/B-工具契约与粒度设计.md': ['plans/B-工具契约与粒度设计.md', '05-平台机制与迁移/B-工具契约与粒度设计.md'],
+  'plans/B-评估集与成本模型.md': ['plans/B-评估集与成本模型.md', '05-平台机制与迁移/B-评估集与成本模型.md'],
+  'plans/B-与方案A的差异说明.md': ['plans/B-与方案A的差异说明.md', '05-平台机制与迁移/B-与方案A的差异说明.md'],
+  'plans/B-分阶段任务清单.md': ['plans/B-分阶段任务清单.md', '05-平台机制与迁移/B-分阶段任务清单.md'],
 }
 
 /** 在候选路径里找第一个存在的，返回相对路径或 null。 */
@@ -112,7 +132,7 @@ function resolveLegacyDir() {
 function main() {
   let fail = 0;
   console.log('═'.repeat(72));
-  console.log('  抖音自动回复工作台 · 交接文档终检');
+  console.log('  可承载多种专业分化工作流的 Agent 平台 · 交接文档终检');
   console.log('═'.repeat(72));
 
   // 1. 文档到位
@@ -147,13 +167,25 @@ function main() {
   } else { fail++; console.log('  ✗ 不存在 —— P2/P3 的 DOM 工作将失去唯一参考'); }
 
   // 3. 根目录整洁
-  console.log('\n【3】仓库根目录');
-  const allowed = new Set(['.git', '.gitignore', '.gitattributes', 'docs', 'shared', 'plans',
-                           'legacy', 'AGENTS.md', 'README.md', 'README-DEV.md', 'client',
-                           'license-server', 'test', 'scripts', 'package.json', 'node_modules']);
+  //    ⚠️ 两种布局的根目录**允许清单不同**：仓库布局是 docs/shared/plans，
+  //       交接包布局是编号目录 + 旧代码-只读参考。本脚本要在两处都能跑
+  //       （接手人拿到包后第一件事就是跑它），所以两条清单取并集。
+  //       漏掉包布局的那几条会表现为"非预期条目"警告——正是上一版犯的错。
+  console.log('\n【3】根目录');
+  const allowed = new Set([
+    // 仓库布局
+    '.git', '.gitignore', '.gitattributes', 'docs', 'shared', 'plans',
+    'legacy', 'AGENTS.md', 'README.md', 'README-DEV.md', 'client',
+    'license-server', 'test', 'scripts', 'package.json', 'node_modules', 'packs',
+    // 交接包布局
+    '00-交付包说明-先读我.md',
+    '01-先读这些', '02-定位与需求', '03-架构与运维',
+    '04-契约规范与平台知识', '05-平台机制与迁移',
+    '旧代码-只读参考',
+  ]);
   const stray = fs.readdirSync(ROOT).filter((n) => !allowed.has(n));
   if (stray.length === 0) console.log('  ✓ 无游离文件');
-  else { console.log(`  ⚠ 非预期条目：${stray.join(', ')}`); }
+  else console.log(`  ⚠ 非预期条目：${stray.join(', ')}`);
 
   // 4. 三条红线覆盖
   console.log('\n【4】三条红线在文档体系中的覆盖');
@@ -197,9 +229,12 @@ function main() {
     if (files.length === 0) console.log(`  ✓ ${s.padEnd(26)} 无残留`);
     else console.log(`  ⚠ ${s.padEnd(26)} ${files.join(', ')}（若在"作废说明"中属正常）`);
   }
-  // 数值型陈旧值单独判（可能出现在作废对照中）
-  for (const s of ['61200', '124100']) {
-    if (texts.some((x) => x.t.includes(s))) { fail++; console.log(`  ✗ ${s} 仍是硬伤，必须清零`); }
+  // 数值型陈旧值单独判：必须**同时**出现数字与它的字段名才算硬伤
+  // （裸数字会误报——"61200 毫秒"是完全正当的耗时值）
+  for (const [num, ctx] of STALE_PAIRS) {
+    const hit = texts.filter((x) => x.t.includes(num) && x.t.includes(ctx)).map((x) => x.f);
+    if (hit.length) { fail++; console.log(`  ✗ ${ctx}=${num} 仍是硬伤，必须清零：${hit.join(', ')}`); }
+    else console.log(`  ✓ ${ctx}=${num}`.padEnd(30) + ' 无残留');
   }
 
   // 7. 契约自检
