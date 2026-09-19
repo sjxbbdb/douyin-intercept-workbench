@@ -1,0 +1,23 @@
+feat(probe): 直播间截流自动化（弹幕 → sec_uid → 拟人化私信），含真机证据与工作日志
+
+功能：
+- live.py：直播间弹幕采集改为读【页面内存数据模型】（React fiber props.originalList），
+  每条弹幕自带 sec_uid —— 只读 DOM 文本时标识完整率 0%，改后实测 100%。
+  含关键词筛选（四档语义）、可解释意向打分、主播/同行/平台匿名化过滤、私信队列。
+- dm.py：私信执行器（额度闸 / send_id 幂等 / 熔断 / 分批节奏 / 送达复核），
+  新增拟人化输入：逐字打字每字 0.1~0.9 秒随机、鼠标分步移动与抖动、点击前后停顿。
+- manual.py：人工点击工作台（本机 127.0.0.1 网页）：程序出清单+话术+记账，人点发送。
+- douyin.py：DM 入口增加命中测试（elementFromPoint）+ 按钮矩形内 5x5 采样可点到的点；
+  新增 force_page_active（setWebLifecycleState + 焦点模拟），修窗口遮挡导致的点击不送达。
+- dyselectors.py：selectors.py 改名（原名顶掉标准库 selectors，导致 import http.server 失败）。
+- shot.py / watch.py / harvest.py：证据截图、人工操作观察、备用 sec_uid 收割。
+
+测试：
+- 真机：120 秒采 8 条弹幕（标识完整率 100%）；私信 5/5 送达（首次 3/5，2 条因按钮被搜索框
+  盖住失败，修完重试成功）；打字 1.0~1.6 秒/2 字；间隔 15.5~36.2 秒；失败不占额度可安全重试，
+  已发送者被额度闸拦下，未重复打扰。
+- 离线：live_selftest.py（含 node DOM shim 跑真实采集 JS）与 manual_selftest.py 全过。
+
+证据与工作日志：probe/worklog/（截图 + 原始输出，已脱敏：无 sec_uid 原值 / 无昵称 / 无凭据）。
+依赖：零第三方依赖（仅 Python 标准库）。
+边界：不伪造签名、不解码或重放数据帧、不碰验证码；额度与节奏参数后续应由服务端下发。

@@ -1,0 +1,30 @@
+# 本文件已脱敏（入库要求）：
+#   · sec_uid 只保留前 16 位并以 … 截断，不可用于定位任何账号
+#   · 用户昵称 / 直播间名替换为 用户NN / 直播间X
+#   · 不含 Cookie、token、会话原文以外的任何凭据
+
+﻿== 时间 ==
+2026-09-19 22:27:15 +08:00
+== 工作目录 ==
+C:\Users\Administrator\Desktop\agent截流
+== Python ==
+Python 3.13.14
+== git ==
+git version 2.55.0.windows.3
+== Chrome ==
+Chrome/153.0.8010.50
+== CDP 标签 ==
+   https://live.douyin.com/136159747577
+   https://www.douyin.com/user/MS4wLjABAAAAOtma…
+   https://live.douyin.com/
+== 环境变量 DSH_* ==
+  DSH_HOME=C:\Users\Administrator\AppData\Roaming\DeepSeek Harness 桌面端\dsh-home
+  DSH_SESSION_ID=session-16792477-58e2-4735-b224-065bcd1d7fd7
+  DSH_SESSION_JSONL=C:\Users\Administrator\AppData\Roaming\DeepSeek Harness 桌面端\dsh-home\sessions\--C-Users-Administrator-Desktop-agent~622A~6D41--\session-16792477-58e2-4735-b224-065bcd1d7fd7\session.jsonl.zstd
+  DSH_SHELL=1
+  DSH_WEB_URL=http://127.0.0.1:3080
+== 沙箱限制（已知，影响 PR） ==
+  · git 用 schannel 后端: SEC_E_NO_CREDENTIALS（拿不到 TLS 凭据）
+  · git 用 openssl 后端: MSYS signal pipe Win32 error 5（命名管道被沙箱禁止）
+  · Chrome 无法在本沙箱内启动（Mojo 命名管道同样被拒），但可以连接已运行的 Chrome
+  · Python 的 HTTPS 可以出网（github.com -> 200），但没有 GitHub 凭据

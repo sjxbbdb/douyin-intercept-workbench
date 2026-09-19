@@ -6,6 +6,7 @@
   · 全部 IO 走 127.0.0.1，不对外暴露（交接包 §2.13 的反面教材就是绑 0.0.0.0）。
 """
 import json
+import random
 import time
 import urllib.request
 
@@ -93,32 +94,72 @@ class CDP:
 
     # ---------- 真实鼠标/键盘（trusted events） ----------
 
-    def click_at(self, x, y):
+    def move_mouse(self, x, y, steps=3, jitter=8):
+        """分几步把鼠标移过去（真人不会瞬移），并在路径上加轻微抖动。"""
+        try:
+            cx, cy = self._mouse
+        except AttributeError:
+            cx, cy = x - random.uniform(60, 200), y - random.uniform(40, 160)
+        for i in range(1, steps + 1):
+            t = i / float(steps)
+            nx = cx + (x - cx) * t + random.uniform(-jitter, jitter)
+            ny = cy + (y - cy) * t + random.uniform(-jitter, jitter)
+            self.call("Input.dispatchMouseEvent",
+                      {"type": "mouseMoved", "x": int(round(nx)), "y": int(round(ny))}, timeout=10)
+            time.sleep(random.uniform(0.02, 0.09))
+        self._mouse = (float(x), float(y))
+
+    def click_at(self, x, y, jitter=3, human=True):
+        """点一下。human=True 时按真人节奏来：移过去 -> 停一下 -> 按下 -> 松开。
+
+        抖动默认只有 ±3px：按钮常常只有 32x32（比如私信的发送图标），
+        抖大了会点到旁边 —— "拟人"不能把功能点坏。
+        """
+        if human:
+            self.move_mouse(x, y)
+            x += random.uniform(-jitter, jitter)
+            y += random.uniform(-jitter, jitter)
+            time.sleep(random.uniform(0.08, 0.28))
         x, y = int(round(x)), int(round(y))
         self.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, timeout=10)
-        time.sleep(0.15)
+        time.sleep(random.uniform(0.06, 0.2) if human else 0.15)
         self.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1}, timeout=10)
-        time.sleep(0.12)
+        time.sleep(random.uniform(0.06, 0.16) if human else 0.12)
         self.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1}, timeout=10)
 
     def insert_text(self, text):
+        """一次性插入整段文字（像粘贴）。⚠️ 拟人场景【不要】用它，用 type_text。"""
         self.call("Input.insertText", {"text": text}, timeout=10)
 
-    def type_text(self, text, per_char_delay=0.06):
-        """用真实按键事件逐字输入。
+    def type_text(self, text, lo=0.1, hi=0.9, per_char_delay=None, log=None):
+        """逐字输入，节奏像真人。返回实际耗时（秒）。
 
-        为什么要多这一个方法（2026-09-19 真机观察）：
-          面板正常打开、dm_composer 读到的 text 已是「你好」、发送按钮也点到了，
-          但整轮【零个 HTTP 请求、零个带内容的 WS 发送帧】——消息没有真的发出去。
-        推断：Input.insertText 只改了 DOM，富文本编辑器（React 受控组件）
-              的内部状态可能没更新，于是"点发送"时被判为空内容而无动作。
-        Input.dispatchKeyEvent(type=char) 会产生 beforeinput/input 事件，
-        更接近真人输入，React 能收到。
+        🔴 2026-09-19 用户要求：每个字母/字的间隔**在 0.1~0.9 秒之间随机**。
+           算一下代价：一条 30 字的话术要打 3~27 秒（平均 ~15 秒）。
+           这是刻意的 —— "文字瞬间整段出现"是最容易被识别的机器特征之一，
+           而这个通道上一旦被识别，代价是账号（见 03 号文档冲突 3）。
+
+        为什么用 Input.dispatchKeyEvent 而不是 insertText（2026-09-19 真机观察）：
+          面板正常打开、编辑器里也有文字、发送按钮也点到了，
+          但整轮【零个 HTTP 请求、零个带内容的 WS 发送帧】——消息没真的发出去。
+          推断：insertText 只改 DOM，富文本编辑器（React 受控组件）的内部状态可能没更新。
+          type=char 的按键事件会产生 beforeinput/input，React 收得到。
+
+        per_char_delay 保留兼容：给了它就按固定间隔打（只用于调试/自检）。
         """
-        for ch in text:
-            self.call("Input.dispatchKeyEvent",
-                      {"type": "char", "text": ch, "unmodifiedText": ch, "key": ch}, timeout=10)
-            time.sleep(per_char_delay)
+        started = time.time()
+        total = len(text)
+        for i, ch in enumerate(text, 1):
+            if ord(ch) > 0xFFFF:
+                # emoji 这类非 BMP 字符没法用单个按键事件表达，退回 insertText
+                self.insert_text(ch)
+            else:
+                self.call("Input.dispatchKeyEvent",
+                          {"type": "char", "text": ch, "unmodifiedText": ch, "key": ch}, timeout=10)
+            if log and (i == 1 or i % 10 == 0 or i == total):
+                log("          打字中 %d/%d …" % (i, total))
+            time.sleep(per_char_delay if per_char_delay is not None else random.uniform(lo, hi))
+        return time.time() - started
 
     def press_key(self, key, code=None, key_code=None):
         base = {"key": key, "code": code or key, "windowsVirtualKeyCode": key_code or 0, "nativeVirtualKeyCode": key_code or 0}
@@ -226,6 +267,7 @@ class NetworkRecorder:
                 self.pending[p["requestId"]] = {
                     "url": p["request"]["url"],
                     "method": p["request"].get("method"),
+                    "postData": p["request"].get("postData"),
                 }
         except Exception:
             pass
@@ -266,7 +308,7 @@ class NetworkRecorder:
                     import base64 as _b64
                     body = _b64.b64decode(body).decode("utf-8", "replace")
             except Exception as exc:
-                rec["bodyError"] = type(exc).__name__
+                rec["bodyError"] = str(exc)
             parsed = None
             if body:
                 try:

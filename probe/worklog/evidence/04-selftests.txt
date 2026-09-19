@@ -1,0 +1,22 @@
+# 本文件已脱敏（入库要求）：
+#   · sec_uid 只保留前 16 位并以 … 截断，不可用于定位任何账号
+#   · 用户昵称 / 直播间名替换为 用户NN / 直播间X
+#   · 不含 Cookie、token、会话原文以外的任何凭据
+
+﻿== live_selftest（直播间模块：Python 逻辑 + 节点 DOM shim 跑真实采集 JS） ==
+=== live_selftest：Python 逻辑 ===
+  失败 0 项
+
+=== 采集循环（假页面：去重 / room_id / 未登录熔断） ===
+  失败 0 项
+
+=== JS 采集表达式（离线 DOM shim，node=C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2\node.exe） ===
+  失败 0 项
+
+SELFTEST OK
+
+== manual_selftest（人工工作台：渲染/记账/额度/去重/重启恢复） ==
+=== manual_selftest：人工点击工作台 ===
+  失败 0 项
+
+SELFTEST OK

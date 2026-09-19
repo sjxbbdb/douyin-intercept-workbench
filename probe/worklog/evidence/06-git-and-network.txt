@@ -1,0 +1,45 @@
+# 本文件已脱敏（入库要求）：
+#   · sec_uid 只保留前 16 位并以 … 截断，不可用于定位任何账号
+#   · 用户昵称 / 直播间名替换为 用户NN / 直播间X
+#   · 不含 Cookie、token、会话原文以外的任何凭据
+
+﻿== 分支与提交 ==
+* feat/python-cdp-probe
+  rewrite/v4-agent
+  remotes/origin/rewrite/v4-agent
+7f2d41a feat(probe): 新增 Python 版 CDP 可行性探针与私信执行器
+74cb9b7 test: add isolated Electron UI and readonly page evidence
+c575f38 feat: add Linux license server and HTTP contract
+4adc66b test: add cross-module integration contract and CI
+
+== 远端连通性（证明沙箱内无法推送） ==
+命令: git ls-remote --heads origin
+git.exe : fatal: unable to access 'https://github.com/sjxbbdb/douyin-intercept-workbench.git/': schannel: AcquireCreden
+tialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e) - ��ȫ����û�п��õ�ƾ֤
+At line:81 char:3
++   & $git -C _repo\dibw ls-remote --heads origin 2>&1 | Select-Object  ...
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (fatal: unable t...�ȫ����û�п��õ�ƾ֤:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+
+== 凭据检查 ==
+GITHUB_TOKEN: False
+GH_TOKEN: False
+~/.git-credentials: False
+~/.ssh: False
+gh CLI: False
+
+== 本次提交结果（2026-09-19） ==
+分支: feat/live-intercept-automation（从 rewrite/v4-agent 新建）
+提交: ba4688e feat(probe): 直播间截流自动化（弹幕 -> sec_uid -> 拟人化私信），含真机证据与工作日志
+改动: 35 个文件，6488 行新增（含 probe/ 工具包 + worklog/ 证据）
+
+== 推送尝试（本沙箱内失败，已留证据） ==
+命令: git push -u origin feat/live-intercept-automation
+结果: exit 128
+      fatal: unable to access '...': schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)
+
+=> 结论：本沙箱内无法推送/开 PR。
+   需要在沙箱外（有 GitHub 凭据的机器）执行推送，或用带 token 的 GitHub API 提交。
+   命令见 probe/PR-BODY.md 末尾《如何完成推送与开 PR》。

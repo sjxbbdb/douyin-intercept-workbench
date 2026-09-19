@@ -1,0 +1,33 @@
+# 本文件已脱敏（入库要求）：
+#   · sec_uid 只保留前 16 位并以 … 截断，不可用于定位任何账号
+#   · 用户昵称 / 直播间名替换为 用户NN / 直播间X
+#   · 不含 Cookie、token、会话原文以外的任何凭据
+
+﻿== 本次直播间测试的台账记录（send_ledger.jsonl） ==
+  21:59:37  用户00       sent_dom_confirmed message_in_conversation_panel
+  22:00:17  用户01        sent_dom_confirmed message_in_conversation_panel
+  22:01:05  用户02        failed             dm_composer_not_open_after_retries
+  22:02:34  用户03         sent_dom_confirmed message_in_conversation_panel
+  22:03:27  用户04       failed             dm_composer_not_open_after_retries
+  22:04:52  用户00       skipped            quota_user_exceeded
+  22:04:52  用户01        skipped            quota_user_exceeded
+  22:04:52  用户02        sent_dom_confirmed message_in_conversation_panel
+  22:05:49  用户03         skipped            quota_user_exceeded
+  22:05:49  用户04       sent_dom_confirmed message_in_conversation_panel
+
+== 最后一次 dm 汇总（state/dm_summary.json） ==
+  total                5
+  sent_confirmed       0
+  sent_dom_confirmed   2
+  submitted            0
+  skipped              3
+  failed               0
+  prepared_only        0
+  unverified           0
+  stopped_reason       None
+  --- 每个目标的细节 ---
+   {"nick": "用户00", "verdict": "skipped", "reason": "quota_user_exceeded"}
+   {"nick": "用户01", "verdict": "skipped", "reason": "quota_user_exceeded"}
+   {"nick": "用户02", "verdict": "sent_dom_confirmed", "reason": "message_in_conversation_panel", "visibility": "visible", "entry_on_top": true, "typing_seconds": 1.6}
+   {"nick": "用户03", "verdict": "skipped", "reason": "quota_user_exceeded"}
+   {"nick": "用户04", "verdict": "sent_dom_confirmed", "reason": "message_in_conversation_panel", "visibility": "visible", "entry_on_top": true, "typing_seconds": 1.2}

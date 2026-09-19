@@ -1,0 +1,23 @@
+# 本文件已脱敏（入库要求）：
+#   · sec_uid 只保留前 16 位并以 … 截断，不可用于定位任何账号
+#   · 用户昵称 / 直播间名替换为 用户NN / 直播间X
+#   · 不含 Cookie、token、会话原文以外的任何凭据
+
+﻿commentList      confidence=high   live=[未真机验证]  [data-e2e="comment-list"]
+commentItem      confidence=high   live=[未真机验证]  [data-e2e="comment-item"]
+commentContent   confidence=high   live=[未真机验证]  [data-e2e="comment-content"]
+dmPanelEditors   confidence=medium live=[未真机验证]  [contenteditable=true],textarea,input
+dmEditorScope    confidence=high   live=2026-09-19  [class*="messageEditor"]
+searchBar        confidence=high   live=2026-09-19  [data-e2e="searchbar-input"]
+dmSendButton     confidence=high   live=2026-09-19  [class*="e2e-send-msg-btn"]
+noteDetail       confidence=high   live=[未真机验证]  .note-detail-container
+liveChatBox      confidence=high   live=2026-09-19  [class*="webcast-chatroom"]
+liveChatList     confidence=high   live=2026-09-19  [class*="webcast-chatroom___list"]
+liveChatRow      confidence=high   live=2026-09-19  [class*="webcast-chatroom___item"]
+liveChatContent  confidence=high   live=2026-09-19  [class*="webcast-chatroom___content-with-emoji-text"]
+liveChatNodes    confidence=low    live=2026-09-19  （模糊全集，含未观察到的 danmu/bullet/message 等）
+liveRowKeyAttrs  confidence=low    live=[未真机验证]  data-id,data-msg-id,data-message-id,data-comment-id,data-key
+liveSecUidAttrs  confidence=low    live=2026-09-19  data-sec-uid,data-secuid,data-sec-open-id（真机实测：弹幕行内不存在）
+liveNoiseRe      confidence=medium live=2026-09-19  ^(进入直播间|加入了直播间|点赞了|为主播点赞了|关注了主播|分享了直播间|送出|赠送|来了|拍了拍|加入了粉丝团|点亮了粉丝团)
+liveNickFallbackRe confidence=high   live=2026-09-19  ^(.{1,32})[:：]\s*(.{1,220})$
+liveRoomStatus   confidence=low    live=[未真机验证]  (?:在线人数|在线|观看|人气)\s*[:：]?\s*([0-9.,万千]+)

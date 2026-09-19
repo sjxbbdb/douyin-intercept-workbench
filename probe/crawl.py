@@ -595,7 +595,7 @@ def dedupe_comments(rows):
 
 
 def crawl_video_comments(page, video, log=print, scroll_rounds=7, settle=3.0, want_dom=True,
-                         scroll_pause=2.0, navigate=True):
+                         scroll_pause=2.0):
     """抓一条视频的评论。返回 (comments, meta)。
 
     评论里带 sec_uid —— 这是私信环节的输入。
@@ -613,11 +613,7 @@ def crawl_video_comments(page, video, log=print, scroll_rounds=7, settle=3.0, wa
     rec = cdpmod.NetworkRecorder(
         page, lambda u: COMMENT_API_MARK in (u or "") and ("aweme_id=%s" % aweme_id) in (u or ""))
 
-    # Callers that already performed a controlled navigation (the sidecar's
-    # persistent owned tab) can opt out to avoid a reload and losing the
-    # accumulated comment view.  The legacy CLI keeps navigate=True.
-    if navigate:
-        page.call("Page.navigate", {"url": video["url"]}, timeout=25)
+    page.call("Page.navigate", {"url": video["url"]}, timeout=25)
 
     appeared = False
     for _ in range(10):
