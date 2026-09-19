@@ -1,0 +1,18 @@
+# 运行时数据 —— 绝不入库
+# state/ 含真实 sec_uid、昵称、会话文案，属于用户隐私数据
+state/
+*.jsonl
+dm_summary.json
+last_batch.json
+v1_comments.json
+flow_candidates.json
+
+# 本地产物
+__pycache__/
+*.pyc
+vendor/
+chrome-profile/
+chrome-test/
+.tmp-*
+_*.py
+_fetch.js
