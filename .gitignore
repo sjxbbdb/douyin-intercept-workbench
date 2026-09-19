@@ -58,6 +58,42 @@ license_state.json
 credit_ledger.json
 *.local.json
 
+# ============================================================
+# ⚠️ 运行目录（本项目的真实产物都在这两个目录下，绝不能提交）
+# ============================================================
+#
+# client/instances/<实例>/
+#   · 每个抖音账号一个实例目录，包含专用 Chrome 的 profile
+#     （里面有登录 Cookie！）、队列、去重历史、线索名单、审计日志。
+#   · 这是**全项目最敏感**的目录：泄露它等于泄露商家的抖音登录态。
+#
+# license-server/data/（或 DB_PATH 指向的目录）
+#   · SQLite 库 + WAL + 备份：全部商家账号、密码哈希、台账、发送明细。
+#
+client/instances/
+instances/
+license-server/data/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backups/
+
+# 客户端的本地控制台访问令牌（拿到即可代替商家发评论）
+ui-token.txt
+client-config.json
+browser-host.lock
+instances.json
+queue.json
+pending-sends.json
+send-outbox.json
+report-quarantine.json
+runtime-state.json
+audit-log*.jsonl
+client-log.jsonl
+
 # 统计与日志
 logs/
 *.log
