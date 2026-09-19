@@ -199,6 +199,242 @@ function buildPolicy({ accountId, accountDayIndex, policyVersion, nowMs }) {
   return { ...core, policy_hash, account_id: accountId, generated_at_ms: nowMs }
 }
 
+/**
+ * 把**账号级覆盖**合并进等级基准策略，得到实际生效的策略。
+ *
+ * ⚠️ 这个函数补的是一个真实的功能缺口：CLI 的 `policy set` 会把账号级覆盖
+ *    写进 `policy.policy_json`，并写 `policy_history`、自增版本号 —— 但
+ *    `buildPolicy()` 只按等级表推导、**不读覆盖**，于是运维以为
+ *    "我给这家商户收紧了限额"，客户端拿到的还是等级基准值。
+ *    一个"看起来生效、实际什么都没发生"的开关，比没有这个命令更糟：
+ *    它让人以为已经处理过了，出事时才发现当时根本没收紧。
+ *
+ * ⚠️ 合并方向**只能更保守**（红线 1）。四个方向分别处理，最容易弄反的
+ *    仍是 `content_similarity_max`（**越小越保守**）。这里的方向判据必须与
+ *    `validateClientLimits` 一致 —— 两处相反的话，服务端会下发一个
+ *    自己的校验器都不接受的值，客户端每次心跳都会被判越权。
+ *
+ * ⚠️ `sending_enabled` / `collect_only` **不可被账号级覆盖放宽**。
+ *    它们由等级表按天数推导（观察期禁发是产品前提），本函数不碰它们。
+ *
+ * @param {object} base          `buildPolicy()` 的输出
+ * @param {object|null} override 从 `policy.policy_json` 读出的覆盖层
+ * @returns {object} 合并后的策略；`policy_hash` 按合并结果重算
+ */
+function mergePolicyOverride(base, override) {
+  if (!override || typeof override !== 'object') return base
+
+  const out = JSON.parse(JSON.stringify(base))
+  let changed = false
+
+  // ── 三渠道限额 ──────────────────────────────────────────
+  if (override.limits && typeof override.limits === 'object') {
+    for (const src of SOURCE_TYPES) {
+      const o = override.limits[src]
+      if (!o || typeof o !== 'object') continue
+      const cur = out.limits[src]
+      if (!cur) continue
+
+      if (Number.isFinite(Number(o.daily_max))) {
+        const v = Math.min(Number(cur.daily_max), Math.max(0, Math.floor(Number(o.daily_max))))
+        if (v !== cur.daily_max) { cur.daily_max = v; changed = true }
+      }
+      if (Number.isFinite(Number(o.min_interval_ms))) {
+        // ⚠️ 上界仍受 `min_interval_ms_range` 约束：覆盖可以拉长间隔，
+        //    但不能超过契约允许的区间上限 —— 否则客户端 ack 会被
+        //    `validateClientLimits` 拒掉，表现为"策略下发后心跳一直失败"。
+        const lo = Number(cur.min_interval_ms)
+        const hi = MIN_INTERVAL_MS_RANGE[src][1]
+        const v = Math.max(lo, Math.min(hi, Math.floor(Number(o.min_interval_ms))))
+        if (v !== cur.min_interval_ms) { cur.min_interval_ms = v; changed = true }
+      }
+      if (Number.isFinite(Number(o.content_similarity_max))) {
+        const v = Math.min(Number(cur.content_similarity_max), Number(o.content_similarity_max))
+        if (v !== cur.content_similarity_max) { cur.content_similarity_max = v; changed = true }
+      }
+    }
+  }
+
+  // ── 活跃时段：只能调短（取交集），不得延长或新增窗口 ────
+  if (override.active_hours && Array.isArray(override.active_hours.windows)) {
+    const merged = intersectWindowSets(out.active_hours.windows, override.active_hours.windows)
+    if (merged) {
+      const same = JSON.stringify(merged) === JSON.stringify(out.active_hours.windows)
+      if (!same) {
+        out.active_hours = {
+          tz_offset_minutes: out.active_hours.tz_offset_minutes,
+          windows: merged,
+        }
+        changed = true
+      }
+    }
+  }
+
+  // ── 熔断参数：只能更严（阈值调低 / 冷却调长）─────────────
+  if (override.circuit_breaker && typeof override.circuit_breaker === 'object') {
+    const cb = out.circuit_breaker
+    const o = override.circuit_breaker
+    const lower = (k) => {
+      if (!Number.isFinite(Number(o[k]))) return
+      const v = Math.min(Number(cb[k]), Number(o[k]))
+      if (v !== cb[k]) { cb[k] = v; changed = true }
+    }
+    const higher = (k) => {
+      if (!Number.isFinite(Number(o[k]))) return
+      const v = Math.max(Number(cb[k]), Number(o[k]))
+      if (v !== cb[k]) { cb[k] = v; changed = true }
+    }
+    lower('failure_rate_threshold')
+    lower('failure_rate_window')
+    lower('platform_reject_threshold')
+    higher('cooldown_ms')
+    higher('cooldown_l2_ms')
+    higher('risk_code_cooldown_ms')
+  }
+
+  // ── 空闲停扣：只能调短（越早停越保守）──────────────────
+  if (Number.isFinite(Number(override.idle_pause_ms))) {
+    const v = Math.min(Number(out.idle_pause_ms), Math.max(0, Number(override.idle_pause_ms)))
+    if (v !== out.idle_pause_ms) { out.idle_pause_ms = v; changed = true }
+  }
+
+  if (!changed) return base
+
+  // ⚠️ 内容变了就必须**重算 policy_hash**：客户端在心跳里 ack 这个哈希，
+  //    服务端用它写 `policy_ack_log` 存证。不重算的话"生效值变了但哈希没变"
+  //    会让审计无法区分两个不同的策略 —— 而红线 3 要的恰恰是
+  //    "当时**实际生效**的是哪一份"。
+  const hashable = { ...out }
+  delete hashable.policy_hash
+  delete hashable.account_id
+  delete hashable.generated_at_ms
+  const policy_hash = crypto.createHash('sha256')
+    .update(stableStringify(hashable), 'utf8').digest('hex').slice(0, 16)
+  return { ...out, policy_hash }
+}
+
+/**
+ * 两个活跃时段窗口集合求交集。
+ *
+ * ⚠️ 返回 `[]` 表示"交集为空"，即该商户**全天都不能发**。这不是错误，
+ *    是合法的收紧结果（例如运维把窗口缩到与基准不重叠的时段）。
+ *    照常下发即可：客户端会因 `active_hours` 不通过而停发，
+ *    而护栏的 `outside_active_hours` 归因能让运维一眼看出原因。
+ *
+ * ⚠️ 输出必须**稳定排序 + 去重**，否则同一份覆盖每次算出的 JSON 不同，
+ *    `policy_hash` 就会抖动，客户端会以为策略一直在变、
+ *    每次心跳都触发一次"策略切换"。
+ */
+function intersectWindowSets(baseWindows, overrideWindows) {
+  const base = (baseWindows || []).map(parseWindow).filter(Boolean)
+  const ov = (overrideWindows || []).map(parseWindow).filter(Boolean)
+  if (!base.length) return []
+  if (!ov.length) return []
+
+  const seen = new Set()
+  for (const [bs, be] of base) {
+    for (const [os, oe] of ov) {
+      const s = Math.max(bs, os)
+      const e = Math.min(be, oe)
+      if (s < e) seen.add(`${s}-${e}`)
+    }
+  }
+  return [...seen]
+    .map((k) => k.split('-').map(Number))
+    .sort((a, b) => a[0] - b[0])
+    .map(([s, e]) => [minutesToHHMM(s), minutesToHHMM(e)])
+}
+
+/** "HH:MM" → 当日分钟数；非法返回 null。 */
+function parseWindow(w) {
+  const a = hhmmToMinutes(w && w[0])
+  const b = hhmmToMinutes(w && w[1])
+  if (a === null || b === null || a >= b) return null
+  return [a, b]
+}
+
+function hhmmToMinutes(hhmm) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || ''))
+  if (!m) return null
+  const h = Number(m[1]); const min = Number(m[2])
+  if (h > 23 || min > 59) return null
+  return h * 60 + min
+}
+
+function minutesToHHMM(min) {
+  return `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`
+}
+
+/**
+ * 读取账号级覆盖并合并，得到**实际会下发给客户端的**策略。
+ *
+ * ⚠️ 这是所有下发路径（登录、续期、心跳、`GET /policy/current`）都该走的
+ *    入口。直接调 `buildPolicy()` 会绕过账号级覆盖 —— 而那条路径正是
+ *    "`policy set` 写了但不下发"这个缺口的来源，所以这里做成唯一入口。
+ *
+ * ⚠️ 覆盖是**每请求都要读一次**的东西（心跳 60 秒一次）。为了不让它
+ *    变成热路径上的额外查询，这里带一个**按 (accountId, version) 缓存**：
+ *    覆盖只在 `policy set` 时改变，而那一定伴随 `policy_version` 自增，
+ *    所以版本号就是天然的失效键 —— 不会读到陈旧值。
+ *
+ * @param {object} db
+ * @param {object} p `{ accountId, accountDayIndex, policyVersion, nowMs }`
+ */
+function buildEffectivePolicy(db, p) {
+  const base = buildPolicy(p)
+  if (!db || p.accountId === undefined || p.accountId === null) return base
+
+  const cacheKey = `${p.accountId}:${p.policyVersion}`
+  let override
+  if (OVERRIDE_CACHE.has(cacheKey)) {
+    override = OVERRIDE_CACHE.get(cacheKey)
+  } else {
+    override = null
+    try {
+      const row = db.prepare(
+        'SELECT policy_json FROM policy WHERE account_id = ? AND policy_version = ?'
+      ).get(p.accountId, p.policyVersion)
+      if (row && row.policy_json) override = safeParseJson(row.policy_json)
+    } catch (e) {
+      // ⚠️ 读不到覆盖**不能**让策略下发失败：宁可下发等级基准值
+      //    （更宽松但合法），也不要让商家因为一次查询异常而无法登录。
+      //    但必须留痕 —— 静默忽略会让"覆盖不生效"永远查不出来。
+      warnOverrideReadFailed(e, cacheKey)
+    }
+    // 缓存 null 也是有效的（说明该账号此刻没有覆盖），避免每请求都查一次库
+    if (OVERRIDE_CACHE.size >= OVERRIDE_CACHE_MAX) OVERRIDE_CACHE.clear()
+    OVERRIDE_CACHE.set(cacheKey, override)
+  }
+
+  return mergePolicyOverride(base, override)
+}
+
+/** 覆盖缓存：键 `accountId:version`。版本自增即天然失效，无需 TTL。 */
+const OVERRIDE_CACHE = new Map()
+const OVERRIDE_CACHE_MAX = 500
+
+let overrideWarnHook = null
+/** 注册"读覆盖失败"的告警钩子（由 server 装配时注入 logger）。 */
+function setOverrideWarnHook(fn) { overrideWarnHook = typeof fn === 'function' ? fn : null }
+
+function warnOverrideReadFailed(e, key) {
+  if (overrideWarnHook) {
+    try { overrideWarnHook({ event: 'policy_override_read_failed', key, message: e && e.message }) } catch (hookErr) {
+      // 钩子本身抛错不能影响策略下发。
+      process.stderr.write(`[policy] 告警钩子抛错：${hookErr && hookErr.message}\n`)
+    }
+    return
+  }
+  process.stderr.write(`[policy] 读取账号级覆盖失败（${key}）：${e && e.message}；已退回等级基准值\n`)
+}
+
+function safeParseJson(s) {
+  try { return JSON.parse(s) } catch (e) { return null }
+}
+
+/** 清空覆盖缓存（`policy set` 之后调用；正常靠版本号失效，这是兜底）。 */
+function clearOverrideCache() { OVERRIDE_CACHE.clear() }
+
 /** 完整等级表（供 GET /policy/current 下发，便于客户端与运维核对）。 */
 function tierTableForClient() {
   return {
@@ -399,6 +635,11 @@ module.exports = {
   daysUntilNextTier,
   nextTierName,
   buildPolicy,
+  buildEffectivePolicy,
+  mergePolicyOverride,
+  intersectWindowSets,
+  setOverrideWarnHook,
+  clearOverrideCache,
   tierTableForClient,
   stableDailyMaxTotal,
   validateClientLimits,

@@ -11,7 +11,7 @@
 const { AppError } = require('../../shared/lib/errors')
 const { SOURCE_TYPES, SOURCE_COUNTERS, VERDICTS, CONFIRM_SIGNALS, FAILURE_REASONS, PLATFORM_ENDPOINTS } =
   require('../../shared/lib/protocol')
-const { buildPolicy, deriveDayIndex, validateClientLimits, tierTableForClient } = require('../domain/policy')
+const { buildEffectivePolicy, deriveDayIndex, validateClientLimits, tierTableForClient } = require('../domain/policy')
 const { settleSendBatch, usedQuota, dailyMaxFor } = require('../domain/billing')
 const { buildQuotaNotice } = require('./quota-notice')
 
@@ -42,7 +42,7 @@ function heartbeat(ctx) {
 
   const policyVersion = policyVersionOf(db)
   const dayIndex = deriveDayIndex(Number(session.first_login_ms || nowMs), nowMs)
-  const policy = buildPolicy({
+  const policy = buildEffectivePolicy(db, {
     accountId: session.account_id, accountDayIndex: dayIndex, policyVersion, nowMs,
   })
 
@@ -228,7 +228,7 @@ function policyCurrent(ctx) {
   const { db, session, nowMs } = ctx
   const policyVersion = policyVersionOf(db)
   const dayIndex = deriveDayIndex(Number(session.first_login_ms || nowMs), nowMs)
-  const policy = buildPolicy({
+  const policy = buildEffectivePolicy(db, {
     accountId: session.account_id, accountDayIndex: dayIndex, policyVersion, nowMs,
   })
   return { ok: true, server_time_ms: nowMs, policy, ...tierTableForClient() }

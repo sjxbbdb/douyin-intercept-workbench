@@ -25,6 +25,7 @@ const { sha256Hex } = require('./crypto/sign')
 const auth = require('./api/routes-auth')
 const audit = require('./api/routes-audit')
 const credit = require('./api/routes-credit')
+const { createAdmin } = require('./admin/api')
 
 const API = '/api/v1'
 const HEADER_SERVER_TS = 'X-Lic-Server-Ts'
@@ -208,8 +209,74 @@ async function withToken(ctx, handler) {
   return handler({ ...ctx, session: row })
 }
 
-/** 创建服务实例（不监听）。便于集成测试直接调用。 */
-function createServer(options = {}) {
+/**
+ * 启动时把后台的暴露面**大声**说清楚。
+ *
+ * ⚠️ 为什么值得单独一个函数：
+ *    后台是否挂载、白名单是否生效，只体现在 `.env` 里。
+ *    运维改了 `.env` 却看日志无从确认时，最常见的应对是"先开着公网试试"——
+ *    而 §9.3 要求的顺序恰好相反（SSH 隧道 > IP 白名单 > 随机路径 + HTTPS）。
+ *    所以：**挂载路径、白名单是否生效、路径是否可猜**，三件事都必须在启动日志里。
+ *
+ * @returns {{path: string, ip_allow_active: boolean, guessable: boolean, warnings: string[]}}
+ */
+function logAdminStartup(config, log) {
+  const warnings = []
+
+  // ⚠️ "可猜"判定同时看**长度**与**可字典化**，两者任一命中都要告警：
+  //    · 短于 8 字符 → 暴力枚举成本极低
+  //    · 去掉前缀后就是 `admin`/`manage`/`console` 这类常见词 → 字典第一条就中
+  const stripped = config.adminPath.replace(/^\/+/, '')
+  const tail = stripped.replace(/^admin[-_]?/i, '')
+  const dictWords = ['admin', 'manage', 'manager', 'console', 'panel', 'backend', 'dashboard', 'root', 'sys']
+  const guessable = stripped.length < 8 ||
+    dictWords.includes(stripped.toLowerCase()) ||
+    tail === '' || tail.length < 6
+
+  if (guessable) {
+    warnings.push(
+      `ADMIN_PATH=${config.adminPath} 容易被猜到（短于 8 字符，或去掉 admin 前缀后不足 6 字符）。` +
+      '请换成随机串：echo "/admin-$(openssl rand -hex 3)"'
+    )
+  }
+
+  // 白名单"生效"的定义：名单里存在**非回环**条目。
+  // 只写 127.0.0.1 时本质上等于"没有白名单"，因为后台默认就只允许回环。
+  const ipAllowActive = config.adminIpAllow.some((e) => !/^127\.|^::1|^localhost/i.test(String(e)))
+  if (!ipAllowActive) {
+    warnings.push(
+      'ADMIN_IP_ALLOW 未包含任何非回环地址 → 后台当前**只有本机可访问**。' +
+      '如需远程访问，首选 SSH 隧道（部署指南 §9.3 ①）：' +
+      'ssh -N -L 18080:127.0.0.1:18080 root@<VPS>'
+    )
+  }
+  if (!config.adminCookieSecure) {
+    warnings.push(
+      'ADMIN_COOKIE_SECURE=0：后台会话 cookie 不带 Secure 属性，只应在纯 HTTP 的 SSH 隧道/本机联调下使用'
+    )
+  }
+  if (config.trustProxy && !ipAllowActive) {
+    warnings.push(
+      'TRUST_PROXY=1 但 ADMIN_IP_ALLOW 只有回环：反代转发来的请求会拿 X-Forwarded-For 作为来源 IP，' +
+      '请把反代所在地址或你的固定公网 IP 加进 ADMIN_IP_ALLOW'
+    )
+  }
+
+  log.info('admin_mounted', {
+    path: config.adminPath,
+    ip_allow: config.adminIpAllow,
+    ip_allow_active: ipAllowActive,
+    session_ttl_hours: config.adminSessionTtlHours,
+    cookie_secure: Boolean(config.adminCookieSecure),
+    trust_proxy: Boolean(config.trustProxy),
+    guessable,
+  })
+  for (const w of warnings) log.warn('admin_startup_warning', { message: w })
+
+  return { path: config.adminPath, ip_allow_active: ipAllowActive, guessable, warnings }
+}
+
+/** 创建服务实例（不监听）。便于集成测试直接调用。 */function createServer(options = {}) {
   const config = options.config || loadConfig(options)
   const log = options.logger || new Logger(config.logLevel, options.logSink || process.stdout)
   const { db, applied, close } = openDatabase(config.dbPath, {
@@ -221,6 +288,23 @@ function createServer(options = {}) {
 
   const router = buildRouter()
   const startedAtMs = Date.now()
+
+  // ── 管理后台 ──────────────────────────────────────────────
+  // ⚠️ `ADMIN_PATH` 未配置 → `createAdmin` 返回 null → **后台彻底不存在**。
+  //    这里不注册任何后台路由，于是 `/admin` 走的是普通 404，
+  //    和"这个服务上根本没有这个路径"完全无法区分。
+  //    **绝不给 `/admin` 之类的默认值**——后台是厂商侧最高危的暴露面
+  //    （见 docs/部署指南-服务端.md §9.3）。
+  const admin = createAdmin(config, log)
+  if (admin) {
+    admin.attachDb(db)
+    logAdminStartup(config, log)
+  } else {
+    log.info('admin_disabled', {
+      reason: 'ADMIN_PATH 未配置',
+      hint: '如需启用后台，请在 .env 中设置随机路径（例：ADMIN_PATH=/admin-7f3c91），并参考部署指南 §9.3 决定暴露面',
+    })
+  }
 
   const server = http.createServer(async (req, res) => {
     const nowMs = Date.now()
@@ -239,6 +323,14 @@ function createServer(options = {}) {
     }
 
     try {
+      // ⚠️ 后台必须在客户端路由**之前**分流，且只吃自己的路径前缀：
+      //    · 在之前 → 后台路径永远不会落到 `/api/v1/*` 的 404/405 分支上
+      //    · 只吃前缀 → 客户端契约（含 `/api/v1/*` 的签名与防重放）完全不受影响
+      if (admin && (parsed.pathname === config.adminPath ||
+                    parsed.pathname.startsWith(config.adminPath + '/'))) {
+        return await admin.handle(ctx, parsed.pathname)
+      }
+
       const hit = router.match(req.method, parsed.pathname)
       if (!hit) {
         if (router.hasPath(parsed.pathname)) {
@@ -280,21 +372,45 @@ function createServer(options = {}) {
     db,
     config,
     log,
+    admin,
     close: () => {
       // ⚠️ 不用空 catch。关闭失败要留痕——否则端口占用等问题会被静默吞掉，
       //    表现为"重启后端口还被占着"却查不到原因。
+      //
+      // ⚠️ 幂等：`server.close()` 在已关闭时回调一个 ERR_SERVER_NOT_RUNNING 错误
+      //    （不抛），而 `close()`（DB）第二次调用会抛。两者都必须能被重复调用，
+      //    因为 shutdown 路径与测试的 finally 都可能各调一次。
       try {
         server.close()
       } catch (e) {
         log.warn('server_close_failed', { message: e && e.message })
       }
-      close()
+      // ⚠️ 后台的定时器必须拆掉：漏掉它，进程会因为那个 handle 挂着不退出，
+      //    表现为"明明 close 了，node 还停在那"。
+      if (admin) {
+        try {
+          admin.dispose()
+        } catch (e) {
+          log.warn('admin_dispose_failed', { message: e && e.message })
+        }
+      }
+      try {
+        close()
+      } catch (e) {
+        log.warn('db_close_failed', { message: e && e.message })
+      }
     },
     listen: () => new Promise((resolve, reject) => {
       server.once('error', reject)
       server.listen(config.port, config.host, () => {
         const addr = server.address()
-        log.info('listening', { host: addr.address, port: addr.port, protocol_version: config.protocolVersion })
+        log.info('listening', {
+          host: addr.address, port: addr.port, protocol_version: config.protocolVersion,
+          // ⚠️ 后台挂载路径必须出现在这一行里：运维只 `journalctl | grep listening`
+          //    时也要能看到"后台到底开没开、开在哪"。
+          admin_path: config.adminPath,
+          admin_enabled: Boolean(admin),
+        })
         resolve(addr)
       })
     }),
@@ -315,6 +431,14 @@ if (require.main === module) {
     console.log(`[dy-license] 已就绪 → http://${instance.config.host}:${instance.config.port}/healthz`)
     if (instance.config.host === '127.0.0.1') {
       console.log('[dy-license] 仅绑定回环。对外请经反向代理 + HTTPS（见部署指南 §6）')
+    }
+    // ⚠️ 后台入口在启动横幅里再报一次（不只是结构化日志）：
+    //    首次部署的人看的是终端，不是 journalctl。
+    if (instance.config.adminPath) {
+      console.log(`[dy-license] 管理后台已挂载 → ${instance.config.adminPath}/（IP 白名单：${instance.config.adminIpAllow.join(', ')}）`)
+      console.log('[dy-license] ⚠️ 推荐经 SSH 隧道访问，不要把后台暴露到公网（部署指南 §9.3）')
+    } else {
+      console.log('[dy-license] 管理后台**未启用**（未设置 ADMIN_PATH）。如需启用请参考部署指南 §7/§9.3')
     }
   }).catch((e) => {
     console.error('[fatal] 监听失败：' + e.message)
@@ -341,4 +465,4 @@ if (require.main === module) {
   process.on('SIGTERM', () => shutdown('SIGTERM'))
 }
 
-module.exports = { createServer, buildRouter, API, withToken, sendSigned }
+module.exports = { createServer, buildRouter, API, withToken, sendSigned, logAdminStartup }

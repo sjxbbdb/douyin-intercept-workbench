@@ -76,6 +76,7 @@ const {
   TZ_OFFSET_MINUTES,
   MS_PER_DAY,
   buildPolicy,
+  buildEffectivePolicy,
   deriveDayIndex,
   tierForDayIndex,
   stableDailyMaxTotal,
@@ -743,7 +744,13 @@ function currentPolicy(db, account, nowMs, withOverride = false) {
     const row = db.prepare('SELECT policy_version FROM policy WHERE account_id = ?').get(accountId)
     if (row) version = Math.max(version, Number(row.policy_version))
   }
-  return buildPolicy({
+  // ⚠️ 用 `buildEffectivePolicy`（而非 `buildPolicy`）：`policy show` /
+  //    `account show` 必须显示**实际会下发给客户端的**那份策略。
+  //    只显示等级基准值会让运维以为"我刚收紧的限额没生效"——
+  //    而真相是"显示了另一份策略"。
+  // ⚠️ 版本号取 `max(全局, 账号级)`：账号级覆盖会自增版本，
+  //    只读全局版本会让覆盖缓存命中错误的键（读到陈旧覆盖）。
+  return buildEffectivePolicy(db, {
     accountId,
     accountDayIndex: dayIndexOf(account, nowMs),
     policyVersion: version,

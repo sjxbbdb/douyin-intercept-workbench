@@ -15,7 +15,7 @@ const { hashPassword, verifyPassword } = require('../crypto/password')
 const {
   generateToken, generateSignKey, sha256Hex, buildLoginProof,
 } = require('../crypto/sign')
-const { buildPolicy, deriveDayIndex, planCreditsFor, minPlanCredit } = require('../domain/policy')
+const { buildEffectivePolicy, deriveDayIndex, planCreditsFor, minPlanCredit } = require('../domain/policy')
 const { buildQuotaNotice } = require('./quota-notice')
 
 /** 登录失败阈值与锁定时长（protocol.md §1.4） */
@@ -173,7 +173,7 @@ function login(ctx) {
   // ── 策略与额度
   const policyVersion = currentPolicyVersion(db)
   const dayIndex = deriveDayIndex(firstLoginMs, nowMs)
-  const policy = buildPolicy({
+  const policy = buildEffectivePolicy(db, {
     accountId: acc.account_id, accountDayIndex: dayIndex, policyVersion, nowMs,
   })
 
@@ -326,7 +326,7 @@ function refresh(ctx) {
   `).run(sha256Hex(newToken), sha256Hex(newKey), newKey, nowMs, nowMs, expiresAt, session.id)
 
   const dayIndex = deriveDayIndex(Number(session.first_login_ms || nowMs), nowMs)
-  const policy = buildPolicy({
+  const policy = buildEffectivePolicy(db, {
     accountId: session.account_id, accountDayIndex: dayIndex,
     policyVersion: currentPolicyVersion(db), nowMs,
   })
@@ -378,7 +378,7 @@ function logout(ctx) {
 function me(ctx) {
   const { db, session, nowMs, config } = ctx
   const dayIndex = deriveDayIndex(Number(session.first_login_ms || nowMs), nowMs)
-  const policy = buildPolicy({
+  const policy = buildEffectivePolicy(db, {
     accountId: session.account_id, accountDayIndex: dayIndex,
     policyVersion: currentPolicyVersion(db), nowMs,
   })
