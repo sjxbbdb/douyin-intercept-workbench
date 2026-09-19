@@ -226,7 +226,6 @@ class NetworkRecorder:
                 self.pending[p["requestId"]] = {
                     "url": p["request"]["url"],
                     "method": p["request"].get("method"),
-                    "postData": p["request"].get("postData"),
                 }
         except Exception:
             pass
@@ -267,7 +266,7 @@ class NetworkRecorder:
                     import base64 as _b64
                     body = _b64.b64decode(body).decode("utf-8", "replace")
             except Exception as exc:
-                rec["bodyError"] = str(exc)
+                rec["bodyError"] = type(exc).__name__
             parsed = None
             if body:
                 try:

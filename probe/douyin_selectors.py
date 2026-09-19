@@ -16,6 +16,51 @@ COMMENT_CONTENT = '[data-e2e="comment-content"]'
 FEED_COMMENT_ICON = '[data-e2e="feed-comment-icon"]'
 NOTE_DETAIL = '.note-detail-container'
 CONTENTEDITABLE = '[contenteditable=true]'
+COMMENT_EDITORS = [
+    '[data-e2e="comment-input"]',
+    '[data-e2e="comment-input-inner"]',
+    '[contenteditable="true"]',
+]
+COMMENT_SEND_BUTTONS = [
+    '[data-e2e="comment-submit"]',
+    '[data-e2e="comment-send"]',
+]
+COMMENT_REPLY_BUTTONS = [
+    '[data-e2e="comment-reply"]',
+    '[data-e2e="comment-item-reply"]',
+]
+COMMENT_REPLY_EDITORS = [
+    '[data-e2e="comment-reply-input"]',
+    '[data-e2e="comment-reply-editor"] [contenteditable="true"]',
+    '[data-e2e="comment-item"] [data-e2e="comment-input-inner"]',
+]
+COMMENT_REPLY_SEND_BUTTONS = [
+    '[data-e2e="comment-reply-submit"]',
+    '[data-e2e="comment-reply-send"]',
+]
+
+# ---------- 直播公开评论（DOM 适配，live_verified_at remains None） ----------
+LIVE_COMMENT_ITEMS = [
+    '[data-e2e="live-chat-item"]',
+    '[data-e2e="chat-item"]',
+    '[class*="webcast-chatroom___item"]',
+]
+LIVE_COMMENT_CONTENT = [
+    '[data-e2e="live-chat-content"]',
+    '[data-e2e="chat-content"]',
+]
+LIVE_COMMENT_AUTHORS = [
+    '[data-e2e="live-chat-author"]',
+    '[data-e2e="chat-author"]',
+]
+LIVE_PUBLIC_EDITORS = [
+    '[data-e2e="live-chat-input"]',
+    '[data-e2e="chat-input"]',
+]
+LIVE_PUBLIC_SEND_BUTTONS = [
+    '[data-e2e="live-chat-send"]',
+    '[data-e2e="chat-send"]',
+]
 
 # ---------- 私信 ----------
 DM_PANEL_EDITORS = '[contenteditable=true],textarea,input'
@@ -87,10 +132,10 @@ CAPTCHA_TEXT_STRONG = ["验证码中间页", "请输入验证码", "请完成安
 #
 # 🔴 2026-09-19 之后的真机教训：正文匹配「登录后」会把【已登录】误判成未登录——
 #    搜索页里一条视频简介写着"一旦退出登录后，再次登录就要验证手机号"就触发了。
-#    现在的主判据是 cookie（sessionid / sid_tt / sid_guard，均为 HttpOnly，JS 读不到），
-#    下面这串正文只保留给「确实没有 Network 域可用」时的极弱兜底，且不再用于主判据。
+#    sidecar 不读取 cookie；登录态只由可见账号元素或登录弹窗判定，
+#    无法确认时返回 unknown，不能把未知状态当成已登录。
 LOGIN_REQUIRED_RE = "扫码登录"
-# 登录弹窗（可见才算）：仅在拿不到 cookie 时使用的兜底判据
+# 登录弹窗（可见才算）
 LOGIN_MODAL_DOM = [
     '[class*="login-mask"]',
     '[class*="loginMask"]',
@@ -98,6 +143,11 @@ LOGIN_MODAL_DOM = [
     '[class*="loginPanel"]',
     '[class*="qrcode"]',
     '[class*="qr-code"]',
+]
+LOGIN_ACCOUNT_DOM = [
+    '[data-e2e="user-info"]',
+    '[data-e2e="user-avatar"]',
+    '[data-e2e="nav-user"]',
 ]
 
 # ---------- 网络接口（判定发送成功的唯一依据，红线 2） ----------
@@ -128,4 +178,4 @@ def registry_report():
     for key, meta in REGISTRY.items():
         live = meta["live_verified_at"] or "[未真机验证]"
         rows.append("%-16s confidence=%-6s live=%s  %s" % (key, meta["confidence"], live, meta["value"]))
-    return "\n".join(rows)
+    return "\n".join(rows)\n

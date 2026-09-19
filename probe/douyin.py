@@ -14,7 +14,7 @@ import time
 
 import cdp as cdpmod
 from cdp import NetworkRecorder
-import selectors as S
+import douyin_selectors as S
 
 
 # ===================== 状态判定 =====================
@@ -141,44 +141,38 @@ def check_captcha(cdp):
     return bool(captcha_probe(cdp).get("hit"))
 
 
-def _cookie_names(cdp):
-    """拿本站 cookie 名集合。Network 域没开时返回 None（而不是抛错）。
-
-    为什么不用 document.cookie：sessionid / sid_tt 都是 HttpOnly，
-    JS 读不到——用它们判登录态反而会得到"永远未登录"的假信号。
-    """
-    try:
-        res = cdp.call("Network.getCookies", {"urls": ["https://www.douyin.com"]}, timeout=10)
-    except Exception:
-        return None
-    return {c.get("name") for c in (res.get("cookies") or [])}
-
-
-LOGIN_COOKIE_MARKS = ("sessionid", "sessionid_ss", "sid_tt", "sid_guard")
-
-
-def check_login_required(cdp):
-    """是否未登录。
+def login_state(cdp):
+    """返回 ``required``、``verified`` 或 ``unknown``。
 
     🔴 真机教训（原实现是错的）：原来只看正文里有没有「扫码登录|登录后」，
        结果搜索页一条视频简介写着"一旦退出登录后，再次登录就要验证手机号"——
        正文命中「登录后」，于是【明明登录着却判定为未登录】。
        这和验证码那个误判是同一类 bug：拿正文关键词当状态机。
 
-    判定顺序：
-      1) cookie：有 sessionid/sid_tt 等 -> 已登录（权威）
-      2) cookie 拿不到时，才回退到「可见的扫码登录弹窗」DOM（不是正文关键词）
+    只使用页面可见账号元素与登录弹窗。Cookie 存在本身不构成登录
+    证明，因为 sidecar 不应读取或持久化凭据。
     """
-    names = _cookie_names(cdp)
-    if names is not None:
-        return not any(m in names for m in LOGIN_COOKIE_MARKS)
-    return bool(cdp.eval_json(
+    modal = bool(cdp.eval_json(
         "(function(){var sels=" + json.dumps(S.LOGIN_MODAL_DOM) + ";"
         "for(var i=0;i<sels.length;i++){var ns=document.querySelectorAll(sels[i]);"
         " for(var j=0;j<ns.length;j++){var r=ns[j].getBoundingClientRect();"
         "  if(r.width>0&&r.height>0) return true;}}"
         "return false;})()"
     ))
+    if modal:
+        return "required"
+    account = bool(cdp.eval_json(
+        "(function(){var sels=" + json.dumps(S.LOGIN_ACCOUNT_DOM) + ";"
+        "for(var i=0;i<sels.length;i++){var ns=document.querySelectorAll(sels[i]);"
+        "for(var j=0;j<ns.length;j++){var e=ns[j],r=e.getBoundingClientRect();"
+        "if(r.width>0&&r.height>0&&e.innerText&&e.innerText.trim())return true;}}"
+        "return false;})()"
+    ))
+    return "verified" if account else "unknown"
+
+
+def check_login_required(cdp):
+    return login_state(cdp) == "required"
 
 
 def is_note_page(cdp):
@@ -418,6 +412,43 @@ def dm_entry(cdp):
     return cdp.eval_json(_DM_ENTRY_JS) or {"found": False, "blocked": False, "reason": "eval_failed"}
 
 
+_RECIPIENT_CONTEXT_JS = (
+    "(function(expectedId,expectedName){"
+    "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
+    "function exactPath(h){try{var p=new URL(h,location.href).pathname.replace(/\\/$/,'');"
+    "return p==='/user/'+expectedId;}catch(e){return false;}}"
+    "var links=Array.from(document.querySelectorAll('a[href]'));"
+    "for(var i=0;i<links.length;i++){var a=links[i];if(!vis(a)||!exactPath(a.href))continue;"
+    "if(!ALLOW_PROFILE&&!a.closest('[class*=message],[class*=chat],[class*=imChat],[data-e2e*=message]'))continue;"
+    "var name=(a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim();"
+    "if(!expectedName||name===expectedName)return {verified:true,via:'profile_link',name:name};}"
+    "var nodes=Array.from(document.querySelectorAll('[data-recipient-id],[data-user-id],[data-author-id]'));"
+    "for(var j=0;j<nodes.length;j++){var n=nodes[j];if(!vis(n))continue;"
+    "var id=n.getAttribute('data-recipient-id')||n.getAttribute('data-user-id')||n.getAttribute('data-author-id');"
+    "var name=(n.innerText||n.textContent||'').replace(/\\s+/g,' ').trim();"
+    "if(id===expectedId&&(!expectedName||name===expectedName))return {verified:true,via:'recipient_context',name:name};}"
+    "return {verified:false};})(EXPECTED_ID,EXPECTED_NAME)"
+)
+
+
+def recipient_context(cdp, author_id, author_name="", allow_profile=True):
+    """Verify the visible recipient identity without trusting page body text."""
+    profile_fallback = (
+        "var p=location.pathname.replace(/\\/$/,'');"
+        "if(" + json.dumps(bool(allow_profile)) + "&&p==='/user/'+expectedId)"
+        "return {verified:true,via:'exact_profile_url'};"
+    )
+    expr = _RECIPIENT_CONTEXT_JS.replace("EXPECTED_ID", json.dumps(str(author_id))) \
+        .replace("EXPECTED_NAME", json.dumps(str(author_name or "").strip())) \
+        .replace("ALLOW_PROFILE", json.dumps(bool(allow_profile))) \
+        .replace("return {verified:false};", profile_fallback + "return {verified:false};")
+    try:
+        return cdp.eval_json(expr) or {"verified": False}
+    except Exception:
+        return {"verified": False}
+
+
 _DM_COMPOSER_JS = (
     "(function(){"
     "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
@@ -460,6 +491,38 @@ def dm_composer(cdp):
     return cdp.eval_json(_DM_COMPOSER_JS) or {"found": False}
 
 
+_DM_COMPOSER_FOR_RECIPIENT_JS = (
+    "(function(expectedId,expectedName){"
+    "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
+    "function pathOk(a){try{return new URL(a.href,location.href).pathname.replace(/\\/$/,'')==='/user/'+expectedId;}"
+    "catch(e){return false;}}"
+    "function ctxOk(editor){var box=editor.closest('[data-recipient-id],[data-user-id],[data-author-id],[class*=message],[class*=chat],[class*=imChat],[class*=MsgInput]');"
+    "if(!box)return null;var ids=[box.getAttribute('data-recipient-id'),box.getAttribute('data-user-id'),box.getAttribute('data-author-id')];"
+    "var idOk=ids.indexOf(expectedId)>=0;var explicit=ids.some(function(v){return !!v;});"
+    "if(explicit&&!idOk)return null;"
+    "var links=Array.from(box.querySelectorAll('[data-e2e*=header] a[href],[class*=header] a[href]')).filter(function(a){return vis(a)&&pathOk(a);});"
+    "var nameOk=!expectedName||links.some(function(a){return (a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim()===expectedName;});"
+    "if(!idOk&&!links.length)return null;if(expectedName&&!nameOk)return null;"
+    "return {box:box,key:box.id||box.getAttribute('data-recipient-id')||box.getAttribute('data-user-id')||box.className||'im-container'};}"
+    "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ",hits=[];"
+    "for(var s=0;s<scopes.length;s++){var box=document.querySelector(scopes[s]);if(!box)continue;"
+    "var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
+    "for(var i=0;i<eds.length;i++){var e=eds[i];if(!vis(e)||e.disabled||e.getAttribute('aria-disabled')==='true')continue;"
+    "var context=ctxOk(e);if(!context)continue;var r=e.getBoundingClientRect();"
+    "hits.push({found:true,scope:scopes[s],containerKey:String(context.key).slice(0,160),"
+    "x:Math.round(r.x+Math.min(120,Math.max(30,r.width/2))),y:Math.round(r.y+r.height/2),text:(e.innerText||e.value||'')});}}"
+    "if(hits.length!==1)return {found:false,reason:hits.length?'ambiguous_recipient_composer':'recipient_composer_not_found',count:hits.length};"
+    "return hits[0];})(EXPECTED_ID,EXPECTED_NAME)"
+)
+
+
+def dm_composer_for_recipient(cdp, author_id, author_name=""):
+    expr = _DM_COMPOSER_FOR_RECIPIENT_JS.replace("EXPECTED_ID", json.dumps(str(author_id))) \
+        .replace("EXPECTED_NAME", json.dumps(str(author_name or "").strip()))
+    return cdp.eval_json(expr) or {"found": False}
+
+
 _DM_SEND_JS = (
     "(function(){"
     "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
@@ -499,6 +562,118 @@ def dm_send_button(cdp):
     return cdp.eval_json(_DM_SEND_JS) or {"found": False}
 
 
+_DM_SEND_FOR_RECIPIENT_JS = (
+    "(function(expectedId,expectedName){"
+    "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
+    "function pathOk(a){try{return new URL(a.href,location.href).pathname.replace(/\\/$/,'')==='/user/'+expectedId;}catch(e){return false;}}"
+    "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ",hits=[];"
+    "for(var s=0;s<scopes.length;s++){var box=document.querySelector(scopes[s]);if(!box)continue;"
+    "var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
+    "for(var i=0;i<eds.length;i++){var ed=eds[i];if(!vis(ed))continue;"
+    "var root=ed.closest('[data-recipient-id],[data-user-id],[data-author-id],[class*=message],[class*=chat],[class*=imChat],[class*=MsgInput]');"
+    "if(!root)continue;var ids=[root.getAttribute('data-recipient-id'),root.getAttribute('data-user-id'),root.getAttribute('data-author-id')];"
+    "var explicit=ids.some(function(v){return !!v;});if(explicit&&ids.indexOf(expectedId)<0)continue;"
+    "var links=Array.from(root.querySelectorAll('[data-e2e*=header] a[href],[class*=header] a[href]')).filter(function(a){return vis(a)&&pathOk(a);});"
+    "if(ids.indexOf(expectedId)<0&&!links.length)continue;"
+    "if(expectedName&&!links.some(function(a){return (a.innerText||a.textContent||'').replace(/\\s+/g,' ').trim()===expectedName;}))continue;"
+    "var bs=Array.from(root.querySelectorAll('" + S.DM_SEND_BUTTON + "," + S.DM_SEND_FALLBACK + ",button,[role=button]')).filter(function(b){"
+    "var t=(b.innerText||b.textContent||'').replace(/\\s+/g,'').trim();return vis(b)&&(b.matches('" + S.DM_SEND_BUTTON + "," + S.DM_SEND_FALLBACK + "')||t==='" + S.DM_SEND_TEXT + "');});"
+    "for(var j=0;j<bs.length;j++){var r=bs[j].getBoundingClientRect();hits.push({found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
+    "disabled:!!(bs[j].disabled||bs[j].getAttribute('aria-disabled')==='true'),containerKey:String(root.id||root.getAttribute('data-recipient-id')||root.getAttribute('data-user-id')||root.className||'im-container').slice(0,160)});}}}"
+    "if(hits.length!==1)return {found:false,reason:hits.length?'ambiguous_recipient_send_button':'recipient_send_button_not_found',count:hits.length};return hits[0];})(EXPECTED_ID,EXPECTED_NAME)"
+)
+
+
+def dm_send_button_for_recipient(cdp, author_id, author_name=""):
+    expr = _DM_SEND_FOR_RECIPIENT_JS.replace("EXPECTED_ID", json.dumps(str(author_id))) \
+        .replace("EXPECTED_NAME", json.dumps(str(author_name or "").strip()))
+    return cdp.eval_json(expr) or {"found": False}
+
+
+_COMMENT_COMPOSER_JS = (
+    "(function(){function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
+    "var sels=" + json.dumps(S.COMMENT_EDITORS) + ";"
+    "for(var i=0;i<sels.length;i++){var es=document.querySelectorAll(sels[i]);"
+    "for(var j=0;j<es.length;j++){var e=es[j];if(!vis(e))continue;"
+    "var r=e.getBoundingClientRect();return {found:true,x:Math.round(r.x+r.width/2),"
+    "y:Math.round(r.y+r.height/2),text:(e.innerText||e.value||'')};}}"
+    "return {found:false};})()"
+)
+
+
+def comment_composer(cdp):
+    return cdp.eval_json(_COMMENT_COMPOSER_JS) or {"found": False}
+
+
+_COMMENT_REPLY_COMPOSER_JS = (
+    "(function(target){function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
+    "function authorOk(row){if(!target.authorId)return true;var as=row.querySelectorAll('a[href]');"
+    "for(var i=0;i<as.length;i++){try{var p=new URL(as[i].href,location.href).pathname.replace(/\\/$/,'');"
+    "var n=(as[i].innerText||as[i].textContent||'').trim();"
+    "if(p==='/user/'+target.authorId&&(!target.authorName||n===target.authorName))return true;"
+    "}catch(e){}}return false;}"
+    "function textOk(row){var ns=row.querySelectorAll('" + S.COMMENT_CONTENT + "');"
+    "for(var i=0;i<ns.length;i++)if((ns[i].innerText||ns[i].textContent||'').trim()===(target.text||'').trim())return true;"
+    "return false;}"
+    "var rows=Array.from(document.querySelectorAll('" + S.COMMENT_ITEM + "')).filter(vis);"
+    "var byId=rows.filter(function(row){return row.id===target.id||row.getAttribute('data-comment-id')===target.id;});"
+    "var hits=(byId.length?byId:rows).filter(function(row){return textOk(row)&&authorOk(row);});"
+    "if(hits.length!==1)return {found:false,reason:hits.length?'ambiguous_comment':'comment_not_found',count:hits.length};"
+    "var row=hits[0],sels=" + json.dumps(S.COMMENT_REPLY_EDITORS) + ",eds=[];"
+    "for(var s=0;s<sels.length;s++){var ns=row.querySelectorAll(sels[s]);for(var j=0;j<ns.length;j++)if(vis(ns[j])&&eds.indexOf(ns[j])<0)eds.push(ns[j]);}"
+    "if(eds.length!==1)return {found:false,reason:eds.length?'ambiguous_reply_editor':'reply_editor_not_found',count:eds.length};"
+    "var r=eds[0].getBoundingClientRect();return {found:true,scope:'reply',"
+    "rowId:row.id||row.getAttribute('data-comment-id')||'',x:Math.round(r.x+r.width/2),"
+    "y:Math.round(r.y+r.height/2),text:(eds[0].innerText||eds[0].value||'')};})(TARGET)"
+)
+
+
+def comment_reply_composer(cdp, target):
+    """Find exactly one editor inside the confirmed target comment row."""
+    return cdp.eval_json(_COMMENT_REPLY_COMPOSER_JS.replace("TARGET", json.dumps({
+        "id": str(target.get("id") or ""), "authorId": str(target.get("authorId") or ""),
+        "authorName": str(target.get("authorName") or ""), "text": str(target.get("text") or ""),
+    }))) or {"found": False}
+
+
+_COMMENT_SEND_JS = (
+    "(function(){function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
+    "var sels=" + json.dumps(S.COMMENT_SEND_BUTTONS) + ";"
+    "for(var i=0;i<sels.length;i++){var es=document.querySelectorAll(sels[i]);"
+    "for(var j=0;j<es.length;j++){var e=es[j];if(!vis(e))continue;"
+    "var r=e.getBoundingClientRect();return {found:true,x:Math.round(r.x+r.width/2),"
+    "y:Math.round(r.y+r.height/2),disabled:!!(e.disabled||e.getAttribute('aria-disabled')==='true')};}}"
+    "return {found:false};})()"
+)
+
+
+def comment_send_button(cdp):
+    return cdp.eval_json(_COMMENT_SEND_JS) or {"found": False}
+
+
+_COMMENT_REPLY_SEND_JS = _COMMENT_REPLY_COMPOSER_JS.replace(
+    "var r=eds[0].getBoundingClientRect();return {found:true,scope:'reply',"
+    "rowId:row.id||row.getAttribute('data-comment-id')||'',x:Math.round(r.x+r.width/2),"
+    "y:Math.round(r.y+r.height/2),text:(eds[0].innerText||eds[0].value||'')};})(TARGET)",
+    "var bs=[],buttons=" + json.dumps(S.COMMENT_REPLY_SEND_BUTTONS) + ";"
+    "for(var s=0;s<buttons.length;s++){var ns=row.querySelectorAll(buttons[s]);for(var j=0;j<ns.length;j++)if(vis(ns[j])&&bs.indexOf(ns[j])<0)bs.push(ns[j]);}"
+    "if(bs.length!==1)return {found:false,reason:bs.length?'ambiguous_reply_send_button':'reply_send_button_not_found',count:bs.length};"
+    "var r=bs[0].getBoundingClientRect();return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
+    "disabled:!!(bs[0].disabled||bs[0].getAttribute('aria-disabled')==='true')};})(TARGET)"
+)
+
+
+def comment_reply_send_button(cdp, target):
+    return cdp.eval_json(_COMMENT_REPLY_SEND_JS.replace("TARGET", json.dumps({
+        "id": str(target.get("id") or ""), "authorId": str(target.get("authorId") or ""),
+        "authorName": str(target.get("authorName") or ""), "text": str(target.get("text") or ""),
+    }))) or {"found": False}
+
+
 # ===================== 导航 =====================
 
 def profile_url(sec_uid):
@@ -520,4 +695,7 @@ def wait_comment_panel(cdp, timeout=25):
 
 
 def make_network_recorder(cdp, url_mark):
-    return NetworkRecorder(cdp, lambda u: url_mark in (u or ""))
+    if callable(url_mark):
+        return NetworkRecorder(cdp, url_mark)
+    mark = str(url_mark or "")
+    return NetworkRecorder(cdp, lambda u: bool(mark) and mark in (u or ""))

@@ -1,9 +1,6 @@
 """私信自动化 —— 遵守平台自己的额度，只对平台确认成功的发送计数。
 
-三条硬约束（来自 02-私信通与官方IM能力查证.md 的官方原文）：
-  · 同一用户主动私信 ≤ 3 条
-  · 每小时触达 ≤ 40 个用户
-  · 每日触达 ≤ 100 个用户
+本模块只提供本地保守限额，不能替代平台规则或服务端授权。
 
 红线 2：判定"发送成功"必须依据【平台响应体】，DOM 变化不算；空响应 = 风控拒绝。
 红线 1：以上数值不得硬编码在逻辑里，统一从 LIMITS 读；实际部署时应由服务端下发。
@@ -21,11 +18,13 @@ import uuid
 import douyin
 import scripts as st
 import winfocus
-import selectors as S
+import douyin_selectors as S
+from send_actions import send_private
+from send_gate import SendGate
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 
-# 官方额度（红线 1：唯一来源，禁止散落硬编码）
+# 本地保守限额（可由可信调用方替换；不宣称为平台官方额度）
 LIMITS = {
     # ⚠️⚠️ 2026-09-19 纠正：非互关 + 非企业号，只能主动私信【1 条】！
     #
@@ -40,8 +39,8 @@ LIMITS = {
     "per_user_max": 1,
     # 对方回复后开启的"单次临时会话"窗口（仅限文字）
     "reply_window_hours": 24,
-    "per_hour_users": 40,
-    "per_day_users": 100,
+    "per_hour_users": 20,
+    "per_day_users": 50,
     "active_hours": (8, 23),
     # 单条间隔：对数正态（更像真人），但硬钳在区间内。
     # ⚠️ 用户要求 10-60s。注意这比原先（中位 45s）【更快】，
@@ -88,38 +87,6 @@ def is_candidate_url(url):
     if any(tok in u for tok in _URL_NOISE):
         return False
     return "douyin.com" in u
-
-
-class WSFrameLog:
-    """记录 WebSocket 帧，用于发现私信发送的真实通道。
-
-    2026-09-19 实测：私信发送【没有】走 HTTP POST
-    （当时只捕获到 /im/get/online_feedback/entrance/ 与 cloudpush/update_sender/ 两个心跳），
-    推断走 WebSocket。旧项目的 _ws*_frames.json 也是这么抓的。
-
-    边界：只记录帧的方向/长度/头部片段用于定位接口，
-    不做解码、不重放、不伪造签名。
-    """
-
-    def __init__(self, cdp, limit=80):
-        self.frames = []
-        self.limit = limit
-        self.sockets = []
-        cdp.on("Network.webSocketFrameSent", lambda p: self._push("sent", p))
-        cdp.on("Network.webSocketFrameReceived", lambda p: self._push("recv", p))
-        cdp.on("Network.webSocketCreated", self._created)
-
-    def _created(self, p):
-        if len(self.sockets) < 20:
-            self.sockets.append((p.get("url") or "")[:120])
-
-    def _push(self, direction, p):
-        if len(self.frames) >= self.limit:
-            return
-        resp = p.get("response") or {}
-        payload = resp.get("payloadData") or ""
-        self.frames.append({"dir": direction, "op": resp.get("opcode"),
-                            "len": len(payload), "head": payload[:100]})
 
 
 # ===================== 落盘 =====================
@@ -170,7 +137,7 @@ class Ledger:
 
 
 class Quota:
-    """按官方口径计额度。
+    """按本地保守口径计额度，不宣称为平台官方规则。
 
     🔴 2026-09-19 修正（真机撞出来的严重 bug）：这里要计【真的占用过对方一次机会】的动作，
        而不是只计 sent_confirmed —— 见下面 _attempted()。
@@ -194,8 +161,8 @@ class Quota:
         为什么按它算额度：
           · 漏判比误判贵。把"可能已经发出去了"算进去，最坏是少发一条；
             不算进去，就可能重复打扰同一个人 —— 而这正是平台最敏感的行为。
-          · 实测后果（原实现）：暖暖💞 在 10 分钟内被同一个工具发了【两条】私信，
-            额度闸一次都没拦住；每日 100 / 每小时 40 的上限也从来没生效过。
+          · 实测后果（原实现）：同一目标可能在未知结果后被重复触达；
+            这里按保守规则把未知尝试锁住。
         """
         return [r for r in self.ledger.all()
                 if r.get("kind") == "result" and r.get("verdict") in self.ATTEMPTED_VERDICTS]
@@ -415,7 +382,6 @@ def prepare_and_maybe_send(cdp, tab_id, target, text, allow_send, ledger, quota)
         # 真机教训（2026-09-19）：只匹配 douyin.com 时，某次发送连一个 POST 都没抓到，
         # 说明发送请求可能落在别的域（或走了别的通道）。宁可多抓，再人工筛。
         recorder = douyin.make_network_recorder(tab, _capture_any)
-        wslog = WSFrameLog(tab)
         for evt in ("Network.enable",):
             try:
                 tab.call(evt, {}, timeout=10)
@@ -455,17 +421,6 @@ def prepare_and_maybe_send(cdp, tab_id, target, text, allow_send, ledger, quota)
         cleared = _editor_cleared(tab)
         result["editor_cleared_after_click"] = cleared
 
-        if not cleared:
-            # 备选通道：Enter 发送
-            # legacy reply_worker.js 明确提过 "Enter-send requires active tab"。
-            try:
-                tab.press_key("Enter", code="Enter", key_code=13)
-            except Exception as exc:
-                result["enter_error"] = str(exc)
-            time.sleep(2.0)
-            cleared2 = _editor_cleared(tab)
-            result["editor_cleared_after_enter"] = cleared2
-
         time.sleep(1.5)
         conv = _read_conversation(tab)
         result["conversation_has_text"] = text in conv if conv else None
@@ -475,23 +430,22 @@ def prepare_and_maybe_send(cdp, tab_id, target, text, allow_send, ledger, quota)
 
         posts = [r for r in records if (r.get("method") or "").upper() == "POST"]
 
-        # 逐条记录，供发现真实发送接口
+        # 只保留非敏感的计数与状态，绝不落原始 URL、body 或 WebSocket 帧。
         details = []
+        matched_statuses = []
         for r in posts:
             parsed = r.get("parsed") or {}
             status = None
             if isinstance(parsed, dict):
                 data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
                 status = data.get("status_code", parsed.get("status_code"))
-            details.append({"url": (r.get("url") or "")[:150], "http": r.get("httpStatus"),
-                            "status_code": status})
-        result["observed_posts"] = details
-        result["ws_frames"] = wslog.frames[:20]
-        result["ws_sockets"] = wslog.sockets
+            details.append({"http": r.get("httpStatus"), "status_code": status})
+            if mark and mark in (r.get("url") or ""):
+                matched_statuses.append(status)
+        result["observed_posts_count"] = len(details)
 
         mark = S.DM_SEND_URL_MARK
-        matched = [d for d in details if mark and mark in (d["url"] or "")]
-        confirmed = any(d.get("status_code") == 0 for d in matched)
+        confirmed = bool(mark) and 0 in matched_statuses
 
         # 证据分级（2026-09-19 实测后的结论）：
         #   私信走 IM 长连接，CDP Network 域【抓不到发送请求】
@@ -510,15 +464,15 @@ def prepare_and_maybe_send(cdp, tab_id, target, text, allow_send, ledger, quota)
             result.update(verdict="blocked", reason="platform_rejected:%s" % blocked)
             return result
 
+        # A generic POST or a cleared editor is not proof that this action
+        # reached the platform.  The unified SendGate path therefore exposes
+        # every unbound click as unknown; this legacy probe remains diagnostic.
         if mark and confirmed:
-            result.update(verdict="sent_confirmed", reason="platform_response")
-        elif result.get("conversation_has_text") is True:
-            result.update(verdict="sent_dom_confirmed",
-                          reason="message_in_conversation_panel")
-        elif result.get("editor_cleared_after_click") or result.get("editor_cleared_after_enter"):
-            result.update(verdict="submitted", reason="editor_cleared_only")
+            result.update(verdict="unknown", reason="platform_response_not_bound_to_send")
+        elif result.get("editor_cleared_after_click"):
+            result.update(verdict="unknown", reason="submitted_without_platform_confirmation")
         else:
-            result.update(verdict="failed", reason="not_submitted")
+            result.update(verdict="unknown", reason="send_outcome_unknown")
         return result
 
     except Exception as exc:
@@ -527,7 +481,7 @@ def prepare_and_maybe_send(cdp, tab_id, target, text, allow_send, ledger, quota)
 
 
 def run_batch(cdp, targets, text_template, allow_send, log=print,
-              use_templates=True):
+              use_templates=False, gate=None):
     """批量执行。返回汇总。
 
     use_templates=True（默认）：从 scripts.TEMPLATES 里【均衡轮换】取模板，注入 {nick}。
@@ -544,6 +498,8 @@ def run_batch(cdp, targets, text_template, allow_send, log=print,
                LIMITS["batch_rest_range"][0] / 60, LIMITS["batch_rest_range"][1] / 60))
     ledger = Ledger()
     quota = Quota(ledger)
+    if allow_send and gate is None:
+        gate = SendGate(STATE_DIR, "legacy-cli")
     summary = {"total": len(targets), "sent_confirmed": 0, "sent_dom_confirmed": 0,
                "submitted": 0, "skipped": 0, "failed": 0,
                "prepared_only": 0, "unverified": 0, "stopped_reason": None, "results": []}
@@ -554,14 +510,15 @@ def run_batch(cdp, targets, text_template, allow_send, log=print,
     time.sleep(2.0)
 
     for idx, target in enumerate(targets, 1):
-        ok, reason = quota.check(target["sec_uid"])
+        ok, reason = (True, "ok") if allow_send else quota.check(target["sec_uid"])
         if not ok:
             log("[%d/%d] 跳过 %s —— %s" % (idx, len(targets), target.get("nick") or target["sec_uid"], reason))
             row = {"target": target["sec_uid"], "nick": target.get("nick"),
                    "verdict": "skipped", "reason": reason, "at": time.time()}
             summary["skipped"] += 1
             summary["results"].append(row)
-            ledger.record(dict(row, kind="result"))
+            if not allow_send:
+                ledger.record(dict(row, kind="result"))
             if reason in ("quota_day_exceeded", "outside_active_hours"):
                 summary["stopped_reason"] = reason
                 break
@@ -580,7 +537,8 @@ def run_batch(cdp, targets, text_template, allow_send, log=print,
                        "verdict": "skipped", "reason": why, "at": time.time()}
                 summary["skipped"] += 1
                 summary["results"].append(row)
-                ledger.record(dict(row, kind="result"))
+                if not allow_send:
+                    ledger.record(dict(row, kind="result"))
                 log("[%d/%d] 跳过 —— 话术安全检查未通过：%s" % (idx, len(targets), why))
                 continue
         else:
@@ -589,7 +547,16 @@ def run_batch(cdp, targets, text_template, allow_send, log=print,
         tag = ("[%s/%s] " % (tpl["id"], tpl["angle"])) if tpl else ""
         log("[%d/%d] %s%s" % (idx, len(targets), tag, (target.get("nick") or target["sec_uid"])[:20]))
         log("      文案：%s" % text[:60])
-        row = prepare_and_maybe_send(worker, wid, target, text, allow_send, ledger, quota)
+        if allow_send:
+            row = send_private(worker, gate, uuid.uuid4().hex,
+                               {"authorId": target.get("sec_uid"),
+                                "authorName": target.get("nick") or ""}, text)
+            row["target"] = target.get("sec_uid")
+            row["nick"] = target.get("nick")
+            row["at"] = time.time()
+            row["verdict"] = row.get("status")
+        else:
+            row = prepare_and_maybe_send(worker, wid, target, text, False, ledger, quota)
         if tpl:
             row["template_id"] = tpl["id"]
             row["angle"] = tpl["angle"]
@@ -609,7 +576,8 @@ def run_batch(cdp, targets, text_template, allow_send, log=print,
         else:
             summary["failed"] += 1
         summary["results"].append(row)
-        ledger.record(dict(row, kind="result"))
+        if not allow_send:
+            ledger.record(dict(row, kind="result"))
         log("      -> %s %s" % (verdict, row.get("reason")))
 
         # 熔断

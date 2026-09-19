@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>.messageEditor{display:none;border:1px solid #333;padding:8px}.history{display:block;border:1px solid #999;padding:8px}</style>
+<button id="open-dm" onclick="setTimeout(function(){document.querySelector('#target-panel').style.display='block'},180)">私信</button>
+<div class="history">
+  <a href="https://www.douyin.com/user/wrong-user">Wrong</a>
+  <div class="messageHistoryEditor" style="display:block"><div contenteditable="true">old history editor</div><button class="e2e-send-msg-btn">发送</button></div>
+</div>
+<div id="target-panel" class="messageEditor" data-recipient-id="target-user">
+  <div class="message-header"><a href="https://www.douyin.com/user/target-user">Target User</a></div>
+  <div data-e2e="message-input" contenteditable="true"></div>
+  <button class="e2e-send-msg-btn">发送</button>
+</div>
+<div id="other-panel" class="messageEditor" data-recipient-id="other-user" style="display:block">
+  <div class="message-header"><a href="https://www.douyin.com/user/target-user">A mentioned in history</a></div>
+  <div data-e2e="message-input" contenteditable="true">existing other draft</div>
+  <button class="e2e-send-msg-btn">发送</button>
+</div>
