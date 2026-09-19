@@ -1158,7 +1158,23 @@ function overview(ctx) {
     }
   }
 
-  const dailyQuota = dailyCapOf(deriveDayIndex(0, nowMs))
+  /**
+   * 全平台"今日额度"。
+   *
+   * ⚠️ 这里**不能**传某个账号的上限，也不能传等级表在"第 0 天"的值
+   *    （观察期上限为 0，那会让整个看板的额度永远是 0——看起来像数据坏了）。
+   *    正确的口径是：**各账号按其自身等级推导出的今日上限之和**。
+   *    每个账号算一行、再相加，与商家端看到的"我的今日上限"逐账号一致。
+   */
+  const dailyQuota = { total: 0, by_source: {} }
+  for (const src of SOURCE_TYPES) dailyQuota.by_source[src] = 0
+  for (const a of accounts) {
+    const cap = dailyCapOf(deriveDayIndex(
+      Number(a.first_login_ms || 0) > 0 ? Number(a.first_login_ms) : nowMs, nowMs
+    ))
+    for (const src of SOURCE_TYPES) dailyQuota.by_source[src] += cap.by_source[src]
+    dailyQuota.total += cap.total
+  }
 
   // ── 额度消耗（按 settled_at_ms 切自然日，供趋势使用）──────
   const usageRows = db.prepare(`
@@ -2400,7 +2416,18 @@ function createAdmin(config, log) {
       const isPost = ctx.req.method === 'POST'
 
       // ① URL 形态检查（在任何鉴权之前：畸形路径不配得到有信息量的响应）
-      assertSafeAssetPath(parsedPath)
+      //
+      // ⚠️ 必须在这里就地转成结构化响应。早期写法直接 `throw`，
+      //    于是 `GET /admin-x/..%2fserver.js` 会冒泡到 server.js 的
+      //    兜底 catch，返回一个 500 `SERVER_INTERNAL` 并且**打一整条 error 日志**。
+      //    安全性没问题（内容取不到），但两个后果都很糟：
+      //      · 扫描器看到 500 会以为"这里有东西"，反而更值得继续试；
+      //      · 日志里全是这种噪声，真正的异常会被淹掉。
+      try {
+        assertSafeAssetPath(parsedPath)
+      } catch (e) {
+        return adminError(ctx, e, { post: isPost })
+      }
 
       const isApi = parsedPath === `${config.adminPath}/api` ||
         parsedPath.startsWith(`${config.adminPath}/api/`)

@@ -115,7 +115,29 @@ async function main() {
   await app.browserHost.close({ silent: true })
   app.store.close()
   try { fs.rmSync(workspace, { recursive: true, force: true }) } catch (e) { console.log('清理失败:', e.message) }
-  process.exit(bad.length ? 1 : 0)
+
+  // ⚠️ 用 `process.exitCode` 而**不是** `process.exit()`。
+  //
+  //    踩过的坑：全部断言都过了，进程却间歇性地以
+  //    `-1073740791`（0xC0000409，Windows 上的栈缓冲溢出/快速失败）结束，
+  //    看起来像"检查失败"。真实原因是 `process.exit()` 在
+  //    `browserHost.close()` 刚释放句柄时被调用，命中了 libuv 的收尾竞态：
+  //    `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`。
+  //    同一个坑在 `ui-render-check.js` 里也踩过一次。
+  //
+  //    设 `exitCode` 后让事件循环自然结束，句柄有机会正常释放；
+  //    代价是如果有句柄没被释放，进程会挂着不退——而这**恰好是更有用的
+  //    失败信号**（"有东西没关干净"），比一个假的成功/失败码好得多。
+  await sleep(200)
+  process.exitCode = bad.length ? 1 : 0
+  return
 }
 
-main().catch((e) => { console.error('[fatal]', e); process.exit(1) })
+function sleep(ms) {
+  return new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref() })
+}
+
+main().catch((e) => {
+  console.error('[fatal]', e)
+  process.exitCode = 1
+})
