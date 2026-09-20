@@ -605,5 +605,127 @@ class ChromiumFixtureTests(unittest.TestCase):
 
 
 
+class CommentFilterTests(unittest.TestCase):
+    """流程一「关键词、排除词与去重」的离线回归（不碰浏览器、不建临时目录）。
+
+    架构依据 images/11-comment-area-business：
+        采集评论 -> 关联评论标识与评论者 -> 关键词、排除词与去重 -> 返回目标批次
+    """
+
+    def _rows(self):
+        return [
+            {"cid": "c1", "sec_uid": "SEC_A", "user": "A", "text": "肉可以这样做吗", "digg": 1},
+            {"cid": "c2", "sec_uid": "SEC_A", "user": "A", "text": "几个月能吃", "digg": 9},
+            {"cid": "c3", "sec_uid": "SEC_B", "user": "B", "text": "请问同行怎么报价 加我微信", "digg": 0},
+            {"cid": "c4", "sec_uid": "SEC_C", "user": "C", "text": "请问米粉要泡吗", "digg": 2},
+            {"cid": "c5", "sec_uid": "", "user": "", "text": "请问这个怎么做", "digg": 0},
+        ]
+
+    def test_exclude_keywords_drop_matched_comments(self):
+        import crawl
+        rows = self._rows()
+        _, base_stats = crawl.filter_comments(rows, "可以,请问,几个月", mode="seg")
+        matched, stats = crawl.filter_comments(rows, "可以,请问,几个月", mode="seg",
+                                               exclude_keywords="微信")
+        self.assertEqual(stats["excluded"], 1)
+        self.assertEqual(stats["matched"], base_stats["matched"] - 1)
+        self.assertTrue(all("微信" not in row["text"] for row in matched))
+        self.assertEqual(stats["exclude_keywords"], ["微信"])
+
+    def test_exclusion_only_counts_comments_that_would_have_matched(self):
+        """excluded 只数「本来命中关键词、却被排除词挡掉」的条数 —— 这才是可调参的数字。"""
+        import crawl
+        rows = [{"cid": "x", "sec_uid": "S", "text": "同行勿扰", "digg": 0}]
+        _, stats = crawl.filter_comments(rows, "怎么做", mode="seg", exclude_keywords="同行")
+        self.assertEqual(stats["excluded"], 0)
+        self.assertEqual(stats["matched"], 0)
+
+    def test_exclude_takes_precedence_over_keyword(self):
+        import crawl
+        rows = [{"cid": "x", "sec_uid": "S", "text": "请问同行怎么报价", "digg": 0}]
+        matched, stats = crawl.filter_comments(rows, "请问", mode="seg", exclude_keywords="同行")
+        self.assertEqual(matched, [])
+        self.assertEqual(stats["excluded"], 1)
+
+    def test_build_queue_accepts_exclude_keywords(self):
+        import crawl
+        queue, stats = crawl.build_queue(self._rows(), "可以,请问,几个月", mode="seg",
+                                         exclude_keywords="微信")
+        self.assertTrue(queue)
+        self.assertNotIn("SEC_B", [row["sec_uid"] for row in queue])
+        self.assertEqual(stats["excluded"], 1)
+
+    def test_dedupe_by_author_keeps_highest_digg_and_never_merges_anonymous(self):
+        import sidecar
+        kept, dropped = sidecar._dedupe_by_author(self._rows())
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(kept), 4)
+        author_a = [row for row in kept if row["sec_uid"] == "SEC_A"]
+        self.assertEqual(len(author_a), 1)
+        self.assertEqual(author_a[0]["cid"], "c2")
+        self.assertEqual(len([row for row in kept if not row["sec_uid"]]), 1)
+
+    def test_filter_text_validates_external_input(self):
+        import sidecar
+        self.assertEqual(sidecar._filter_text(None, "k"), "")
+        self.assertEqual(sidecar._filter_text("  可以 , 请问  ", "k"), "可以 , 请问")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._filter_text(123, "k")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._filter_text("x" * 500, "k")
+
+    def test_sidecar_collect_comments_returns_filtered_targets(self):
+        """targets 必须与 events 同形状 —— 下游两阶段发送直接拿它当 target 用。"""
+        import sidecar
+        rows = self._rows()
+
+        class FakePage:
+            def evaluate(self, expression):
+                return "https://www.douyin.com/video/123"
+
+            def close(self):
+                pass
+
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (FakePage(), {})
+        original_navigate = sidecar._navigate
+        original_login = sidecar.douyin.login_state
+        original_crawl = sidecar.crawlmod.crawl_video_comments
+        sidecar._navigate = lambda page, url: None
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.crawl_video_comments = lambda *a, **k: (
+            rows, {"total": len(rows), "with_sec_uid": 3, "api_comments": len(rows)})
+        try:
+            result = instance.collect_comments({
+                "url": "https://www.douyin.com/video/123",
+                "commentKeywords": "可以,请问,几个月",
+                "excludeKeywords": "微信",
+                "matchMode": "seg",
+            })
+        finally:
+            sidecar._navigate = original_navigate
+            sidecar.douyin.login_state = original_login
+            sidecar.crawlmod.crawl_video_comments = original_crawl
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["events"]), len(rows))
+        self.assertTrue(all("微信" not in row["text"] for row in result["targets"]))
+        self.assertEqual(result["filter"]["excluded"], 1)
+        self.assertEqual(result["filter"]["dedupedAuthors"], 1)
+        self.assertEqual(result["filter"]["matchMode"], "seg")
+        self.assertEqual(result["filter"]["excludeKeywords"], ["微信"])
+        self.assertEqual(result["filter"]["targetCount"], len(result["targets"]))
+        for key in ("id", "source", "roomId", "authorId", "authorName", "text"):
+            self.assertIn(key, result["targets"][0])
+        self.assertIn("matchedKeyword", result["targets"][0])
+
+    def test_sidecar_rejects_bad_filter_params(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.collect_comments({"url": "https://www.douyin.com/video/123", "matchMode": "nope"})
+
+
+
 if __name__ == "__main__":
     unittest.main()
