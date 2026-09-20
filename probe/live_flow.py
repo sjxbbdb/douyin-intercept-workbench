@@ -258,10 +258,6 @@ class LiveQueue:
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                open_batch = conn.execute(
-                    "SELECT * FROM live_batches WHERE account_scope=? AND status=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (self.account_scope, "planned")).fetchone()
                 expired_rows = conn.execute(
                     "SELECT event_key, payload_json FROM live_events "
                     "WHERE account_scope=? AND state=? AND seen_at <= ? ORDER BY seen_at ASC",
@@ -270,26 +266,43 @@ class LiveQueue:
                     self._set_state(conn, row["event_key"], EXPIRED,
                                     {"reason": "window_expired"}, now=now)
                 expired = [json.loads(row["payload_json"] or "{}") for row in expired_rows]
-                if open_batch:
-                    batch_id = open_batch["batch_id"]
-                else:
+
+                batch_id = None
+                open_batch = conn.execute(
+                    "SELECT * FROM live_batches WHERE account_scope=? AND status=? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (self.account_scope, "planned")).fetchone()
+                if open_batch is not None:
+                    planned = conn.execute(
+                        "SELECT COUNT(*) AS n FROM live_events WHERE account_scope=? "
+                        "AND batch_id=? AND state=?",
+                        (self.account_scope, open_batch["batch_id"], PLANNED)).fetchone()["n"]
+                    if planned and now <= open_batch["expires_at"]:
+                        batch_id = open_batch["batch_id"]
+                    else:
+                        # 空批次或已超窗的批次一律关闭：否则空批次会被永久复用，
+                        # 超窗批次还能继续发送，两者都违反时间窗规则。
+                        reason = "batch_window_expired" if planned else "batch_left_empty"
+                        self._close_batch(conn, open_batch["batch_id"], reason, now)
+                if batch_id is None:
                     rows = conn.execute(
                         "SELECT event_key FROM live_events "
                         "WHERE account_scope=? AND state=? ORDER BY seen_at ASC LIMIT ?",
                         (self.account_scope, QUEUED, max_items)).fetchall()
-                    batch_id = uuid.uuid4().hex[:32]
-                    conn.execute(
-                        "INSERT INTO live_batches(account_scope,batch_id,status,created_at,expires_at) "
-                        "VALUES(?,?,?,?,?)",
-                        (self.account_scope, batch_id, "planned", now, now + window_seconds))
-                    for row in rows:
-                        self._set_state(conn, row["event_key"], PLANNED, {}, batch_id, now)
+                    if rows:
+                        batch_id = uuid.uuid4().hex[:32]
+                        conn.execute(
+                            "INSERT INTO live_batches(account_scope,batch_id,status,created_at,expires_at) "
+                            "VALUES(?,?,?,?,?)",
+                            (self.account_scope, batch_id, "planned", now, now + window_seconds))
+                        for row in rows:
+                            self._set_state(conn, row["event_key"], PLANNED, {}, batch_id, now)
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-        batch = self.batch(batch_id)
-        events = self.batch_events(batch_id)
+        batch = self.batch(batch_id) if batch_id else None
+        events = self.batch_events(batch_id) if batch_id else []
         return {
             "status": "ok" if events else "empty",
             "batchId": batch_id,
@@ -301,13 +314,48 @@ class LiveQueue:
             "events": events,
         }
 
+    def _close_batch(self, conn, batch_id, reason, now):
+        """Close a batch and expire its events: an expired batch is never replayed."""
+        conn.execute("UPDATE live_batches SET status=? WHERE account_scope=? AND batch_id=?",
+                     ("expired", self.account_scope, str(batch_id)))
+        for row in conn.execute(
+                "SELECT event_key FROM live_events WHERE account_scope=? AND batch_id=?",
+                (self.account_scope, str(batch_id))).fetchall():
+            self._set_state(conn, row["event_key"], EXPIRED, {"reason": reason}, now=now)
+
+    def ensure_active(self, batch_id, now=None):
+        """Fail closed when a batch may no longer be executed.
+
+        The phase methods call this before touching the browser, so a batch that
+        ran out of its window can never be sent after the fact.
+        """
+        now = float(now if now is not None else self.clock())
+        batch = self.batch(batch_id)
+        if batch is None:
+            raise LiveFlowError("unknown_batch", "batch does not exist")
+        if batch["status"] == "expired" or now > batch["expires_at"]:
+            with self._connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._close_batch(conn, batch_id, "batch_window_expired", now)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            raise LiveFlowError("batch_expired", "batch time window has passed")
+        return batch
+
     def batch(self, batch_id):
+        if not batch_id:
+            return None
         with self._connection() as conn:
             return self._row(conn.execute(
                 "SELECT * FROM live_batches WHERE account_scope=? AND batch_id=?",
                 (self.account_scope, str(batch_id))).fetchone())
 
     def batch_events(self, batch_id):
+        if not batch_id:
+            return []
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM live_events WHERE account_scope=? AND batch_id=? "
@@ -365,7 +413,7 @@ class LiveQueue:
                     "UPDATE live_events SET private_json=?, updated_at=? "
                     "WHERE account_scope=? AND event_key=?",
                     (json.dumps(payload, ensure_ascii=False), float(self.clock()),
-                     self.account_scope, str(event_id)))
+                     self.account_scope, row["event_key"]))
                 conn.commit()
             except LiveFlowError:
                 raise
@@ -390,6 +438,7 @@ class LiveQueue:
         'publicText' and 'privateText'.  Both channels are required for a target
         to stay sendable; this module never fills them itself.
         """
+        policy_source = "request" if policy else "builtin_default"
         policy = normalize_policy(policy)
         batch = self.batch(batch_id)
         if batch is None:
@@ -424,7 +473,8 @@ class LiveQueue:
                     entry["publicText"].encode("utf-8")).hexdigest(),
             })
         plan = {"batchId": str(batch_id), "frozenAt": _iso(self.clock()), "policy": policy,
-                "targets": targets, "blocked": blocked, "scriptSource": "host"}
+                "targets": targets, "blocked": blocked, "scriptSource": "host",
+                "policySource": policy_source}
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(

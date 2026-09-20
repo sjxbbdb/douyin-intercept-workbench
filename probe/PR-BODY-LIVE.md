@@ -114,3 +114,27 @@ python tests/test_probe.py LiveFlowTests BoundaryTests
    （`missing_author_id`），而不是用昵称兜底。
 3. 阶段二送达沿用其他发送通道的 `unknown` 语义，不把 DOM 表象当作成功。
 4. 本 PR 不含真实账号证据；需要真机验证后才能评估 `autoEligible` 的开启条件。
+
+---
+
+## 7. 评审意见修复记录（本修订）
+
+评审列出的 7 项里，本次处理 **4 项**（3 个状态机缺陷 + 策略签发边界），每项都补了回归测试；
+其余 3 项属于服务端接线与真机验收，**如实保持未完成**，不做任何"已完成"的表述。
+
+| 评审项 | 处理结果 | 回归测试 |
+|---|---|---|
+| 1 空批次会永久复用 | 队列为空时**不再创建批次**（返回 `status: "empty"`、`batchId: null`）；已存在的空批次会被关闭为 `expired` | `test_empty_batch_is_closed_instead_of_reused` |
+| 2 过期批次仍可复用 | 取批次时若打开中的批次已过 `expiresAt` → 关闭为 `expired` 并把其事件一并置 `expired`；`live_reply` / `live_private` 执行前调用 `ensure_active`，超窗直接返回 `batch_expired` | `test_open_batch_is_closed_once_its_window_passed`、`test_phase_methods_refuse_an_expired_batch` |
+| 3 私信结果没有持久化 | `mark_private` 改为按解析出的 `event_key` 更新（原实现选中了正确的行，却用调用方的 `event_id` 去写，于是接口返回成功、库里没记录） | `test_private_result_is_persisted` |
+| 4 策略由客户端参数控制 | 边界**拒绝调用方自带 policy**（`policy_not_server_issued`），改用内置保守默认值；冻结计划记录 `policySource: "builtin_default"`；库层保留 `freeze_plan(policy=...)` 作为服务端接线的缝 | `test_client_supplied_policy_is_refused` |
+| 5 积分 / 功能开关 / 服务端审计未接入 | **未做**：需要服务端协议；本 PR 不声称完成，本地 `send_gate.py` 仍是唯一本地闸 | —— |
+| 6 只有离线验证 | **未做**：真机选择器、作者标识、公屏送达、私信送达均待验收；`live_batch.autoEligible` 保持 `false` | —— |
+| 7 合并冲突 | 当前对照最新 `rewrite/v4-agent`（`e8a963a7`）为 `mergeable_state: clean`：该分支自 `6152cbe` 起未改动 `probe/`；若 #5 / #6 先合并且改到 `probe/tests/test_probe.py`，我会基于最新基线重整后再合 | —— |
+
+离线回归（本机实测）：
+
+```text
+LiveFlowTests + BoundaryTests 共 26 项：OK
+```
+
