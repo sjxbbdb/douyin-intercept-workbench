@@ -1352,6 +1352,118 @@ class SearchPagingTests(unittest.TestCase):
             instance.search({"keyword": "宝宝辅食", "cursor": token})
 
 
+    # ------------------------------------------------ 分页终态与游标池（回归）
+
+    def test_captcha_is_terminal_and_offers_no_next_page(self):
+        """真机教训：status 已是 captcha，但 hasMore/cursor 照给 -> 上层只会自动翻页空转。"""
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search_listing(
+            [_vid(1), _vid(2)], {"stopped_reason": "captcha"})
+        try:
+            result = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+        self.assertEqual(result["status"], "captcha")
+        self.assertTrue(result["terminal"])
+        self.assertEqual(result["stopReason"], "captcha")
+        self.assertFalse(result["hasMore"], "终态不得给出「还能翻页」的信号")
+        self.assertIsNone(result["cursor"], "终态不得签发下一页游标")
+        # 验证码出现【之前】拿到的数据不能丢：仍然返回，只是不再往下走。
+        self.assertEqual([v["id"] for v in result["videos"]], ["1", "2"])
+
+    def test_login_required_is_terminal_and_offers_no_next_page(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "required"
+        try:
+            token = sidecar._encode_cursor("宝宝辅食", {"1"}, 3)
+            result = instance.search({"keyword": "宝宝辅食", "cursor": token})
+        finally:
+            sidecar.douyin.login_state = original_login
+
+        self.assertEqual(result["status"], "login_required")
+        self.assertTrue(result["terminal"])
+        self.assertFalse(result["hasMore"])
+        self.assertIsNone(result["cursor"], "登录失效时回声旧游标等于让上层接着翻页")
+        self.assertEqual(result["page"], 3)
+
+    def test_relevance_filtered_videos_enter_the_cursor_pool(self):
+        """被相关度筛掉的视频不会再出现在返回结果里，必须进池。
+
+        不进池的后果：之后每一页都重新扫到同一批被筛掉的视频（重复处理）。
+        """
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original = (sidecar.crawlmod.search_videos, sidecar.crawlmod.video_relevance,
+                    sidecar.douyin.login_state)
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search_listing(
+            [_vid(i) for i in (1, 2, 3, 4)], {})
+        # 1/2 满分、3/4 零分 —— 阈值 50 时 3/4 被筛掉
+        sidecar.crawlmod.video_relevance = (
+            lambda desc, keyword: {"score": 100 if desc in ("标题1", "标题2") else 0})
+        try:
+            result = instance.search({"keyword": "宝宝辅食", "maxVideos": 5,
+                                      "minRelevance": 50})
+        finally:
+            (sidecar.crawlmod.search_videos, sidecar.crawlmod.video_relevance,
+             sidecar.douyin.login_state) = original
+
+        self.assertEqual([v["id"] for v in result["videos"]], ["1", "2"])
+        self.assertEqual(result["filter"]["filteredByRelevance"], 2)
+        seen, _ = sidecar._decode_cursor(result["cursor"], "宝宝辅食")
+        self.assertEqual(seen, {"1", "2", "3", "4"},
+                         "被筛掉的 3/4 必须进池，否则会被反复重扫")
+
+    def test_videos_beyond_max_videos_stay_out_of_the_pool(self):
+        """超出 maxVideos 的只是被【推迟】到下一页，不能进池。
+
+        进池的后果：它们既没被返回、又被当成已见，等于永久丢失。
+        这和「被筛掉的必须进池」方向相反，是同一个游标统计的两面。
+        """
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original = (sidecar.crawlmod.search_videos, sidecar.douyin.login_state)
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search_listing(
+            [_vid(i) for i in (1, 2, 3, 4, 5)], {})
+        try:
+            result = instance.search({"keyword": "宝宝辅食", "maxVideos": 2})
+        finally:
+            (sidecar.crawlmod.search_videos, sidecar.douyin.login_state) = original
+
+        self.assertEqual([v["id"] for v in result["videos"]], ["1", "2"])
+        seen, _ = sidecar._decode_cursor(result["cursor"], "宝宝辅食")
+        self.assertEqual(seen, {"1", "2"}, "没返回的 3/4/5 不能进池，否则永久拿不到")
+
+
+def _vid(i):
+    return {"aweme_id": str(i), "url": "https://www.douyin.com/video/%d" % i,
+            "desc": "标题%d" % i, "author": "作者", "author_sec_uid": "SEC"}
+
+
+def make_fake_search_listing(videos, meta_extra=None):
+    """假的 search_videos：返回固定列表，并按【真实 meta 契约】填分页观测字段。"""
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        if isinstance(meta, dict):
+            meta["skipped_seen"] = 0
+            meta["platform_cursor"] = "pc-1"
+            meta["platform_has_more"] = 1
+            meta.update(meta_extra or {})
+        return list(videos)
+
+    return fake
+
+
 class FakeSearchPage:
     """search 只需要 location.href；续页时靠它判断"还在不在搜索页上"。"""
 

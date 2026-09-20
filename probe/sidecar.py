@@ -468,7 +468,9 @@ class Sidecar:
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
-                return {"status": "login_required", "videos": [], "cursor": cursor_in,
+                # 终态一律不回声可用游标：回声 cursor_in 等于告诉上层"还能接着翻"。
+                return {"status": "login_required", "terminal": True,
+                        "stopReason": "login_required", "videos": [], "cursor": None,
                         "hasMore": False, "page": page_no, "poolSize": len(seen)}
             # 只有【第一页】或【已经不在搜索页上】才重新导航；
             # 否则保持页面原状、继续往下滚 —— 这才是"读取下一页"。
@@ -485,11 +487,15 @@ class Sidecar:
                                                 strict=False, meta=meta,
                                                 navigate=navigate, seen_ids=seen)
             out = []
-            filtered = 0
+            filtered_ids = []
             for video in videos:
                 relevance = crawlmod.video_relevance(video.get("desc"), keyword)
                 if relevance["score"] < min_relevance:
-                    filtered += 1
+                    # 🔴 被相关度筛掉的视频【不会再出现在任何返回结果里】，
+                    #    所以必须进游标池；否则之后每一页都会把同一批重扫一遍。
+                    #    注意与下面「超出 maxVideos」的区别：那部分只是被推迟到下一页，
+                    #    刻意不进池 —— 进池会让它们既没被返回、又被当成已见，等于永久丢失。
+                    filtered_ids.append(str(video.get("aweme_id") or ""))
                     continue
                 if len(out) >= max_videos:
                     break
@@ -499,19 +505,26 @@ class Sidecar:
                             "author": str(video.get("author") or "")[:120],
                             "authorId": str(video.get("author_sec_uid") or "")[:200],
                             "relevance": relevance})
-            pool = set(seen) | {v["id"] for v in out if v["id"]}
+            pool = (set(seen) | {v["id"] for v in out if v["id"]}
+                    | {i for i in filtered_ids if i})
+            # 🔴 终态收敛：命中验证码时绝不给出「还能继续翻页」的信号。
+            #    此前 status 已是 captcha，但 hasMore 仍取 bool(out)、cursor 照样签发，
+            #    上层只要看其中任意一个就会一直自动请求、在人工处理前空转。
+            terminal = "captcha" if meta.get("stopped_reason") == "captcha" else None
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
-            return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
+            return {"status": terminal or "ok",
+                    "terminal": bool(terminal),
+                    "stopReason": terminal,
                     "videos": out,
-                    "cursor": _encode_cursor(keyword, pool, page_no + 1),
-                    "hasMore": bool(out),
+                    "cursor": None if terminal else _encode_cursor(keyword, pool, page_no + 1),
+                    "hasMore": False if terminal else bool(out),
                     "page": page_no,
                     "poolSize": len(pool),
                     "skippedSeen": int(meta.get("skipped_seen") or 0),
                     "platformHasMore": meta.get("platform_has_more"),
                     "platformCursor": meta.get("platform_cursor"),
                     "filter": {"collected": len(videos), "returned": len(out),
-                               "filteredByRelevance": filtered,
+                               "filteredByRelevance": len(filtered_ids),
                                "minRelevance": min_relevance}}
         finally:
             page.close()
