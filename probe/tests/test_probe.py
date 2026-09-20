@@ -414,7 +414,9 @@ class BoundaryTests(unittest.TestCase):
                 return "complete" if expression == "document.readyState" else None
 
             def eval_json(self, _expression):
-                return {"ok": False, "count": 2, "reason": "ambiguous_comment"}
+                # 模拟 douyin.comment_reply_button 真实会返回的歧义结果
+                # （真机上它由 douyin.py 的 _REPLY_BUTTON_JS 产生）
+                return {"found": False, "count": 2, "reason": "ambiguous_comment"}
 
             def click_at(self, *args):
                 self.clicks.append(args)
@@ -432,6 +434,8 @@ class BoundaryTests(unittest.TestCase):
         finally:
             send_actions.douyin.check_captcha, send_actions.douyin.login_state = old
         self.assertEqual(result["status"], "failed")
+        # 归因必须明确指到【回复按钮定位】这一步，而不是笼统的 not_found
+        self.assertEqual(result["reason"], "reply_ambiguous_comment")
         self.assertEqual(page.clicks, [])
 
     def test_sidecar_stdout_is_protocol_only(self):
@@ -561,28 +565,122 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.page.evaluate("document.querySelectorAll('[data-e2e=live-chat-input]')[1].remove()")
         self.assertTrue(live.find_composer(self.page)["found"])
 
-    def test_video_target_exact_id_author_text_and_reply_button(self):
-        import send_actions
-        self._load("comments.html")
-        good = self.page.eval_json(send_actions.build_comment_target_expression({
-            "id": "comment-1", "authorId": "author-1", "authorName": "Alice", "text": "same question"}))
-        self.assertTrue(good["ok"])
-        self.page.click_at(good["x"], good["y"])
-        self.assertEqual(self.page.evaluate("document.querySelector('#comment-1 [data-e2e=comment-reply]').dataset.clicks"), "1")
+    def test_video_reply_never_relies_on_invented_data_e2e(self):
+        """回归护栏：夹具里不许再出现真机不存在的那些 data-e2e。
+
+        旧夹具靠 comment-content / comment-reply / comment-reply-input /
+        comment-reply-submit 让测试全绿，而真机上一个都没有 —— 这正是
+        video_reply 长期停在 autoEligible=false 的原因。把它们钉死在这里。
+        """
+        import pathlib
+        html = (pathlib.Path(__file__).parent / "fixtures" / "comments.html").read_text(encoding="utf-8")
+        for invented in ["comment-content", "comment-reply", "comment-reply-input",
+                         "comment-reply-submit", "comment-reply-editor"]:
+            self.assertNotIn('data-e2e="%s"' % invented, html,
+                             "夹具不得再依赖真机不存在的 data-e2e：%s" % invented)
+
+    def test_video_reply_button_locates_real_structure(self):
+        """「回复」是真机上的裸 <span>，只能按文本定位。"""
         import douyin
-        comment_target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice", "text": "same question"}
-        composer = douyin.comment_reply_composer(self.page, comment_target)
-        self.assertTrue(composer["found"])
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        hit = douyin.comment_reply_button(self.page, target)
+        self.assertTrue(hit["found"], hit)
+        self.assertEqual(hit["tag"], "SPAN")
+        self.assertGreaterEqual(hit["y"], 0)
+        self.page.click_at(hit["x"], hit["y"])
+        self.assertEqual(self.page.evaluate("document.querySelector('#comment-1').dataset.replyClicks"), "1")
+
+    def test_video_reply_button_rejects_wrong_text(self):
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "not the same question"}
+        hit = douyin.comment_reply_button(self.page, target)
+        self.assertFalse(hit["found"])
+        self.assertEqual(hit["reason"], "comment_not_found")
+
+    def test_video_reply_button_requires_scroll_when_out_of_viewport(self):
+        """虚拟列表里出视口的行坐标是负的（真机实测 y=-1415）——必须先滚再读。"""
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-off", "authorId": "author-off", "authorName": "Carol",
+                  "text": "offscreen question"}
+        single = douyin.comment_reply_button(self.page, target, attempts=1, settle=0)
+        self.assertFalse(single["found"])
+        self.assertEqual(single["reason"], "scrolled_into_view")
+        # 默认会重试，最终应当拿到视口内的坐标
+        hit = douyin.comment_reply_button(self.page, target)
+        self.assertTrue(hit["found"], hit)
+        self.assertGreaterEqual(hit["y"], 0)
+
+    def test_video_reply_button_falls_back_to_author_without_id(self):
+        """没有 id 时退化为「正文 + 作者链接」；作者不符必须拒绝。"""
+        import douyin
+        self._load("comments.html")
+        ok = douyin.comment_reply_button(self.page, {
+            "authorId": "author-1", "authorName": "Alice", "text": "same question"})
+        self.assertTrue(ok["found"], ok)
+        bad = douyin.comment_reply_button(self.page, {
+            "authorId": "author-nobody", "authorName": "Nobody", "text": "same question"})
+        self.assertFalse(bad["found"])
+        self.assertEqual(bad["reason"], "comment_not_found")
+
+    def test_video_reply_composer_requires_replying_row(self):
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        self.assertEqual(douyin.comment_reply_composer(self.page, target)["reason"], "reply_not_open")
+        self.page.evaluate("openReply(document.querySelector('#comment-1'))")
+        composer = douyin.comment_reply_composer(self.page, target)
+        self.assertTrue(composer["found"], composer)
         self.assertEqual(composer["rowId"], "comment-1")
-        reply_send = douyin.comment_reply_send_button(self.page, comment_target)
-        self.assertTrue(reply_send["found"])
-        self.assertEqual(douyin.comment_composer(self.page)["found"], True)
-        wrong_author = self.page.eval_json(send_actions.build_comment_target_expression({
-            "id": "comment-1", "authorId": "author-10", "authorName": "Alice", "text": "same question"}))
-        self.assertFalse(wrong_author["ok"])
-        wrong_text = self.page.eval_json(send_actions.build_comment_target_expression({
-            "id": "comment-1", "authorId": "author-1", "authorName": "Alice", "text": "different"}))
-        self.assertFalse(wrong_text["ok"])
+
+    def test_video_reply_ambiguous_open_rows_are_rejected(self):
+        """同时有两行处于「回复中」时必须拒绝，不能猜一行。"""
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        self.page.evaluate("openReply(document.querySelector('#comment-1'));openReply(document.querySelector('#comment-3'))")
+        self.assertEqual(douyin.comment_reply_composer(self.page, target)["reason"], "ambiguous_reply_open")
+        self.assertFalse(douyin.comment_reply_send_button(self.page, target)["found"])
+        self.page.evaluate("document.querySelector('#comment-3 .replying-state').parentElement.querySelector('.comment-input-inner-container').remove();document.querySelector('#comment-3 .replying-state').remove()")
+        self.assertTrue(douyin.comment_reply_composer(self.page, target)["found"])
+
+    def test_video_reply_send_button_is_inactive_until_text_present(self):
+        """空内容时发送键不是品牌红 —— "空内容不发送"由颜色判据自动保证。"""
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        self.page.evaluate("openReply(document.querySelector('#comment-1'))")
+        empty = douyin.comment_reply_send_button(self.page, target)
+        self.assertFalse(empty["found"])
+        self.assertEqual(empty["reason"], "send_button_inactive")
+
+        composer = douyin.comment_reply_composer(self.page, target)
+        self.page.click_at(composer["x"], composer["y"])
+        self.page.type_text("谢谢提醒")
+        active = douyin.comment_reply_send_button(self.page, target)
+        self.assertTrue(active["found"], active)
+        self.assertTrue(active["active"])
+        self.page.click_at(active["x"], active["y"])
+        self.assertEqual(
+            self.page.evaluate("document.querySelector('#comment-1 .commentInput-right-ct .send').dataset.clicks"),
+            "1")
+
+    def test_video_reply_typing_into_wrong_row_is_never_attempted(self):
+        """目标行的编辑器没开时，绝不能把文字打进别的行。"""
+        import douyin
+        self._load("comments.html")
+        other = {"id": "comment-3", "authorId": "author-3", "authorName": "Bob",
+                 "text": "different question"}
+        self.page.evaluate("openReply(document.querySelector('#comment-1'))")
+        self.assertEqual(douyin.comment_reply_composer(self.page, other)["reason"], "reply_row_mismatch")
+
 
     def test_private_async_target_context_excludes_wrong_history(self):
         import douyin
@@ -1232,6 +1330,466 @@ class LiveFlowTests(unittest.TestCase):
         self.assertNotIn("x", ambiguous)
         self.assertEqual(live.find_danmaku(Cdp(None), {"authorName": "N", "text": "x"})["reason"],
                          "danmaku_lookup_failed")
+
+
+    def test_room_echo_is_recorded_as_sent_echoed_and_never_auto_privates(self):
+        """真机证据分级：房间回声记为 sent_echoed，但默认策略不会因此自动私信。"""
+        import sidecar
+
+        class Page:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19250)
+            instance._page = lambda: (Page(), {"pid": 1})
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "@LIVE-E1 你好",
+                                   "privateText": "private message text"}}})
+            batch_id = planned["batch"]["batchId"]
+            original = sidecar.send_danmaku_reply
+            sidecar.send_danmaku_reply = lambda *_args, **_kwargs: {
+                "status": "unknown", "reason": "platform_response_unavailable",
+                "evidence": {"mechanism": "enter", "roomEcho": True}}
+            try:
+                reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s-echo"}]})
+            finally:
+                sidecar.send_danmaku_reply = original
+            self.assertEqual(reply["replyMode"], "danmaku")
+            self.assertEqual(reply["results"][0]["recordedState"], "sent_echoed")
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "sent_echoed")
+            # 默认策略只放行 sent_confirmed：回声不自动升级成私信
+            self.assertEqual(reply["privateCandidates"], [])
+            self.assertEqual(reply["privateRejected"][0]["reason"], "public_sent_echoed")
+
+    def test_echo_requires_the_text_to_actually_appear(self):
+        """没有回声时保持 unknown（不因为"点了发送"就当成成功）。"""
+        import sidecar
+
+        class Page:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19251)
+            instance._page = lambda: (Page(), {"pid": 1})
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "@LIVE-E1 你好",
+                                   "privateText": "private message text"}}})
+            batch_id = planned["batch"]["batchId"]
+            original = sidecar.send_danmaku_reply
+            sidecar.send_danmaku_reply = lambda *_args, **_kwargs: {
+                "status": "unknown", "reason": "platform_response_unavailable",
+                "evidence": {"mechanism": "enter", "roomEcho": False}}
+            try:
+                reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s-noecho"}]})
+            finally:
+                sidecar.send_danmaku_reply = original
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "unknown")
+            self.assertEqual(reply["results"][0]["recordedState"], "unknown")
+
+
+class CommentFilterTests(unittest.TestCase):
+    """流程一「关键词、排除词与去重」的离线回归（不碰浏览器、不建临时目录）。
+
+    架构依据 images/11-comment-area-business：
+        采集评论 -> 关联评论标识与评论者 -> 关键词、排除词与去重 -> 返回目标批次
+    """
+
+    def _rows(self):
+        return [
+            {"cid": "c1", "sec_uid": "SEC_A", "user": "A", "text": "肉可以这样做吗", "digg": 1},
+            {"cid": "c2", "sec_uid": "SEC_A", "user": "A", "text": "几个月能吃", "digg": 9},
+            {"cid": "c3", "sec_uid": "SEC_B", "user": "B", "text": "请问同行怎么报价 加我微信", "digg": 0},
+            {"cid": "c4", "sec_uid": "SEC_C", "user": "C", "text": "请问米粉要泡吗", "digg": 2},
+            {"cid": "c5", "sec_uid": "", "user": "", "text": "请问这个怎么做", "digg": 0},
+        ]
+
+    def test_exclude_keywords_drop_matched_comments(self):
+        import crawl
+        rows = self._rows()
+        _, base_stats = crawl.filter_comments(rows, "可以,请问,几个月", mode="seg")
+        matched, stats = crawl.filter_comments(rows, "可以,请问,几个月", mode="seg",
+                                               exclude_keywords="微信")
+        self.assertEqual(stats["excluded"], 1)
+        self.assertEqual(stats["matched"], base_stats["matched"] - 1)
+        self.assertTrue(all("微信" not in row["text"] for row in matched))
+        self.assertEqual(stats["exclude_keywords"], ["微信"])
+
+    def test_exclusion_only_counts_comments_that_would_have_matched(self):
+        """excluded 只数「本来命中关键词、却被排除词挡掉」的条数 —— 这才是可调参的数字。"""
+        import crawl
+        rows = [{"cid": "x", "sec_uid": "S", "text": "同行勿扰", "digg": 0}]
+        _, stats = crawl.filter_comments(rows, "怎么做", mode="seg", exclude_keywords="同行")
+        self.assertEqual(stats["excluded"], 0)
+        self.assertEqual(stats["matched"], 0)
+
+    def test_exclude_takes_precedence_over_keyword(self):
+        import crawl
+        rows = [{"cid": "x", "sec_uid": "S", "text": "请问同行怎么报价", "digg": 0}]
+        matched, stats = crawl.filter_comments(rows, "请问", mode="seg", exclude_keywords="同行")
+        self.assertEqual(matched, [])
+        self.assertEqual(stats["excluded"], 1)
+
+    def test_build_queue_accepts_exclude_keywords(self):
+        import crawl
+        queue, stats = crawl.build_queue(self._rows(), "可以,请问,几个月", mode="seg",
+                                         exclude_keywords="微信")
+        self.assertTrue(queue)
+        self.assertNotIn("SEC_B", [row["sec_uid"] for row in queue])
+        self.assertEqual(stats["excluded"], 1)
+
+    def test_dedupe_by_author_keeps_highest_digg_and_never_merges_anonymous(self):
+        import sidecar
+        kept, dropped = sidecar._dedupe_by_author(self._rows())
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(kept), 4)
+        author_a = [row for row in kept if row["sec_uid"] == "SEC_A"]
+        self.assertEqual(len(author_a), 1)
+        self.assertEqual(author_a[0]["cid"], "c2")
+        self.assertEqual(len([row for row in kept if not row["sec_uid"]]), 1)
+
+    def test_filter_text_validates_external_input(self):
+        import sidecar
+        self.assertEqual(sidecar._filter_text(None, "k"), "")
+        self.assertEqual(sidecar._filter_text("  可以 , 请问  ", "k"), "可以 , 请问")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._filter_text(123, "k")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._filter_text("x" * 500, "k")
+
+    def test_sidecar_collect_comments_returns_filtered_targets(self):
+        """targets 必须与 events 同形状 —— 下游两阶段发送直接拿它当 target 用。"""
+        import sidecar
+        rows = self._rows()
+
+        class FakePage:
+            def evaluate(self, expression):
+                return "https://www.douyin.com/video/123"
+
+            def close(self):
+                pass
+
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (FakePage(), {})
+        original_navigate = sidecar._navigate
+        original_login = sidecar.douyin.login_state
+        original_crawl = sidecar.crawlmod.crawl_video_comments
+        sidecar._navigate = lambda page, url: None
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.crawl_video_comments = lambda *a, **k: (
+            rows, {"total": len(rows), "with_sec_uid": 3, "api_comments": len(rows)})
+        try:
+            result = instance.collect_comments({
+                "url": "https://www.douyin.com/video/123",
+                "commentKeywords": "可以,请问,几个月",
+                "excludeKeywords": "微信",
+                "matchMode": "seg",
+            })
+        finally:
+            sidecar._navigate = original_navigate
+            sidecar.douyin.login_state = original_login
+            sidecar.crawlmod.crawl_video_comments = original_crawl
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["events"]), len(rows))
+        self.assertTrue(all("微信" not in row["text"] for row in result["targets"]))
+        self.assertEqual(result["filter"]["excluded"], 1)
+        self.assertEqual(result["filter"]["dedupedAuthors"], 1)
+        self.assertEqual(result["filter"]["matchMode"], "seg")
+        self.assertEqual(result["filter"]["excludeKeywords"], ["微信"])
+        self.assertEqual(result["filter"]["targetCount"], len(result["targets"]))
+        for key in ("id", "source", "roomId", "authorId", "authorName", "text"):
+            self.assertIn(key, result["targets"][0])
+        self.assertIn("matchedKeyword", result["targets"][0])
+
+    def test_sidecar_rejects_bad_filter_params(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.collect_comments({"url": "https://www.douyin.com/video/123", "matchMode": "nope"})
+
+
+
+class SearchPagingTests(unittest.TestCase):
+    """视频搜索分页（搜索游标）的离线回归。
+
+    架构依据 images/10-video-search-flow：
+        读取一页结果 -> 按固定条件筛选并去重 -> 保存视频池与搜索游标 -> 申请下一轮搜索
+    这些用例不碰浏览器、不建临时目录。
+    """
+
+    def _instance(self, url=None):
+        import sidecar
+        page = FakeSearchPage(url)
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        return sidecar, instance, page
+
+    def test_cursor_round_trip(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1", "2"}, 3)
+        seen, page_no = sidecar._decode_cursor(token, "宝宝辅食")
+        self.assertEqual(seen, {"1", "2"})
+        self.assertEqual(page_no, 3)
+        self.assertEqual(sidecar._decode_cursor(None, "宝宝辅食"), (set(), 1))
+        self.assertEqual(sidecar._decode_cursor("", "宝宝辅食"), (set(), 1))
+
+    def test_cursor_is_rejected_when_it_does_not_match(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1"}, 2)
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(token, "别的关键词")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor("!!!not-base64!!!", "宝宝辅食")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(12345, "宝宝辅食")
+
+    def test_unsupported_cursor_version_is_rejected(self):
+        import base64
+        import json
+        import sidecar
+        raw = json.dumps({"v": 99, "k": "宝宝辅食", "n": 2, "seen": []}).encode("utf-8")
+        token = base64.urlsafe_b64encode(raw).decode("ascii")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(token, "宝宝辅食")
+
+    def test_first_page_navigates_and_second_page_reuses_the_tab(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+            second = instance.search({"keyword": "宝宝辅食", "maxVideos": 5,
+                                      "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+        first_ids = [v["id"] for v in first["videos"]]
+        second_ids = [v["id"] for v in second["videos"]]
+        self.assertEqual(first_ids, ["1", "2", "3", "4", "5"])
+        self.assertEqual(second_ids, ["6", "7", "8", "9", "10"])
+        self.assertEqual(set(first_ids) & set(second_ids), set())
+        self.assertEqual(first["page"], 1)
+        self.assertEqual(second["page"], 2)
+        self.assertEqual(first["poolSize"], 5)
+        self.assertEqual(second["poolSize"], 10)
+        self.assertTrue(first["hasMore"] and second["hasMore"])
+        self.assertTrue(calls[0]["navigate"], "第一页必须自己导航")
+        self.assertFalse(calls[1]["navigate"], "续页不能重新导航，否则又从第一页开始")
+        self.assertEqual(calls[1]["seen"], {"1", "2", "3", "4", "5"})
+        self.assertEqual(first["platformCursor"], "pc-1")
+
+    def test_continuing_renavigates_when_the_tab_left_the_search_page(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance(url="https://www.douyin.com/video/123")
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+            instance.search({"keyword": "宝宝辅食", "maxVideos": 5, "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertTrue(calls[1]["navigate"], "已经不在搜索页上时必须重新导航")
+
+    def test_empty_page_means_the_pool_is_exhausted(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = lambda *a, **k: []
+        try:
+            result = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(result["videos"], [])
+        self.assertFalse(result["hasMore"], "一页都没有新视频 -> 告诉宿主可以停了")
+
+    def test_search_rejects_cursor_from_another_keyword(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        token = sidecar._encode_cursor("别的关键词", {"1"}, 2)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "cursor": token})
+
+
+class FakeSearchPage:
+    """search 只需要 location.href；续页时靠它判断"还在不在搜索页上"。"""
+
+    def __init__(self, url=None):
+        self.url = url or "https://www.douyin.com/search/x?type=general"
+
+    def evaluate(self, expression):
+        if expression == "location.href":
+            return self.url
+        return None
+
+    def close(self):
+        pass
+
+
+def make_fake_search(calls):
+    """假的 search_videos：池子固定 20 条，按 seen_ids 返回下一页的 5 条。"""
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        seen = set(str(x) for x in (seen_ids or ()))
+        calls.append({"navigate": navigate, "seen": seen})
+        pool = [{"aweme_id": str(i), "url": "https://www.douyin.com/video/%d" % i,
+                 "desc": "标题%d" % i, "author": "作者", "author_sec_uid": "SEC"}
+                for i in range(1, 21)]
+        out = [v for v in pool if v["aweme_id"] not in seen][:5]
+        if isinstance(meta, dict):
+            # 按【真实 crawl.search_videos 的 meta 契约】填：
+            # 它会把平台的 api_cursor / api_has_more 映射成 platform_cursor / platform_has_more，
+            # 并给出 skipped_seen。假函数必须照这个契约来，否则测的不是真东西。
+            meta["skipped_seen"] = 0
+            meta["api_cursor"] = "pc-1"
+            meta["api_has_more"] = 1
+            meta["platform_cursor"] = "pc-1"
+            meta["platform_has_more"] = 1
+        return out
+
+    return fake
+
+
+class VideoRelevanceTests(unittest.TestCase):
+    """找视频模块的「相关度」回归（纯离线，不碰浏览器）。
+
+    架构依据：找视频模块固定流程第 4 步要求返回
+    「视频标题、作者、链接、相关度等候选结果」，模块职责是发现与筛选视频。
+    """
+
+    def test_exact_phrase_scores_by_position(self):
+        import crawl
+        head = crawl.video_relevance("宝宝辅食怎么做 一周不重样", "宝宝辅食")
+        self.assertEqual(head["score"], 100)
+        self.assertEqual(head["reason"], "exact_phrase")
+        self.assertTrue(head["exact"])
+        self.assertEqual(head["position"], 0)
+        early = crawl.video_relevance("今天宝宝辅食吃什么", "宝宝辅食")
+        self.assertEqual((early["score"], early["position"]), (90, 2))
+        late = crawl.video_relevance("今天给大家分享一个我家一直在用的宝宝辅食做法", "宝宝辅食")
+        self.assertEqual(late["score"], 80)
+        self.assertGreater(early["score"], late["score"])
+
+    def test_every_keyword_must_appear_contiguously_for_the_top_tier(self):
+        import crawl
+        both = crawl.video_relevance("教程 宝宝辅食做法", "宝宝辅食,教程")
+        self.assertEqual((both["score"], both["reason"]), (100, "exact_phrase"))
+        self.assertEqual(sorted(both["matchedKeywords"]), ["宝宝辅食", "教程"])
+        only_one = crawl.video_relevance("宝宝辅食做法分享", "宝宝辅食,教程")
+        self.assertEqual(only_one["reason"], "partial_segments")
+        self.assertEqual(only_one["missingKeywords"], ["教程"])
+
+    def test_falls_back_to_segments_when_the_phrase_never_appears(self):
+        """抖音标题几乎不会连续包含「怎么充值codex」这种提问式关键词。"""
+        import crawl
+        rel = crawl.video_relevance("充值 codex 会员教程", "怎么充值codex")
+        self.assertFalse(rel["exact"])
+        self.assertEqual((rel["score"], rel["reason"]), (60, "all_segments"))
+        self.assertEqual(sorted(rel["matchedSegments"]), ["codex", "充值"])
+        self.assertEqual(rel["missingSegments"], [])
+
+    def test_partial_segments_score_between_full_and_none(self):
+        import crawl
+        rel = crawl.video_relevance("codex 会员教程", "怎么充值codex")
+        self.assertEqual(rel["reason"], "partial_segments")
+        self.assertEqual(rel["matchedSegments"], ["codex"])
+        self.assertEqual(rel["missingSegments"], ["充值"])
+        self.assertTrue(0 < rel["score"] < 60)
+
+    def test_no_match_and_edge_cases(self):
+        import crawl
+        none = crawl.video_relevance("完全无关的内容", "宝宝辅食")
+        self.assertEqual((none["score"], none["reason"]), (0, "no_match"))
+        self.assertFalse(none["exact"])
+        self.assertIsNone(none["position"])
+        self.assertEqual(crawl.video_relevance("", "宝宝辅食")["score"], 0)
+        self.assertEqual(crawl.video_relevance("宝宝辅食", "")["reason"], "empty_keyword")
+
+
+class SearchRelevanceTests(unittest.TestCase):
+    """search 把相关度放进候选结果，并支持按阈值筛选（模块内职责）。"""
+
+    class _Page:
+        def close(self):
+            pass
+
+    def _instance(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (self._Page(), {})
+        return sidecar, instance
+
+    @staticmethod
+    def _videos():
+        return [
+            {"aweme_id": "1", "url": "https://www.douyin.com/video/1",
+             "desc": "宝宝辅食怎么做", "author": "A", "author_sec_uid": "S1"},
+            {"aweme_id": "2", "url": "https://www.douyin.com/video/2",
+             "desc": "codex 会员教程", "author": "B", "author_sec_uid": "S2"},
+            {"aweme_id": "3", "url": "https://www.douyin.com/video/3",
+             "desc": "完全无关的内容", "author": "C", "author_sec_uid": "S3"},
+        ]
+
+    def _run(self, params):
+        sidecar, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.search_videos = lambda *a, **k: self._videos()
+        try:
+            return instance.search(params)
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    def test_every_candidate_carries_a_relevance_record(self):
+        result = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["videos"]), 3)
+        self.assertEqual(result["videos"][0]["relevance"]["score"], 100)
+        self.assertEqual(result["videos"][0]["relevance"]["reason"], "exact_phrase")
+        self.assertEqual(result["videos"][2]["relevance"]["reason"], "no_match")
+        self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
+                                            "filteredByRelevance": 0, "minRelevance": 0})
+        # 边界：只发现与筛选，不产生任何发送动作
+        for key in ("sent", "sendId", "private", "reply"):
+            self.assertNotIn(key, result)
+
+    def test_min_relevance_filters_candidates_inside_the_module(self):
+        result = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
+        self.assertEqual([v["id"] for v in result["videos"]], ["1"])
+        self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
+                                            "filteredByRelevance": 2, "minRelevance": 60})
+
+    def test_min_relevance_is_validated(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "minRelevance": 101})
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "minRelevance": -1})
 
 
 if __name__ == "__main__":

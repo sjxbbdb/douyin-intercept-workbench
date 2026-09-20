@@ -67,3 +67,39 @@ LiveFlowTests + BoundaryTests 共 42 项：OK
    而不是退化成随便 @ 一个人。
 4. 仍未完成：积分 / 功能开关 / 服务端审计接线；`live_batch`、`live_danmaku_reply` 的
    `autoEligible` 保持 `false`。
+
+---
+
+## 7. 重整到最新 `rewrite/v4-agent`（2026-09-20）
+
+上游在 PR #7 合并后又合入了协作者的多个模块（视频搜索分页、找视频相关度、评论筛选等），
+本 PR 原先基于已合并的 `feat/live-batch-flow`，**如果直接合会覆盖上游的新实现**（第 6 条协作纪律）。
+本次按正确做法重整：
+
+* 以最新 `rewrite/v4-agent`（`b687484`）为基线，用**合并提交**（父提交 = 本分支原 head + 上游 head）
+  把两边合到一起，**没有 force push**，历史保留。
+* 对本 PR 改过、且上游也改过的 6 个文件做**三方合并**（base = PR #7 head，ours = 本 PR，theirs = 上游）：
+  `sidecar.py`、`send_actions.py`、`douyin.py`、`douyin_selectors.py`、`SIDECAR.md`、
+  `tests/test_probe.py`；两处冲突（能力矩阵新增项、测试新增块）按"两边都保留"解决。
+* 上游改过、本 PR 没碰的文件（`crawl.py`、`EVIDENCE.md`、`tests/fixtures/comments.html`）**原样取上游**。
+* 本地全量离线回归：**71 项，70 通过**；唯一未通过的是
+  `SendGateTests.test_cross_process_same_target_only_one_reservation`，
+  原因是本机沙箱禁止多进程（`PermissionError: [WinError 5]`），属于环境限制而非代码缺陷。
+
+## 8. 真机结论补充（2026-09-20 实发）
+
+| 结论 | 证据 |
+|---|---|
+| 公屏发送键是**回车**，不是输入框右侧的图标 | 点那个图标后输入框内容原样留在框里；改回车后输入框立刻清空 |
+| 发送后能在**房间消息流**里看到自己那条 | 7 次真实发送，每次 `roomEcho: true`（数据源 `page_memory`） |
+| 直播间页面的登录判定必须单独一条 | `data-e2e=user-info` 在 live 域不存在，只靠它会得到 unknown 并拦掉所有公屏回复 |
+| 部分直播间把昵称脱敏成 `小***` | fiber 里 `nickname == desensitized_nickname` 且含星号；此时一律 `nickname_masked` 拒绝，不 @ 假名字 |
+| 页面被遮挡时点击**不送达渲染进程** | 私信面板"成片打不开"、按钮命中正常却无反应（见工作日志第 7 条）；已用 `force_page_active` 处置 |
+| 私信面板没有 `data-recipient-id`，也没有指向 `/user/<sec_uid>` 的链接 | 面板头部 `ChatHeadertitle` 是唯一可用的收件人信号（脱敏昵称按可见前缀比较） |
+| 私信要在**独立标签页**打开主页 | 从直播间标签页直接导航过去时，同样的按钮点不开面板（面板 `dm_panel_not_open`） |
+| 富文本输入框初始内容是一个零宽字符 | 会被误判成"已有草稿"（`composer_has_different_draft`），需归一化后再比较 |
+
+**状态如实标注**：公屏回复已有真实送达证据（房间消息流回声）；私信链路已能打开面板并校验收件人，
+但**"私信真实送达"还没有拿到证据**（上一轮被零宽字符草稿判定挡住，已修，待再跑一次真机）。
+两者 `autoEligible` 均保持 `false`。
+

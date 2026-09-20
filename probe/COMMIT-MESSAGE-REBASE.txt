@@ -1,0 +1,23 @@
+chore: 把「回复弹幕」重整到最新 rewrite/v4-agent（合并提交，不 force push）
+
+背景（协作纪律第 6 条）：PR #7 合并后上游又合入了协作者的多个模块，
+本 PR 原先基于已合并的 feat/live-batch-flow，直接合会覆盖上游的新实现。
+
+本次做法：
+- 以最新 rewrite/v4-agent (b687484) 为基线，用合并提交（父提交 = 本分支原 head + 上游 head），
+  没有 force push，历史完整保留。
+- 对两边都改过的 6 个文件做三方合并（base = PR #7 head）：sidecar.py / send_actions.py /
+  douyin.py / douyin_selectors.py / SIDECAR.md / tests/test_probe.py；
+  两处冲突（能力矩阵新增项、测试新增块）按"两边都保留"解决。
+- 上游改过、本 PR 没碰的文件（crawl.py、EVIDENCE.md、tests/fixtures/comments.html）原样取上游。
+
+同时带上本轮真机修正（均已在 PR 正文第 8 节列出证据）：
+- 公屏发送键改为回车（点输入框右侧图标无效，真机确认）；
+- 发送后读房间消息流回声，记为 sent_echoed（不冒充 sent_confirmed）；
+- 直播间页面的登录判定单独一条（live 域没有 www 的账号元素）；
+- 昵称脱敏（小***）一律 nickname_masked 拒绝，不 @ 假名字；
+- 页面遮挡导致点击不送达渲染进程 -> force_page_active；
+- 私信面板按会话头部标题校验收件人 + 独立标签页打开 + 零宽字符草稿归一化。
+
+本地全量离线回归：71 项 70 通过；唯一未通过的是多进程用例（沙箱 WinError 5，环境限制）。
+私信真实送达尚无证据，如实标注，autoEligible 保持 false。

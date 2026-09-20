@@ -42,6 +42,10 @@ EXPIRED = "expired"
 BLOCKED = "blocked"
 FAILED = "failed"
 UNKNOWN = "unknown"
+# 房间消息流里出现了自己刚发的那条（真机 2026-09-20 起可用）。
+# ⚠️ 它不是平台响应，所以【不】等于 sent_confirmed：默认策略只放行 sent_confirmed，
+#    因此 sent_echoed 不会自动进入私信阶段 —— 要不要放行由平台侧的 policy 决定。
+SENT_ECHOED = "sent_echoed"
 SENT_CONFIRMED = "sent_confirmed"
 
 # Conservative on purpose: an unresolved public reply must not produce a
@@ -560,6 +564,11 @@ class LiveQueue:
                 name = str(event.get("authorName") or "").strip()
                 if not name:
                     reason = "missing_author_name"
+                elif "*" in name:
+                    # 🔴 真机 2026-09-20：部分直播间把昵称脱敏成"小***"（nickname 与
+                    #    desensitized_nickname 同值）。拿这种名字去 @ 只会 @ 到一个假名字，
+                    #    所以宁可 blocked，也不发出一个指不到人的"回复"。
+                    reason = "nickname_masked"
                 elif not str(entry.get("publicText") or "").lstrip().startswith("@" + name):
                     reason = "mention_prefix_missing"
             if reason:

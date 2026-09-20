@@ -17,6 +17,8 @@
   并且发出前必须先在屏上定位到那条弹幕（唯一命中 + 未被遮挡），否则一律拒绝发送。
 """
 import json
+import re
+import time
 
 import douyin_selectors as S
 
@@ -196,40 +198,43 @@ def collect_events(cdp, max_items=100):
 
 FIND_DANMAKU_JS = (
     "(function(target){"
-    "var NICK_FALLBACK=new RegExp(" + json.dumps(S.LIVE_NICK_FALLBACK_RE) + ");"
-    "function textOf(el){return String((el&&(el.innerText||el.textContent))||'')"
-    ".replace(/\\u00a0/g,' ').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
-    ".replace(/\\s+/g,' ').trim();}"
-    "function visible(el){if(!el)return false;var r=el.getBoundingClientRect();"
+    "var ROW_SEL=" + json.dumps(S.LIVE_CHAT_ROW) + ";"
+    "var CONTENT_SEL=" + json.dumps(S.LIVE_CHAT_CONTENT) + ";"
+    "function vis(e){if(!e)return false;var r=e.getBoundingClientRect();"
     "if(!r.width||!r.height)return false;"
     "if(r.bottom<0||r.top>(window.innerHeight||0))return false;"
-    "var s=getComputedStyle(el);"
+    "var s=getComputedStyle(e);"
     "return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0';}"
-    "function onTop(el){try{var r=el.getBoundingClientRect();"
+    "function onTop(e){try{var r=e.getBoundingClientRect();"
     "var x=Math.round(r.x+r.width/2),y=Math.round(r.y+r.height/2);"
     "var h=document.elementFromPoint(x,y);"
-    "return !!(h&&(el===h||el.contains(h)||h.contains(el)));}catch(e){return false;}}"
-    "function parts(el){var lines=String((el&&(el.innerText||el.textContent))||'')"
-    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'').split(/\\n+/);"
-    "var out=[];for(var i=0;i<lines.length;i++){var v=lines[i].replace(/\\s+/g,' ').trim();"
-    "if(v&&out.indexOf(v)<0)out.push(v);}"
-    "if(out.length===1){var m=out[0].match(NICK_FALLBACK);if(m)out=[m[1].trim(),m[2].trim()];}"
-    "if(out.length<2)return null;"
-    "return {authorName:out[0].replace(/^@/,'').trim(),text:out.slice(1).join(' ').trim()};}"
-    "var rows=document.querySelectorAll(" + json.dumps(S.LIVE_CHAT_ROW) + "),hits=[];"
-    "for(var i=0;i<rows.length;i++){var el=rows[i];if(!visible(el))continue;"
-    "var p=parts(el);if(!p)continue;"
-    "if(p.text!==target.text)continue;"
-    "if(target.authorName&&p.authorName!==target.authorName)continue;"
-    "hits.push({el:el,x:Math.round(el.getBoundingClientRect().x),"
-    "y:Math.round(el.getBoundingClientRect().y),"
-    "w:Math.round(el.getBoundingClientRect().width),"
-    "h:Math.round(el.getBoundingClientRect().height)});}"
+    "return !!(h&&(e===h||e.contains(h)||h.contains(e)));}catch(e){return false;}}"
+    "function norm(t){return String(t==null?'':t)"
+    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/\\[[^\\[\\]]{1,10}\\]/g,'')"
+    ".replace(/[\\u{1F000}-\\u{1FAFF}\\u{2190}-\\u{2BFF}\\u{FE00}-\\u{FE0F}]/gu,'')"
+    ".replace(/\\s+/g,'').trim();}"
+    "function authorOf(row){var spans=row.querySelectorAll('span');"
+    "for(var i=0;i<spans.length;i++){var sp=spans[i];if(sp.querySelector('span'))continue;"
+    "var t=String(sp.innerText||sp.textContent||'')"
+    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'').replace(/\\s+/g,' ').trim();"
+    "if(/[:：]$/.test(t))return t.slice(0,-1).trim();}return '';}"
+    "function contentOf(row){var node=row.querySelector(CONTENT_SEL);"
+    "return node?String(node.innerText||node.textContent||''):'';}"
+    "var wantText=norm(target.text),wantAuthor=String(target.authorName||'').trim();"
+    "var rows=document.querySelectorAll(ROW_SEL),hits=[];"
+    "for(var i=0;i<rows.length;i++){var el=rows[i];"
+    "if(!vis(el))continue;"
+    "var text=norm(contentOf(el));"
+    "if(!wantText||text!==wantText)continue;"
+    "var author=authorOf(el);"
+    "if(wantAuthor&&author!==wantAuthor&&author.indexOf(wantAuthor)<0)continue;"
+    "var r=el.getBoundingClientRect();"
+    "hits.push({el:el,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});}"
     "if(!hits.length)return {ok:false,count:0,reason:'danmaku_not_found'};"
     "if(hits.length>1)return {ok:false,count:hits.length,reason:'danmaku_ambiguous'};"
     "var hit=hits[0],top=onTop(hit.el);"
-    "return {ok:true,count:1,onTop:top,x:Math.round(hit.x+hit.w/2),y:Math.round(hit.y+hit.h/2),"
-    "reason:top?'':'danmaku_covered'};"
+    "return {ok:true,count:1,onTop:top,x:hit.x,y:hit.y,reason:top?'':'danmaku_covered'};"
     "})"
 )
 
@@ -289,20 +294,62 @@ SEND_JS = (
 
 
 def find_send_control(cdp):
-    """公屏发送控件。
+    """公屏发送方式（真机结论：回车）。
 
-    真机现状（2026-09-20）：输入框右侧只有 emoji 与两个 svg 图标，**没有**文字「发送」按钮，
-    所以这里优先找受控按钮，找不到时回落到 Enter 发送，并在结果里标明用的是哪种机制
-    （审计与真机验收都需要区分）。
+    🔴 真机实测（2026-09-20，真实直播间）：
+      · 输入框右侧只有 emoji 与两个 svg 图标，没有文字「发送」按钮；
+      · 按"候选控件"的坐标点下去之后，输入框内容【原样留在框里】= 它根本不是发送键；
+      · 改用回车发送，输入框立刻清空，随后能在房间消息流里看到自己发的那条。
+    所以机制固定为回车；候选控件只作为诊断信息返回，不参与发送
+    （宁可发不出去，也不要乱点一个不知道干什么的控件）。
     """
     found = cdp.eval_json(SEND_JS) or {"found": False}
-    if found.get("found") and not found.get("disabled"):
-        found["mechanism"] = "button"
-        return found
-    return {"found": False, "mechanism": "enter", "reason": found.get("reason") or "send_control_disabled",
-            "enterFallback": True}
+    return {"found": False, "mechanism": "enter",
+            "reason": "enter_is_the_verified_mechanism",
+            "diagnostic": {"candidateFound": bool(found.get("found")),
+                           "candidateDisabled": bool(found.get("disabled")),
+                           "note": "候选控件经真机确认不是发送键（点击后输入框不清空）"}}
 
 
 def find_send_button(cdp):
-    """兼容旧调用名：返回发送控件（找不到时 mechanism='enter'）。"""
+    """兼容旧调用名：返回发送方式（mechanism='enter'）。"""
     return find_send_control(cdp)
+
+
+def _normalize_text(text):
+    """发送前后比对用的归一化：零宽字符、[表情名]、表情字符、空白都不参与比较。
+
+    与 FIND_DANMAKU_JS 里的 norm() 同一套口径 —— 页面上的表情是图片，内置数据里是文字，
+    不归一化就永远对不上。
+    """
+    value = str(text or "")
+    for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        value = value.replace(junk, "")
+    value = re.sub(r"\[[^\[\]]{1,10}\]", "", value)
+    value = "".join(ch for ch in value
+                    if not (0x1F000 <= ord(ch) <= 0x1FAFF or 0x2190 <= ord(ch) <= 0x2BFF
+                            or 0xFE00 <= ord(ch) <= 0xFE0F))
+    return re.sub(r"\s+", "", value)
+
+
+def wait_room_echo(cdp, text, seconds=12.0, interval=1.5):
+    """等房间消息流里出现自己刚发的那条（诊断证据，不是"送达"判据本身）。
+
+    价值：把"发送后什么都看不见"变成"平台的消息流里确实出现了这条"。
+    是否把它当作该通道的确认由 host/服务端决定 —— live_flow 记作 sent_echoed，
+    绝不冒充 sent_confirmed。
+    """
+    want = _normalize_text(text)
+    deadline = time.time() + float(seconds)
+    composer_cleared = None
+    while True:
+        composer = find_composer(cdp) or {}
+        if composer.get("found"):
+            composer_cleared = not str(composer.get("text") or "").strip()
+        if want:
+            for row in (collect_feed(cdp).get("rows") or []):
+                if _normalize_text(row.get("text")) == want:
+                    return {"row": row, "composerCleared": composer_cleared}
+        if time.time() >= deadline:
+            return {"row": None, "composerCleared": composer_cleared}
+        time.sleep(interval)

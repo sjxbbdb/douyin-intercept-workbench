@@ -34,6 +34,33 @@ def _gate_result(gate, reservation, send_id):
     return _bad_result(send_id, "blocked", reservation.get("reason", "send_blocked"), evidence)
 
 
+def _clean_draft(value):
+    """输入框里的零宽字符不算草稿。
+
+    🔴 真机（2026-09-20）：抖音的富文本编辑器初始内容就是一个 ZWSP（​），
+    直接拿它跟话术比较会得到 composer_has_different_draft —— 那是假草稿，不是真草稿。
+    """
+    text = str(value or "")
+    for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        text = text.replace(junk, "")
+    return text.strip()
+
+
+def _await_login(tab, seconds=8.0):
+    """等登录态就绪再判定。
+
+    🔴 真机教训（2026-09-20）：主页是 SPA，账号元素（data-e2e=user-info）是异步挂载的。
+    导航后立刻查 login_state 会得到 unknown，于是"明明登录着"却把私信拦在 login_state_unknown。
+    这里轮询到 login_state != unknown 为止（required 立即返回，交给上层的风控处置）。
+    """
+    deadline = time.time() + float(seconds)
+    while True:
+        state = douyin.login_state(tab)
+        if state != "unknown" or time.time() >= deadline:
+            return state
+        time.sleep(0.5)
+
+
 def _validate_private(target, text):
     if not isinstance(target, dict):
         raise ValueError("target must be an object")
@@ -112,10 +139,15 @@ def send_private(tab, gate, send_id, target, text):
         if not _exact_profile_url(current, author_id):
             row = gate.finish(send_id, "failed", "target_profile_mismatch")
             return gate.result(row)
+        # 🔴 真机教训（工作日志第 7 条）：页面 visibilityState=hidden 时点击不送达渲染进程，
+        #    表现就是"私信按钮点上去、面板死活不开"（人工点却正常）。先拉活页面。
+        visibility_before = douyin.visibility_state(tab)
+        if visibility_before != "visible":
+            douyin.ensure_visible(tab)
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
-        login = douyin.login_state(tab)
+        login = _await_login(tab)
         if login != "verified":
             row = gate.finish(send_id, "failed", "login_required" if login == "required" else "login_state_unknown")
             return gate.result(row)
@@ -132,44 +164,94 @@ def send_private(tab, gate, send_id, target, text):
         if not context.get("verified"):
             row = gate.finish(send_id, "failed", "target_context_not_confirmed")
             return gate.result(row)
-        tab.click_at(entry["x"], entry["y"])
-        # The panel is mounted asynchronously.  Wait for the composer and
-        # its own recipient container together; a profile link or old chat
-        # history elsewhere on the page cannot prove the active recipient.
+        # 🔴 真机教训（2026-09-20）：主页从直播间跳过来时头部还在渲染，按旧坐标点一次
+        #    「私信」经常点空（面板根本没打开）。所以这里改成【重新取入口 -> 点 -> 校验面板】
+        #    的循环，最多 3 轮；每一轮都用当下最新的按钮坐标，避免用过期坐标点击。
         composer = {"found": False}
-        for _ in range(12):
-            time.sleep(0.4)
-            composer = douyin.dm_composer_for_recipient(tab, author_id, author_name)
+        context_mode = "recipient_scoped"
+        for attempt in range(3):
+            entry = douyin.dm_entry(tab)
+            if entry.get("blocked"):
+                row = gate.finish(send_id, "blocked", "target_dm_not_available")
+                return gate.result(row)
+            if not entry.get("found"):
+                break
+            tab.click_at(entry["x"], entry["y"])
+            # 面板是异步挂载的：同时等「收件人作用域内的输入框」和「会话头部标题」，
+            # 两者都指向同一个收件人才算打开成功。
+            for _ in range(10):
+                time.sleep(0.5)
+                composer = douyin.dm_composer_for_recipient(tab, author_id, author_name)
+                if composer.get("found"):
+                    break
+                panel = douyin.dm_panel_state(tab, author_name)
+                if panel.get("found") and panel.get("headerMatch"):
+                    context_mode = "live_panel_header"
+                    composer = {"found": True, "x": panel["x"], "y": panel["y"],
+                                "text": panel.get("text") or "",
+                                "containerKey": panel.get("panelKey") or "messageEditor"}
+                    break
             if composer.get("found"):
                 break
         if not composer.get("found"):
-            row = gate.finish(send_id, "failed", "composer_not_found")
-            return gate.result(row)
-        existing_text = str(composer.get("text") or "")
-        if existing_text and existing_text != text:
+            # 🔴 真机回退（2026-09-20，真实主页实测）：真机私信面板里【没有】data-recipient-id /
+            #    data-user-id，也没有指向 /user/<sec_uid> 的链接（实测 count=0），所以上面那套
+            #    严格校验在真机上永远匹配不到，私信会一直停在 composer_not_found。
+            #    真机可用的收件人信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
+            panel = douyin.dm_panel_state(tab, author_name)
+            if not (panel.get("found") and panel.get("headerMatch")):
+                row = gate.finish(send_id, "failed", "composer_not_found")
+                return gate.result(row)
+            context_mode = "live_panel_header"
+            composer = {"found": True, "x": panel["x"], "y": panel["y"],
+                        "text": panel.get("text") or "",
+                        "containerKey": panel.get("panelKey") or "messageEditor"}
+        existing_text = _clean_draft(composer.get("text"))
+        if existing_text and existing_text != _clean_draft(text):
             row = gate.finish(send_id, "failed", "composer_has_different_draft")
             return gate.result(row)
         tab.click_at(composer["x"], composer["y"])
         tab.type_text(text)
         time.sleep(0.3)
-        after = douyin.dm_composer_for_recipient(tab, author_id, author_name)
-        if (after.get("text") or "") != text:
+        if context_mode == "live_panel_header":
+            after = douyin.dm_panel_state(tab, author_name)
+            after_ok = bool(after.get("found") and after.get("headerMatch"))
+            after_text = after.get("text") or ""
+        else:
+            after = douyin.dm_composer_for_recipient(tab, author_id, author_name)
+            after_ok = bool(after.get("found"))
+            after_text = after.get("text") or ""
+        if not after_ok or _clean_draft(after_text) != _clean_draft(text):
             row = gate.finish(send_id, "failed", "text_verification_failed")
             return gate.result(row)
-        button = douyin.dm_send_button_for_recipient(tab, author_id, author_name)
-        if not button.get("found") or button.get("disabled"):
-            row = gate.finish(send_id, "failed", "send_button_unavailable")
-            return gate.result(row)
 
-        final_composer = douyin.dm_composer_for_recipient(tab, author_id, author_name)
-        if not final_composer.get("found") or final_composer.get("containerKey") != composer.get("containerKey"):
-            row = gate.finish(send_id, "failed", "target_session_changed")
-            return gate.result(row)
         button = douyin.dm_send_button_for_recipient(tab, author_id, author_name)
+        mechanism = "button"
         if not button.get("found") or button.get("disabled"):
-            row = gate.finish(send_id, "failed", "send_button_context_changed")
-            return gate.result(row)
-        # The durable started marker is the last operation before the click.
+            # 🔴 真机回退：私信编辑器与直播间公屏是同一套富文本编辑器（zone-container /
+            #    editor-kit），公屏经真机确认是【回车发送】；私信这里同样用回车，
+            #    并在证据里记录机制、输入框是否清空、会话里是否出现这条。
+            mechanism = "enter"
+            button = {"found": False}
+
+        if mechanism == "button":
+            final_composer = douyin.dm_composer_for_recipient(tab, author_id, author_name)
+            if (not final_composer.get("found") or
+                    final_composer.get("containerKey") != composer.get("containerKey")):
+                row = gate.finish(send_id, "failed", "target_session_changed")
+                return gate.result(row)
+            button = douyin.dm_send_button_for_recipient(tab, author_id, author_name)
+            if not button.get("found") or button.get("disabled"):
+                row = gate.finish(send_id, "failed", "send_button_context_changed")
+                return gate.result(row)
+        else:
+            # 回车发送前再确认一次收件人没变（头部标题仍匹配）
+            confirm = douyin.dm_panel_state(tab, author_name)
+            if not (confirm.get("found") and confirm.get("headerMatch")):
+                row = gate.finish(send_id, "failed", "target_session_changed")
+                return gate.result(row)
+
+        # The durable started marker is the last operation before the send.
         gate.mark_started(send_id)
         started = True
         recorder = douyin.make_network_recorder(tab, getattr(S, "DM_SEND_URL_MARK", ""))
@@ -177,14 +259,27 @@ def send_private(tab, gate, send_id, target, text):
             tab.call("Network.enable", {}, timeout=10)
         except Exception:
             pass
-        tab.click_at(button["x"], button["y"])
+        if mechanism == "button":
+            tab.click_at(button["x"], button["y"])
+        else:
+            tab.press_key("Enter", code="Enter", key_code=13)
         records = recorder.collect(wait_seconds=8.0)
         mark = getattr(S, "DM_SEND_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
         statuses = [_response_status(r) for r in matched]
+        echo = douyin.dm_conversation_echo(tab, text)
+        cleared = None
+        try:
+            state = douyin.dm_panel_state(tab, author_name)
+            if state.get("found"):
+                cleared = not str(state.get("text") or "").strip()
+        except Exception:
+            cleared = None
         row = gate.finish(send_id, "unknown", "platform_response_unavailable",
                           {"httpResponses": len(records), "matchedResponses": len(matched),
-                           "platformStatusCodes": statuses[:5]})
+                           "platformStatusCodes": statuses[:5], "mechanism": mechanism,
+                           "recipientVerification": context_mode,
+                           "composerCleared": cleared, "conversationEcho": bool(echo)})
         return gate.result(row)
     except Exception as exc:
         if started:
@@ -236,7 +331,15 @@ COMMENT_TARGET_JS = """(function(target){
 
 
 def build_comment_target_expression(target):
-    """Build the scoped, exact video-comment locator expression."""
+    """⚠️ 已废弃（2026-09-20）：真机上不再可用。
+
+    它依赖 [data-e2e="comment-content"] 与 [data-e2e="comment-reply"]，
+    这两个名字在真实抖音页面上【都不存在】（真机可见评论容器里只有
+    comment-item / video-comment-more / live-avatar 三个 data-e2e）。
+    send_comment 已改用 douyin.comment_reply_button。
+
+    保留仅为兼容历史调用；新代码不要使用。
+    """
     import json
     return COMMENT_TARGET_JS.replace("ITEM_SELECTOR", json.dumps(S.COMMENT_ITEM)) \
         .replace("CONTENT_SELECTOR", json.dumps(S.COMMENT_CONTENT)) \
@@ -269,6 +372,9 @@ def _validate_danmaku_reply(target, text):
         raise ValueError("target.roomId is required")
     if not author_name:
         raise ValueError("target.authorName is required to mention the author")
+    if "*" in author_name:
+        # 脱敏昵称（真机实测："小***"）不能用来 @：那是一个指不到人的假名字。
+        raise ValueError("target.authorName is masked and cannot be mentioned")
     if not danmaku_text:
         raise ValueError("target.text is required to locate the danmaku")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
@@ -310,20 +416,31 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
 
     started = False
     try:
-        tab.call("Page.navigate", {"url": room_url}, timeout=25)
-        if not _wait_ready(tab):
-            return gate.result(gate.finish(send_id, "failed", "page_not_ready"))
+        # 🔴 真机教训（2026-09-20）：这里原来【无条件】重新导航到直播间，结果刚在屏上
+        #    确认过的那条弹幕被页面刷新冲掉，发送永远停在 danmaku_not_found。
+        #    弹幕是"此刻屏上"的东西，所以已经在目标房间时绝不刷新。
         from url_policy import safe_url as normalize_url
-        current_url = normalize_url(tab.evaluate("location.href") or room_url, "resolved room url")
         requested_room = _canonical_room(room_url)
+        current_raw = tab.evaluate("location.href") or ""
+        if not current_raw or _canonical_room(current_raw) != requested_room:
+            tab.call("Page.navigate", {"url": room_url}, timeout=25)
+            if not _wait_ready(tab):
+                return gate.result(gate.finish(send_id, "failed", "page_not_ready"))
+            current_raw = tab.evaluate("location.href") or room_url
+        current_url = normalize_url(current_raw, "resolved room url")
         resolved_room = _canonical_room(current_url)
         if (not resolved_room or resolved_room[0] != "live.douyin.com" or
                 (requested_room and requested_room[0] == "live.douyin.com" and
                  resolved_room != requested_room)):
             return gate.result(gate.finish(send_id, "failed", "target_live_room_mismatch"))
+        # 🔴 真机教训（工作日志第 7 条）：页面被遮挡时 visibilityState=hidden，点击【不送达渲染进程】。
+        #    私信面板"成片打不开"、弹幕定位后点不动，根因都是这个；先把页面拉活再继续。
+        visibility_before = douyin.visibility_state(tab)
+        if visibility_before != "visible":
+            douyin.ensure_visible(tab)
         if douyin.check_captcha(tab):
             return gate.result(gate.finish(send_id, "blocked", "captcha_requires_manual_action"))
-        login = douyin.login_state(tab)
+        login = _await_login(tab)
         if login != "verified":
             return gate.result(gate.finish(
                 send_id, "failed", "login_required" if login == "required" else "login_state_unknown"))
@@ -348,10 +465,18 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
         if control.get("found") and not control.get("disabled"):
             tab.click_at(control["x"], control["y"])
         else:
-            # 真机现状：输入框右侧只有 emoji 与 svg 图标，没有文字「发送」按钮 -> 回车发送。
+            # 🔴 真机确认（2026-09-20）：本通道的发送键是【回车】。输入框右侧的图标不是发送键
+            #    （点它之后内容原样留在框里），所以这里只走回车。
             tab.press_key("Enter", code="Enter", key_code=13)
+        # 发送后的观测：输入框是否清空 + 房间消息流里有没有出现这条。
+        # 这是证据，不是"送达"判据 —— 状态仍是 unknown（红线 2 只认平台响应）；
+        # sidecar 会据 roomEcho 把事件记为 sent_echoed，由策略决定要不要进入下一阶段。
+        echo = live.wait_room_echo(tab, text)
         row = gate.finish(send_id, "unknown", "platform_response_unavailable",
-                          {"mechanism": mechanism, "danmakuLocated": True, "mentioned": True})
+                          {"mechanism": mechanism, "danmakuLocated": True, "mentioned": True,
+                           "composerCleared": echo.get("composerCleared"),
+                           "roomEcho": bool(echo.get("row")),
+                           "roomEchoSource": "page_memory" if echo.get("row") else None})
         return gate.result(row)
     except Exception as exc:
         row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
@@ -417,10 +542,15 @@ def send_comment(tab, gate, send_id, target, text, source):
             # person's row and does not require authorId.
             composer = live.find_composer(tab)
         else:
-            expression = build_comment_target_expression(target)
-            found = tab.eval_json(expression) or {"ok": False, "reason": "comment_not_found"}
-            if not found.get("ok"):
-                row = gate.finish(send_id, "failed", found.get("reason", "comment_not_found"))
+            # 真机校正（2026-09-20）：改用 douyin.comment_reply_button。
+            # 旧路径 build_comment_target_expression 依赖 [data-e2e="comment-content"]
+            # 与 [data-e2e="comment-reply"]，这两个名字在真机上都不存在，
+            # 于是永远停在 comment_not_found —— 这是 video_reply 长期不可自动化的原因。
+            # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
+            found = douyin.comment_reply_button(tab, target)
+            if not found.get("found"):
+                row = gate.finish(send_id, "failed",
+                                  "reply_" + str(found.get("reason") or "not_found"))
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
             time.sleep(0.6)
@@ -430,10 +560,20 @@ def send_comment(tab, gate, send_id, target, text, source):
             return gate.result(row)
         tab.click_at(composer["x"], composer["y"])
         tab.type_text(text)
-        button = live.find_send_button(tab) if source == "live" else douyin.comment_reply_send_button(tab, target)
-        if not button.get("found") or button.get("disabled"):
-            row = gate.finish(send_id, "failed", "comment_send_button_unavailable")
-            return gate.result(row)
+        if source == "live":
+            button = live.find_send_button(tab)
+            if not button.get("found") or button.get("disabled"):
+                row = gate.finish(send_id, "failed", "comment_send_button_unavailable")
+                return gate.result(row)
+        else:
+            # ⚠️ 语义变化：comment_reply_send_button 的 found 表示【处于激活态】。
+            # 真机上发送键是 <svg>，没有 disabled 属性，旧判据永远为假；
+            # 现在按颜色判定 —— 内容为空时它不是品牌红，于是"空内容不发送"自动成立。
+            button = douyin.comment_reply_send_button(tab, target)
+            if not button.get("found"):
+                row = gate.finish(send_id, "failed",
+                                  "comment_send_button_" + str(button.get("reason") or "not_found"))
+                return gate.result(row)
         after = live.find_composer(tab) if source == "live" else douyin.comment_reply_composer(tab, target)
         if (after.get("text") or "") != text:
             row = gate.finish(send_id, "failed", "text_verification_failed")
