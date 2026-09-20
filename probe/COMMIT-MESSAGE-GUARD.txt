@@ -1,0 +1,18 @@
+fix(probe): 公屏回复加"命中测试 + 搜索框"护栏；并如实记录平台的静默丢弃现象
+
+真机反馈（用户观察）：坐标点偏时会把话术打进页面上的搜索框。据此加护栏：
+- live.find_composer：新增命中测试（elementFromPoint），并排除 placeholder/class 含
+  「搜索 / search」的输入框；
+- send_actions：输入框被遮挡（onTop=false）-> failed/composer_covered；
+  输入后若文字落在搜索框里 -> failed/typed_into_search_box，且【绝不按回车】（那会触发搜索）；
+- send_actions：补 import json（新护栏需要）。
+
+真机复跑（用户已授权发送）：
+- 私信：conversationEcho=true、recipientVerification=live_panel_header、mechanism=enter；
+  平台响应 0 -> unknown（不冒充成功）。
+- 公屏回复：composerCleared=true 但 roomEcho=false；等待 60 秒后复查仍无，
+  期间房间消息数 45->82（房间活跃）-> 判定为平台静默丢弃（连续发送约 10 条后的限流表现）。
+  结果保持 unknown，不记 sent_echoed、不推进两阶段 —— fail-closed 生效。
+- probe/EVIDENCE.md 记录该现象，并把"发送频率阈值"列为发布前必须实测项。
+
+离线回归：python tests/test_probe.py <9 个测试类> -> Ran 90 tests OK。

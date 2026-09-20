@@ -3,6 +3,7 @@
 This module never treats a DOM change as delivery.  A click without a
 platform response is recorded as ``unknown`` and blocks a later retry.
 """
+import json
 import re
 import time
 from urllib.parse import urlsplit
@@ -44,6 +45,32 @@ def _clean_draft(value):
     for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
         text = text.replace(junk, "")
     return text.strip()
+
+
+_SEARCH_BOX_JS = (
+    "(function(want){"
+    "var ns=document.querySelectorAll('input,textarea');"
+    "for(var i=0;i<ns.length;i++){var e=ns[i];var v=String(e.value||'');"
+    "var ph=String(e.getAttribute('placeholder')||e.getAttribute('data-placeholder')||'');"
+    "var cls=String(e.className||'');"
+    "if(v&&v.indexOf(want)>=0&&/搜索|search/i.test(ph+' '+cls))return true;}"
+    "return false;})"
+)
+
+
+def _text_in_search_box(tab, text):
+    """输入后检查文字是不是落进了搜索框。
+
+    🔴 真机教训（2026-09-20）：页面上同时存在搜索框时，坐标一旦点偏就会把话术打进搜索框。
+    此时【绝不能按回车】（那会触发一次搜索），必须以 failed/typed_into_search_box 收手。
+    """
+    want = str(text or "").strip()
+    if not want:
+        return False
+    try:
+        return bool(tab.eval_json("(%s)(%s)" % (_SEARCH_BOX_JS, json.dumps(want))))
+    except Exception:
+        return False
 
 
 def _await_login(tab, seconds=8.0):
@@ -453,8 +480,14 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
         if not composer.get("found"):
             return gate.result(gate.finish(send_id, "failed",
                                            composer.get("reason") or "comment_composer_not_found"))
+        if composer.get("onTop") is False:
+            # 命中测试不过：输入框被别的东西盖住（真机上常见的是搜索框/面板），点了会打偏。
+            return gate.result(gate.finish(send_id, "failed", "composer_covered"))
         tab.click_at(composer["x"], composer["y"])
         tab.type_text(text)                      # 真人节奏：每字 0.1-0.9 秒
+        if _text_in_search_box(tab, text):
+            # 文字落进搜索框：立刻收手，绝不按回车（否则会触发一次搜索）。
+            return gate.result(gate.finish(send_id, "failed", "typed_into_search_box"))
         after = live.find_composer(tab)
         if (after.get("text") or "").strip() != text.strip():
             return gate.result(gate.finish(send_id, "failed", "text_verification_failed"))

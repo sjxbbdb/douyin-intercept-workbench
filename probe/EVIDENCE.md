@@ -323,4 +323,33 @@ live-avatar           x4
 
 **发行开关条件**：以上"未完成"项逐条有可复查证据之前，`live_danmaku_reply.autoEligible`
 与私信相关开关必须保持 `false`。
+### 静默丢弃与限流（2026-09-20 同会话实测）
+
+同一次会话内连续发送约 10 条 `@` 弹幕回复之后，后续发送出现
+**输入框清空、但房间消息流里没有该条**：
+
+| 观测 | 值 |
+|---|---|
+| `composerCleared` | `true`（回车后输入框为空） |
+| `roomEcho` | **`false`**（`page_memory` 与 DOM 两侧都查不到该条） |
+| 等待 60 秒后复查 | 仍无；期间房间消息数 45 → 82，说明房间活跃、不是"没人说话" |
+| 判定 | 平台**静默丢弃**（既无响应也无气泡），符合反刷屏限流的表现 |
+
+工程结论：
+
+* `roomEcho` 是识别这种静默丢弃的关键证据 —— 实现保持 `status=unknown` 且**不记**
+  `sent_echoed`，两阶段流程也不会被误推进（fail-closed 生效）。
+* **发布前必须实测发送频率阈值**并回填服务端策略（见下方发行开关条件）。
+* 同一时间私信通道仍然成功（`conversationEcho: true`），说明丢弃发生在公屏通道。
+
+### 点击打偏的护栏（2026-09-20 真机反馈）
+
+用户观察到坐标点偏时话术被打进页面上的**搜索框**。据此加了两道护栏：
+
+* `live.find_composer` 增加命中测试（`elementFromPoint`）并排除 placeholder/class 含
+  「搜索 / search」的输入框；
+* 发送动作：输入框被遮挡（`onTop=false`）→ `failed/composer_covered`；
+  输入后文字若落在搜索框里 → `failed/typed_into_search_box`，并且**绝不按回车**
+  （那会触发一次搜索）。
+
 
