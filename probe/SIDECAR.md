@@ -92,6 +92,28 @@ selectors remain fixture-validated only, the platform has not been observed to
 publish an author id for every live comment, and phase-two delivery keeps the
 same `unknown` semantics as the other send paths.
 
+### 采集数据源与「回复弹幕」（2026-09-20 真机）
+
+* **采集优先读页面内存**：弹幕虚拟列表组件的 React fiber props 里有 originalList（消息数组），
+  每条 WebcastChatMessage 的 payload.user 带 `sec_uid` / nickname —— 真机实测 42/42 带标识。
+  DOM 文本采集保留为兜底，但**行内没有用户标识**（真机 0%），此时 `authorId` 一律留空，
+  绝不拿昵称冒充标识。`live_listen` 的响应如实回报 `source` 与 `identityCoverage`。
+* **回复弹幕**：真机确认网页端没有「点某条弹幕 → 回复」的原生入口（全页 hover 扫描恒为 0；
+  点击弹幕不进入回复态；输入框 `@` 也没有提及联想）。因此「回复弹幕」= 公屏发一条以
+  `@昵称` 开头的消息，边界规则：
+  1. `live_plan` 新增 `replyMode`（`composer` 默认 / `danmaku`），在**冻结计划时定稿**；
+     之后 `live_reply` 传别的 mode 会被 `mode_mismatch` 拒绝 —— 同一批次里不允许两种触达方式；
+  2. `danmaku` 模式下，**计划期**就要求每个目标有昵称（否则 `missing_author_name`）且话术自带
+     `@昵称` 前缀（否则 `mention_prefix_missing`）：话术仍归平台侧，本模块不代写、不改写；
+  3. 发出前必须先在屏上**定位到那条弹幕**（唯一命中 + 未被面板遮挡），否则以
+     `danmaku_not_found` / `danmaku_ambiguous` / `danmaku_covered` 拒绝，且不产生任何输入；
+  4. 输入框内容与话术完全一致后才发送；用的是按钮还是回车记录在结果的 `mechanism` 里。
+* **拟人输入**：`type_text` 默认逐字真人节奏（每字 **0.1–0.9 秒**随机，标点后略长），
+  不再使用固定 60ms 节拍；显式传 `per_char_delay` 时保留固定节拍（离线回归与兼容旧调用）。
+  输入仍走 `Input.dispatchKeyEvent(type=char)`（真机验证过：`insertText` 对受控富文本编辑器无效）。
+* 未验证边界（fail-closed）：`@昵称` 的送达证据（对方是否收到提醒）、发送机制是按钮还是回车、
+  以及弹幕定位在虚拟列表滚动中的稳定性，都需要真机确认；`autoEligible` 保持 `false`。
+
 ## Review fixes (PR #7 revision)
 
 Three state-machine defects reported in review are fixed, each with a

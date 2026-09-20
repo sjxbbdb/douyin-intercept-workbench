@@ -1019,5 +1019,220 @@ class LiveFlowTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "batch_expired")
 
 
+    # ---- 回复弹幕（公屏 @该观众）：真机结论 + 离线回归 ----
+
+    def test_plan_freezes_the_reply_mode_and_rejects_unknown_modes(self):
+        """落地方式在【冻结计划】时定稿；未知模式直接拒绝。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19240)
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "@LIVE-E1 这个我会，稍后私信你",
+                                   "privateText": "private message text"}}})
+            self.assertEqual(planned["replyMode"], "danmaku")
+            self.assertEqual(
+                instance.live_queue.plan(planned["batch"]["batchId"])["replyMode"], "danmaku")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                "replyMode": "shout", "scripts": {}})
+            self.assertEqual(raised.exception.code, "invalid_input")
+
+    def test_danmaku_mode_blocks_a_target_without_a_nickname(self):
+        """没有昵称就 @ 不到人：计划期直接 blocked，绝不用 ID 猜一个人名。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19241)
+            instance.live_queue.append([self._event("e1", author_id="", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "@someone 稍后私信你",
+                                   "privateText": "private message text"}}})
+            self.assertEqual(planned["status"], "blocked")
+            self.assertEqual(planned["blocked"][0]["reason"], "missing_author_name")
+
+    def test_danmaku_mode_requires_the_mention_prefix_from_the_host_script(self):
+        """话术归平台侧：没有 @昵称 前缀就 blocked —— 本模块不代写、不改写话术。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19242)
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "这个我会，稍后私信你",
+                                   "privateText": "private message text"}}})
+            self.assertEqual(planned["status"], "blocked")
+            self.assertEqual(planned["blocked"][0]["reason"], "mention_prefix_missing")
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "blocked")
+
+    def test_reply_mode_cannot_change_after_the_plan_is_frozen(self):
+        """同一批次里不允许两种触达方式：改口在打开浏览器之前就被拒绝。"""
+        import sidecar
+
+        def explode():
+            raise AssertionError("a mode mismatch must be refused before any browser work")
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19243)
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance._page = explode
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_reply", {"batchId": batch_id, "mode": "danmaku",
+                                                 "items": [{"eventId": "e1", "sendId": "s1"}]})
+            self.assertEqual(raised.exception.code, "mode_mismatch")
+
+    def test_danmaku_reply_refuses_before_typing_when_the_row_is_gone(self):
+        """屏上没有那条弹幕就不发：绝不把 @ 认错人，也不产生任何输入与点击。"""
+        import live
+        import send_actions
+
+        class Page:
+            def __init__(self):
+                self.clicks, self.typed = [], []
+
+            def call(self, *_args, **_kwargs):
+                return {}
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://live.douyin.com/123"
+                return None
+
+            def click_at(self, *args):
+                self.clicks.append(args)
+
+            def type_text(self, *args, **_kwargs):
+                self.typed.append(args)
+
+        old = (live.find_danmaku, send_actions.douyin.check_captcha,
+               send_actions.douyin.login_state, send_actions.time.sleep)
+        live.find_danmaku = lambda _tab, _target: {"ok": False, "reason": "danmaku_not_found"}
+        send_actions.douyin.check_captcha = lambda _tab: False
+        send_actions.douyin.login_state = lambda _tab: "verified"
+        send_actions.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                page = Page()
+                gate = SendGate(td, "account-a")
+                result = send_actions.send_danmaku_reply(page, gate, "s-live-1", {
+                    "id": "evt-1", "roomId": "https://live.douyin.com/123",
+                    "authorName": "LIVE-E1", "text": "怎么做"}, "@LIVE-E1 稍后私信你")
+        finally:
+            (live.find_danmaku, send_actions.douyin.check_captcha,
+             send_actions.douyin.login_state, send_actions.time.sleep) = old
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "danmaku_not_found")
+        self.assertEqual(page.typed, [])
+        self.assertEqual(page.clicks, [])
+
+    def test_danmaku_reply_input_guards_run_before_anything_else(self):
+        """缺昵称 / 话术没带 @昵称：连浏览器都不碰就拒绝。"""
+        import send_actions
+        missing_nick = send_actions.send_danmaku_reply(object(), None, "s-live-2", {
+            "id": "evt-2", "roomId": "https://live.douyin.com/123",
+            "authorName": "", "text": "怎么做"}, "@谁 稍后私信你")
+        self.assertEqual(missing_nick["status"], "failed")
+        self.assertIn("authorName", missing_nick["reason"])
+        no_prefix = send_actions.send_danmaku_reply(object(), None, "s-live-3", {
+            "id": "evt-3", "roomId": "https://live.douyin.com/123",
+            "authorName": "LIVE-E1", "text": "怎么做"}, "稍后私信你")
+        self.assertEqual(no_prefix["status"], "failed")
+        self.assertIn("@authorName", no_prefix["reason"])
+
+    def test_human_typing_paces_every_character_between_0_1_and_0_9_seconds(self):
+        """拟人节奏：每字 0.1-0.9 秒随机停顿，而不是固定节拍（真机要求）。"""
+        import cdp
+        sleeps, methods = [], []
+        old_sleep, old_uniform = cdp.time.sleep, cdp.random.uniform
+        cdp.time.sleep = lambda seconds: sleeps.append(round(float(seconds), 4))
+        cdp.random.uniform = lambda lo, hi: (lo + hi) / 2.0
+
+        class Tab(cdp.CDP):
+            def __init__(self):
+                pass
+
+            def call(self, method, params=None, timeout=None):
+                methods.append(method)
+                return {}
+
+        try:
+            Tab().type_text("你好呀")                    # 3 个字，无标点
+            self.assertEqual(len(sleeps), 3)
+            for value in sleeps:
+                self.assertGreaterEqual(value, 0.1)
+                self.assertLessEqual(value, 0.9)
+            self.assertEqual(methods, ["Input.dispatchKeyEvent"] * 3)
+            sleeps[:] = []
+            Tab().type_text("好的，明白了")               # 含标点：停顿仍在上限内
+            for value in sleeps:
+                self.assertGreaterEqual(value, 0.1)
+                self.assertLessEqual(value, 0.9)
+            sleeps[:] = []
+            Tab().type_text("ab", per_char_delay=0.06)   # 显式固定节拍仍然可用
+            self.assertEqual(sleeps, [0.06, 0.06])
+        finally:
+            cdp.time.sleep, cdp.random.uniform = old_sleep, old_uniform
+
+    def test_live_capture_prefers_page_memory_and_falls_back_to_dom(self):
+        """采集优先页面内存（带 sec_uid），不可用时才回落到 DOM 文本（无标识）。"""
+        import live
+
+        class Cdp:
+            def __init__(self, feed, dom):
+                self.feed, self.dom = feed, dom
+
+            def eval_json(self, expression):
+                if expression == live.FEED_JS:
+                    return self.feed
+                if expression == live.COLLECT_JS:
+                    return self.dom
+                return None
+
+        memory = {"ok": True, "rows": [{"id": "m1", "sec_uid": "FAKE-SEC-UID", "uid": "9",
+                                        "authorName": "N", "text": "怎么做", "atMs": 1,
+                                        "roomId": "room", "userFlags": {}}]}
+        rows = live.collect_events(Cdp(memory, {"rows": []}), max_items=5)
+        self.assertEqual(rows[0]["authorId"], "FAKE-SEC-UID")
+        self.assertEqual(rows[0]["source"], "page_memory")
+        dom = {"rows": [{"id": "d1", "authorName": "N", "text": "怎么做", "onTop": True,
+                         "source": "dom"}]}
+        rows = live.collect_events(Cdp({"ok": False, "reason": "no_originalList"}, dom), max_items=5)
+        self.assertEqual(rows[0]["authorName"], "N")
+        self.assertEqual(rows[0]["authorId"], "")
+        self.assertEqual(rows[0]["source"], "dom")
+
+    def test_danmaku_locator_reports_the_reason_instead_of_guessing(self):
+        """定位器把「没找到 / 多条命中 / 被遮挡」如实回报，绝不返回一个近似坐标。"""
+        import live
+
+        class Cdp:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def eval_json(self, _expression):
+                return self.payload
+
+        self.assertFalse(live.find_danmaku(Cdp({"ok": False, "count": 0,
+                                                "reason": "danmaku_not_found"}),
+                                          {"authorName": "N", "text": "怎么做"})["ok"])
+        ambiguous = live.find_danmaku(Cdp({"ok": False, "count": 2,
+                                           "reason": "danmaku_ambiguous"}),
+                                     {"authorName": "N", "text": "怎么做"})
+        self.assertEqual(ambiguous["reason"], "danmaku_ambiguous")
+        self.assertNotIn("x", ambiguous)
+        self.assertEqual(live.find_danmaku(Cdp(None), {"authorName": "N", "text": "x"})["reason"],
+                         "danmaku_lookup_failed")
+
+
 if __name__ == "__main__":
     unittest.main()

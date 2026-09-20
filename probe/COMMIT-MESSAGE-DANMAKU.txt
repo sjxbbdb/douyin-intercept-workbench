@@ -1,0 +1,29 @@
+feat(probe): 直播间新增「回复弹幕」（公屏 @观众），并把采集切到真机的页面内存数据源
+
+真机取证（2026-09-20，Chrome 153，真实直播间，全部只读）
+- 弹幕行的 DOM 文本里没有任何用户标识（0%），原 data-e2e 占位选择器真机命中 0 条；
+  于是 live 事件的 authorId 恒为空，私信阶段被 missing_author_id 全部拦下。
+- 页面内存里的弹幕数据模型（虚拟列表 React fiber props 的 originalList，每条
+  WebcastChatMessage.payload.user 带 sec_uid / nickname）采纳后实测 42/42 带标识。
+- 网页端对普通观众【没有】「点某条弹幕 -> 回复」的原生入口：全页 hover 扫描「回复」类元素恒为 0，
+  点击弹幕不进入回复态，输入框 @ 也没有提及联想。所以「回复弹幕」的真实落地形式是
+  公屏发一条以 @昵称 开头的消息。
+
+改动
+- live.py：双数据源采集（页面内存优先，DOM 文本兜底，authorId 不拿昵称冒充）；
+  新增 find_danmaku（唯一命中 + 未被遮挡）、find_send_control（按钮/回车两种机制）。
+- send_actions.py：新增 send_danmaku_reply，幂等键 live-danmaku:<eventId>:<authorName>；
+  缺昵称、缺 @昵称 前缀、弹幕不在屏上，三类拒绝都发生在动浏览器之前。
+- live_flow.py：计划冻结 replyMode（composer/danmaku）；danmaku 模式在计划期校验
+  昵称与 @昵称 前缀，缺一个就 blocked。
+- sidecar.py：live_plan 接受并冻结 replyMode；live_reply 按冻结模式分发，中途改口返回
+  mode_mismatch；live_listen 如实回报 source / identityCoverage；能力矩阵新增
+  live_danmaku_reply 与 live_capture_source（autoEligible 均 false）。
+- cdp.py：type_text 改为真人节奏，每字 0.1-0.9 秒随机（标点后略长），显式传参仍走固定节拍。
+- 新增只读探针 live_danmaku_probe.py（只 hover，不点击/不输入/不发送）。
+
+测试：LiveFlowTests + BoundaryTests 共 42 项通过（新增 8 项）。
+真机只读验收：采集 42/42 带 sec_uid；定位器连续 3 次精确命中；输入框与发送控件均可定位。
+
+未验证并如实标注：本 PR 没有真机执行过一次发送（@昵称 是否送达、按钮还是回车、平台响应证据
+均未取得）；滚动回溯不做；积分/功能开关/服务端审计未接线；autoEligible 保持 false。

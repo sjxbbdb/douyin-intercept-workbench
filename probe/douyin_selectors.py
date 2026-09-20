@@ -39,7 +39,40 @@ COMMENT_REPLY_SEND_BUTTONS = [
     '[data-e2e="comment-reply-send"]',
 ]
 
-# ---------- 直播公开评论（DOM 适配，live_verified_at remains None） ----------
+# ---------- 直播间弹幕：真机结构（2026-09-19，两个真实直播间） ----------
+# 上面 LIVE_COMMENT_* / LIVE_PUBLIC_* 是【离线 fixture 的占位值】，不是当前平台事实：
+# 真机上 [data-e2e="live-chat-item"] 等一个都不存在（实测命中数 0/0/0）。以下才是真机结构。
+#   div.webcast-chatroom
+#     └ div.webcast-chatroom___list            ← 虚拟列表（可滚动区）
+#         └ div[data-index] > div.webcast-chatroom___item   ← 一行弹幕
+#             └ div.<hash>.webcast-chatroom___item-wrapper
+#                 └ div.<hash> > span.<等级徽章> + span.<"昵称："> + span.<正文>
+# 正文节点：span.webcast-chatroom___content-with-emoji-text
+# ⚠️ 行内【没有 data-sec-uid / data-user-id，也没有 a[href]】——DOM 只给得出昵称；
+#    用户标识（sec_uid）只能从页面内存的弹幕数据模型里取，见 live.py 的 FEED_JS。
+LIVE_CHAT_BOX = '[class*="webcast-chatroom"]'
+LIVE_CHAT_LIST = '[class*="webcast-chatroom___list"]'
+LIVE_CHAT_ROW = '[class*="webcast-chatroom___item"]:not([class*="item-wrapper"])'
+LIVE_CHAT_ROW_ANY = '[class*="webcast-chatroom___item"]'
+LIVE_CHAT_WRAPPER = '[class*="webcast-chatroom___item-wrapper"]'
+LIVE_CHAT_CONTENT = '[class*="webcast-chatroom___content-with-emoji-text"]'
+LIVE_CHAT_EDITOR = '[class*="webcast-chatroom___input-container"] [contenteditable=true]'
+LIVE_CHAT_EDITOR_BOX = '[class*="webcast-chatroom___input-container"]'
+LIVE_CHAT_SEND_CANDIDATES = [
+    '[class*="webcast-chatroom___send"]',
+    '[data-e2e*="chat-send"]',
+    '[data-e2e*="send-btn"]',
+]
+LIVE_CHAT_NODE_SELECTORS = [LIVE_CHAT_ROW, LIVE_CHAT_LIST, LIVE_CHAT_BOX]
+LIVE_CHAT_FEED_MAX_HOPS = 30      # 从弹幕行沿 fiber.return 往上找 originalList 的最大层数
+LIVE_NICK_MAX = 48
+LIVE_TEXT_MAX = 260
+LIVE_NICK_FALLBACK_RE = "^(.{1,32})[:：]\\s*(.{1,220})$"
+LIVE_NOISE_TEXT_RE = ("^(进入直播间|加入了直播间|点赞了|为主播点赞了|关注了主播|分享了直播间|"
+                      "送出|赠送|来了|拍了拍|加入了粉丝团|点亮了粉丝团)")
+LIVE_NOISE_NICK_RE = "^(直播间|全部评论|互动消息|在线人数|发消息|说点什么)"
+
+# ---------- 直播公开评论（离线 fixture 占位值，live_verified_at remains None） ----------
 LIVE_COMMENT_ITEMS = [
     '[data-e2e="live-chat-item"]',
     '[data-e2e="chat-item"]',

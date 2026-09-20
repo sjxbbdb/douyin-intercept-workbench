@@ -249,6 +249,115 @@ def build_comment_target_expression(target):
         }))
 
 
+def _validate_danmaku_reply(target, text):
+    """回复弹幕的输入校验：没有昵称、没有原文、话术没带 @昵称 —— 一律拒绝。
+
+    为什么这三条是硬要求：
+      · 真机确认网页端没有「点弹幕回复」的原生入口，"回复"的落地形式就是公屏里的 @昵称；
+      · 昵称只能来自平台（target.authorName），不允许用 ID 或调用方拼出来的名字代替；
+      · 话术由平台侧下发（红线：本模块不写、不改话术），所以 @昵称 前缀必须已经写在话术里。
+    """
+    if not isinstance(target, dict):
+        raise ValueError("target must be an object")
+    target_id = str(target.get("id") or "")
+    room_id = str(target.get("roomId") or "")
+    author_name = str(target.get("authorName") or "").strip()
+    danmaku_text = str(target.get("text") or "").strip()
+    if not target_id or len(target_id) > 300:
+        raise ValueError("target.id is required")
+    if not room_id or len(room_id) > 2048:
+        raise ValueError("target.roomId is required")
+    if not author_name:
+        raise ValueError("target.authorName is required to mention the author")
+    if not danmaku_text:
+        raise ValueError("target.text is required to locate the danmaku")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+        raise ValueError("text must be 1-%d characters" % MAX_TEXT)
+    if not text.lstrip().startswith("@" + author_name):
+        raise ValueError("text must start with @authorName")
+    return target_id, room_id, author_name, danmaku_text, text
+
+
+def send_danmaku_reply(tab, gate, send_id, target, text):
+    """回复弹幕：在公屏发一条以 @昵称 开头的消息，且必须先定位到那条弹幕。
+
+    真机事实（2026-09-20，见 live.py 顶部结论）：网页端对普通观众没有
+    「点某条弹幕 -> 回复」的原生入口（全页 hover 扫描恒为 0；点击弹幕不进入回复态；
+    输入框 @ 也没有提及联想）。所以本函数把"回复弹幕"落地为：公屏消息里 @该观众。
+
+    为了确保"确实是在回这一条"，发出前逐项校验，任何一项不过就拒绝发送：
+      1. 目标弹幕此刻仍在屏上、唯一命中、未被面板遮挡（live.find_danmaku）；
+      2. 话术必须以 @该弹幕的昵称 开头（话术由平台侧下发，本模块不自己拼）；
+      3. 输入框内容与期望文本完全一致后才按发送。
+    平台响应不可得 -> 结果保留 unknown（红线 2/3），绝不自动重试。
+    """
+    try:
+        target_id, room_id, author_name, danmaku_text, text = _validate_danmaku_reply(target, text)
+    except ValueError as exc:
+        return _bad_result(send_id, "failed", str(exc))
+    try:
+        from url_policy import safe_url
+        room_url = safe_url(room_id, "target.roomId", keep_query=True)
+    except Exception as exc:
+        return _bad_result(send_id, "failed", str(exc))
+    gate_key = "live-danmaku:%s:%s" % (target_id, author_name)
+    try:
+        reservation = gate.reserve(send_id, gate_key, text, kind="danmaku_reply")
+    except GateError as exc:
+        return _bad_result(send_id, "failed", exc.message)
+    if reservation.get("kind") != "reserved":
+        return _gate_result(gate, reservation, send_id)
+
+    started = False
+    try:
+        tab.call("Page.navigate", {"url": room_url}, timeout=25)
+        if not _wait_ready(tab):
+            return gate.result(gate.finish(send_id, "failed", "page_not_ready"))
+        from url_policy import safe_url as normalize_url
+        current_url = normalize_url(tab.evaluate("location.href") or room_url, "resolved room url")
+        requested_room = _canonical_room(room_url)
+        resolved_room = _canonical_room(current_url)
+        if (not resolved_room or resolved_room[0] != "live.douyin.com" or
+                (requested_room and requested_room[0] == "live.douyin.com" and
+                 resolved_room != requested_room)):
+            return gate.result(gate.finish(send_id, "failed", "target_live_room_mismatch"))
+        if douyin.check_captcha(tab):
+            return gate.result(gate.finish(send_id, "blocked", "captcha_requires_manual_action"))
+        login = douyin.login_state(tab)
+        if login != "verified":
+            return gate.result(gate.finish(
+                send_id, "failed", "login_required" if login == "required" else "login_state_unknown"))
+
+        placed = live.find_danmaku(tab, {"authorName": author_name, "text": danmaku_text})
+        if not placed.get("ok"):
+            return gate.result(gate.finish(send_id, "failed",
+                                           placed.get("reason") or "danmaku_not_found"))
+        composer = live.find_composer(tab)
+        if not composer.get("found"):
+            return gate.result(gate.finish(send_id, "failed",
+                                           composer.get("reason") or "comment_composer_not_found"))
+        tab.click_at(composer["x"], composer["y"])
+        tab.type_text(text)                      # 真人节奏：每字 0.1-0.9 秒
+        after = live.find_composer(tab)
+        if (after.get("text") or "").strip() != text.strip():
+            return gate.result(gate.finish(send_id, "failed", "text_verification_failed"))
+        control = live.find_send_control(tab)
+        mechanism = str(control.get("mechanism") or "enter")
+        gate.mark_started(send_id)
+        started = True
+        if control.get("found") and not control.get("disabled"):
+            tab.click_at(control["x"], control["y"])
+        else:
+            # 真机现状：输入框右侧只有 emoji 与 svg 图标，没有文字「发送」按钮 -> 回车发送。
+            tab.press_key("Enter", code="Enter", key_code=13)
+        row = gate.finish(send_id, "unknown", "platform_response_unavailable",
+                          {"mechanism": mechanism, "danmakuLocated": True, "mentioned": True})
+        return gate.result(row)
+    except Exception as exc:
+        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
+        return gate.result(row)
+
+
 def send_comment(tab, gate, send_id, target, text, source):
     """Safely locate one visible comment before a single click.
 
