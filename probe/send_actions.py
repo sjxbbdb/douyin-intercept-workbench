@@ -354,8 +354,34 @@ def send_comment(tab, gate, send_id, target, text, source):
             return gate.result(row)
         gate.mark_started(send_id)
         started = True
+        # 🔴 评论公开回复与私信的关键差别：它走 HTTP 接口（comment/publish），
+        #    平台响应【可观测】。所以这里能给出确定结论，而不是只能停在 unknown。
+        #    判据只认响应体里的 status_code == 0；任何 DOM 现象一律不算成功。
+        recorder = douyin.make_network_recorder(
+            tab, getattr(S, "COMMENT_PUBLISH_URL_MARK", ""))
+        try:
+            tab.call("Network.enable", {}, timeout=10)
+        except Exception:
+            pass
         tab.click_at(button["x"], button["y"])
-        row = gate.finish(send_id, "unknown", "platform_response_unavailable")
+        records = recorder.collect(wait_seconds=8.0)
+        mark = getattr(S, "COMMENT_PUBLISH_URL_MARK", "")
+        matched = [r for r in records if mark and mark in (r.get("url") or "")]
+        statuses = [_response_status(r) for r in matched]
+        detail = {"httpResponses": len(records), "matchedResponses": len(matched),
+                  "platformStatusCodes": statuses[:5]}
+        if matched and any(status == 0 for status in statuses):
+            # 平台确认发布成功 —— 只有这一条才允许进入私信阶段
+            # （图 11 固定流程二：只有公开回复确认成功后才私信）。
+            row = gate.finish(send_id, "sent_confirmed", "platform_response", detail)
+        elif matched and any(status not in (None, 0) for status in statuses):
+            # 拿到响应且明确非 0：平台拒绝，评论没有发出去（图 17 的「明确未提交或被拒绝」）。
+            row = gate.finish(send_id, "failed", "platform_rejected", detail)
+        elif matched:
+            # 命中接口但读不出状态码：证据不足，按未确定处理 —— 禁止自动进入私信。
+            row = gate.finish(send_id, "unknown", "platform_response_unreadable", detail)
+        else:
+            row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
         return gate.result(row)
     except Exception as exc:
         row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)

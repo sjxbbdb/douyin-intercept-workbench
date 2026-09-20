@@ -705,3 +705,169 @@ class ChromiumFixtureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CommentFlowTests(unittest.TestCase):
+    """评论区两阶段流程的状态机（images/11-comment-area-business）。
+
+    纯离线：不碰浏览器，因此跑得很快，而且能在任何环境复现。
+    重点覆盖需求给死的四条状态规则与两条硬门控。
+    """
+
+    def setUp(self):
+        import comment_flow
+        self.CF = comment_flow
+        self.T = [1000000.0]
+        self.tmp = tempfile.TemporaryDirectory()
+        self.n = 0
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _queue(self):
+        self.n += 1
+        return self.CF.CommentQueue(
+            os.path.join(self.tmp.name, "c%d" % self.n), "account-a",
+            capacity=500, clock=lambda: self.T[0])
+
+    @staticmethod
+    def _target(i, text="求链接"):
+        return {"id": "tg-%s" % i, "roomId": "https://www.douyin.com/video/1",
+                "authorId": "author-%s" % i, "authorName": "用户%s" % i, "text": text}
+
+    def _prep(self, count=3, policy=None):
+        """建批并一次性冻结（frozen 不可变，策略必须在这时给）。"""
+        queue = self._queue()
+        queue.append([self._target(i) for i in range(1, count + 1)], now=self.T[0])
+        batch = queue.take_batch(now=self.T[0])
+        scripts = {("tg-%d" % i): {"publicText": "看到你说求链接", "privateText": "细节在我主页"}
+                   for i in range(1, count + 1)}
+        queue.freeze_plan(batch["batchId"], scripts, policy=policy)
+        return queue, batch["batchId"]
+
+    # ---------------------------------------------------------------- 队列/批次
+
+    def test_empty_queue_creates_no_batch_and_later_targets_get_one(self):
+        """空队列不得建批次，否则空批次被永久复用。"""
+        queue = self._queue()
+        first = queue.take_batch(now=self.T[0])
+        self.assertEqual(first["status"], "empty")
+        self.assertIsNone(first["batchId"])
+        self.assertEqual(queue.stats()["batches"], 0)
+        queue.append([self._target(1)], now=self.T[0])
+        second = queue.take_batch(now=self.T[0])
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual([t["targetId"] for t in second["targets"]], ["tg-1"])
+
+    def test_expired_batch_is_closed_and_never_reused(self):
+        """超窗批次不得再被返回，也不得再允许发送。"""
+        queue = self._queue()
+        queue.append([self._target(1)], now=self.T[0])
+        batch = queue.take_batch(window_seconds=900, now=self.T[0])
+        batch_id = batch["batchId"]
+        self.T[0] += 901
+        again = queue.take_batch(window_seconds=900, now=self.T[0])
+        self.assertNotEqual(again["batchId"], batch_id)
+        with self.assertRaises(self.CF.CommentFlowError) as ctx:
+            queue.ensure_active(batch_id, now=self.T[0])
+        self.assertEqual(ctx.exception.code, "batch_expired")
+        self.assertTrue(all(t["state"] == "expired" for t in queue.batch_targets(batch_id)))
+
+    def test_queue_dedupes_and_caps_capacity(self):
+        queue = self._queue()
+        first = queue.append([self._target(1), self._target(1)], now=self.T[0])
+        self.assertEqual((first["added"], first["duplicates"]), (1, 1))
+
+    # ------------------------------------------------- 门控一：只有确认成功才私信
+
+    def test_phase_two_only_accepts_sent_confirmed(self):
+        queue, batch_id = self._prep(4)
+        queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        queue.mark_public("tg-2", self.CF.UNKNOWN, batch_id)
+        queue.mark_public("tg-3", self.CF.FAILED, batch_id)
+        queue.mark_public("tg-4", self.CF.BLOCKED, batch_id)
+        allowed, rejected = queue.private_candidates(batch_id)
+        self.assertEqual([t["targetId"] for t in allowed], ["tg-1"])
+        reasons = {r["reason"] for r in rejected}
+        self.assertIn("public_unknown_no_retry", reasons)
+        self.assertIn("public_failed", reasons)
+        self.assertIn("public_blocked", reasons)
+
+    def test_phase_two_honors_max_private(self):
+        queue, batch_id = self._prep(3, policy={"maxPrivate": 1})
+        for i in (1, 2, 3):
+            queue.mark_public("tg-%d" % i, self.CF.SENT_CONFIRMED, batch_id)
+        allowed, rejected = queue.private_candidates(batch_id)
+        self.assertEqual(len(allowed), 1)
+        self.assertIn("over_private_capacity", {r["reason"] for r in rejected})
+
+    def test_phase_two_requires_author_id(self):
+        queue, batch_id = self._prep(1)
+        queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        with queue._connection() as conn:  # 直接把 author_id 抹掉
+            conn.execute("UPDATE comment_targets SET author_id='' WHERE account_scope='account-a'")
+        allowed, rejected = queue.private_candidates(batch_id)
+        self.assertEqual(allowed, [])
+        self.assertIn("missing_author_id", {r["reason"] for r in rejected})
+
+    # ------------------------------------------- 门控二：unknown 禁止盲目重试
+
+    def test_unknown_public_reply_is_never_retried(self):
+        """点击已发出、结果未定 —— 不得再发第二次。"""
+        queue, batch_id = self._prep(1, policy={"maxPublicAttempts": 99})
+        queue.mark_public("tg-1", self.CF.UNKNOWN, batch_id)
+        candidates, rejected = queue.public_candidates(batch_id)
+        self.assertEqual(candidates, [])
+        self.assertIn("public_unknown_no_retry", {r["reason"] for r in rejected})
+
+    def test_failed_public_reply_respects_retry_budget(self):
+        """failed 才进重试预算；预算=1 表示含首次只试一次。"""
+        queue, batch_id = self._prep(1)
+        queue.mark_public("tg-1", self.CF.FAILED, batch_id)
+        self.assertEqual(queue.public_candidates(batch_id)[0], [])
+
+        queue3, batch3 = self._prep(1, policy={"maxPublicAttempts": 3})
+        for expected in (1, 1, 0):
+            queue3.mark_public("tg-1", self.CF.FAILED, batch3)
+            self.assertEqual(len(queue3.public_candidates(batch3)[0]), expected)
+
+    def test_frozen_plan_ignores_a_later_policy(self):
+        """冻结不可变：事后传 policy 是空操作，不能借此放宽策略。"""
+        queue, batch_id = self._prep(1)
+        queue.freeze_plan(batch_id, {"tg-1": {"publicText": "x", "privateText": "y"}},
+                          policy={"maxPublicAttempts": 99})
+        queue.mark_public("tg-1", self.CF.FAILED, batch_id)
+        self.assertEqual(queue.public_candidates(batch_id)[0], [])
+
+    # ------------------------------------------------------------- 计划与记录
+
+    def test_both_channel_scripts_are_required(self):
+        """缺任一条渠道话术 -> blocked，停下等人工；本模块从不自己补话术。"""
+        queue = self._queue()
+        queue.append([self._target(1), self._target(2)], now=self.T[0])
+        batch = queue.take_batch(now=self.T[0])
+        plan = queue.freeze_plan(batch["batchId"], {
+            "tg-1": {"publicText": "公开话术", "privateText": "私信话术"},
+            "tg-2": {"publicText": "只有公开话术"},
+        })
+        self.assertEqual([t["targetId"] for t in plan["targets"]], ["tg-1"])
+        self.assertEqual(plan["blocked"][0]["reason"], "private_text_missing")
+        self.assertEqual(queue.find_target("tg-2")["state"], self.CF.BLOCKED)
+
+    def test_mark_private_does_not_overwrite_phase_one_state(self):
+        queue, batch_id = self._prep(1)
+        queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        queue.mark_private("tg-1", "unknown", batch_id)
+        row = queue.find_target("tg-1")
+        self.assertEqual(row["state"], self.CF.SENT_CONFIRMED)
+        self.assertEqual(json.loads(row["private_json"])["status"], "unknown")
+
+    def test_result_carries_no_client_side_credit_fields(self):
+        """docs/api.md：服务端是积分唯一权威，客户端不得提交 charged/price/balance。"""
+        queue, batch_id = self._prep(1)
+        queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        result = queue.result(batch_id)
+        for forbidden in ("charged", "price", "balance"):
+            self.assertNotIn(forbidden, result)
+        self.assertEqual(result["channel"], "comment")
+        self.assertEqual(result["source"], "video_comment")
+        self.assertIn("phase", result["checkpoint"])

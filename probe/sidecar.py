@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 
 import cdp as cdpmod
+import comment_flow
 import crawl as crawlmod
 import douyin
 import douyin_selectors as S
@@ -121,6 +122,7 @@ class Sidecar:
         os.makedirs(self.state_dir, exist_ok=True)
         self.account_scope = hashlib.sha256(self.profile_dir.encode("utf-8")).hexdigest()[:32]
         self.gate = SendGate(self.state_dir, self.account_scope)
+        self.comment_queue = comment_flow.CommentQueue(self.state_dir, self.account_scope)
         self.marker_path = os.path.join(self.state_dir, "browser-owner.json")
 
     @staticmethod
@@ -175,7 +177,9 @@ class Sidecar:
         return {
             "protocolVersion": 1,
             "methods": ["capabilities", "launch", "doctor", "open", "search",
-                         "collect_comments", "collect_live", "send_private", "send_comment", "close"],
+                         "collect_comments", "collect_live", "send_private", "send_comment",
+                         "comment_enqueue", "comment_plan", "comment_reply",
+                         "comment_private", "comment_result", "close"],
             "sendStatuses": ["unknown", "failed", "blocked"],
             "capability": {
                 "video_capture": {"implemented": True, "autoEligible": True,
@@ -184,7 +188,14 @@ class Sidecar:
                                    "validation": {"status": "pr1_real_account_flow", "scope": "collaborator_account",
                                                    "delivery": "unknown_without_bound_platform_response"}},
                 "video_reply": {"implemented": True, "autoEligible": False,
-                                 "validation": {"status": "offline_dom_fixture", "delivery": "unknown"}},
+                                 "validation": {"status": "real_device_selectors_2026-09-20",
+                                                "delivery": "platform_response_when_captured_else_unknown"}},
+                # 评论区两阶段闭环（images/11-comment-area-business 固定流程二）。
+                # autoEligible 保持 false：定位器已真机校正，但【没有一次真实的公开回复送达证据】，
+                # 发行开关条件见 probe/EVIDENCE.md §11.8。
+                "comment_batch": {"implemented": True, "autoEligible": False,
+                                  "validation": {"status": "offline_fixture",
+                                                 "delivery": "gated_on_phase_one_sent_confirmed"}},
                 "live_capture": {"implemented": True, "autoEligible": True,
                                   "validation": {"status": "offline_dom_fixture", "delivery": "capture_only"}},
                 "live_reply": {"implemented": True, "autoEligible": False,
@@ -397,15 +408,162 @@ class Sidecar:
         finally:
             page.close()
 
+    # ---------------------------------------------------- 评论区两阶段闭环
+
+    def comment_enqueue(self, params):
+        """把【已经筛好的】候选目标放进队列。
+
+        关键词匹配 / 排除词 / 点赞阈值 / 作者去重属于流程一
+        （images/11-comment-area-business 的「固定流程一：评论采集与筛选」），
+        由宿主完成后传进来；本方法只做去重入队，不重复实现筛选。
+        """
+        targets = params.get("targets")
+        if targets is None:
+            targets = []
+        if not isinstance(targets, list):
+            raise SidecarError("invalid_input", "targets must be an array")
+        return {"queue": self.comment_queue.append(targets),
+                "stats": self.comment_queue.stats()}
+
+    def comment_plan(self, params):
+        """取一批 + 冻结双渠道话术。话术由宿主提供，本模块从不自己生成。"""
+        max_items = int(params.get("maxItems", comment_flow.MAX_BATCH))
+        window_seconds = int(params.get("windowSeconds", comment_flow.WINDOW_DEFAULT))
+        if not 1 <= max_items <= comment_flow.MAX_BATCH:
+            raise SidecarError("invalid_input", "maxItems is out of range")
+        if not 1 <= window_seconds <= 86400:
+            raise SidecarError("invalid_input", "windowSeconds is out of range")
+        batch = self.comment_queue.take_batch(max_items=max_items,
+                                              window_seconds=window_seconds)
+        if not batch.get("batchId"):
+            return {"status": "empty", "batchId": None,
+                    "expiredCount": batch.get("expiredCount", 0),
+                    "expired": batch.get("expired") or []}
+        plan = self.comment_queue.freeze_plan(batch["batchId"], params.get("scripts"),
+                                              params.get("policy"))
+        public, rejected = self.comment_queue.public_candidates(batch["batchId"])
+        return {
+            "status": "ok",
+            "batchId": batch["batchId"],
+            "createdAt": batch["createdAt"],
+            "expiresAt": batch["expiresAt"],
+            "expiredCount": batch.get("expiredCount", 0),
+            "expired": batch.get("expired") or [],
+            "targets": [{"targetKey": t["targetKey"], "targetId": t["targetId"],
+                         "authorName": t["authorName"], "text": t["text"],
+                         "publicText": t["publicText"], "privateText": t["privateText"]}
+                        for t in plan.get("targets") or []],
+            "blocked": plan.get("blocked") or [],
+            "policySource": plan.get("policySource"),
+            "publicCandidates": [t["targetKey"] for t in public],
+            "publicRejected": rejected,
+        }
+
+    def comment_reply(self, params):
+        """第一阶段：逐条公开回复。结果直接决定谁能进入第二阶段。"""
+        batch_id, items = _flow_batch_items(params)
+        self.comment_queue.ensure_active(batch_id)
+        allowed, rejected = self.comment_queue.public_candidates(batch_id)
+        by_key = {t["targetKey"]: t for t in allowed}
+        results = []
+        for item in items:
+            key = item.get("targetKey") or item.get("targetId")
+            target = by_key.get(key)
+            if target is None:
+                results.append({"targetKey": key, "status": "skipped",
+                                "reason": "not_a_public_candidate"})
+                continue
+            page, _ = self._page()
+            try:
+                outcome = send_comment(
+                    page, self.gate, str(item.get("sendId") or ""),
+                    {"id": target.get("targetId") or target.get("targetKey"),
+                     "roomId": target.get("roomId"), "authorId": target.get("authorId"),
+                     "authorName": target.get("authorName"), "text": target.get("text")},
+                    target.get("publicText"), "video")
+            finally:
+                page.close()
+            status = str(outcome.get("status") or "unknown")
+            self.comment_queue.mark_public(key, status, batch_id,
+                                           {"reason": outcome.get("reason")})
+            results.append({"targetKey": key, "status": status,
+                            "reason": outcome.get("reason"), "sendId": outcome.get("sendId")})
+        allowed2, rejected2 = self.comment_queue.private_candidates(batch_id)
+        return {
+            "batchId": batch_id,
+            "results": results,
+            "rejected": rejected,
+            "privateCandidates": [{"targetKey": t["targetKey"], "authorName": t["authorName"]}
+                                  for t in allowed2],
+            "privateRejected": rejected2,
+            "checkpoint": self.comment_queue.result(batch_id)["checkpoint"],
+        }
+
+    def comment_private(self, params):
+        """第二阶段：只对第一阶段【确认成功】的目标私信。
+
+        unknown 的公开回复在这里被明确拒绝 —— 点击已经发出、结果未定，
+        架构与需求都禁止把它变成第二条盲目触达。
+        """
+        batch_id, items = _flow_batch_items(params)
+        self.comment_queue.ensure_active(batch_id)
+        allowed, rejected = self.comment_queue.private_candidates(batch_id)
+        by_key = {t["targetKey"]: t for t in allowed}
+        reject_reasons = {r.get("targetKey"): r.get("reason") for r in rejected}
+        results = []
+        for item in items:
+            key = item.get("targetKey") or item.get("targetId")
+            target = by_key.get(key)
+            if target is None:
+                reason = reject_reasons.get(key) or "not_a_private_candidate"
+                self.comment_queue.mark_private(key, "blocked", batch_id, {"reason": reason})
+                results.append({"targetKey": key, "status": "blocked", "reason": reason})
+                continue
+            page, _ = self._page()
+            try:
+                outcome = send_private(
+                    page, self.gate, str(item.get("sendId") or ""),
+                    {"authorId": target.get("authorId")},
+                    target.get("privateText"))
+            finally:
+                page.close()
+            status = str(outcome.get("status") or "unknown")
+            self.comment_queue.mark_private(key, status, batch_id,
+                                            {"reason": outcome.get("reason")})
+            results.append({"targetKey": key, "status": status,
+                            "reason": outcome.get("reason"), "sendId": outcome.get("sendId")})
+        return {"batchId": batch_id, "results": results,
+                "checkpoint": self.comment_queue.result(batch_id)["checkpoint"]}
+
+    def comment_result(self, params):
+        batch_id = str(params.get("batchId") or "")
+        if not batch_id:
+            raise SidecarError("invalid_input", "batchId is required")
+        return {"result": self.comment_queue.result(batch_id),
+                "stats": self.comment_queue.stats()}
+
     def dispatch(self, method, params):
         allowed = {"capabilities", "launch", "doctor", "open", "search",
-                   "collect_comments", "collect_live", "send_private", "send_comment", "close"}
+                   "collect_comments", "collect_live", "send_private", "send_comment",
+                   "comment_enqueue", "comment_plan", "comment_reply",
+                   "comment_private", "comment_result", "close"}
         if method not in allowed:
             raise SidecarError("unknown_method", "method is not supported")
         fn = getattr(self, method)
         if not isinstance(params, dict):
             raise SidecarError("invalid_input", "params must be an object")
         return fn(params)
+
+
+def _flow_batch_items(params):
+    """两阶段方法共用的入参校验：必须给出 batchId 与非空 items。"""
+    batch_id = str(params.get("batchId") or "")
+    if not batch_id:
+        raise SidecarError("invalid_input", "batchId is required")
+    items = params.get("items")
+    if not isinstance(items, list) or not items:
+        raise SidecarError("invalid_input", "items must be a non-empty array")
+    return batch_id, items
 
 
 def _emit(value):

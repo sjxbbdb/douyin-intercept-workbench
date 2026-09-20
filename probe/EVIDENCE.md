@@ -232,7 +232,10 @@ live-avatar           x4
 | 回复按钮定位 | 依赖真机不存在的 `data-e2e` | 文本严格「回复」+ 唯一性 + 先滚后读 | 真机 11.3 / 11.5 |
 | 回复编辑器定位 | 依赖真机不存在的 `data-e2e` | 含「回复中」行内的唯一 `[contenteditable]` | 真机 11.3 |
 | 回复发送键判定 | 读 `disabled` DOM 属性（`<svg>` 上恒为假） | 读 computed `fill` == 品牌红（激活态） | 真机 11.4 |
+| 公开回复结果判定 | 无法判定（无平台响应可读） | 观测 `comment/publish` 响应，状态码 0 → `sent_confirmed` | 见 11.9 |
+| 公开回复 → 私信闭环 | 不存在（两阶段未接线） | `comment_flow.CommentQueue` 冻结计划 + 阶段门控 | 见 11.9 |
 | `video_reply` 发行开关 | `autoEligible: false`（定位不到） | **仍保持 `false`** —— 见 11.8 | — |
+| `comment_batch` 发行开关 | 不存在 | `autoEligible: false`，`validation.status: offline_fixture` | 见 11.8 / 11.9 |
 
 ### 11.7 失败状态（全部 fail-closed，绝不降级成"随便点一个"）
 
@@ -248,6 +251,9 @@ live-avatar           x4
 | `reply_reply_editor_not_found` / `ambiguous_reply_editor` | 编辑器不存在或多于一个 | ❌ |
 | `comment_send_button_send_button_inactive` | 发送键未处于激活态（含内容为空） | ❌ |
 | `comment_send_button_comment_input_right_not_found` | 找不到编辑器右侧操作区 | ❌ |
+| `platform_rejected` | 捕获到 `comment/publish` 且平台状态码非 0 | 已点击（结果为 `failed`，不重试，见 11.9） |
+| `public_unknown_no_retry` | 阶段一结果为 `unknown`，仍被请求进入下一阶段 | ❌（**两阶段均拒绝**） |
+| `private_text_missing` | 缺少私信话术 | ❌（该目标不进批次，其余目标不受影响） |
 
 ### 11.8 未验证边界与发行开关条件（严格按 `AGENTS.md` 工程边界）
 
@@ -270,3 +276,45 @@ live-avatar           x4
 3. 验证 `SendGate` 在三态（已完成 / 结果未知 / 未执行）下的落库与重启恢复；
 4. 验证连续回复触发平台限流的阈值，并把观测值回填到服务端策略；
 5. 以上任一项未达成，`autoEligible` 必须保持 `false`（fail-closed）。
+
+同一条门控同样适用于 `comment_batch`：它的阶段一就是公开回复，因此第 1、2、4 项
+不达成时，`comment_batch.autoEligible` 也必须保持 `false`。
+
+### 11.9 评论区两阶段闭环（公开回复 → 私信）
+
+**为什么必须分成两阶段。** 平台规则要求：对方回复或关注你之前，只能发送一条文字消息。
+一次触达的机会只有一条，一旦阶段一（公开回复）结果不确定就贸然进入阶段二，
+丢失的不是一次点击，而是这个客户。所以阶段二的前置条件被写成状态机规则，而不是调用方的自觉。
+
+**状态规则（全部由 `comment_flow.CommentQueue` 强制执行）**：
+
+| 阶段一状态 | 含义 | 能否进入阶段二 | 能否重试阶段一 |
+|---|---|---|---|
+| `sent_confirmed` | 捕获到 `comment/publish` 且平台状态码为 0 | ✅ 唯一放行态 | 不重试（已确认成功） |
+| `unknown` | 无响应、或响应无法绑定到本次点击 | ❌ **两阶段均拒绝** | ❌ **绝不盲重试** |
+| `failed` | 平台明确拒绝（状态码非 0） | ❌ | ✅ 受 `maxPublicAttempts` 预算约束 |
+| `blocked` | 缺话术、命中风控等需人工介入 | ❌ | ❌ 停下等人 |
+
+`unknown` 之所以在两个方向上都拒绝，是因为它既不能证明送达、也不能证明未送达：
+重试会造成重复触达，放行会造成无依据的私自触达。两种错误的代价都不可逆，因此 fail-closed。
+
+**实现要点**：
+
+- 计划一经冻结即不可变：后续 `comment_plan` 传入的新策略被忽略，
+  `plan.policySource` 如实回报策略实际来源（当前为 `builtin_default` —— 见下方未验证边界）。
+- 阶段二写入独立的 `private_json` 列，**不会覆盖**阶段一状态。
+- `comment_result` 的输出中**不含** `charged` / `price` / `balance`：
+  积分是服务端的唯一权威，sidecar 连表达它的字段都不提供。
+
+**离线验证**：`comment_flow` 状态机 29/29 断言通过，覆盖空队列不建批次、
+过期批次不复用（`ensure_active` 抛 `batch_expired`）、仅 `sent_confirmed` 放行、
+`unknown` 在 `maxPublicAttempts=99` 下仍被两阶段拒绝、`failed` 遵守重试预算、
+缺任一阶段话术即 `blocked`、`mark_private` 不污染阶段一状态。
+
+**仍未验证（不得声称可用）**：
+
+- ❌ 未在真机跑通任何一次两阶段闭环；`comment_batch` 只有离线夹具证据。
+- ❌ 阶段一的 `sent_confirmed` 依赖 `comment/publish` 响应捕获，
+  **该捕获尚未在真机上观测到过一次真实响应**。
+- ❌ 策略目前由调用方传入（`policySource: builtin_default`）。
+  按安全红线 2，策略必须由服务端下发；接线前 `comment_batch` 不得开启自动发送。
