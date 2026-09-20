@@ -47,6 +47,42 @@ FAILED = "failed"
 UNKNOWN = "unknown"
 SENT_CONFIRMED = "sent_confirmed"
 
+# 目标的全部合法状态。对外契约的一部分，capabilities 会原样公布。
+STATES = (QUEUED, PLANNED, SENT_CONFIRMED, UNKNOWN, FAILED, BLOCKED, EXPIRED)
+
+# 🔴 拒绝原因是【对外契约】，不是内部日志文案。
+#    宿主按它决定「转人工 / 放弃 / 重试」，所以必须是封闭集合，且只在这里声明一次。
+#    散落各处拼字符串的后果：宿主只能对着自由文本做匹配，改动无人察觉。
+#    新增原因必须同时更新本表 —— test_probe 会校验实际产生的每个原因都在表内。
+REJECT_REASONS = (
+    # 阶段一：公开回复
+    "public_unknown_no_retry",     # 点过了、结果未定 —— 两阶段都拒绝，绝不重试
+    "public_blocked",              # 需人工介入（缺话术、命中风控）
+    "public_failed",               # 平台明确拒绝
+    "public_attempts_exhausted",   # failed 且重试预算用尽
+    "public_sent_confirmed",       # 已确认成功，阶段一无需再发
+    "public_expired",              # 超出时间窗
+    "public_pending",              # 尚无阶段一结果
+    "public_planned",              # 已入批但未处理
+    "public_queued",               # 仍待在队列里
+    # 话术冻结（由 _script_error 按 label 生成，见 _script_error）
+    "script_missing",
+    "public_text_missing",
+    "public_text_too_short",
+    "public_text_too_long",
+    "private_text_missing",
+    "private_text_too_short",
+    "private_text_too_long",
+    # 阶段二：私信
+    "missing_author_id",           # 没有作者标识，无法定位收件人
+    "over_private_capacity",       # 超出 maxPrivate
+)
+
+
+def _public_reason(state):
+    """状态 -> 阶段一拒绝原因。动态拼接只在这一处发生，保证闭集可枚举。"""
+    return "public_%s" % (state or "pending")
+
 # 保守为上：公开回复结果未确定时，绝不产生第二条触达。
 POLICY_DEFAULTS = {
     "allowPublicStates": [SENT_CONFIRMED],
@@ -396,11 +432,11 @@ class CommentQueue:
             elif state == BLOCKED:
                 reason = "public_blocked"
             elif state in (SENT_CONFIRMED, EXPIRED):
-                reason = "public_%s" % state
+                reason = _public_reason(state)
             elif state == FAILED and attempts >= policy["maxPublicAttempts"]:
                 reason = "public_attempts_exhausted"
             elif state not in (PLANNED, FAILED):
-                reason = "public_%s" % (state or "pending")
+                reason = _public_reason(state)
             if reason:
                 rejected.append({"targetKey": target.get("targetKey"),
                                  "authorName": target.get("authorName"), "reason": reason})
@@ -575,7 +611,7 @@ class CommentQueue:
             elif state == FAILED:
                 reason = "public_failed"
             elif state not in policy["allowPublicStates"]:
-                reason = "public_%s" % (state or "pending")
+                reason = _public_reason(state)
             elif not str(item.get("authorId") or "").strip():
                 reason = "missing_author_id"
             if reason:

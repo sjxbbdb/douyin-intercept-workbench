@@ -195,7 +195,11 @@ class Sidecar:
                 # 发行开关条件见 probe/EVIDENCE.md §11.8。
                 "comment_batch": {"implemented": True, "autoEligible": False,
                                   "validation": {"status": "offline_fixture",
-                                                 "delivery": "gated_on_phase_one_sent_confirmed"}},
+                                                 "delivery": "gated_on_phase_one_sent_confirmed"},
+                                  # 目标状态与拒绝原因是对外契约：宿主按它们做人工转派和重试决策，
+                                  # 所以在这里原样公布，宿主不必对着自由文本做匹配。
+                                  "states": list(comment_flow.STATES),
+                                  "rejectReasons": list(comment_flow.REJECT_REASONS)},
                 "live_capture": {"implemented": True, "autoEligible": True,
                                   "validation": {"status": "offline_dom_fixture", "delivery": "capture_only"}},
                 "live_reply": {"implemented": True, "autoEligible": False,

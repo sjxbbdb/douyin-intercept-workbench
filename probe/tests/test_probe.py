@@ -873,6 +873,71 @@ class CommentFlowTests(unittest.TestCase):
         self.assertEqual(row["state"], self.CF.SENT_CONFIRMED)
         self.assertEqual(json.loads(row["private_json"])["status"], "unknown")
 
+    # ------------------------------------------------- 对外契约：状态与拒绝原因
+
+    def test_every_rejection_reason_is_declared(self):
+        """拒绝原因是【对外契约】：实际产生的每一个都必须在声明表内。
+
+        宿主按拒绝原因决定转人工 / 放弃 / 重试。原因一旦是散落的自由文本，
+        宿主只能靠字符串匹配，改动无人察觉 —— 这个用例就是防止那种漂移。
+        """
+        produced = set()
+
+        # 阶段一：unknown / blocked / failed(预算用尽) / 已确认 / 未处理
+        queue, batch_id = self._prep(5)
+        queue.mark_public("tg-1", self.CF.UNKNOWN, batch_id)
+        queue.mark_public("tg-2", self.CF.BLOCKED, batch_id)
+        queue.mark_public("tg-3", self.CF.FAILED, batch_id)
+        queue.mark_public("tg-4", self.CF.SENT_CONFIRMED, batch_id)
+        _, rejected = queue.public_candidates(batch_id)
+        produced |= {r["reason"] for r in rejected}
+
+        # 阶段二：unknown / blocked / failed / 缺作者 / 超容量
+        _, rejected = queue.private_candidates(batch_id)
+        produced |= {r["reason"] for r in rejected}
+        tight, tight_batch = self._prep(2, policy={"maxPrivate": 1})
+        for i in (1, 2):
+            tight.mark_public("tg-%d" % i, self.CF.SENT_CONFIRMED, tight_batch)
+        _, rejected = tight.private_candidates(tight_batch)
+        produced |= {r["reason"] for r in rejected}
+
+        # 话术冻结：缺话术 / 公话术缺失 / 私话术缺失 / 过短
+        queue2 = self._queue()
+        queue2.append([self._target(i) for i in (1, 2, 3, 4)], now=self.T[0])
+        b2 = queue2.take_batch(now=self.T[0])["batchId"]
+        plan = queue2.freeze_plan(b2, {
+            "tg-2": {"publicText": "只有公开" },
+            "tg-3": {"privateText": "只有私信" },
+            "tg-4": {"publicText": "看", "privateText": "细"}})
+        produced |= {b["reason"] for b in plan.get("blocked") or []}
+
+        declared = set(self.CF.REJECT_REASONS)
+        self.assertTrue(produced, "场景没有产生任何拒绝原因，用例本身失效了")
+        self.assertEqual(produced - declared, set(),
+                         "产生了未在 REJECT_REASONS 中声明的原因，宿主无法依赖")
+
+    def test_only_public_reasons_appear_where_expected(self):
+        """阶段二只应出现「阶段一不合格」与「无法私信」两类原因，不得自造新词。"""
+        queue, batch_id = self._prep(4)
+        queue.mark_public("tg-1", self.CF.UNKNOWN, batch_id)
+        queue.mark_public("tg-2", self.CF.BLOCKED, batch_id)
+        queue.mark_public("tg-3", self.CF.FAILED, batch_id)
+        queue.mark_public("tg-4", self.CF.SENT_CONFIRMED, batch_id)
+        allowed, rejected = queue.private_candidates(batch_id)
+        reasons = {r["reason"] for r in rejected}
+        self.assertIn("public_unknown_no_retry", reasons)
+        self.assertIn("public_blocked", reasons)
+        self.assertIn("public_failed", reasons)
+        self.assertEqual([t["targetKey"] for t in allowed],
+                         [queue.plan(batch_id)["targets"][3]["targetKey"]])
+
+    def test_declared_states_cover_every_state_constant(self):
+        constants = {self.CF.QUEUED, self.CF.PLANNED, self.CF.EXPIRED, self.CF.BLOCKED,
+                     self.CF.FAILED, self.CF.UNKNOWN, self.CF.SENT_CONFIRMED}
+        self.assertEqual(constants - set(self.CF.STATES), set(),
+                         "有状态常量没有出现在对外公布的 STATES 里")
+
+
     def test_result_carries_no_client_side_credit_fields(self):
         """docs/api.md：服务端是积分唯一权威，客户端不得提交 charged/price/balance。"""
         queue, batch_id = self._prep(1)
