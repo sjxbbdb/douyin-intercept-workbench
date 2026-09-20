@@ -82,3 +82,35 @@ selectors remain fixture-validated only, the platform has not been observed to
 publish an author id for every live comment, and phase-two delivery keeps the
 same `unknown` semantics as the other send paths.
 
+## Review fixes (PR #7 revision)
+
+Three state-machine defects reported in review are fixed, each with a
+regression test in `LiveFlowTests`:
+
+1. An empty queue no longer leaves a reusable batch behind. `live_plan` on an
+   empty queue returns `status: "empty"` with `batchId: null`; a later
+   listening round therefore gets a fresh batch instead of inheriting the empty
+   one (`test_empty_batch_is_closed_instead_of_reused`).
+2. An open batch that ran past `expiresAt` is closed as `expired`, its events
+   are marked `expired`, and it is never handed back or sent. `live_reply` and
+   `live_private` call `ensure_active` before touching the browser and fail
+   with `batch_expired` (`test_open_batch_is_closed_once_its_window_passed`,
+   `test_phase_methods_refuse_an_expired_batch`).
+3. `mark_private` now updates the row by the resolved `event_key`. It previously
+   selected the right row and then wrote with the caller-facing event id, so the
+   private result was reported as saved while the row stayed empty
+   (`test_private_result_is_persisted`).
+
+Policy is refused at the boundary until the authorization service signs it:
+`live_plan` rejects a caller-supplied `policy` with
+`policy_not_server_issued` and the frozen plan records
+`policySource: "builtin_default"` (`test_client_supplied_policy_is_refused`).
+The library-level seam (`LiveQueue.freeze_plan(policy=...)`) stays in place for
+the server wiring.
+
+Still open and deliberately not claimed as done: server-issued policy,
+credits / feature-switch / audit integration (the local `send_gate.py` remains
+the only local authority), and real-platform acceptance for live selectors,
+author identity, public reply delivery and private delivery.
+
+

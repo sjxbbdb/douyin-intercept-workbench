@@ -479,6 +479,11 @@ class Sidecar:
             raise SidecarError("invalid_input", "livePlan bounds are invalid")
         if not 1 <= max_items <= live_flow.MAX_BATCH:
             raise SidecarError("invalid_input", "livePlan maxItems is out of range")
+        if params.get("policy") is not None:
+            # 策略（allowPublicStates / maxPrivate 等）必须由授权服务端签发并校验；
+            # 在这个接线完成之前，边界一律拒绝调用方自带策略，改用内置的保守默认值。
+            raise SidecarError("policy_not_server_issued",
+                               "policy must be issued by the authorization service, not by the caller")
         batch = self.live_queue.take_batch(max_items=max_items, window_seconds=window_seconds)
         summary = {key: batch[key] for key in
                    ("batchId", "createdAt", "expiresAt", "expiredCount", "frozen", "status")}
@@ -489,7 +494,8 @@ class Sidecar:
                                            params.get("policy"))
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
-                "expired": batch["expired"], "policy": plan["policy"]}
+                "expired": batch["expired"], "policy": plan["policy"],
+                "policySource": plan.get("policySource")}
 
     def live_reply(self, params):
         """Phase one: public reply for accepted items of a frozen batch.
@@ -499,6 +505,7 @@ class Sidecar:
         (images/09) and this side never rewrites them.
         """
         batch_id, items = _live_batch_items(params)
+        self.live_queue.ensure_active(batch_id)
         plan = self.live_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
@@ -546,6 +553,7 @@ class Sidecar:
         instead of being sent.
         """
         batch_id, items = _live_batch_items(params)
+        self.live_queue.ensure_active(batch_id)
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         by_id = {item["eventId"]: item for item in allowed}
         results, sendable = [], []

@@ -791,6 +791,92 @@ class LiveFlowTests(unittest.TestCase):
         self.assertEqual(result["queue"]["duplicates"], 1)
         self.assertEqual(result["queue"]["queued"], 1)
 
+    def test_empty_batch_is_closed_instead_of_reused(self):
+        """回归（评审 #1）：队列为空时不得留下可被永久复用的空批次。"""
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            empty = queue.take_batch(max_items=10, window_seconds=600)
+            self.assertEqual(empty["status"], "empty")
+            self.assertIsNone(empty["batchId"])
+            now[0] += 10
+            queue.append([self._event("e1")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            self.assertNotEqual(batch["batchId"], empty["batchId"])
+            self.assertEqual([event["id"] for event in batch["events"]], ["e1"])
+
+    def test_open_batch_is_closed_once_its_window_passed(self):
+        """回归（评审 #2）：未冻结的批次超窗后必须关闭，不能再被取回或发送。"""
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("e1")])
+            first = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual(first["status"], "ok")
+            now[0] += 61
+            second = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertIsNone(second["batchId"])
+            self.assertEqual(second["status"], "empty")
+            self.assertEqual(queue.batch(first["batchId"])["status"], "expired")
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+
+    def test_phase_methods_refuse_an_expired_batch(self):
+        """回归（评审 #2）：超窗批次即使已被冻结，也不得再发公屏或私信。"""
+        import live_flow
+        import sidecar
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19228)
+            instance.live_queue.clock = lambda: now[0]
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 60,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            now[0] += 61
+            instance._page = lambda: (_ for _ in ()).throw(AssertionError("no browser for expired batch"))
+            for method in ("live_reply", "live_private"):
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.dispatch(method, {"batchId": batch_id,
+                                               "items": [{"eventId": "e1", "sendId": "s-1"}]})
+                self.assertEqual(raised.exception.code, "batch_expired")
+            self.assertEqual(instance.live_queue.batch(batch_id)["status"], "expired")
+
+    def test_private_result_is_persisted(self):
+        """回归（评审 #3）：私信结果必须真的落到库里，否则断点恢复与防重复都会失效。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1")])
+            batch = queue.take_batch(max_items=5, window_seconds=600)
+            queue.freeze_plan(batch["batchId"], self._scripts(["e1"]))
+            queue.mark("e1", live_flow.SENT_CONFIRMED, batch["batchId"])
+            queue.mark_private("e1", live_flow.UNKNOWN, batch["batchId"], {"sendId": "s-1"})
+            event = queue.find_event("e1")
+            self.assertIn("unknown", str(event["private_json"]))
+            self.assertEqual(event["state"], live_flow.SENT_CONFIRMED)
+            reopened = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            self.assertEqual(reopened.result(batch["batchId"])["privateCounts"], {"unknown": 1})
+
+    def test_client_supplied_policy_is_refused(self):
+        """回归（评审 #4）：策略必须由授权服务端签发，边界拒绝调用方自带策略。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19229)
+            instance.live_queue.append([self._event("e1")])
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                "scripts": self._scripts(["e1"]),
+                                                "policy": {"allowPublicStates": ["unknown"]}})
+            self.assertEqual(raised.exception.code, "policy_not_server_issued")
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            self.assertEqual(planned["policy"]["allowPublicStates"], ["sent_confirmed"])
+            self.assertEqual(planned["policySource"], "builtin_default")
+
 
 if __name__ == "__main__":
     unittest.main()
