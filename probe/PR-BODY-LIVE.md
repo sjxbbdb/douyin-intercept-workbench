@@ -138,3 +138,32 @@ python tests/test_probe.py LiveFlowTests BoundaryTests
 LiveFlowTests + BoundaryTests 共 26 项：OK
 ```
 
+
+---
+
+## 8. 与「重新对齐后的直播间九步流程」逐条对照
+
+| # | 流程步骤 | 落点 | 状态 |
+|---|---|---|---|
+| 1 | 持续监听直播间评论 | `live_listen`：一次调用做一轮可见采集并入队，由 host 反复调用形成持续监听 | ✅ |
+| 2 | 按关键词匹配评论 | `live_plan` 的 `keywords` / `excludeKeywords` / `matchMode`（phrase/seg/all/any，**与评论链路同一个匹配器**）；**匹配发生在成批之前**，未命中的事件标 `filtered`，不占批次名额，响应里给 `filter` 计数 | ✅ **本次补齐** |
+| 3 | 去重并形成批次 | 队列按 房间+作者+文本 去重 + `take_batch`（数量上限 50、时间窗 `windowSeconds`） | ✅ |
+| 4 | Agent 根据向量话术库选择公屏回复 | 边界：host 在 `live_plan` 里下发 `scripts[eventId].publicText`；sidecar **不生成、不改写**话术 | ✅ |
+| 5 | 执行公屏回复 | `live_reply` → `send_comment(source="live")`，逐条写状态 | ✅ |
+| 6 | **只有公屏回复确认成功后，才进入私信阶段** | `private_candidates` 默认只放行 `sent_confirmed`；`unknown` 被拒（原因 `public_unknown`），`blocked` / `failed` 同样被拒 | ✅ |
+| 7 | Agent 根据向量话术库选择私信内容 | 边界：host 下发 `scripts[eventId].privateText` | ✅ |
+| 8 | 执行私信 | `live_private` → `send_private`，只对第 6 步得到的候选发送 | ✅ |
+| 9 | 保存批次、事件、发送状态与恢复检查点 | `live_flow.sqlite3`（批次/事件/公屏状态/私信结果）+ `send_state.sqlite3`（幂等与本地额度）+ `live_result.checkpoint` | ✅ |
+
+第 6 步有一处**需要平台侧知晓**的现实约束：本通道的公屏回复结果通常是 `unknown`
+（DOM 现象不算确认，只有把平台响应绑定到那次点击才能给出 `sent_confirmed`）。
+默认策略下这种情况**会停在阶段一、不进入私信** —— 这是按第 6 步刻意设计的 fail-closed 行为，
+不是缺陷；若要让它继续，需要平台侧先提供可绑定的响应证据。
+
+### 本次新增的回归测试
+
+`test_plan_matches_keywords_before_forming_a_batch`（命中才成批，未命中标 filtered / keyword_miss）、
+`test_plan_exclude_keywords_take_precedence`（命中关键词但同时命中排除词 → filtered / keyword_excluded）、
+`test_plan_without_keywords_keeps_every_event`（不给关键词时行为不变）。
+
+离线回归：LiveFlowTests + BoundaryTests 共 **29 项通过**。

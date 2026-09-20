@@ -47,6 +47,12 @@ the platform boundary of images/18 and the script boundary of images/09:
 | `live_private` | phase two: private message per derived candidate | only when something is sendable |
 | `live_result` | batch report, counts and resume checkpoint | no |
 
+`live_plan` also takes the flow-step-2 filter: `keywords`, `excludeKeywords` and `matchMode`
+(`phrase` / `seg` / `all` / `any`), using the same matcher as the video comment path. Matching
+happens before a batch is formed: events that miss every keyword, or that match a keyword and an
+exclude keyword, are marked `filtered` and never occupy a batch slot. The response reports the
+counts under `filter` (`matched` / `missed` / `excluded`).
+
 `live_listen` deduplicates by room plus author plus text and trims the queue to
 its capacity, so the host may call it repeatedly. `live_plan` takes a
 count-bounded batch inside `windowSeconds`; anything older is marked `expired`

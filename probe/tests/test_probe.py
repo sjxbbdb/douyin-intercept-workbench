@@ -877,6 +877,61 @@ class LiveFlowTests(unittest.TestCase):
             self.assertEqual(planned["policy"]["allowPublicStates"], ["sent_confirmed"])
             self.assertEqual(planned["policySource"], "builtin_default")
 
+    def test_plan_matches_keywords_before_forming_a_batch(self):
+        """回归（流程第 2 步）：关键词匹配发生在成批之前，未命中的事件不进批次。"""
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19230)
+            instance.live_queue.append([
+                self._event("hit", text="这个蒸糕怎么做"),
+                self._event("miss", text="主播晚上好"),
+            ])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 10, "windowSeconds": 600, "matchMode": "seg",
+                "keywords": "怎么做", "scripts": self._scripts(["hit", "miss"])})
+            self.assertEqual(planned["status"], "ok")
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["hit"])
+            self.assertEqual(planned["filter"]["matched"], 1)
+            self.assertEqual(planned["filter"]["missed"], 1)
+            self.assertEqual(instance.live_queue.find_event("miss")["state"], live_flow.FILTERED)
+            self.assertEqual(instance.live_queue.find_event("miss")["detail"]["reason"], "keyword_miss")
+
+    def test_plan_exclude_keywords_take_precedence(self):
+        """回归（流程第 2 步）：命中关键词但同时命中排除词的事件被丢弃。"""
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19231)
+            instance.live_queue.append([
+                self._event("ok", text="求链接 谢谢"),
+                self._event("ad", text="求链接 加微信广告"),
+            ])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 10, "windowSeconds": 600, "matchMode": "seg",
+                "keywords": "链接", "excludeKeywords": "广告",
+                "scripts": self._scripts(["ok", "ad"])})
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["ok"])
+            self.assertEqual(planned["filter"]["excluded"], 1)
+            self.assertEqual(planned["filter"]["matched"], 1)
+            self.assertEqual(instance.live_queue.find_event("ad")["detail"]["reason"],
+                             "keyword_excluded")
+
+    def test_plan_without_keywords_keeps_every_event(self):
+        """没给关键词时行为不变：队列里的事件全部可成批。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19232)
+            instance.live_queue.append([self._event("a", text="任何一句话")])
+            planned = instance.dispatch("live_plan", {"maxItems": 10, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["a"])})
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["a"])
+            self.assertEqual(planned["filter"]["matched"], 0)
+            self.assertEqual(planned["filter"]["missed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,7 +33,10 @@ import time
 import uuid
 from contextlib import contextmanager
 
+import crawl as crawlmod
+
 QUEUED = "queued"
+FILTERED = "filtered"
 PLANNED = "planned"
 EXPIRED = "expired"
 BLOCKED = "blocked"
@@ -94,6 +97,41 @@ def normalize_policy(value):
             elif key in ("minTextLength", "maxTextLength"):
                 policy[key] = max(0, int(item))
     return policy
+
+
+def normalize_filter(keywords=None, exclude_keywords=None, mode="seg"):
+    """Keyword spec for one batch (same four modes as the video comment path).
+
+    Reusing crawl's matcher keeps one matching semantics across both chains:
+    phrase / seg / all / any, with exclude keywords taking precedence.
+    """
+    if mode not in crawlmod.MATCH_MODES:
+        raise LiveFlowError("invalid_input",
+                            "matchMode must be one of %s" % ", ".join(crawlmod.MATCH_MODES))
+    return {
+        "keywords": crawlmod.split_keywords(keywords) if not isinstance(keywords, (list, tuple))
+                    else [str(item).strip() for item in keywords if str(item).strip()],
+        "excludeKeywords": crawlmod.split_keywords(exclude_keywords)
+                           if not isinstance(exclude_keywords, (list, tuple))
+                           else [str(item).strip() for item in exclude_keywords if str(item).strip()],
+        "mode": mode,
+    }
+
+
+def filter_is_active(spec):
+    return bool(spec and (spec.get("keywords") or spec.get("excludeKeywords")))
+
+
+def match_event(text, spec):
+    """Return (matched, reason): reason is '', 'keyword_miss' or 'keyword_excluded'."""
+    source = crawlmod.normalize_search_text(text)
+    hit = crawlmod.comment_matches(text, spec["keywords"], spec["mode"])
+    if hit is None:
+        return False, "keyword_miss"
+    for word in spec.get("excludeKeywords") or []:
+        if crawlmod.normalize_search_text(word) and crawlmod.normalize_search_text(word) in source:
+            return False, "keyword_excluded"
+    return True, ""
 
 
 def _script_error(text, policy, label):
@@ -244,7 +282,8 @@ class LiveQueue:
                             {"reason": "queue_capacity_exceeded"}, now=now)
         return len(stale)
 
-    def take_batch(self, max_items=MAX_BATCH, window_seconds=WINDOW_DEFAULT, now=None):
+    def take_batch(self, max_items=MAX_BATCH, window_seconds=WINDOW_DEFAULT, now=None,
+                   filters=None):
         """Take a count-bounded batch inside a time window.
 
         Events older than the window are marked 'expired' first and can never be
@@ -254,6 +293,11 @@ class LiveQueue:
         now = float(now if now is not None else self.clock())
         max_items = max(1, min(int(max_items), MAX_BATCH))
         window_seconds = max(1, int(window_seconds))
+        spec = filters if isinstance(filters, dict) else None
+        filter_stats = {"keywords": list((spec or {}).get("keywords") or []),
+                        "excludeKeywords": list((spec or {}).get("excludeKeywords") or []),
+                        "mode": (spec or {}).get("mode") or "",
+                        "matched": 0, "missed": 0, "excluded": 0}
         expired = []
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -266,6 +310,21 @@ class LiveQueue:
                     self._set_state(conn, row["event_key"], EXPIRED,
                                     {"reason": "window_expired"}, now=now)
                 expired = [json.loads(row["payload_json"] or "{}") for row in expired_rows]
+
+                # 关键词匹配发生在成批之前：不命中的事件标 filtered，不再占用批次名额
+                if filter_is_active(spec):
+                    pending = conn.execute(
+                        "SELECT event_key, payload_json FROM live_events "
+                        "WHERE account_scope=? AND state=? ORDER BY seen_at ASC",
+                        (self.account_scope, QUEUED)).fetchall()
+                    for row in pending:
+                        event = json.loads(row["payload_json"] or "{}")
+                        matched, reason = match_event(event.get("text") or "", spec)
+                        if matched:
+                            filter_stats["matched"] += 1
+                            continue
+                        filter_stats["excluded" if reason == "keyword_excluded" else "missed"] += 1
+                        self._set_state(conn, row["event_key"], FILTERED, {"reason": reason}, now=now)
 
                 batch_id = None
                 open_batch = conn.execute(
@@ -311,6 +370,7 @@ class LiveQueue:
             "frozen": bool(batch and batch["status"] == "frozen"),
             "expiredCount": len(expired),
             "expired": expired[:50],
+            "filter": filter_stats,
             "events": events,
         }
 
@@ -423,11 +483,21 @@ class LiveQueue:
         return {"eventId": str(event_id), "status": str(status)}
 
     def find_event(self, event_id):
-        """Look one event up by the host-facing id or by its queue fingerprint."""
+        """Look one event up by the host-facing id or by its queue fingerprint.
+
+        Parsed 'detail' / 'private' / 'payload' are included so callers do not
+        have to decode the stored JSON themselves.
+        """
         with self._connection() as conn:
-            return self._row(conn.execute(
+            row = self._row(conn.execute(
                 "SELECT * FROM live_events WHERE account_scope=? AND (event_id=? OR event_key=?)",
                 (self.account_scope, str(event_id), str(event_id))).fetchone())
+        if row is None:
+            return None
+        row["detail"] = json.loads(row.get("detail_json") or "{}")
+        row["private"] = json.loads(row.get("private_json") or "{}")
+        row["payload"] = json.loads(row.get("payload_json") or "{}")
+        return row
 
     # ------------------------------------------------------------------- plan
 
