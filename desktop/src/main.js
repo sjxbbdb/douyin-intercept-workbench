@@ -12,6 +12,7 @@ const { ProbeBridge } = require('./lib/probe-bridge');
 const { DEFAULT_SELECTOR_PROFILE, normalizeProfile } = require('./lib/selectors');
 const { TaskEngine } = require('./lib/task-engine');
 const { WorkflowRuntime } = require('./lib/workflow-runtime');
+const { platformAccountId: normalizePlatformAccountId, platformScope, accountDataPath: scopedAccountDataPath, accountDir: scopedAccountDir, browserPartition, sidecarPort: scopedSidecarPort } = require('./lib/platform-account');
 const { targetUrl, text, safeIdempotencyKey } = require('./lib/validation');
 
 let mainWindow;
@@ -27,6 +28,8 @@ let apiEndpoint;
 let uiFrameUrl;
 let sessionEpoch = 0;
 let currentAccountUserId = null;
+let currentPlatformAccountId = null;
+let platformAccounts = [];
 let loginAttempt = 0;
 let accountTransition = Promise.resolve();
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -57,21 +60,23 @@ const PLATFORM_WORKFLOWS = [
   { workflowId: 'live.reply_then_private', version: '1', steps: [{ stepId: 'reply_public', retryLimit: 2, sideEffect: true }, { stepId: 'private_message', retryLimit: 2, sideEffect: true }] }
 ];
 
-function accountDataPath(userId) {
-  const key = crypto.createHash('sha256').update(`${apiEndpoint}:${userId}`).digest('hex').slice(0, 32);
-  return path.join(app.getPath('userData'), 'accounts', key, 'agent-data.json');
+function accountDataPath(userId, platformAccount = currentPlatformAccountId) {
+  return scopedAccountDataPath(app.getPath('userData'), apiEndpoint, userId || 'guest', platformAccount);
 }
 
-function accountDir(userId) {
-  return userId ? path.dirname(accountDataPath(userId)) : path.join(app.getPath('userData'), 'guest-account');
+function accountDir(userId, platformAccount = currentPlatformAccountId) {
+  return scopedAccountDir(app.getPath('userData'), apiEndpoint, userId || 'guest', platformAccount);
 }
 
-function sidecarPort(userId) {
-  const digest = crypto.createHash('sha256').update(`${apiEndpoint}:${userId || 'guest'}`).digest();
-  return 38000 + ((digest.readUInt16BE(0) % 1200));
+function sidecarPort(userId, platformAccount = currentPlatformAccountId) {
+  return scopedSidecarPort(apiEndpoint, userId || 'guest', platformAccount);
 }
 
-async function createBrowser(userId) {
+function runtimeAccountId(userId, platformAccount) {
+  return platformScope({ workbenchUserId: userId || 'guest', platformAccountId: platformAccount }).runtimeAccountId;
+}
+
+async function createBrowser(userId, platformAccount = currentPlatformAccountId) {
   const previous = browser;
   browser = null;
   if (previous) await previous.close?.();
@@ -81,17 +86,17 @@ async function createBrowser(userId) {
     onEvents: (events) => { if (callbackEpoch !== sessionEpoch) return; void engine?.ingest(events); }
   };
   browser = process.env.DOUYIN_ELECTRON_BRIDGE === '1'
-    ? new BrowserBridge({ parentWindow: mainWindow, getPartition: () => 'persist:douyin-' + crypto.createHash('sha256').update(apiEndpoint + ':' + (engine?.publicLicense().user?.id || 'guest')).digest('hex').slice(0, 32), ...common })
-    : new ProbeBridge({ accountDir: accountDir(userId), port: sidecarPort(userId), cwd: path.resolve(__dirname, '..', '..'), resourcesPath: process.resourcesPath, packaged: app.isPackaged, ...common });
+    ? new BrowserBridge({ parentWindow: mainWindow, getPartition: () => browserPartition(apiEndpoint, userId || 'guest', platformAccount), ...common })
+    : new ProbeBridge({ accountDir: accountDir(userId, platformAccount), port: sidecarPort(userId, platformAccount), cwd: path.resolve(__dirname, '..', '..'), resourcesPath: process.resourcesPath, packaged: app.isPackaged, ...common });
 }
 
-function createEngineForStore(nextStore, userId = null) {
+function createEngineForStore(nextStore, userId = null, platformAccount = currentPlatformAccountId) {
   dataStore = nextStore;
   currentAccountUserId = userId;
   engine = new TaskEngine({ store: dataStore, api, authStore, browser, selectorProfile: currentProfile(), onStateChange: emitState, ensureLicense: refreshLicense });
   workflowRuntime = new WorkflowRuntime({
     store: dataStore,
-    accountId: userId || 'guest',
+    accountId: runtimeAccountId(userId, platformAccount),
     workflows: PLATFORM_WORKFLOWS,
     modelDecider: async ({ intent, context }) => {
       if (typeof api?.plan !== 'function') throw new Error('授权中心尚未提供 Agent 规划能力');
@@ -112,10 +117,11 @@ function createEngineForStore(nextStore, userId = null) {
   });
 }
 
-function switchAccountStore(userId, reason = 'account_switch', isCurrent = () => true) {
+function switchAccountStore(userId, reason = 'account_switch', isCurrent = () => true, platformAccount = currentPlatformAccountId) {
   const ownEpoch = ++sessionEpoch;
   const transition = accountTransition.then(async () => {
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
+    const targetPlatformAccount = userId ? (platformAccount || null) : null;
     browserState = { connected: false, collector: 'closed', matchCount: 0 };
     lastProbe = null;
     engine?.invalidate(reason);
@@ -124,15 +130,17 @@ function switchAccountStore(userId, reason = 'account_switch', isCurrent = () =>
     if (previous) await previous.close?.();
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
     browser = null;
+    currentPlatformAccountId = targetPlatformAccount;
+    if (!userId) platformAccounts = [];
     authStore?.setLicense(null);
-    await createBrowser(userId);
+    await createBrowser(userId, targetPlatformAccount);
     if (ownEpoch !== sessionEpoch || !isCurrent()) {
       const created = browser;
       browser = null;
       await created?.close?.();
       return false;
     }
-    createEngineForStore(new JsonStore(userId ? accountDataPath(userId) : path.join(app.getPath('userData'), 'agent-data-guest.json'), defaultData), userId);
+    createEngineForStore(new JsonStore(accountDataPath(userId, targetPlatformAccount), defaultData), userId, targetPlatformAccount);
     return true;
   });
   accountTransition = transition.catch(() => {});
@@ -146,10 +154,68 @@ function assertLocalSender(event) {
 }
 
 function emitState() {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: currentAccountUserId || 'guest', runs: [] } });
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, platformAccounts, platformAccountId: currentPlatformAccountId });
 }
 
 function currentProfile() { return dataStore.get().selectorProfile || DEFAULT_SELECTOR_PROFILE; }
+
+function normalizedPlatformAccounts(payload) {
+  const rows = Array.isArray(payload) ? payload : payload?.accounts;
+  if (!Array.isArray(rows)) throw new Error('授权中心返回的平台账号列表无效');
+  return rows.filter((item) => item && typeof item.id === 'string' && item.id.trim() && item.status !== 'disabled').map((item) => ({ ...item, id: normalizePlatformAccountId(item.id) }));
+}
+
+async function fetchPlatformAccounts(requestApi = api, tokenOverride = null) {
+  const response = await requestApi.platformAccounts(tokenOverride || authStore.getToken());
+  return normalizedPlatformAccounts(response);
+}
+
+function preferredPlatformAccount(userId, accounts) {
+  const persisted = authStore.getPlatformAccountId(userId);
+  return accounts.find((item) => item.id === persisted)?.id || accounts[0]?.id || null;
+}
+
+async function switchPlatformAccount(platformAccount) {
+  if (!currentAccountUserId || !authStore.getToken()) throw new Error('请先登录工作台');
+  const selected = normalizePlatformAccountId(platformAccount);
+  const requestToken = authStore.getToken();
+  const requestApi = api;
+  const accounts = await fetchPlatformAccounts(requestApi, requestToken);
+  if (!accounts.some((item) => item.id === selected)) throw new Error('平台账号不属于当前工作台或已停用');
+  if (selected === currentPlatformAccountId) { platformAccounts = accounts; authStore.setPlatformAccountId(currentAccountUserId, selected); emitState(); return { accounts, platformAccountId: selected }; }
+  const license = authStore.getLicense();
+  const switched = await switchAccountStore(currentAccountUserId, 'platform_account_switch', () => requestApi === api && authStore.getToken() === requestToken, selected);
+  if (!switched) throw new Error('平台账号切换已过期');
+  platformAccounts = accounts;
+  authStore.setPlatformAccountId(currentAccountUserId, selected);
+  if (license) engine.setLicense(license);
+  emitState();
+  return { accounts, platformAccountId: selected };
+}
+
+async function createPlatformAccount(input) {
+  if (!currentAccountUserId || !authStore.getToken()) throw new Error('请先登录工作台');
+  const platform = text(input?.platform || 'douyin', 'platform', 40);
+  const accountRef = text(input?.accountRef, 'accountRef', 200);
+  const displayName = input?.displayName == null || input.displayName === '' ? '' : text(input.displayName, 'displayName', 200);
+  const requestToken = authStore.getToken();
+  const created = await api.createPlatformAccount({ platform, accountRef, displayName }, requestToken);
+  const selected = normalizePlatformAccountId(created?.id);
+  const result = await switchPlatformAccount(selected);
+  return { account: created, ...result };
+}
+
+async function listPlatformAccounts() {
+  if (!currentAccountUserId || !authStore.getToken()) throw new Error('请先登录工作台');
+  const accounts = await fetchPlatformAccounts(api, authStore.getToken());
+  platformAccounts = accounts;
+  if (currentPlatformAccountId && !accounts.some((item) => item.id === currentPlatformAccountId)) {
+    const selected = preferredPlatformAccount(currentAccountUserId, accounts);
+    if (selected) await switchPlatformAccount(selected);
+  }
+  emitState();
+  return { accounts: platformAccounts, platformAccountId: currentPlatformAccountId };
+}
 
 async function refreshLicense(tokenOverride = null) {
   const requestEpoch = sessionEpoch;
@@ -165,9 +231,13 @@ async function refreshLicense(tokenOverride = null) {
     if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) return { state: 'stale' };
     const safe = publicLicensePayload(me);
     if (!safe.user?.id) throw new Error('授权中心响应缺少用户身份');
-    if (currentAccountUserId !== safe.user.id) {
-      const switched = await switchAccountStore(safe.user.id, 'account_switch_from_refresh', () => requestApi === api && authStore.getToken() === requestToken);
+    if (currentAccountUserId !== safe.user.id || currentPlatformAccountId == null) {
+      const accounts = await fetchPlatformAccounts(requestApi, requestToken);
+      const selected = preferredPlatformAccount(safe.user.id, accounts);
+      const switched = await switchAccountStore(safe.user.id, 'account_switch_from_refresh', () => requestApi === api && authStore.getToken() === requestToken, selected);
       if (!switched) return { state: 'stale' };
+      platformAccounts = accounts;
+      if (selected) authStore.setPlatformAccountId(safe.user.id, selected);
     }
     engine.setLicense(safe);
     return engine.publicLicense();
@@ -197,8 +267,12 @@ async function handleLogin(_event, input) {
     if (attempt !== loginAttempt || requestApi !== api) throw new Error('登录会话已切换，请重试');
     const safe = publicLicensePayload(me);
     if (!safe.user?.id) throw new Error('授权中心响应缺少用户身份');
-    const switched = await switchAccountStore(safe.user.id, 'login_account_switch', () => attempt === loginAttempt && requestApi === api);
+    const accounts = await fetchPlatformAccounts(requestApi, response.token);
+    const selected = preferredPlatformAccount(safe.user.id, accounts);
+    const switched = await switchAccountStore(safe.user.id, 'login_account_switch', () => attempt === loginAttempt && requestApi === api, selected);
     if (!switched || attempt !== loginAttempt || requestApi !== api) throw new Error('登录会话已切换，请重试');
+    platformAccounts = accounts;
+    if (selected) authStore.setPlatformAccountId(safe.user.id, selected);
     authStore.setSession(response.token, safe, requestApi.baseUrl);
     engine.setLicense(safe);
     return engine.publicLicense();
@@ -251,8 +325,11 @@ async function handleRedeem(_event, input) {
 
 function registerIpc() {
   const wrap = (handler) => async (event, payload) => { assertLocalSender(event); return handler(event, payload); };
-  ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: currentAccountUserId || 'guest', runs: [] } })));
+  ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, platformAccounts, platformAccountId: currentPlatformAccountId })));
   ipcMain.handle('agent:list-workflows', wrap(() => workflowRuntime.listWorkflows()));
+  ipcMain.handle('platform-accounts:list', wrap(() => listPlatformAccounts()));
+  ipcMain.handle('platform-accounts:select', wrap((_event, platformId) => switchPlatformAccount(platformId)));
+  ipcMain.handle('platform-accounts:create', wrap((_event, input) => createPlatformAccount(input)));
   ipcMain.handle('agent:chat', wrap(async (_event, input) => {
     if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
     const message = text(input?.message, 'message', 4000);
@@ -264,7 +341,7 @@ function registerIpc() {
     const contractSteps = Array.isArray(registered.contract?.steps) ? registered.contract.steps : [];
     if (!contractSteps.length) throw new Error('授权中心返回的固定流程没有可执行步骤');
     workflowRuntime.registerWorkflow({ workflowId: registered.workflowId, version: String(registered.version), steps: contractSteps });
-    const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}`) });
+    const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: currentPlatformAccountId || undefined, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}`) });
     const remoteRunId = remote?.run?.id;
     if (!remoteRunId) throw new Error('授权中心未返回流程实例');
     await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: 0 });
@@ -363,7 +440,7 @@ async function boot() {
   // A cached license is only a display hint.  Do not expose it as authorized
   // before the first online /me check; keep the encrypted token for recovery.
   authStore.setLicense(null);
-  dataStore = new JsonStore(path.join(userData, 'agent-data-guest.json'), defaultData);
+  dataStore = new JsonStore(accountDataPath(null, null), defaultData);
   await createBrowser(null);
   createEngineForStore(dataStore, null);
   registerIpc();

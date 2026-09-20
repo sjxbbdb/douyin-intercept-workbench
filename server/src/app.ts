@@ -4,6 +4,7 @@ import { randomId, randomToken, hashPayload, hashToken, hashPassword, verifyPass
 import { Store } from './store.js';
 import { AppError, badRequest, conflict, forbidden, unauthorized } from './errors.js';
 import { registerWorkflowRoutes } from './workflow-routes.js';
+import { registerKnowledgeRoutes } from './knowledge-routes.js';
 
 export interface AppConfig {
   dbPath?: string;
@@ -382,6 +383,10 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
     userFromRequest: (request) => userFromRequest(store, request, config),
     adminFromRequest: (request) => adminFromRequest(store, request),
     planner: (input) => providerPlan(config, input),
+  });
+  registerKnowledgeRoutes(app, {
+    store,
+    userFromRequest: (request) => userFromRequest(store, request, config),
   });
 
   app.addHook('onClose', async () => store.close());

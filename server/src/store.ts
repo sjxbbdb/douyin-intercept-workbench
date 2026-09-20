@@ -89,6 +89,30 @@ CREATE TABLE IF NOT EXISTS knowledge_sets (
   UNIQUE(user_id, name)
 );
 CREATE INDEX IF NOT EXISTS knowledge_sets_user_idx ON knowledge_sets(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  knowledge_set_id TEXT NOT NULL REFERENCES knowledge_sets(id) ON DELETE CASCADE,
+  knowledge_set_version INTEGER NOT NULL CHECK(knowledge_set_version > 0),
+  title TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS knowledge_documents_scope_idx ON knowledge_documents(user_id, knowledge_set_id, knowledge_set_version);
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  knowledge_set_id TEXT NOT NULL REFERENCES knowledge_sets(id) ON DELETE CASCADE,
+  knowledge_set_version INTEGER NOT NULL CHECK(knowledge_set_version > 0),
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  text TEXT NOT NULL,
+  vector_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(document_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS knowledge_chunks_scope_idx ON knowledge_chunks(user_id, knowledge_set_id, knowledge_set_version);
 CREATE TABLE IF NOT EXISTS workflow_runs (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -7,7 +7,7 @@ const { JsonStore } = require('./json-store');
 class AuthStore {
   constructor(userDataPath, safeStorage) {
     this.safeStorage = safeStorage;
-    this.store = new JsonStore(`${userDataPath}/auth.json`, () => ({ deviceId: crypto.randomUUID(), token: null, license: null, endpoint: null }));
+    this.store = new JsonStore(`${userDataPath}/auth.json`, () => ({ deviceId: crypto.randomUUID(), token: null, license: null, endpoint: null, platformAccountIds: {} }));
   }
 
   getDevice() {
@@ -44,6 +44,17 @@ class AuthStore {
 
   getLicense() {
     return this.store.get().license || null;
+  }
+
+  getPlatformAccountId(workbenchUserId) {
+    if (typeof workbenchUserId !== 'string' || !workbenchUserId.trim()) return null;
+    const state = this.store.get();
+    return state.platformAccountIds?.[workbenchUserId] || null;
+  }
+
+  setPlatformAccountId(workbenchUserId, platformAccountId) {
+    if (typeof workbenchUserId !== 'string' || !workbenchUserId.trim()) throw new TypeError('workbenchUserId is required');
+    this.store.update((state) => ({ ...state, platformAccountIds: { ...(state.platformAccountIds || {}), [workbenchUserId]: platformAccountId || null } }));
   }
 
   clear() {

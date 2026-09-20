@@ -17,6 +17,20 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build the bundled sidecar runtime
+        shell: cmd
+        working-directory: probe
+        run: build_sidecar.cmd
+      - name: Copy the complete sidecar onedir into the desktop bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force desktop/build/probe | Out-Null
+          Copy-Item probe/dist/probe-agent/* desktop/build/probe -Recurse -Force
+      - name: Check release inputs before electron-builder
+        run: node scripts/verify-desktop-release-preflight.mjs
       - run: npm ci
         working-directory: desktop
       - run: npm run check
@@ -25,6 +39,10 @@ jobs:
         working-directory: desktop
       - run: npm run build:nsis
         working-directory: desktop
+      - name: Check release artifacts and packaged contents
+        run: node scripts/verify-desktop-release-preflight.mjs --artifacts
+      - name: Run isolated package smoke check
+        run: node scripts/verify-desktop-package.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: douyin-intercept-agent-windows

@@ -9,6 +9,8 @@ const { targetUrl, selectorProfile } = require('../src/lib/validation');
 const { ApiClient, ApiError } = require('../src/lib/api-client');
 const { TaskEngine } = require('../src/lib/task-engine');
 const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
+const { AuthStore } = require('../src/lib/auth-store');
+const { platformScope, accountDataPath, browserPartition, sidecarPort } = require('../src/lib/platform-account');
 
 let passed = 0;
 function test(name, fn) { try { fn(); passed += 1; console.log(`PASS ${name}`); } catch (error) { console.error(`FAIL ${name}`); throw error; } }
@@ -26,6 +28,40 @@ test('JsonStore rejects a directory containing only damaged versions', () => { c
 test('JsonStore EXDEV fallback is revision based and reopens latest data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated EFS rename'); error.code = 'EXDEV'; throw error; }; const store = new JsonStore(file, { state: 'initial' }); store.set({ state: 'one' }); store.set({ state: 'two' }); const reopened = new JsonStore(file, {}); assert.equal(reopened.get().state, 'two'); assert.equal(reopened.revision, 2); } finally { fs.renameSync = originalRename; } });
 test('JsonStore does not commit memory when disk write fails', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { state: 'initial' }); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated disk full'); error.code = 'ENOSPC'; throw error; }; assert.throws(() => store.set({ state: 'failed' }), /disk full/); assert.equal(store.get().state, 'initial'); assert.equal(store.revision, 0); } finally { fs.renameSync = originalRename; } });
 test('restarts pause persisted running tasks without an active collector', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [{ id: 'task-running', status: 'running', generation: 2 }], events: [], leads: [], logs: [], pending: [], selectorProfile: {} })); const authStore = { getLicense: () => null, setLicense: () => {} }; new TaskEngine({ store, api: {}, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {} }); const recovered = store.get(); assert.equal(recovered.tasks[0].status, 'paused'); assert.equal(recovered.tasks[0].generation, 3); assert.equal(recovered.logs.at(-1).detail.reason, 'desktop_restarted_without_active_collector'); });
+
+test('platform account selection is persisted per workbench user and derives isolated runtime/browser scopes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-platform-'));
+  const safeStorage = { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() };
+  const auth = new AuthStore(dir, safeStorage);
+  auth.setPlatformAccountId('workbench-a', 'platform-a');
+  auth.setPlatformAccountId('workbench-b', 'platform-b');
+  assert.equal(auth.getPlatformAccountId('workbench-a'), 'platform-a');
+  assert.equal(auth.getPlatformAccountId('workbench-b'), 'platform-b');
+  assert.equal(auth.getPlatformAccountId('workbench-c'), null);
+  const scopeA = platformScope({ workbenchUserId: 'workbench-a', platformAccountId: 'platform-a' });
+  const scopeB = platformScope({ workbenchUserId: 'workbench-a', platformAccountId: 'platform-b' });
+  assert.notEqual(scopeA.runtimeAccountId, scopeB.runtimeAccountId);
+  assert.notEqual(accountDataPath(dir, 'https://license.example', 'workbench-a', 'platform-a'), accountDataPath(dir, 'https://license.example', 'workbench-a', 'platform-b'));
+  assert.notEqual(browserPartition('https://license.example', 'workbench-a', 'platform-a'), browserPartition('https://license.example', 'workbench-a', 'platform-b'));
+  assert.notEqual(sidecarPort('https://license.example', 'workbench-a', 'platform-a'), sidecarPort('https://license.example', 'workbench-a', 'platform-b'));
+});
+
+testAsync('workflow runtime isolates two platform accounts under one workbench user', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-platform-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = { workflowId: 'platform-isolation.fixture', version: '1', steps: ['hold'] };
+  const make = (platformId) => new WorkflowRuntime({ store, accountId: platformScope({ workbenchUserId: 'workbench-a', platformAccountId: platformId }).runtimeAccountId, modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: {} }), workflows: [definition], stepExecutor: async () => ({ status: 'wait_human', checkpoint: { platformId } }) });
+  const accountA = make('platform-a');
+  const accountB = make('platform-b');
+  const runA = accountA.startPlan(await accountA.planFromIntent('账号 A')); const runB = accountB.startPlan(await accountB.planFromIntent('账号 B'));
+  const [waitingA, waitingB] = await Promise.all([accountA.run(runA.runId), accountB.run(runB.runId)]);
+  assert.equal(waitingA.checkpoint.platformId, 'platform-a');
+  assert.equal(waitingB.checkpoint.platformId, 'platform-b');
+  assert.equal(accountA.snapshot().runs.length, 1);
+  assert.equal(accountB.snapshot().runs.length, 1);
+  assert.equal(accountA.snapshot().runs[0].accountId, 'workbench-a:platform-a');
+  assert.equal(accountB.snapshot().runs[0].accountId, 'workbench-a:platform-b');
+});
 
 testAsync('workflow decision is frozen before execution and never called while running', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
@@ -220,6 +256,17 @@ testAsync('ApiClient uses login token for immediate me check without persisting 
   const api = new ApiClient({ baseUrl: 'https://license.example', authStore: { getToken: () => null }, fetchImpl: async (_url, options) => { seen = options.headers.Authorization; return { ok: true, status: 200, json: async () => ({ user: { id: 'u1' } }) }; } });
   await api.me('fresh-token');
   assert.equal(seen, 'Bearer fresh-token');
+});
+testAsync('ApiClient platform account endpoints preserve the server account contract', async () => {
+  const requests = [];
+  const api = new ApiClient({ baseUrl: 'https://license.example', authStore: { getToken: () => null }, fetchImpl: async (url, options) => { requests.push({ url, options }); return { ok: true, status: 200, json: async () => url.endsWith('/platform-accounts') && options.method === 'GET' ? { accounts: [{ id: 'platform-a', platform: 'douyin', accountRef: 'a', displayName: '主账号', status: 'active' }] } : { id: 'platform-b', platform: 'douyin', accountRef: 'b', displayName: '备用账号', status: 'active' } }; } });
+  const listed = await api.platformAccounts('platform-token');
+  const created = await api.createPlatformAccount({ platform: 'douyin', accountRef: 'b', displayName: '备用账号' }, 'platform-token');
+  assert.equal(listed.accounts[0].id, 'platform-a');
+  assert.equal(created.id, 'platform-b');
+  assert.equal(requests[0].url, 'https://license.example/v1/platform-accounts');
+  assert.equal(requests[1].options.method, 'POST');
+  assert.equal(requests[1].options.headers.Authorization, 'Bearer platform-token');
 });
 
 testAsync('rule event skips unrelated text before paid evaluation', async () => {

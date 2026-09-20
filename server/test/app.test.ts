@@ -215,3 +215,19 @@ test('credit action reserve commit release is idempotent and bounded', async () 
     const second = await f.app.inject({ method: 'POST', url: '/v1/credits/actions/reserve', headers: { authorization: `Bearer ${token}` }, payload: { actionKey: 'reply-action-003', owner: 'reply', amount: 1, metadata: {} } }); assert.equal(second.statusCode, 200); const released = await f.app.inject({ method: 'POST', url: `/v1/credits/actions/${second.json().action.id}/release`, headers: { authorization: `Bearer ${token}` }, payload: {} }); assert.equal(released.json().action.status, 'released');
   } finally { await f.close(); }
 });
+
+test('knowledge documents are chunked, version-frozen, isolated and searchable', async () => {
+  const f = await fixture(); try {
+    const a = await f.create({ username: 'kb-a' }); const b = await f.create({ username: 'kb-b' });
+    const loginA = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: a.username, password: a.password, deviceId: 'kb-a', deviceName: 'A' } }); const tokenA = loginA.json().token;
+    const loginB = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: b.username, password: b.password, deviceId: 'kb-b', deviceName: 'B' } }); const tokenB = loginB.json().token;
+    const set = await f.app.inject({ method: 'POST', url: '/v1/knowledge-sets', headers: { authorization: `Bearer ${tokenA}` }, payload: { name: '产品资料' } }); const setId = set.json().id;
+    const doc = await f.app.inject({ method: 'POST', url: '/v1/knowledge-documents', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, title: '价格说明', content: '价格 套餐 联系方式。'.repeat(60), metadata: { source: 'fixture' } } }); assert.equal(doc.statusCode, 200); assert.equal(doc.json().document.version, 1); assert.ok(doc.json().document.chunkCount > 1);
+    const hidden = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${tokenB}` }, payload: { knowledgeSetId: setId, query: '价格' } }); assert.equal(hidden.statusCode, 404);
+    const found = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, query: '价格', topK: 2 } }); assert.equal(found.statusCode, 200); assert.equal(found.json().version, 1); assert.ok(found.json().results.length > 0); assert.equal(found.json().backend, 'deterministic-token-bag');
+    const bumped = await f.app.inject({ method: 'PATCH', url: `/v1/knowledge-sets/${setId}`, headers: { authorization: `Bearer ${tokenA}` }, payload: { description: '版本二' } }); assert.equal(bumped.json().version, 2);
+    const currentEmpty = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, query: '价格' } }); assert.equal(currentEmpty.statusCode, 200); assert.equal(currentEmpty.json().version, 2); assert.equal(currentEmpty.json().results.length, 0);
+    const frozen = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, version: 1, query: '价格' } }); assert.equal(frozen.statusCode, 200); assert.ok(frozen.json().results.length > 0);
+    const tooLarge = await f.app.inject({ method: 'POST', url: '/v1/knowledge-documents', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, title: '大文档', content: 'x'.repeat(200_001) } }); assert.equal(tooLarge.statusCode, 413);
+  } finally { await f.close(); }
+});

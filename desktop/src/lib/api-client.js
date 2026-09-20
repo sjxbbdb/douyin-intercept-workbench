@@ -101,6 +101,14 @@ class ApiClient {
   recoverWorkflow(runId, body) {
     return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/recover`, body, 12000);
   }
+
+  platformAccounts(tokenOverride = null) {
+    return this.request('GET', '/v1/platform-accounts', undefined, 12000, tokenOverride);
+  }
+
+  createPlatformAccount(body, tokenOverride = null) {
+    return this.request('POST', '/v1/platform-accounts', body, 12000, tokenOverride);
+  }
 }
 
 module.exports = { ApiClient, ApiError };
