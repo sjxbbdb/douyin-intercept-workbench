@@ -1,0 +1,29 @@
+feat(probe): 直播间批次流程（事件队列 / 时间窗批次 / 双渠道话术 / 两阶段触达）
+
+按架构图 images/12-live-room-business 实现协作方这一侧，同时守住两张边界图：
+话术与知识库由平台准备（images/09）、动作账本与幂等（images/17）。
+
+新增 probe/live_flow.py：
+- 去重、有容量上限的事件队列：按 房间+作者+文本 去重，超出容量丢最旧并记 expired
+- 按数量取批次 + 有效时间窗口校验：过期事件标 expired，之后永不复用（过期处理，不集中补发）
+- 未冻结的批次在重试时复用，避免一次重试产生两个批次
+- freeze_plan：双渠道话术 publicText/privateText 必须由平台下发；缺失或超界则目标 blocked，
+  绝不代写或改写话术
+- private_candidates：阶段二清单由阶段一状态推导，默认只放行 sent_confirmed；
+  unknown/blocked/failed/缺作者标识/超出 maxPrivate 一律拒绝并给出原因
+- result：分状态计数、私信候选与可恢复检查点；状态落在 live_flow.sqlite3（与发送账本同目录）
+
+sidecar.py 新增 5 个方法，capabilities 同步声明（live_batch 的 autoEligible=false）：
+live_listen / live_plan / live_reply / live_private / live_result。
+两个发送阶段先做离线预检（话术与冻结计划不一致 -> script_mismatch 直接拦截），
+只有确实要发才打开浏览器；每个条目沿用 host 下发的 sendId，
+持久化 reservation、额度与 未知不重发 仍留在 send_gate.py。
+
+测试：tests/test_probe.py 新增 LiveFlowTests（8 个用例），覆盖去重与容量上限、
+窗口过期不再复用、批次复用、双渠道话术缺失拦截、阶段二策略（unknown 不放行）、
+规划与拦截均不需要浏览器、capabilities 与 result 的契约。
+离线回归：LiveFlowTests + BoundaryTests 共 21 项通过。
+
+未验证边界（fail-closed，发行开关前必须解决）：
+直播间选择器仍只经离线 fixture 校验；平台未证实每条弹幕都带作者标识；
+阶段二送达沿用其他发送通道的 unknown 语义。
