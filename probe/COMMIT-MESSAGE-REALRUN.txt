@@ -1,0 +1,20 @@
+docs(probe): 记录 2026-09-20 真机执行结果（弹幕回复 9 次 / 私信首次跑通），并回填能力矩阵
+
+probe/EVIDENCE.md 新增「直播间回复弹幕与私信：真机执行记录（2026-09-20）」：
+- 弹幕回复 9 次真实发送（跨多个直播间）：目标弹幕唯一命中且未被遮挡、话术自带 @昵称、
+  发送键=回车、发送后输入框清空、房间消息流出现该条（roomEcho true）；
+  平台 HTTP 响应为 0（本通道走长连接）-> 仍记 unknown，另记 sent_echoed。
+- 私信首次真机跑通：收件人校验走会话头部标题（live_panel_header）、发送键回车、
+  发送后输入框清空、会话里出现该条（conversationEcho true）；平台响应 0 -> unknown。
+- 前提条件：visibilityState=hidden 时点击不送达渲染进程，发送前必须 force_page_active。
+- 未完成项如实列出：面板能否打开是平台侧差异；回声 != 平台响应；送达后的可见性与限流未测；
+  脱敏昵称（小***）一律 nickname_masked 拒绝，不 @ 假名字。
+
+probe/sidecar.py 能力矩阵按实测回填（autoEligible 仍全部 false）：
+- live_danmaku_reply: sendMechanism=enter_verified_2026_09_20,
+  delivery=room_echo_only_platform_response_unavailable
+- 新增 live_private_reply: recipientVerification=live_panel_header,
+  sendMechanism=enter_verified_2026_09_20,
+  delivery=conversation_echo_only_platform_response_unavailable
+
+离线回归：78 项 77 通过；唯一失败为沙箱禁止多进程（PermissionError WinError 5），环境限制。

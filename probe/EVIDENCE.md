@@ -270,3 +270,57 @@ live-avatar           x4
 3. 验证 `SendGate` 在三态（已完成 / 结果未知 / 未执行）下的落库与重启恢复；
 4. 验证连续回复触发平台限流的阈值，并把观测值回填到服务端策略；
 5. 以上任一项未达成，`autoEligible` 必须保持 `false`（fail-closed）。
+---
+
+## 直播间「回复弹幕」与私信：真机执行记录（2026-09-20）
+
+> 与本文其余部分同一脱敏口径：**不含 sec_uid、昵称、消息原文、Cookie 或 token**。
+
+### 执行环境
+
+| 项 | 值 |
+|---|---|
+| 日期 | 2026-09-20 |
+| 浏览器 | Chrome 153.0.8010.50（CDP `127.0.0.1:9222`） |
+| 账号 | 抖音个人号；在专用调试 profile 中由商家**手动扫码登录** |
+| 页面 | `live.douyin.com` 真实直播间（跨多个房间，实时弹幕） |
+
+### 弹幕回复（`live_danmaku_reply`）
+
+真实执行 **9 次**（跨多个直播间，每次目标弹幕不同），每次发送后的观测一致：
+
+| 观测项 | 结果 |
+|---|---|
+| 目标弹幕定位 | 唯一命中且未被遮挡（`danmakuLocated: true`） |
+| 话术前缀 | 平台侧下发、自带 `@昵称`（`mentioned: true`） |
+| 发送机制 | **回车**（`mechanism: "enter"`）；输入框右侧图标经实测**不是**发送键 |
+| 发送后输入框 | 立刻清空（`composerCleared: true`） |
+| 房间消息流 | 出现该条（`roomEcho: true`，数据源 `page_memory`） |
+| 平台 HTTP 响应 | **无**（本通道走长连接）→ 按红线 2 记 `unknown`，另记 `sent_echoed` |
+
+### 私信（`live_private_reply` / `send_private`）
+
+| 观测项 | 结果 |
+|---|---|
+| 收件人校验 | `live_panel_header`：面板 `messageEditor` + 会话头部标题与目标昵称一致 |
+| 发送机制 | **回车**（与公屏同一套富文本编辑器） |
+| 发送后输入框 | 清空（`composerCleared: true`） |
+| 会话回声 | 出现该条（`conversationEcho: true`） |
+| 平台 HTTP 响应 | 0 条（IM 走长连接）→ 结果 `unknown` |
+
+> 关键前提：真机发现 `visibilityState=hidden` 时**点击不送达渲染进程**（私信面板"成片打不开"、
+> 人工点却正常），因此发送前必须 `force_page_active`（`Page.setWebLifecycleState(active)` +
+> `Emulation.setFocusEmulationEnabled`）。
+
+### 未完成 / 未验证（fail-closed 依据）
+
+* ❌ 私信面板**能否打开是平台侧差异**：同一批目标里，部分点「私信」面板正常打开、部分始终不开
+  （疑似需互关或对方设置了隐私）。面板不开时一律 `composer_not_found`，不做任何猜测性点击。
+* ❌ `roomEcho` / `conversationEcho` 是**页面观测证据**，不是平台响应；是否把它们当作该通道的确认，
+  需平台侧与评审共同决定（默认策略仍只放行 `sent_confirmed`，因此不会自动串起两阶段）。
+* ❌ 未验证送达后的**对方可见性**（提醒、折叠、限流阈值）。
+* ❌ 部分直播间把昵称脱敏为 `小***`：此时 `danmaku` 模式一律 `nickname_masked` 拒绝，**不 @ 假名字**。
+
+**发行开关条件**：以上"未完成"项逐条有可复查证据之前，`live_danmaku_reply.autoEligible`
+与私信相关开关必须保持 `false`。
+

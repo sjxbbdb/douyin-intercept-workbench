@@ -358,14 +358,24 @@ class Sidecar:
                                                "scripts": "host_provided_only",
                                                "window": "expired_events_are_not_replayed"}},
                 # 回复弹幕（公屏 @该观众）。真机结论 2026-09-20：网页端没有「点弹幕回复」的
-                # 原生入口，所以落地形式是公屏 @昵称；发送机制（按钮 or 回车）与送达证据
-                # 都还没拿到真机确认 —— 因此 autoEligible 保持 false，并写明未验证项。
+                # 原生入口，落地形式是公屏 @昵称；发送键经实测是【回车】。
+                # 已有房间消息流回声作证据，但没有平台响应 -> delivery 仍不是 confirmed。
                 "live_danmaku_reply": {"implemented": True, "autoEligible": False,
-                                        "validation": {"status": "offline_unit_tests",
-                                                       "delivery": "unknown",
+                                        "validation": {"status": "offline_unit_tests+real_run_2026_09_20",
+                                                       "delivery": "room_echo_only_platform_response_unavailable",
                                                        "mention": "text_must_start_with_at_nickname",
                                                        "target": "danmaku_must_be_visible_and_unique",
-                                                       "sendMechanism": "unverified_button_or_enter"}},
+                                                       "sendMechanism": "enter_verified_2026_09_20",
+                                                       "realRuns": "9 sends, roomEcho true each time"}},
+                # 私信（两阶段里的第二阶段）。真机 2026-09-20 首次跑通一条：
+                # 收件人校验用会话头部标题，发送键回车，发送后会话里出现该条。
+                # 仍然 autoEligible=false：没有平台响应，且"面板能否打开"是平台侧差异。
+                "live_private_reply": {"implemented": True, "autoEligible": False,
+                                        "validation": {"status": "offline_unit_tests+real_run_2026_09_20",
+                                                       "delivery": "conversation_echo_only_platform_response_unavailable",
+                                                       "recipientVerification": "live_panel_header",
+                                                       "sendMechanism": "enter_verified_2026_09_20",
+                                                       "panelMayNotOpen": "platform_side_difference"}},
                 # 评论区固定流程：关键词匹配评论 -> 公开回复 -> 只有 sent_confirmed 才允许私信。
                 # 拒绝原因是稳定枚举（见模块级 _public_guard），宿主可直接据此决策。
                 "comment_flow": {"implemented": True, "autoEligible": False,
