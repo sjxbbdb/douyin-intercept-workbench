@@ -607,71 +607,185 @@ def comment_composer(cdp):
     return cdp.eval_json(_COMMENT_COMPOSER_JS) or {"found": False}
 
 
-_COMMENT_REPLY_COMPOSER_JS = (
-    "(function(target){function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
-    "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
-    "function authorOk(row){if(!target.authorId)return true;var as=row.querySelectorAll('a[href]');"
-    "for(var i=0;i<as.length;i++){try{var p=new URL(as[i].href,location.href).pathname.replace(/\\/$/,'');"
-    "var n=(as[i].innerText||as[i].textContent||'').trim();"
-    "if(p==='/user/'+target.authorId&&(!target.authorName||n===target.authorName))return true;"
-    "}catch(e){}}return false;}"
-    "function textOk(row){var ns=row.querySelectorAll('" + S.COMMENT_CONTENT + "');"
-    "for(var i=0;i<ns.length;i++)if((ns[i].innerText||ns[i].textContent||'').trim()===(target.text||'').trim())return true;"
-    "return false;}"
-    "var rows=Array.from(document.querySelectorAll('" + S.COMMENT_ITEM + "')).filter(vis);"
-    "var byId=rows.filter(function(row){return row.id===target.id||row.getAttribute('data-comment-id')===target.id;});"
-    "var hits=(byId.length?byId:rows).filter(function(row){return textOk(row)&&authorOk(row);});"
-    "if(hits.length!==1)return {found:false,reason:hits.length?'ambiguous_comment':'comment_not_found',count:hits.length};"
-    "var row=hits[0],sels=" + json.dumps(S.COMMENT_REPLY_EDITORS) + ",eds=[];"
-    "for(var s=0;s<sels.length;s++){var ns=row.querySelectorAll(sels[s]);for(var j=0;j<ns.length;j++)if(vis(ns[j])&&eds.indexOf(ns[j])<0)eds.push(ns[j]);}"
-    "if(eds.length!==1)return {found:false,reason:eds.length?'ambiguous_reply_editor':'reply_editor_not_found',count:eds.length};"
-    "var r=eds[0].getBoundingClientRect();return {found:true,scope:'reply',"
-    "rowId:row.id||row.getAttribute('data-comment-id')||'',x:Math.round(r.x+r.width/2),"
-    "y:Math.round(r.y+r.height/2),text:(eds[0].innerText||eds[0].value||'')};})(TARGET)"
+# ===================== 评论区回复：真机验证过的定位原语 =====================
+#
+# 🔴 2026-09-20 真机校正（video/7686815808756020563，Chrome 153）
+#
+# 旧实现用 [data-e2e="comment-content"] / comment-reply / comment-reply-input /
+# comment-reply-submit 定位 —— 这些名字【真机上都不存在】，只在离线夹具里成立。
+# 结果 video_reply 一直停在 autoEligible=false：夹具全绿，真机一个也匹配不到。
+#
+# 真机上的实际形态与对应策略：
+#   1) 评论正文   裸节点           -> 兄弟节点排除法（bodyText）
+#   2) 「回复」    裸 <span>        -> 文本严格等于「回复」
+#   3) 回复编辑器  恰好 1 个 Draft  -> 在含「回复中」的那一项内取 [contenteditable=true]
+#   4) 发送键      编辑器右侧图标    -> path 填充 == 抖音红（激活态）
+#   5) 虚拟列表    出视口坐标为负    -> 先 scrollIntoView，再等重渲染后重读
+#
+# ⚠️ 这些是【结构锚点】而非平台承诺；平台改版会失效。每项都带 live_verified_at，
+#    失效时应当 fail-closed（返回 not_found / inactive），绝不放宽成"随便点一个"。
+
+
+def _row_helpers_js():
+    """评论区共用的 JS 前置：可见根、行枚举、正文提取、目标匹配。"""
+    return (
+        "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+        "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
+        "function inView(e){var r=e.getBoundingClientRect();"
+        "return r.bottom>=0&&r.top<=innerHeight&&r.right>=0&&r.left<=innerWidth;}"
+        "function visibleRoot(){var ls=Array.from(document.querySelectorAll(" + json.dumps(S.COMMENT_LIST) + "));"
+        "for(var i=0;i<ls.length;i++){var r=ls[i].getBoundingClientRect();"
+        "if(r.width>0&&r.height>0)return ls[i];}return null;}"
+        "function rows(){var root=visibleRoot();if(!root)return [];"
+        "return Array.from(root.querySelectorAll(" + json.dumps(S.COMMENT_ITEM) + ")).filter(vis);}"
+        # 正文提取：排除作者链接内、时间/地区、纯数字、固定操作文案，取最长候选
+        "function bodyText(row){var noise=" + json.dumps(S.COMMENT_NOISE_TEXTS) + ";"
+        "var link=row.querySelector('a[href*=\"/user/\"]');var best='';"
+        "var all=row.querySelectorAll('span,div');"
+        "for(var i=0;i<all.length;i++){var e=all[i];"
+        "if(e.children&&e.children.length>0)continue;"
+        "if(link&&link.contains(e))continue;"
+        "var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();"
+        "if(!t)continue;"
+        "if(/^\\d+$/.test(t))continue;"
+        "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
+        "if(t.indexOf('·')>=0&&/\\d/.test(t))continue;"
+        "if(noise.indexOf(t)>=0)continue;"
+        "if(t.length>best.length)best=t;}"
+        "return best;}"
+        # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
+        "function rowMatches(row,t){"
+        "if(t.text&&bodyText(row)!==t.text)return false;"
+        "if(t.id&&(row.id===t.id||row.getAttribute('data-comment-id')===t.id))return true;"
+        "if(!t.text)return false;"
+        "if(!t.authorId)return true;"
+        "var as=row.querySelectorAll('a[href]');"
+        "for(var i=0;i<as.length;i++){var p='';"
+        "try{p=new URL(as[i].getAttribute('href')||'',location.href).pathname.replace(/\\/$/,'');}catch(e){continue;}"
+        "var n=(as[i].innerText||as[i].textContent||'').trim();"
+        "if(p==='/user/'+t.authorId&&(!t.authorName||n===t.authorName))return true;}"
+        "return false;}"
+        "function replyingRow(){var rs=rows();"
+        "var open=rs.filter(function(r){return (r.innerText||'').indexOf(" + json.dumps(S.COMMENT_REPLYING_TEXT) + ")>=0;});"
+        "return open;}"
+    )
+
+
+def _target_json(target):
+    return json.dumps({
+        "id": str(target.get("id") or ""),
+        "authorId": str(target.get("authorId") or ""),
+        "authorName": str(target.get("authorName") or ""),
+        "text": str(target.get("text") or ""),
+    })
+
+
+# --- 1) 「回复」按钮：先滚入视口，再读坐标 ---
+_REPLY_BUTTON_JS = (
+    "(function(t){" + _row_helpers_js() +
+    "var rs=rows();"
+    "var hits=rs.filter(function(r){return rowMatches(r,t);});"
+    "if(hits.length!==1)return {found:false,count:hits.length,"
+    "reason:hits.length?'ambiguous_comment':'comment_not_found'};"
+    "var row=hits[0];"
+    "var all=row.querySelectorAll('span,div,button,[role=button]');"
+    "var btn=null;"
+    "for(var i=0;i<all.length;i++){var e=all[i];"
+    "if(e.children&&e.children.length>0)continue;"
+    "var s=(e.innerText||e.textContent||'').replace(/\\s+/g,'').trim();"
+    "if(s!==" + json.dumps(S.COMMENT_REPLY_BUTTON_TEXT) + ")continue;"
+    "if(!vis(e))continue;btn=e;break;}"
+    "if(!btn)return {found:false,count:1,reason:'reply_button_not_found'};"
+    "if(!inView(btn)){row.scrollIntoView({block:'center'});"
+    "return {found:false,count:1,reason:'scrolled_into_view'};}"
+    "var r=btn.getBoundingClientRect();"
+    "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),tag:btn.tagName};})(TARGET)"
+)
+
+
+def comment_reply_button(cdp, target, attempts=4, settle=1.2):
+    """定位目标评论的「回复」按钮，必要时先滚入视口再重读坐标。
+
+    为什么必须重试：评论在虚拟列表里，出视口的行坐标是负的
+    （真机实测某行「回复」按钮 y=-1415）。直接按坐标点会点到别处。
+    legacy reply_worker.js 的既有做法就是 scrollIntoView -> 等重渲染 -> 再读一次。
+    """
+    expression = _REPLY_BUTTON_JS.replace("TARGET", _target_json(target))
+    result = {"found": False, "reason": "not_attempted"}
+    for _ in range(max(1, attempts)):
+        result = cdp.eval_json(expression) or {"found": False, "reason": "eval_failed"}
+        if result.get("found"):
+            return result
+        if result.get("reason") != "scrolled_into_view":
+            return result
+        time.sleep(settle)
+    return result
+
+
+# --- 2) 行内回复编辑器：在含「回复中」的那一项内取唯一的 [contenteditable] ---
+_REPLY_COMPOSER_JS = (
+    "(function(t){" + _row_helpers_js() +
+    "var open=replyingRow();"
+    "if(open.length!==1)return {found:false,count:open.length,"
+    "reason:open.length?'ambiguous_reply_open':'reply_not_open'};"
+    "var row=open[0];"
+    "if(!rowMatches(row,t))return {found:false,count:1,reason:'reply_row_mismatch'};"
+    "var eds=Array.from(row.querySelectorAll(" + json.dumps(S.COMMENT_REPLY_EDITOR_SELECTOR) + ")).filter(vis);"
+    "if(eds.length!==1)return {found:false,count:eds.length,"
+    "reason:eds.length?'ambiguous_reply_editor':'reply_editor_not_found'};"
+    "var e=eds[0],r=e.getBoundingClientRect();"
+    "return {found:true,scope:'reply',rowId:row.id||row.getAttribute('data-comment-id')||'',"
+    "x:Math.round(r.x+Math.min(80,Math.max(20,r.width/2))),y:Math.round(r.y+r.height/2),"
+    "text:(e.innerText||'').replace(/\\u200b/g,'')};})(TARGET)"
 )
 
 
 def comment_reply_composer(cdp, target):
     """Find exactly one editor inside the confirmed target comment row."""
-    return cdp.eval_json(_COMMENT_REPLY_COMPOSER_JS.replace("TARGET", json.dumps({
-        "id": str(target.get("id") or ""), "authorId": str(target.get("authorId") or ""),
-        "authorName": str(target.get("authorName") or ""), "text": str(target.get("text") or ""),
-    }))) or {"found": False}
+    return cdp.eval_json(_REPLY_COMPOSER_JS.replace("TARGET", _target_json(target))) or {"found": False}
 
 
-_COMMENT_SEND_JS = (
-    "(function(){function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
-    "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
-    "var sels=" + json.dumps(S.COMMENT_SEND_BUTTONS) + ";"
-    "for(var i=0;i<sels.length;i++){var es=document.querySelectorAll(sels[i]);"
-    "for(var j=0;j<es.length;j++){var e=es[j];if(!vis(e))continue;"
-    "var r=e.getBoundingClientRect();return {found:true,x:Math.round(r.x+r.width/2),"
-    "y:Math.round(r.y+r.height/2),disabled:!!(e.disabled||e.getAttribute('aria-disabled')==='true')};}}"
-    "return {found:false};})()"
-)
-
-
-def comment_send_button(cdp):
-    return cdp.eval_json(_COMMENT_SEND_JS) or {"found": False}
-
-
-_COMMENT_REPLY_SEND_JS = _COMMENT_REPLY_COMPOSER_JS.replace(
-    "var r=eds[0].getBoundingClientRect();return {found:true,scope:'reply',"
-    "rowId:row.id||row.getAttribute('data-comment-id')||'',x:Math.round(r.x+r.width/2),"
-    "y:Math.round(r.y+r.height/2),text:(eds[0].innerText||eds[0].value||'')};})(TARGET)",
-    "var bs=[],buttons=" + json.dumps(S.COMMENT_REPLY_SEND_BUTTONS) + ";"
-    "for(var s=0;s<buttons.length;s++){var ns=row.querySelectorAll(buttons[s]);for(var j=0;j<ns.length;j++)if(vis(ns[j])&&bs.indexOf(ns[j])<0)bs.push(ns[j]);}"
-    "if(bs.length!==1)return {found:false,reason:bs.length?'ambiguous_reply_send_button':'reply_send_button_not_found',count:bs.length};"
-    "var r=bs[0].getBoundingClientRect();return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
-    "disabled:!!(bs[0].disabled||bs[0].getAttribute('aria-disabled')==='true')};})(TARGET)"
+# --- 3) 发送键：编辑器右侧操作区里 path 填充为品牌红的那个图标（激活态） ---
+_REPLY_SEND_JS = (
+    "(function(t){" + _row_helpers_js() +
+    "var open=replyingRow();"
+    "if(open.length!==1)return {found:false,count:open.length,"
+    "reason:open.length?'ambiguous_reply_open':'reply_not_open'};"
+    "var row=open[0];"
+    "if(!rowMatches(row,t))return {found:false,count:1,reason:'reply_row_mismatch'};"
+    "var ct=row.querySelector(" + json.dumps(S.COMMENT_INPUT_RIGHT_CT) + ");"
+    "if(!ct)return {found:false,count:0,reason:'comment_input_right_not_found'};"
+    "var cands=Array.from(ct.querySelectorAll('span,div,svg'));"
+    "var best=null;"
+    "for(var i=0;i<cands.length;i++){var e=cands[i];"
+    "if(!vis(e))continue;"
+    "var ps=Array.from(e.querySelectorAll('path'));"
+    "var active=false;"
+    "for(var j=0;j<ps.length;j++){"
+    "if(getComputedStyle(ps[j]).fill===" + json.dumps(S.COMMENT_SEND_ACTIVE_FILL) + "){active=true;break;}}"
+    "if(!active)continue;"
+    "var r=e.getBoundingClientRect();"
+    # ⚠️ 取【面积最小】的那个，不能取最右。
+    #    原因：外层 div 也包含同一个红色 path，同样"是激活的"，
+    #    而它的中心点落在图标【外面】—— 按最右选中它会点空
+    #    （真机与夹具都会踩，测试已抓到）。
+    "var area=r.width*r.height;"
+    "if(!best||area<best.area)best={area:area,"
+    "x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};}"
+    "if(!best)return {found:false,count:0,reason:'send_button_inactive'};"
+    "return {found:true,active:true,x:best.x,y:best.y};})(TARGET)"
 )
 
 
 def comment_reply_send_button(cdp, target):
-    return cdp.eval_json(_COMMENT_REPLY_SEND_JS.replace("TARGET", json.dumps({
-        "id": str(target.get("id") or ""), "authorId": str(target.get("authorId") or ""),
-        "authorName": str(target.get("authorName") or ""), "text": str(target.get("text") or ""),
-    }))) or {"found": False}
+    """发送键是否处于【激活】态，以及它的坐标。
+
+    ⚠️ 语义与旧实现不同：旧实现返回的是"元素存在且未 disabled（DOM 属性）"，
+    真机上发送键是 <svg>，没有 disabled 属性 —— 那个判据永远为假。
+    现在的判据是【颜色】：内容为空时它不显示品牌红，因此
+    "空内容不发送"这道保护是自动获得的，不需要额外判断。
+    """
+    return cdp.eval_json(_REPLY_SEND_JS.replace("TARGET", _target_json(target))) or {"found": False}
 
 
 # ===================== 导航 =====================

@@ -1,33 +1,122 @@
 <!doctype html>
 <meta charset="utf-8">
-<style>.hidden{display:none}.reply-editor{display:none}</style>
-<div data-e2e="comment-list">
+<!--
+  comments fixture —— 按【真机结构】编写（2026-09-20 校正）
+
+  旧夹具用了 comment-content / comment-reply / comment-reply-input / comment-reply-submit
+  这些 data-e2e —— 它们在真实抖音页面上【都不存在】，所以旧夹具一直是"自己骗自己"：
+  测试全绿，真机一个也匹配不到，video_reply 因此长期停在 autoEligible=false。
+
+  本夹具刻意【去掉】那些假属性，还原真机形态：
+    · 评论正文 = 裸 <span>，时间/地区/点赞/分享/回复 是它的兄弟节点
+    · 「回复」= 裸 <span>，无 class、无 data-e2e
+    · 点「回复」后出现「回复中」+ 恰好在 1 个 [contenteditable] 内（Draft.js 形态）
+    · 发送键 = 编辑器右侧图标，激活态 path fill = rgb(254,44,85)
+  这样断言的才是"真机上能不能定位"，而不是"夹具配不配合"。
+-->
+<style>
+  body { margin: 0; font: 14px sans-serif; }
+  /* 出视口但仍有非零尺寸：用来验证必须先 scrollIntoView 再读坐标。
+     ⚠️ 用"折线下方 + 撑高"的方式，而不是 top:-3000px ——
+     文档无法滚到负偏移，放到上方时 scrollIntoView 永远救不回来（实测踩过）。 */
+  /* 发送键的激活/未激活：真机上是颜色差异，不是 disabled 属性 */
+  .send.inactive path { fill: rgba(255, 255, 255, 0.6); }
+  .send.active path { fill: rgb(254, 44, 85); }
+  .comment-item { padding: 12px; border-bottom: 1px solid #eee; }
+</style>
+
+<div data-e2e="comment-list" id="list">
   <article data-e2e="comment-item" id="comment-1" data-comment-id="comment-1">
-    <a href="https://www.douyin.com/user/author-1">Alice</a>
-    <span data-e2e="comment-content">same question</span>
-    <button data-e2e="comment-like" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1">赞</button>
-    <button data-e2e="comment-reply" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1;this.parentElement.querySelector('.reply-editor').style.display='block'">回复</button>
-    <div class="reply-editor" data-e2e="comment-reply-editor"><div data-e2e="comment-reply-input" contenteditable="true"></div><button data-e2e="comment-reply-submit">发送</button></div>
+    <a href="https://www.douyin.com/user/author-1"><span>Alice</span></a>
+    <div class="more" data-e2e="video-comment-more">...</div>
+    <span>same question</span>
+    <span>3小时前·广东</span>
+    <span>0</span>
+    <div>分享</div>
+    <span onclick="openReply(this.closest('article'))">回复</span>
   </article>
+
   <article data-e2e="comment-item" id="comment-2" data-comment-id="comment-2">
-    <a href="https://www.douyin.com/user/author-2">Alice</a>
-    <span data-e2e="comment-content">same question</span>
-    <button data-e2e="comment-like">赞</button>
-    <button data-e2e="comment-reply">回复</button>
-    <div class="reply-editor" style="display:block" data-e2e="comment-reply-editor"><div data-e2e="comment-reply-input" contenteditable="true"></div><button data-e2e="comment-reply-submit">发送</button></div>
+    <a href="https://www.douyin.com/user/author-2"><span>Alice</span></a>
+    <div class="more" data-e2e="video-comment-more">...</div>
+    <span>same question</span>
+    <span>1天前·北京</span>
+    <span>0</span>
+    <div>分享</div>
+    <span onclick="openReply(this.closest('article'))">回复</span>
   </article>
+
   <article data-e2e="comment-item" id="comment-3" data-comment-id="comment-3">
-    <a href="https://www.douyin.com/user/author-3">Bob</a>
-    <span data-e2e="comment-content">different question</span>
-    <button data-e2e="comment-like">赞</button>
-    <button data-e2e="comment-reply">回复</button>
+    <a href="https://www.douyin.com/user/author-3"><span>Bob</span></a>
+    <div class="more" data-e2e="video-comment-more">...</div>
+    <span>different question</span>
+    <span>2天前·上海</span>
+    <span>0</span>
+    <div>分享</div>
+    <span onclick="openReply(this.closest('article'))">回复</span>
   </article>
+
   <article data-e2e="comment-item" id="comment-10" data-comment-id="comment-10">
-    <a href="https://www.douyin.com/user/author-10">Alice</a>
-    <span data-e2e="comment-content">same question</span>
-    <button data-e2e="comment-like">赞</button>
-    <button data-e2e="comment-reply">回复</button>
+    <a href="https://www.douyin.com/user/author-10"><span>Alice</span></a>
+    <div class="more" data-e2e="video-comment-more">...</div>
+    <span>same question</span>
+    <span>5天前·浙江</span>
+    <span>0</span>
+    <div>分享</div>
+    <span onclick="openReply(this.closest('article'))">回复</span>
+  </article>
+
+  <!-- 撑高页面，把下一条推到折线以下 -->
+  <div id="spacer" style="height: 3000px"></div>
+
+  <!-- 出视口的一条：用来验证"先滚入视口再重读坐标" -->
+  <article data-e2e="comment-item" id="comment-off" data-comment-id="comment-off">
+    <a href="https://www.douyin.com/user/author-off"><span>Carol</span></a>
+    <span>offscreen question</span>
+    <span>3天前·江苏</span>
+    <span>0</span>
+    <div>分享</div>
+    <span onclick="openReply(this.closest('article'))">回复</span>
   </article>
 </div>
-<div data-e2e="comment-input" contenteditable="true"></div>
-<button data-e2e="comment-submit">发送</button>
+
+<!-- 顶层评论输入框（发布新评论，不是回复） -->
+<div class="comment-input-inner-container">
+  <div class="public-DraftEditor-content" contenteditable="true" id="top-editor"></div>
+  <div class="commentInput-right-ct">
+    <div><span class="send inactive" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1">
+      <svg width="20" height="20"><path d="M0 0h10v10H0z"></path></svg>
+    </span></div>
+  </div>
+</div>
+
+<script>
+function syncSend(row) {
+  var ed = row.querySelector("[contenteditable=true]");
+  var ico = row.querySelector(".commentInput-right-ct .send");
+  if (!ed || !ico) return;
+  var hasText = (ed.innerText || "").replace(/\u200b/g, "").trim().length > 0;
+  ico.className = "send " + (hasText ? "active" : "inactive");
+}
+function openReply(row) {
+  if (!row) return;
+  row.dataset.replyClicks = (+row.dataset.replyClicks || 0) + 1;
+  if (row.querySelector(".replying-state")) return;   // 同一行只开一个
+  var st = document.createElement("span");
+  st.className = "replying-state";
+  st.textContent = "回复中";
+  row.appendChild(st);
+  var wrap = document.createElement("div");
+  wrap.className = "comment-input-inner-container";
+  wrap.innerHTML =
+    '<div class="public-DraftEditor-content" contenteditable="true"></div>' +
+    '<div class="commentInput-right-ct"><div>' +
+    '<span class="send inactive" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1">' +
+    '<svg width="20" height="20"><path d="M0 0h10v10H0z"></path></svg></span>' +
+    '</div></div>';
+  row.appendChild(wrap);
+  var ed = wrap.querySelector("[contenteditable=true]");
+  ed.addEventListener("input", function () { syncSend(row); });
+  syncSend(row);
+}
+</script>
