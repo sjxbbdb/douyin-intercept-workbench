@@ -1,0 +1,24 @@
+fix(probe): 恢复被并发覆盖的实现，补齐第 2 步（关键词匹配），并修掉对账缺口与台账风险
+
+分支经过（如实记录）：
+  8767c2e 协作者用另一套写法覆盖了 live_flow.py / tests/test_probe.py
+  89464b6a 同一作者 revert 回本 PR 的实现，并指出一个可观测性缺口
+  2248d953 本 PR 作者基于过期的 HEAD 读取推送，误把被 revert 的内容带了回来
+  本次提交 = 把两个文件恢复到 revert 后的实现（本 PR 的实现），再叠加下面的改动。
+  全程没有 force push。
+
+本次改动：
+- 补齐九步流程第 2 步：take_batch(filters=...) 在成批【之前】匹配关键词，未命中或命中排除词的
+  事件标 filtered（终态），不占批次名额；live_plan 接受 keywords / excludeKeywords / matchMode，
+  响应给出 filter 计数；匹配语义复用 crawl 的匹配器（phrase/seg/all/any，排除词优先）。
+- 修掉协作者指出的对账缺口：批次退休作废的事件计入同一份 expiredCount / expired，逐条带
+  expiredReason；ensure_active 的 batch_expired 消息报出被作废的数量。
+- 修掉一处台账风险：_close_batch 原先会把批次名下所有事件置为 expired（含已 sent_confirmed 的），
+  等于抹掉真实发生过的触达；现在只作废仍处 planned 的事件。
+
+回归测试（离线）：新增 4 个用例（批次退休事件计入 expiredCount / 过期不改写已记录结果 /
+窗口内批次可用且未知批次 fail-closed / 两个阶段的拒绝先于任何浏览器动作），
+LiveFlowTests + BoundaryTests 共 33 项通过。
+
+仍未完成并如实标注：积分 / 功能开关 / 服务端审计未接入；真机验收未进行；
+live_batch.autoEligible 保持 false。

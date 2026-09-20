@@ -116,9 +116,36 @@ class ProbeBridge {
     return promise;
   }
 
-  async search(keyword, maxVideos = 20, scrollRounds = 2) {
+  async search(keyword, maxVideos = 20, scrollRounds = 2, options = {}) {
     await this.#launch();
-    return this.client.request('search', { keyword, maxVideos, scrollRounds }, { timeoutMs: 60000 });
+    const params = keyword && typeof keyword === 'object'
+      ? keyword
+      : { keyword, maxVideos, scrollRounds, ...options };
+    return this.client.request('search', params, { timeoutMs: 60000 });
+  }
+
+  async collectOnce(source, url, options = {}) {
+    const requested = targetUrl(url);
+    this.source = source === 'live' ? 'live' : 'video';
+    await this.#launch();
+    if (!this.currentUrl || !this.isOpenFor(requested)) {
+      const opened = await this.open(requested);
+      if (opened) this.currentUrl = opened;
+    }
+    try {
+      await this.#probeCapability(source);
+    } catch (error) {
+      this.onStatus?.({ connected: false, collector: 'capability_error', status: 'unsupported', error: error.message });
+      return { status: 'unsupported', events: [], capability: this.capability, error: error.message };
+    }
+    const method = source === 'live' ? 'collect_live' : 'collect_comments';
+    const params = source === 'live'
+      ? { url: this.currentUrl || requested, maxItems: Number.isInteger(options.maxItems) ? options.maxItems : 100 }
+      : { url: this.currentUrl || requested, maxItems: Number.isInteger(options.maxItems) ? options.maxItems : 100, scrollRounds: Number.isInteger(options.scrollRounds) ? options.scrollRounds : 0 };
+    const result = await this.client.request(method, params, { timeoutMs: 45000 });
+    const events = validEvents(result, source);
+    this.onStatus?.({ connected: true, collector: result.status || 'ready', status: result.status || 'ready', matchCount: events.length, capability: result.capability || this.capability });
+    return { ...result, events };
   }
 
   isOpenFor(url) {

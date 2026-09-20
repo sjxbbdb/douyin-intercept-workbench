@@ -1,0 +1,26 @@
+（已被后续提交取代：见 COMMIT-MESSAGE-LIVE-FIXUP.txt。本提交基于过期的 HEAD 读取，
+误把 89464b6a revert 掉的内容带了回来；后续提交把 live_flow.py / tests 恢复到 revert 后的实现。）
+
+feat(probe): 直播间流程补齐第 2 步（关键词匹配），并修回被删掉的批次窗口守卫
+
+分支 8767c2e 已用另一套写法重做了评审第 1/2/3 条（过期与空批次都在 take_batch 内部处理），
+本提交不回退那套实现，只在它之上补齐缺口：
+
+- live_flow：新增 filtered 状态与 normalize_filter / filter_is_active / match_event；
+  take_batch 支持 filters，在成批【之前】匹配关键词，未命中或命中排除词的事件标 filtered，
+  不再占用批次名额（九步流程：第 2 步匹配 → 第 3 步成批）；匹配语义复用 crawl 的匹配器
+  （phrase/seg/all/any，排除词优先），与评论链路保持一致；成批响应给出 filter 计数。
+- live_flow：补回 LiveQueue.ensure_active。8767c2e 删除了它，而 sidecar 的 live_reply /
+  live_private 仍在调用 —— 这条分支此前一旦进入这两个阶段就会 AttributeError。
+  守卫按 expiresAt 绝对过期：批次连同仍处 planned 的事件作废，两个阶段以 batch_expired
+  拒绝，且拒绝发生在打开浏览器之前；已记录结果的事件不被改写（台账事实不抹除）。
+- sidecar：live_plan 接受 keywords / excludeKeywords / matchMode，批次摘要回传 filter。
+- live_flow：find_event 返回解析后的 detail / private / payload。
+
+回归测试（离线）：新增 9 个用例覆盖 成批前匹配 / filtered 终态 / 排除词优先 /
+无关键词行为不变 / 边界透传与非法 matchMode / 过期批次退休且不重放 / 未知批次 /
+分支上 ensure_active 断链（拒绝先于浏览器）/ 过期不改写已记录结果。
+LiveFlowTests + BoundaryTests 共 33 项通过。
+
+仍未完成并如实标注：积分 / 功能开关 / 服务端审计未接入；真机验收（选择器、作者标识、
+公屏送达、私信送达）未进行；live_batch.autoEligible 保持 false。

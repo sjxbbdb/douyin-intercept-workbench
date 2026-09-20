@@ -1078,6 +1078,814 @@ def _iter_keys(node):
         for item in node:
             for nested in _iter_keys(item):
                 yield nested
+class LiveFlowTests(unittest.TestCase):
+    """Offline coverage for the live batch flow (images/12) and its two
+    boundaries: host-provided scripts (images/09) and per-action idempotency
+    with no replay of unresolved results (images/17)."""
+
+    @staticmethod
+    def _event(event_id, author_id=None, text=None, room="room-1"):
+        """Build one live event.  Identity and text default to the event id so
+        two different events never collapse into one fingerprint."""
+        import sidecar
+        author_id = "live-%s" % event_id if author_id is None else author_id
+        text = "question %s" % event_id if text is None else text
+        return sidecar._event("live", room, {"id": event_id, "authorId": author_id,
+                                             "authorName": author_id.upper(), "text": text})
+
+    @staticmethod
+    def _scripts(event_ids, public="public reply text", private="private message text"):
+        return {event_id: {"publicText": public, "privateText": private} for event_id in event_ids}
+
+    def test_queue_dedupes_by_identity_and_enforces_capacity(self):
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", capacity=3, clock=lambda: now[0])
+            first = queue.append([self._event("e1"), self._event("e1"), self._event("e2")])
+            self.assertEqual((first["added"], first["duplicates"]), (2, 1))
+            for index in range(3, 7):
+                now[0] += 1
+                queue.append([self._event("e%d" % index)])
+            states = queue.stats()["states"]
+            self.assertEqual(states.get(live_flow.QUEUED), 3)
+            self.assertEqual(states.get(live_flow.EXPIRED), 3)
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+
+    def test_batch_window_expires_old_events_and_never_replays_them(self):
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("old")])
+            now[0] += 120
+            queue.append([self._event("fresh")])
+            batch = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual([event["id"] for event in batch["events"]], ["fresh"])
+            self.assertEqual(batch["expiredCount"], 1)
+            self.assertEqual(queue.find_event("old")["state"], live_flow.EXPIRED)
+            again = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual([event["id"] for event in again["events"]], ["fresh"])
+            self.assertEqual(again["expiredCount"], 0)
+
+    def test_open_batch_is_reused_so_a_retry_cannot_plan_twice(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1"), self._event("e2")])
+            first = queue.take_batch(max_items=1, window_seconds=600)
+            second = queue.take_batch(max_items=1, window_seconds=600)
+            self.assertEqual(first["batchId"], second["batchId"])
+            self.assertEqual(len(queue.batch_events(first["batchId"])), 1)
+
+    def test_plan_requires_both_host_scripts(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1"), self._event("e2")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            plan = queue.freeze_plan(batch["batchId"], {
+                "e1": {"publicText": "ok reply", "privateText": "ok private"},
+                "e2": {"publicText": "only public"},
+            })
+            self.assertEqual([item["eventId"] for item in plan["targets"]], ["e1"])
+            self.assertEqual(plan["blocked"], [{"eventId": "e2", "reason": "private_text_missing"}])
+            self.assertEqual(queue.find_event("e2")["state"], live_flow.BLOCKED)
+            self.assertEqual(plan["scriptSource"], "host")
+
+    def test_private_candidates_follow_phase_one_states(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("confirmed"), self._event("unresolved"),
+                          self._event("anonymous", author_id="")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            ids = ["confirmed", "unresolved", "anonymous"]
+            queue.freeze_plan(batch["batchId"], self._scripts(ids))
+            queue.mark("confirmed", live_flow.SENT_CONFIRMED, batch["batchId"])
+            queue.mark("unresolved", live_flow.UNKNOWN, batch["batchId"])
+            queue.mark("anonymous", live_flow.SENT_CONFIRMED, batch["batchId"])
+            allowed, rejected = queue.private_candidates(batch["batchId"])
+            self.assertEqual([item["eventId"] for item in allowed], ["confirmed"])
+            reasons = {item["eventId"]: item["reason"] for item in rejected}
+            self.assertEqual(reasons["unresolved"], "public_unknown")
+            self.assertEqual(reasons["anonymous"], "missing_author_id")
+            opt_in, opt_rejected = queue.private_candidates(
+                batch["batchId"],
+                {"allowPublicStates": ["sent_confirmed", "unknown"], "maxPrivate": 1})
+            self.assertEqual([item["eventId"] for item in opt_in], ["confirmed"])
+
+    def test_sidecar_live_plan_and_guards_need_no_browser(self):
+        import sidecar
+
+        def explode():
+            raise AssertionError("browser must not be opened for planning or for guarded items")
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19225)
+            instance._page = explode
+            instance.live_queue.append([self._event("e1"), self._event("e2")])
+            planned = instance.dispatch("live_plan", {"maxItems": 10, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1", "e2"])})
+            self.assertEqual(planned["status"], "ok")
+            batch_id = planned["batch"]["batchId"]
+            reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "s1", "text": "different text"}]})
+            self.assertEqual(reply["status"], "blocked")
+            self.assertEqual(reply["results"][0]["reason"], "script_mismatch")
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "blocked")
+            private = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e2", "sendId": "s2"}]})
+            self.assertEqual(private["status"], "blocked")
+            self.assertEqual(private["results"][0]["reason"], "public_planned")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_result", {"batchId": "does-not-exist"})
+            self.assertEqual(raised.exception.code, "unknown_batch")
+
+    def test_sidecar_live_result_reports_counts_and_checkpoint(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19226)
+            caps = instance.dispatch("capabilities", {})
+            self.assertIn("live_plan", caps["methods"])
+            self.assertIn("live_result", caps["methods"])
+            self.assertFalse(caps["capability"]["live_batch"]["autoEligible"])
+            self.assertEqual(caps["capability"]["live_batch"]["validation"]["scripts"],
+                             "host_provided_only")
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance.live_queue.mark("e1", "sent_confirmed", batch_id)
+            report = instance.dispatch("live_result", {"batchId": batch_id})
+            self.assertEqual(report["counts"]["sent_confirmed"], 1)
+            self.assertEqual(report["privateCandidates"], 1)
+            self.assertEqual(report["checkpoint"]["planTargets"], 1)
+            self.assertEqual(report["checkpoint"]["phase"], "private")
+
+    def test_live_listen_enqueues_deduped_events(self):
+        import sidecar
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://live.douyin.com/room-1"
+                return None
+
+            def call(self, method, *_args, **_kwargs):
+                self.calls.append(method)
+
+            def close(self):
+                pass
+
+        old = sidecar.live.collect_events, sidecar.douyin.login_state
+        try:
+            sidecar.live.collect_events = lambda _page, max_items=100: [
+                {"id": "live-c1", "authorId": "u1", "authorName": "A", "text": "same"},
+                {"id": "live-c1", "authorId": "u1", "authorName": "A", "text": "same"}]
+            sidecar.douyin.login_state = lambda _page: "verified"
+            with tempfile.TemporaryDirectory() as td:
+                instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                           os.path.join(td, "profile"), 19227)
+                page = Page()
+                instance._page = lambda: (page, {"pid": 1})
+                result = instance.dispatch("live_listen", {"url": "https://live.douyin.com/room-1",
+                                                           "maxItems": 10})
+        finally:
+            sidecar.live.collect_events, sidecar.douyin.login_state = old
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["queue"]["added"], 1)
+        self.assertEqual(result["queue"]["duplicates"], 1)
+        self.assertEqual(result["queue"]["queued"], 1)
+
+    def test_empty_batch_is_closed_instead_of_reused(self):
+        """回归（评审 #1）：队列为空时不得留下可被永久复用的空批次。"""
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            empty = queue.take_batch(max_items=10, window_seconds=600)
+            self.assertEqual(empty["status"], "empty")
+            self.assertIsNone(empty["batchId"])
+            now[0] += 10
+            queue.append([self._event("e1")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            self.assertNotEqual(batch["batchId"], empty["batchId"])
+            self.assertEqual([event["id"] for event in batch["events"]], ["e1"])
+
+    def test_open_batch_is_closed_once_its_window_passed(self):
+        """回归（评审 #2）：未冻结的批次超窗后必须关闭，不能再被取回或发送。"""
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("e1")])
+            first = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual(first["status"], "ok")
+            now[0] += 61
+            second = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertIsNone(second["batchId"])
+            self.assertEqual(second["status"], "empty")
+            self.assertEqual(queue.batch(first["batchId"])["status"], "expired")
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+
+    def test_phase_methods_refuse_an_expired_batch(self):
+        """回归（评审 #2）：超窗批次即使已被冻结，也不得再发公屏或私信。"""
+        import live_flow
+        import sidecar
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19228)
+            instance.live_queue.clock = lambda: now[0]
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 60,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            now[0] += 61
+            instance._page = lambda: (_ for _ in ()).throw(AssertionError("no browser for expired batch"))
+            for method in ("live_reply", "live_private"):
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.dispatch(method, {"batchId": batch_id,
+                                               "items": [{"eventId": "e1", "sendId": "s-1"}]})
+                self.assertEqual(raised.exception.code, "batch_expired")
+            self.assertEqual(instance.live_queue.batch(batch_id)["status"], "expired")
+
+    def test_private_result_is_persisted(self):
+        """回归（评审 #3）：私信结果必须真的落到库里，否则断点恢复与防重复都会失效。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1")])
+            batch = queue.take_batch(max_items=5, window_seconds=600)
+            queue.freeze_plan(batch["batchId"], self._scripts(["e1"]))
+            queue.mark("e1", live_flow.SENT_CONFIRMED, batch["batchId"])
+            queue.mark_private("e1", live_flow.UNKNOWN, batch["batchId"], {"sendId": "s-1"})
+            event = queue.find_event("e1")
+            self.assertIn("unknown", str(event["private_json"]))
+            self.assertEqual(event["state"], live_flow.SENT_CONFIRMED)
+            reopened = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            self.assertEqual(reopened.result(batch["batchId"])["privateCounts"], {"unknown": 1})
+
+    def test_client_supplied_policy_is_refused(self):
+        """回归（评审 #4）：策略必须由授权服务端签发，边界拒绝调用方自带策略。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19229)
+            instance.live_queue.append([self._event("e1")])
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                "scripts": self._scripts(["e1"]),
+                                                "policy": {"allowPublicStates": ["unknown"]}})
+            self.assertEqual(raised.exception.code, "policy_not_server_issued")
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            self.assertEqual(planned["policy"]["allowPublicStates"], ["sent_confirmed"])
+            self.assertEqual(planned["policySource"], "builtin_default")
+
+    def test_plan_matches_keywords_before_forming_a_batch(self):
+        """回归（流程第 2 步）：关键词匹配发生在成批之前，未命中的事件不进批次。"""
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19230)
+            instance.live_queue.append([
+                self._event("hit", text="这个蒸糕怎么做"),
+                self._event("miss", text="主播晚上好"),
+            ])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 10, "windowSeconds": 600, "matchMode": "seg",
+                "keywords": "怎么做", "scripts": self._scripts(["hit", "miss"])})
+            self.assertEqual(planned["status"], "ok")
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["hit"])
+            self.assertEqual(planned["filter"]["matched"], 1)
+            self.assertEqual(planned["filter"]["missed"], 1)
+            self.assertEqual(instance.live_queue.find_event("miss")["state"], live_flow.FILTERED)
+            self.assertEqual(instance.live_queue.find_event("miss")["detail"]["reason"], "keyword_miss")
+
+    def test_plan_exclude_keywords_take_precedence(self):
+        """回归（流程第 2 步）：命中关键词但同时命中排除词的事件被丢弃。"""
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19231)
+            instance.live_queue.append([
+                self._event("ok", text="求链接 谢谢"),
+                self._event("ad", text="求链接 加微信广告"),
+            ])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 10, "windowSeconds": 600, "matchMode": "seg",
+                "keywords": "链接", "excludeKeywords": "广告",
+                "scripts": self._scripts(["ok", "ad"])})
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["ok"])
+            self.assertEqual(planned["filter"]["excluded"], 1)
+            self.assertEqual(planned["filter"]["matched"], 1)
+            self.assertEqual(instance.live_queue.find_event("ad")["detail"]["reason"],
+                             "keyword_excluded")
+
+    def test_plan_without_keywords_keeps_every_event(self):
+        """没给关键词时行为不变：队列里的事件全部可成批。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19232)
+            instance.live_queue.append([self._event("a", text="任何一句话")])
+            planned = instance.dispatch("live_plan", {"maxItems": 10, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["a"])})
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["a"])
+            self.assertEqual(planned["filter"]["matched"], 0)
+            self.assertEqual(planned["filter"]["missed"], 0)
+
+
+    # ---- 批次退休的对账与台账保护（协作者在 89464b6a 里指出的可观测性缺口）----
+
+    def test_retired_batch_events_are_counted_in_the_response(self):
+        """回归：因批次退休而作废的事件必须计入 expiredCount / expired。
+
+        原实现只把"按时间窗过期"的事件放进返回的列表，批次退休时一并作废的那批
+        planned 事件却凭空消失：宿主看到 expiredCount=0，无法对账"这次丢了多少"。
+        """
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("e1")])
+            first = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual([event["id"] for event in first["events"]], ["e1"])
+            now[0] += 61
+            second = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual(second["expiredCount"], 1)
+            self.assertEqual(second["expired"][0]["id"], "e1")
+            self.assertEqual(second["expired"][0]["expiredReason"], "batch_window_expired")
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+            self.assertEqual(queue.find_event("e1")["detail"]["reason"], "batch_window_expired")
+
+    def test_expiry_never_rewrites_a_recorded_send_result(self):
+        """回归：批次退休只能作废【还没发出去】的事件，已记录的结果不得被改写。
+
+        台账（sent_confirmed / unknown / failed / blocked）是"到底做了什么"的唯一事实，
+        如果窗口检查顺手把它改成 expired，就等于把已经发生的触达抹掉，
+        之后的对账、去重与防重复触达都会失准。
+        """
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("sent"), self._event("pending")])
+            batch_id = queue.take_batch(max_items=10, window_seconds=60)["batchId"]
+            queue.mark("sent", live_flow.SENT_CONFIRMED, batch_id)
+            now[0] += 61
+            with self.assertRaises(live_flow.LiveFlowError) as raised:
+                queue.ensure_active(batch_id)
+            self.assertEqual(raised.exception.code, "batch_expired")
+            self.assertIn("1 event(s) were expired", raised.exception.message)
+            self.assertEqual(queue.find_event("sent")["state"], live_flow.SENT_CONFIRMED)
+            self.assertEqual(queue.find_event("pending")["state"], live_flow.EXPIRED)
+
+    def test_ensure_active_keeps_a_live_batch_and_refuses_unknown_ids(self):
+        """窗口内的批次（含已冻结）继续可用；未知批次 fail-closed。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1")])
+            batch_id = queue.take_batch(max_items=10, window_seconds=600)["batchId"]
+            queue.freeze_plan(batch_id, self._scripts(["e1"]))
+            self.assertEqual(queue.ensure_active(batch_id)["batch_id"], batch_id)
+            with self.assertRaises(live_flow.LiveFlowError) as raised:
+                queue.ensure_active("does-not-exist")
+            self.assertEqual(raised.exception.code, "unknown_batch")
+
+    def test_sidecar_refuses_an_expired_batch_without_touching_the_browser(self):
+        """边界：两个阶段都以 batch_expired 拒绝过期批次，且拒绝先于任何浏览器动作。"""
+        import sidecar
+
+        def explode():
+            raise AssertionError("an expired batch must be refused before any browser work")
+
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19234)
+            instance.live_queue.clock = lambda: now[0]
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 60,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance._page = explode
+            now[0] += 61
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s1", "text": "public reply text"}]})
+            self.assertEqual(raised.exception.code, "batch_expired")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s2", "text": "private message text"}]})
+            self.assertEqual(raised.exception.code, "batch_expired")
+
+
+class CommentFilterTests(unittest.TestCase):
+    """流程一「关键词、排除词与去重」的离线回归（不碰浏览器、不建临时目录）。
+
+    架构依据 images/11-comment-area-business：
+        采集评论 -> 关联评论标识与评论者 -> 关键词、排除词与去重 -> 返回目标批次
+    """
+
+    def _rows(self):
+        return [
+            {"cid": "c1", "sec_uid": "SEC_A", "user": "A", "text": "肉可以这样做吗", "digg": 1},
+            {"cid": "c2", "sec_uid": "SEC_A", "user": "A", "text": "几个月能吃", "digg": 9},
+            {"cid": "c3", "sec_uid": "SEC_B", "user": "B", "text": "请问同行怎么报价 加我微信", "digg": 0},
+            {"cid": "c4", "sec_uid": "SEC_C", "user": "C", "text": "请问米粉要泡吗", "digg": 2},
+            {"cid": "c5", "sec_uid": "", "user": "", "text": "请问这个怎么做", "digg": 0},
+        ]
+
+    def test_exclude_keywords_drop_matched_comments(self):
+        import crawl
+        rows = self._rows()
+        _, base_stats = crawl.filter_comments(rows, "可以,请问,几个月", mode="seg")
+        matched, stats = crawl.filter_comments(rows, "可以,请问,几个月", mode="seg",
+                                               exclude_keywords="微信")
+        self.assertEqual(stats["excluded"], 1)
+        self.assertEqual(stats["matched"], base_stats["matched"] - 1)
+        self.assertTrue(all("微信" not in row["text"] for row in matched))
+        self.assertEqual(stats["exclude_keywords"], ["微信"])
+
+    def test_exclusion_only_counts_comments_that_would_have_matched(self):
+        """excluded 只数「本来命中关键词、却被排除词挡掉」的条数 —— 这才是可调参的数字。"""
+        import crawl
+        rows = [{"cid": "x", "sec_uid": "S", "text": "同行勿扰", "digg": 0}]
+        _, stats = crawl.filter_comments(rows, "怎么做", mode="seg", exclude_keywords="同行")
+        self.assertEqual(stats["excluded"], 0)
+        self.assertEqual(stats["matched"], 0)
+
+    def test_exclude_takes_precedence_over_keyword(self):
+        import crawl
+        rows = [{"cid": "x", "sec_uid": "S", "text": "请问同行怎么报价", "digg": 0}]
+        matched, stats = crawl.filter_comments(rows, "请问", mode="seg", exclude_keywords="同行")
+        self.assertEqual(matched, [])
+        self.assertEqual(stats["excluded"], 1)
+
+    def test_build_queue_accepts_exclude_keywords(self):
+        import crawl
+        queue, stats = crawl.build_queue(self._rows(), "可以,请问,几个月", mode="seg",
+                                         exclude_keywords="微信")
+        self.assertTrue(queue)
+        self.assertNotIn("SEC_B", [row["sec_uid"] for row in queue])
+        self.assertEqual(stats["excluded"], 1)
+
+    def test_dedupe_by_author_keeps_highest_digg_and_never_merges_anonymous(self):
+        import sidecar
+        kept, dropped = sidecar._dedupe_by_author(self._rows())
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(kept), 4)
+        author_a = [row for row in kept if row["sec_uid"] == "SEC_A"]
+        self.assertEqual(len(author_a), 1)
+        self.assertEqual(author_a[0]["cid"], "c2")
+        self.assertEqual(len([row for row in kept if not row["sec_uid"]]), 1)
+
+    def test_filter_text_validates_external_input(self):
+        import sidecar
+        self.assertEqual(sidecar._filter_text(None, "k"), "")
+        self.assertEqual(sidecar._filter_text("  可以 , 请问  ", "k"), "可以 , 请问")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._filter_text(123, "k")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._filter_text("x" * 500, "k")
+
+    def test_sidecar_collect_comments_returns_filtered_targets(self):
+        """targets 必须与 events 同形状 —— 下游两阶段发送直接拿它当 target 用。"""
+        import sidecar
+        rows = self._rows()
+
+        class FakePage:
+            def evaluate(self, expression):
+                return "https://www.douyin.com/video/123"
+
+            def close(self):
+                pass
+
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (FakePage(), {})
+        original_navigate = sidecar._navigate
+        original_login = sidecar.douyin.login_state
+        original_crawl = sidecar.crawlmod.crawl_video_comments
+        sidecar._navigate = lambda page, url: None
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.crawl_video_comments = lambda *a, **k: (
+            rows, {"total": len(rows), "with_sec_uid": 3, "api_comments": len(rows)})
+        try:
+            result = instance.collect_comments({
+                "url": "https://www.douyin.com/video/123",
+                "commentKeywords": "可以,请问,几个月",
+                "excludeKeywords": "微信",
+                "matchMode": "seg",
+            })
+        finally:
+            sidecar._navigate = original_navigate
+            sidecar.douyin.login_state = original_login
+            sidecar.crawlmod.crawl_video_comments = original_crawl
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["events"]), len(rows))
+        self.assertTrue(all("微信" not in row["text"] for row in result["targets"]))
+        self.assertEqual(result["filter"]["excluded"], 1)
+        self.assertEqual(result["filter"]["dedupedAuthors"], 1)
+        self.assertEqual(result["filter"]["matchMode"], "seg")
+        self.assertEqual(result["filter"]["excludeKeywords"], ["微信"])
+        self.assertEqual(result["filter"]["targetCount"], len(result["targets"]))
+        for key in ("id", "source", "roomId", "authorId", "authorName", "text"):
+            self.assertIn(key, result["targets"][0])
+        self.assertIn("matchedKeyword", result["targets"][0])
+
+    def test_sidecar_rejects_bad_filter_params(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.collect_comments({"url": "https://www.douyin.com/video/123", "matchMode": "nope"})
+
+
+
+class SearchPagingTests(unittest.TestCase):
+    """视频搜索分页（搜索游标）的离线回归。
+
+    架构依据 images/10-video-search-flow：
+        读取一页结果 -> 按固定条件筛选并去重 -> 保存视频池与搜索游标 -> 申请下一轮搜索
+    这些用例不碰浏览器、不建临时目录。
+    """
+
+    def _instance(self, url=None):
+        import sidecar
+        page = FakeSearchPage(url)
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        return sidecar, instance, page
+
+    def test_cursor_round_trip(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1", "2"}, 3)
+        seen, page_no = sidecar._decode_cursor(token, "宝宝辅食")
+        self.assertEqual(seen, {"1", "2"})
+        self.assertEqual(page_no, 3)
+        self.assertEqual(sidecar._decode_cursor(None, "宝宝辅食"), (set(), 1))
+        self.assertEqual(sidecar._decode_cursor("", "宝宝辅食"), (set(), 1))
+
+    def test_cursor_is_rejected_when_it_does_not_match(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1"}, 2)
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(token, "别的关键词")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor("!!!not-base64!!!", "宝宝辅食")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(12345, "宝宝辅食")
+
+    def test_unsupported_cursor_version_is_rejected(self):
+        import base64
+        import json
+        import sidecar
+        raw = json.dumps({"v": 99, "k": "宝宝辅食", "n": 2, "seen": []}).encode("utf-8")
+        token = base64.urlsafe_b64encode(raw).decode("ascii")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(token, "宝宝辅食")
+
+    def test_first_page_navigates_and_second_page_reuses_the_tab(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+            second = instance.search({"keyword": "宝宝辅食", "maxVideos": 5,
+                                      "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+        first_ids = [v["id"] for v in first["videos"]]
+        second_ids = [v["id"] for v in second["videos"]]
+        self.assertEqual(first_ids, ["1", "2", "3", "4", "5"])
+        self.assertEqual(second_ids, ["6", "7", "8", "9", "10"])
+        self.assertEqual(set(first_ids) & set(second_ids), set())
+        self.assertEqual(first["page"], 1)
+        self.assertEqual(second["page"], 2)
+        self.assertEqual(first["poolSize"], 5)
+        self.assertEqual(second["poolSize"], 10)
+        self.assertTrue(first["hasMore"] and second["hasMore"])
+        self.assertTrue(calls[0]["navigate"], "第一页必须自己导航")
+        self.assertFalse(calls[1]["navigate"], "续页不能重新导航，否则又从第一页开始")
+        self.assertEqual(calls[1]["seen"], {"1", "2", "3", "4", "5"})
+        self.assertEqual(first["platformCursor"], "pc-1")
+
+    def test_continuing_renavigates_when_the_tab_left_the_search_page(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance(url="https://www.douyin.com/video/123")
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+            instance.search({"keyword": "宝宝辅食", "maxVideos": 5, "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertTrue(calls[1]["navigate"], "已经不在搜索页上时必须重新导航")
+
+    def test_empty_page_means_the_pool_is_exhausted(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = lambda *a, **k: []
+        try:
+            result = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(result["videos"], [])
+        self.assertFalse(result["hasMore"], "一页都没有新视频 -> 告诉宿主可以停了")
+
+    def test_search_rejects_cursor_from_another_keyword(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        token = sidecar._encode_cursor("别的关键词", {"1"}, 2)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "cursor": token})
+
+
+class FakeSearchPage:
+    """search 只需要 location.href；续页时靠它判断"还在不在搜索页上"。"""
+
+    def __init__(self, url=None):
+        self.url = url or "https://www.douyin.com/search/x?type=general"
+
+    def evaluate(self, expression):
+        if expression == "location.href":
+            return self.url
+        return None
+
+    def close(self):
+        pass
+
+
+def make_fake_search(calls):
+    """假的 search_videos：池子固定 20 条，按 seen_ids 返回下一页的 5 条。"""
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        seen = set(str(x) for x in (seen_ids or ()))
+        calls.append({"navigate": navigate, "seen": seen})
+        pool = [{"aweme_id": str(i), "url": "https://www.douyin.com/video/%d" % i,
+                 "desc": "标题%d" % i, "author": "作者", "author_sec_uid": "SEC"}
+                for i in range(1, 21)]
+        out = [v for v in pool if v["aweme_id"] not in seen][:5]
+        if isinstance(meta, dict):
+            # 按【真实 crawl.search_videos 的 meta 契约】填：
+            # 它会把平台的 api_cursor / api_has_more 映射成 platform_cursor / platform_has_more，
+            # 并给出 skipped_seen。假函数必须照这个契约来，否则测的不是真东西。
+            meta["skipped_seen"] = 0
+            meta["api_cursor"] = "pc-1"
+            meta["api_has_more"] = 1
+            meta["platform_cursor"] = "pc-1"
+            meta["platform_has_more"] = 1
+        return out
+
+    return fake
+
+
+class VideoRelevanceTests(unittest.TestCase):
+    """找视频模块的「相关度」回归（纯离线，不碰浏览器）。
+
+    架构依据：找视频模块固定流程第 4 步要求返回
+    「视频标题、作者、链接、相关度等候选结果」，模块职责是发现与筛选视频。
+    """
+
+    def test_exact_phrase_scores_by_position(self):
+        import crawl
+        head = crawl.video_relevance("宝宝辅食怎么做 一周不重样", "宝宝辅食")
+        self.assertEqual(head["score"], 100)
+        self.assertEqual(head["reason"], "exact_phrase")
+        self.assertTrue(head["exact"])
+        self.assertEqual(head["position"], 0)
+        early = crawl.video_relevance("今天宝宝辅食吃什么", "宝宝辅食")
+        self.assertEqual((early["score"], early["position"]), (90, 2))
+        late = crawl.video_relevance("今天给大家分享一个我家一直在用的宝宝辅食做法", "宝宝辅食")
+        self.assertEqual(late["score"], 80)
+        self.assertGreater(early["score"], late["score"])
+
+    def test_every_keyword_must_appear_contiguously_for_the_top_tier(self):
+        import crawl
+        both = crawl.video_relevance("教程 宝宝辅食做法", "宝宝辅食,教程")
+        self.assertEqual((both["score"], both["reason"]), (100, "exact_phrase"))
+        self.assertEqual(sorted(both["matchedKeywords"]), ["宝宝辅食", "教程"])
+        only_one = crawl.video_relevance("宝宝辅食做法分享", "宝宝辅食,教程")
+        self.assertEqual(only_one["reason"], "partial_segments")
+        self.assertEqual(only_one["missingKeywords"], ["教程"])
+
+    def test_falls_back_to_segments_when_the_phrase_never_appears(self):
+        """抖音标题几乎不会连续包含「怎么充值codex」这种提问式关键词。"""
+        import crawl
+        rel = crawl.video_relevance("充值 codex 会员教程", "怎么充值codex")
+        self.assertFalse(rel["exact"])
+        self.assertEqual((rel["score"], rel["reason"]), (60, "all_segments"))
+        self.assertEqual(sorted(rel["matchedSegments"]), ["codex", "充值"])
+        self.assertEqual(rel["missingSegments"], [])
+
+    def test_partial_segments_score_between_full_and_none(self):
+        import crawl
+        rel = crawl.video_relevance("codex 会员教程", "怎么充值codex")
+        self.assertEqual(rel["reason"], "partial_segments")
+        self.assertEqual(rel["matchedSegments"], ["codex"])
+        self.assertEqual(rel["missingSegments"], ["充值"])
+        self.assertTrue(0 < rel["score"] < 60)
+
+    def test_no_match_and_edge_cases(self):
+        import crawl
+        none = crawl.video_relevance("完全无关的内容", "宝宝辅食")
+        self.assertEqual((none["score"], none["reason"]), (0, "no_match"))
+        self.assertFalse(none["exact"])
+        self.assertIsNone(none["position"])
+        self.assertEqual(crawl.video_relevance("", "宝宝辅食")["score"], 0)
+        self.assertEqual(crawl.video_relevance("宝宝辅食", "")["reason"], "empty_keyword")
+
+
+class SearchRelevanceTests(unittest.TestCase):
+    """search 把相关度放进候选结果，并支持按阈值筛选（模块内职责）。"""
+
+    class _Page:
+        def close(self):
+            pass
+
+    def _instance(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (self._Page(), {})
+        return sidecar, instance
+
+    @staticmethod
+    def _videos():
+        return [
+            {"aweme_id": "1", "url": "https://www.douyin.com/video/1",
+             "desc": "宝宝辅食怎么做", "author": "A", "author_sec_uid": "S1"},
+            {"aweme_id": "2", "url": "https://www.douyin.com/video/2",
+             "desc": "codex 会员教程", "author": "B", "author_sec_uid": "S2"},
+            {"aweme_id": "3", "url": "https://www.douyin.com/video/3",
+             "desc": "完全无关的内容", "author": "C", "author_sec_uid": "S3"},
+        ]
+
+    def _run(self, params):
+        sidecar, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.search_videos = lambda *a, **k: self._videos()
+        try:
+            return instance.search(params)
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    def test_every_candidate_carries_a_relevance_record(self):
+        result = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["videos"]), 3)
+        self.assertEqual(result["videos"][0]["relevance"]["score"], 100)
+        self.assertEqual(result["videos"][0]["relevance"]["reason"], "exact_phrase")
+        self.assertEqual(result["videos"][2]["relevance"]["reason"], "no_match")
+        self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
+                                            "filteredByRelevance": 0, "minRelevance": 0})
+        # 边界：只发现与筛选，不产生任何发送动作
+        for key in ("sent", "sendId", "private", "reply"):
+            self.assertNotIn(key, result)
+
+    def test_min_relevance_filters_candidates_inside_the_module(self):
+        result = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
+        self.assertEqual([v["id"] for v in result["videos"]], ["1"])
+        self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
+                                            "filteredByRelevance": 2, "minRelevance": 60})
+
+    def test_min_relevance_is_validated(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "minRelevance": 101})
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "minRelevance": -1})
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { deliveryStatus } = require('./workflow-contracts');
 
 const RUN_STATES = Object.freeze({
   PLANNED: 'PLANNED',
@@ -10,10 +11,14 @@ const RUN_STATES = Object.freeze({
   WAITING_HUMAN: 'WAITING_HUMAN',
   PAUSED: 'PAUSED',
   COMPLETED: 'COMPLETED',
-  FAILED: 'FAILED'
+  FAILED: 'FAILED',
+  // STOPPED means an operator/model explicitly closed a non-successful run.
+  // It is intentionally distinct from COMPLETED so a failed/unknown send is
+  // never reported as a successful platform action.
+  STOPPED: 'STOPPED'
 });
 
-const TERMINAL_STATES = new Set([RUN_STATES.COMPLETED, RUN_STATES.FAILED]);
+const TERMINAL_STATES = new Set([RUN_STATES.COMPLETED, RUN_STATES.FAILED, RUN_STATES.STOPPED]);
 const RESUMABLE_STATES = new Set([
   RUN_STATES.PLANNED,
   RUN_STATES.CHECKPOINT,
@@ -36,6 +41,32 @@ function requiredText(value, name, max = 160) {
   return value.trim();
 }
 
+function stringList(value, name, maxItems = 10, maxLength = 80) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > maxItems) throw new TypeError(`${name} must be a non-empty list`);
+  const result = value.map((item, index) => requiredText(item, `${name}[${index}]`, maxLength));
+  return [...new Set(result)];
+}
+
+function normalizeResultGate(value, name) {
+  if (value == null) return null;
+  plainObject(value, name);
+  const stepId = requiredText(value.stepId || value.id, `${name}.stepId`, 120);
+  const resultStatuses = stringList(value.resultStatuses || value.allowedStatuses, `${name}.resultStatuses`);
+  return { stepId, resultStatuses };
+}
+
+function outcomeResult(outcome) {
+  if (outcome?.result && typeof outcome.result === 'object' && !Array.isArray(outcome.result)) return outcome.result;
+  // Older adapter bridges put the platform verdict below checkpoint.result.
+  // Accepting that read-only shape keeps the orchestration boundary backward
+  // compatible while still requiring an explicit delivery status.
+  const legacy = outcome?.checkpoint?.result;
+  if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
+    return { ...legacy, deliveryStatus: legacy.deliveryStatus || legacy.status || legacy.verdict };
+  }
+  return null;
+}
+
 function normalizeDefinition(definition) {
   plainObject(definition, 'workflow definition');
   const workflowId = requiredText(definition.workflowId || definition.id, 'workflowId', 120);
@@ -43,13 +74,19 @@ function normalizeDefinition(definition) {
   if (!Array.isArray(definition.steps) || definition.steps.length === 0 || definition.steps.length > 100) throw new TypeError('workflow steps must be a non-empty list');
   const steps = definition.steps.map((step, index) => {
     const value = typeof step === 'string' ? { stepId: step } : plainObject(step, `workflow step ${index}`);
+    const successStatuses = value.successStatuses || value.allowedResultStatuses;
     return {
       stepId: requiredText(value.stepId || value.id, `workflow step ${index}`, 120),
       retryLimit: Number.isInteger(value.retryLimit) && value.retryLimit >= 0 && value.retryLimit <= 3 ? value.retryLimit : 2,
-      sideEffect: value.sideEffect === true
+      sideEffect: value.sideEffect === true,
+      action: value.action == null ? null : requiredText(value.action, `workflow step ${index}.action`, 160),
+      phase: value.phase == null ? null : requiredText(value.phase, `workflow step ${index}.phase`, 80),
+      resultRequired: value.resultRequired === true || successStatuses !== undefined,
+      successStatuses: successStatuses === undefined ? null : stringList(successStatuses, `workflow step ${index}.successStatuses`),
+      requiresPrevious: normalizeResultGate(value.requiresPrevious, `workflow step ${index}.requiresPrevious`)
     };
   });
-  return { workflowId, version, steps };
+  return { workflowId, version, kind: definition.kind == null ? null : requiredText(definition.kind, 'workflow kind', 120), steps };
 }
 
 class WorkflowRuntime {
@@ -118,6 +155,90 @@ class WorkflowRuntime {
     return { decision: decision.decision };
   }
 
+  /**
+   * Apply the model's post-run decision without letting it rewrite a plan.
+   * The model may only choose a transition; the fixed executor still owns all
+   * step ordering and side effects.  Unknown side-effect results are never
+   * retried from this method: they must be reconciled or handled by a person.
+   */
+  applyResultDecision(runId, decision, { reason = 'model_result_decision', checkpoint = null } = {}) {
+    const run = this.getRun(runId);
+    if (run.status === RUN_STATES.RUNNING) throw new Error('result decision is forbidden while workflow is RUNNING');
+    if (!['continue', 'retry', 'complete', 'wait_human'].includes(decision)) throw new TypeError('workflow result decision is invalid');
+    const data = this.#readData();
+    const current = this.#findOwned(data, runId);
+    const currentStep = current.steps[current.currentStep] || null;
+    const decisionRecord = { decision, reason: requiredText(reason, 'decision reason', 300), at: this.clock() };
+
+    if (decision === 'wait_human') {
+      current.status = RUN_STATES.WAITING_HUMAN;
+      current.checkpoint = checkpoint == null ? (current.checkpoint || { reason: 'model_requested_human' }) : clone(checkpoint);
+      current.lastError = { code: 'RESULT_DECISION_WAITING_HUMAN', reason: decisionRecord.reason };
+      current.resultDecision = decisionRecord;
+      current.updatedAt = this.clock();
+      this.#writeData(data);
+      return { action: 'wait_human', run: clone(current) };
+    }
+
+    if (decision === 'complete') {
+      if (current.status === RUN_STATES.COMPLETED) {
+        current.resultDecision = decisionRecord;
+        current.updatedAt = this.clock();
+        this.#writeData(data);
+        return { action: 'complete', run: clone(current) };
+      }
+      // Closing a failed or unresolved run must remain visibly non-successful.
+      // This is used when the model says there is no useful next action; it is
+      // never allowed to turn a platform failure into COMPLETED.
+      if (!TERMINAL_STATES.has(current.status)) current.status = RUN_STATES.STOPPED;
+      current.resultDecision = decisionRecord;
+      current.lastError = current.lastError || { code: 'STOPPED_BY_RESULT_DECISION' };
+      current.updatedAt = this.clock();
+      this.#writeData(data);
+      return { action: 'complete', run: clone(current) };
+    }
+
+    if (current.status === RUN_STATES.UNKNOWN) {
+      const error = new Error('unknown side-effect result requires reconciliation before retry or continue');
+      error.code = 'RESULT_REQUIRES_RECONCILIATION';
+      throw error;
+    }
+
+    if (current.status === RUN_STATES.COMPLETED) {
+      if (decision === 'continue') {
+        current.resultDecision = decisionRecord;
+        current.updatedAt = this.clock();
+        this.#writeData(data);
+        return { action: 'next_task', run: clone(current) };
+      }
+      throw new Error('completed workflow cannot be retried');
+    }
+
+    if (!currentStep) throw new Error('workflow current step is missing');
+    if (decision === 'retry') {
+      if (current.status !== RUN_STATES.FAILED && current.status !== RUN_STATES.CHECKPOINT && current.status !== RUN_STATES.PAUSED) {
+        throw new Error(`workflow cannot retry from ${current.status}`);
+      }
+      currentStep.status = 'pending';
+      currentStep.attempts = 0;
+      currentStep.result = null;
+      currentStep.resultStatus = null;
+      current.status = RUN_STATES.PLANNED;
+    } else if (decision === 'continue') {
+      if (![RUN_STATES.CHECKPOINT, RUN_STATES.PAUSED, RUN_STATES.WAITING_HUMAN, RUN_STATES.FAILED].includes(current.status)) {
+        throw new Error(`workflow cannot continue from ${current.status}`);
+      }
+      currentStep.status = 'pending';
+      current.status = RUN_STATES.PLANNED;
+      current.checkpoint = null;
+      current.lastError = null;
+    }
+    current.resultDecision = decisionRecord;
+    current.updatedAt = this.clock();
+    this.#writeData(data);
+    return { action: 'run', run: clone(current) };
+  }
+
   startPlan(plan) {
     const normalizedPlan = this.#normalizePlan(plan);
     const definition = this.workflows.get(`${normalizedPlan.workflowId}@${normalizedPlan.version}`);
@@ -138,9 +259,21 @@ class WorkflowRuntime {
       plan: normalizedPlan,
       status: RUN_STATES.PLANNED,
       currentStep: 0,
-      steps: definition.steps.map((step) => ({ stepId: step.stepId, status: 'pending', attempts: 0, sideEffect: step.sideEffect, actionId: id('action'), idempotencyKey: id('idem') })),
+      steps: definition.steps.map((step) => ({
+        stepId: step.stepId,
+        action: step.action,
+        phase: step.phase,
+        status: 'pending',
+        attempts: 0,
+        sideEffect: step.sideEffect,
+        actionId: id('action'),
+        idempotencyKey: id('idem'),
+        result: null,
+        resultStatus: null
+      })),
       checkpoint: null,
       lastError: null,
+      resultDecision: null,
       createdAt: this.clock(),
       updatedAt: this.clock()
     };
@@ -233,6 +366,16 @@ class WorkflowRuntime {
       if (run.status === RUN_STATES.PAUSED) return clone(run);
       const definitionStep = definition.steps[run.currentStep];
       const step = run.steps[run.currentStep];
+      const prerequisite = this.#checkPrerequisite(run, definitionStep);
+      if (!prerequisite.ok) {
+        step.status = 'blocked';
+        run.status = RUN_STATES.WAITING_HUMAN;
+        run.checkpoint = { code: 'PREREQUISITE_NOT_CONFIRMED', ...prerequisite.detail };
+        run.lastError = { code: 'PREREQUISITE_NOT_CONFIRMED', ...prerequisite.detail };
+        run.updatedAt = this.clock();
+        this.#writeData(data);
+        return clone(run);
+      }
       step.status = 'running';
       run.status = RUN_STATES.RUNNING;
       run.updatedAt = this.clock();
@@ -262,8 +405,10 @@ class WorkflowRuntime {
           outcome = { status: RETRYABLE, error: { code: error.code || 'STEP_ERROR', message: error.message || 'step failed' } };
         }
         const normalized = this.#normalizeOutcome(outcome);
-        if (normalized.status !== RETRYABLE || attempt >= attemptLimit) {
-          outcome = normalized;
+        const gated = this.#gateStepResult(definitionStep, normalized);
+        if (gated) outcome = gated;
+        else outcome = normalized;
+        if (outcome.status !== RETRYABLE || attempt >= attemptLimit) {
           break;
         }
         await this.sleep(this.retryBackoffMs[Math.min(attempt - 1, this.retryBackoffMs.length - 1)], { runId, stepId: definitionStep.stepId, attempt });
@@ -275,6 +420,8 @@ class WorkflowRuntime {
       const currentStep = run.steps[run.currentStep];
       if (outcome?.status === 'completed') {
         currentStep.status = 'completed';
+        currentStep.result = outcome.result || null;
+        currentStep.resultStatus = deliveryStatus(currentStep.result);
         run.currentStep += 1;
         run.checkpoint = null;
         run.lastError = null;
@@ -282,6 +429,11 @@ class WorkflowRuntime {
         this.#writeData(data);
         continue;
       }
+      if (outcome?.result) {
+        currentStep.result = outcome.result;
+        currentStep.resultStatus = deliveryStatus(outcome.result);
+      }
+      if (outcome?.checkpoint != null) run.checkpoint = clone(outcome.checkpoint);
       currentStep.status = outcome?.status === RETRYABLE ? 'unknown' : outcome.status;
       run.lastError = outcome.error || (outcome.reason ? { code: outcome.reason } : null);
       if (outcome?.status === RETRYABLE) {
@@ -331,11 +483,21 @@ class WorkflowRuntime {
     const data = this.#readData();
     const current = this.#findOwned(data, run.runId);
     if (result.status === 'confirmed') {
-      current.steps[current.currentStep].status = 'completed';
-      current.currentStep += 1;
-      current.status = RUN_STATES.RUNNING;
-      current.lastError = null;
-      current.checkpoint = { reconciled: 'confirmed', actionId: action.actionId };
+      const reconciledStep = current.steps[current.currentStep];
+      const reconciledStatus = deliveryStatus(result.result);
+      if (step.resultRequired && (!reconciledStatus || !step.successStatuses?.includes(reconciledStatus))) {
+        current.status = RUN_STATES.WAITING_HUMAN;
+        current.checkpoint = { reconciled: 'confirmed_without_delivery_status', actionId: action.actionId };
+        current.lastError = { code: 'RECONCILE_RESULT_UNCONFIRMED' };
+      } else {
+        reconciledStep.status = 'completed';
+        reconciledStep.result = result.result == null ? null : clone(result.result);
+        reconciledStep.resultStatus = reconciledStatus;
+        current.currentStep += 1;
+        current.status = RUN_STATES.RUNNING;
+        current.lastError = null;
+        current.checkpoint = { reconciled: 'confirmed', actionId: action.actionId };
+      }
     } else if (result.status === 'not_found' && result.safeToRetry === true) {
       current.steps[current.currentStep].status = 'pending';
       current.status = RUN_STATES.RUNNING;
@@ -355,8 +517,56 @@ class WorkflowRuntime {
     return result.status === 'confirmed' || (result.status === 'not_found' && result.safeToRetry === true);
   }
 
+  #checkPrerequisite(run, definitionStep) {
+    const requirement = definitionStep.requiresPrevious;
+    if (!requirement) return { ok: true };
+    const previous = run.steps.find((step) => step.stepId === requirement.stepId);
+    const status = deliveryStatus(previous?.result) || previous?.resultStatus || null;
+    if (status && requirement.resultStatuses.includes(status)) return { ok: true };
+    return {
+      ok: false,
+      detail: {
+        stepId: definitionStep.stepId,
+        prerequisiteStepId: requirement.stepId,
+        observedStatus: status
+      }
+    };
+  }
+
+  #gateStepResult(definitionStep, outcome) {
+    if (outcome.status !== 'completed' || !definitionStep.resultRequired) return null;
+    const result = outcomeResult(outcome);
+    const status = deliveryStatus(result);
+    if (!status) {
+      return {
+        status: 'wait_human',
+        result,
+        checkpoint: { code: 'DELIVERY_RESULT_REQUIRED', stepId: definitionStep.stepId },
+        error: { code: 'DELIVERY_RESULT_REQUIRED', message: '副作用步骤没有提供可核验的发送结果' }
+      };
+    }
+    if (definitionStep.successStatuses?.includes(status)) return result === outcome.result ? null : { ...outcome, result };
+    if (['unknown', 'sent_unknown', 'started'].includes(status)) {
+      return {
+        status: 'unknown',
+        result,
+        error: { code: 'DELIVERY_RESULT_UNKNOWN', message: '发送结果无法确认', observedStatus: status }
+      };
+    }
+    return {
+      status: 'wait_human',
+      result,
+      checkpoint: { code: 'DELIVERY_NOT_CONFIRMED', stepId: definitionStep.stepId, observedStatus: status },
+      error: { code: 'DELIVERY_NOT_CONFIRMED', message: '发送结果不是已确认成功', observedStatus: status }
+    };
+  }
+
   #normalizeOutcome(outcome) {
-    if (outcome == null || outcome.status === 'completed' || outcome.status === 'success' || outcome.status === 'done') return { status: 'completed' };
+    if (outcome == null) return { status: 'completed' };
+    if (outcome.status === 'completed' || outcome.status === 'success' || outcome.status === 'done') {
+      const result = outcomeResult(outcome);
+      return { status: 'completed', ...(result == null ? {} : { result: clone(result) }) };
+    }
     plainObject(outcome, 'workflow step outcome');
     const status = outcome.status;
     if (![RETRYABLE, 'unknown', 'checkpoint', 'wait_human', 'failed'].includes(status)) throw new Error(`unsupported workflow step outcome: ${status}`);
@@ -364,6 +574,8 @@ class WorkflowRuntime {
     if (outcome.reason != null) result.reason = requiredText(String(outcome.reason), 'outcome reason', 300);
     if (outcome.error != null) result.error = clone(outcome.error);
     if (outcome.checkpoint != null) result.checkpoint = clone(outcome.checkpoint);
+    const stepResult = outcomeResult(outcome);
+    if (stepResult != null) result.result = plainObject(stepResult, 'workflow step result') && clone(stepResult);
     return result;
   }
 
