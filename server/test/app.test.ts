@@ -38,6 +38,10 @@ async function plannerServer() {
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('planner did not bind');
   return { server, baseUrl: `http://127.0.0.1:${address.port}` };
 }
+async function resultDecisionServer() {
+  const server: Server = createServer((_request, response) => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"decision":"complete"}' } }] })); }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', () => resolve())); const address = server.address(); if (!address || typeof address === 'string') throw new Error('result decider did not bind'); return { server, baseUrl: `http://127.0.0.1:${address.port}` };
+}
 async function runCli(args: string[], env: Record<string, string>) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => { const child = spawn('node', ['--import', 'tsx', 'src/cli.ts', ...args], { cwd: process.cwd(), env: { ...process.env, ...env }, windowsHide: true }); let stdout = ''; let stderr = ''; let finished = false; const done = (code: number | null) => { if (!finished) { finished = true; clearTimeout(timer); resolve({ code, stdout, stderr }); } }; const timer = setTimeout(() => { child.kill(); stderr += 'CLI subprocess timeout'; done(null); }, 5000); child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.on('data', (chunk) => { stderr += chunk; }); child.on('error', (error) => { stderr += String(error); done(null); }); child.on('close', (code) => done(code)); });
 }
@@ -230,4 +234,19 @@ test('knowledge documents are chunked, version-frozen, isolated and searchable',
     const frozen = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, version: 1, query: '价格' } }); assert.equal(frozen.statusCode, 200); assert.ok(frozen.json().results.length > 0);
     const tooLarge = await f.app.inject({ method: 'POST', url: '/v1/knowledge-documents', headers: { authorization: `Bearer ${tokenA}` }, payload: { knowledgeSetId: setId, title: '大文档', content: 'x'.repeat(200_001) } }); assert.equal(tooLarge.statusCode, 413);
   } finally { await f.close(); }
+});
+
+test('workflow result decision is post-run only, scoped and idempotent', async () => {
+  const provider = await resultDecisionServer(); const f = await fixture({ provider: { baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' } }); try {
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'decision.test', version: 1, name: '决策测试', contract: { steps: ['done'] } } }); assert.equal(workflow.statusCode, 200);
+    const a = await f.create({ username: 'decision-a' }); const b = await f.create({ username: 'decision-b' }); const loginA = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: a.username, password: a.password, deviceId: 'a', deviceName: 'A' } }); const tokenA = loginA.json().token; const loginB = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: b.username, password: b.password, deviceId: 'b', deviceName: 'B' } }); const tokenB = loginB.json().token;
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'decision-plan-1', a.id, 'decision.test', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
+    const created = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${tokenA}` }, payload: { planId: 'decision-plan-1', workflowId: 'decision.test', version: 1, params: {}, idempotencyKey: 'decision-run-001' } }); const runId = created.json().run.id;
+    const running = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(running.statusCode, 200);
+    const blocked = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'RUNNING', summary: {}, idempotencyKey: 'decision-key-001' } }); assert.equal(blocked.statusCode, 409); assert.equal(blocked.json().code, 'RESULT_DECISION_RUNNING');
+    const spoofed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', summary: {}, idempotencyKey: 'decision-key-003' } }); assert.equal(spoofed.statusCode, 409); assert.equal(spoofed.json().code, 'RESULT_DECISION_RUNNING');
+    const failed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', expectedVersion: 1 } }); assert.equal(failed.statusCode, 200);
+    const decision = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', summary: { reason: 'x' }, idempotencyKey: 'decision-key-002' } }); assert.equal(decision.statusCode, 200); assert.equal(decision.json().decision, 'complete'); const replay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', summary: { reason: 'x' }, idempotencyKey: 'decision-key-002' } }); assert.deepEqual(replay.json(), decision.json());
+    const hidden = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'FAILED', summary: {}, idempotencyKey: 'decision-hidden-001' } }); assert.equal(hidden.statusCode, 404);
+  } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
 });

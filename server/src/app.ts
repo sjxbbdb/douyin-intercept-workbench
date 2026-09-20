@@ -232,6 +232,17 @@ async function providerPlan(cfg: AppConfig, input: AnyRecord): Promise<AnyRecord
     throw new AppError(503, 'PROVIDER_FAILED', error instanceof Error && error.name === 'AbortError' ? 'AI provider 超时' : 'AI provider 不可用');
   } finally { clearTimeout(timer); }
 }
+async function providerResultDecision(cfg: AppConfig, input: AnyRecord): Promise<AnyRecord> {
+  const provider = cfg.provider ?? {}; if (!provider.baseUrl || !provider.apiKey || !provider.model) throw new AppError(503, 'PROVIDER_NOT_CONFIGURED', 'AI provider 未配置');
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), cfg.draftTimeoutMs ?? 30_000);
+  try {
+    const response = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`, { method: 'POST', signal: controller.signal, headers: { 'content-type': 'application/json', authorization: `Bearer ${provider.apiKey}` }, body: JSON.stringify({ model: provider.model, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: '你是固定流程结果决策器。只输出 JSON：decision 必须是 continue、retry、complete、wait_human 之一。不要返回步骤、工具或代码。' }, { role: 'user', content: JSON.stringify(input) }] }) });
+    if (!response.ok) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 请求失败'); const raw = await response.text(); if (raw.length > 100_000) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 响应过大'); const content = (JSON.parse(raw) as AnyRecord).choices?.[0]?.message?.content; if (typeof content !== 'string') throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 响应无效'); const parsed = JSON.parse(content) as AnyRecord; if (Object.keys(parsed).length !== 1 || !['continue', 'retry', 'complete', 'wait_human'].includes(parsed.decision)) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策无效'); return parsed;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'PROVIDER_FAILED', error instanceof Error && error.name === 'AbortError' ? 'AI provider 超时' : 'AI provider 不可用');
+  } finally { clearTimeout(timer); }
+}
 
 export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance> {
   const store = new Store(config.dbPath ?? './data/license.sqlite');
@@ -383,6 +394,7 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
     userFromRequest: (request) => userFromRequest(store, request, config),
     adminFromRequest: (request) => adminFromRequest(store, request),
     planner: (input) => providerPlan(config, input),
+    resultDecider: (input) => providerResultDecision(config, input),
   });
   registerKnowledgeRoutes(app, {
     store,

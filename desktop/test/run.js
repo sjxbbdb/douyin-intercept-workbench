@@ -221,6 +221,15 @@ testAsync('workflow runtime fails closed when no fixed executor is supplied', as
   assert.equal(result.lastError.code, 'EXECUTOR_UNAVAILABLE');
 });
 
+testAsync('workflow result decision is post-run only and validates the four decisions', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-result-decision-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] }); let calls = 0; let releaseStep; const gate = new Promise((resolve) => { releaseStep = resolve; });
+  const runtime = new WorkflowRuntime({ store, accountId: 'decision-account', modelDecider: async () => ({ workflowId: 'decision.fixture', version: '1', params: {} }), resultDecider: async ({ status }) => { calls += 1; assert.equal(status, RUN_STATES.FAILED); return { decision: 'retry' }; }, workflows: [{ workflowId: 'decision.fixture', version: '1', steps: ['step'] }], stepExecutor: async () => { await gate; return { status: 'failed', error: { code: 'fixture' } }; } });
+  const run = runtime.startPlan(await runtime.planFromIntent('结果决策')); const running = runtime.run(run.runId); for (let i = 0; i < 20 && runtime.getRun(run.runId).status !== RUN_STATES.RUNNING; i += 1) await new Promise((resolve) => setTimeout(resolve, 1)); await assert.rejects(runtime.decideResult(run.runId), /RUNNING/); releaseStep(); await running;
+  assert.deepEqual(await runtime.decideResult(run.runId, { summary: 'fixture' }), { decision: 'retry' }); assert.equal(calls, 1);
+  const invalid = new WorkflowRuntime({ store: new JsonStore(path.join(dir, 'invalid.json'), { workflowRuns: [] }), accountId: 'invalid', resultDecider: async () => ({ decision: 'complete', extra: true }), workflows: [{ workflowId: 'decision.fixture', version: '1', steps: ['step'] }] }); const invalidRun = invalid.startPlan({ workflowId: 'decision.fixture', version: '1', params: {} }); await invalid.pauseRun(invalidRun.runId); await assert.rejects(invalid.decideResult(invalidRun.runId), /invalid/);
+});
+
 testAsync('workflow invalidation pauses the old account while preserving new-account isolation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
@@ -267,6 +276,12 @@ testAsync('ApiClient platform account endpoints preserve the server account cont
   assert.equal(requests[0].url, 'https://license.example/v1/platform-accounts');
   assert.equal(requests[1].options.method, 'POST');
   assert.equal(requests[1].options.headers.Authorization, 'Bearer platform-token');
+});
+testAsync('ApiClient result decision preserves the original run boundary', async () => {
+  let seen;
+  const api = new ApiClient({ baseUrl: 'https://license.example', authStore: { getToken: () => 'token' }, fetchImpl: async (url, options) => { seen = { url, options }; return { ok: true, status: 200, json: async () => ({ runId: 'run-1', decision: 'wait_human' }) }; } });
+  const result = await api.resultDecision('run-1', { status: 'UNKNOWN', summary: { reason: 'fixture' }, idempotencyKey: 'result-key-001' });
+  assert.equal(result.decision, 'wait_human'); assert.equal(seen.url, 'https://license.example/v1/workflow-runs/run-1/result-decision'); assert.equal(seen.options.headers.Authorization, 'Bearer token');
 });
 
 testAsync('rule event skips unrelated text before paid evaluation', async () => {

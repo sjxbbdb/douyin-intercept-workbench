@@ -12,6 +12,7 @@ interface WorkflowRouteDeps {
   userFromRequest: AuthFn;
   adminFromRequest: AuthFn;
   planner?: (input: RecordValue) => Promise<RecordValue>;
+  resultDecider?: (input: RecordValue) => Promise<RecordValue>;
 }
 
 const checkpointStatuses = new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']);
@@ -335,4 +336,14 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   const recoverHandler = async (request: RequestValue) => { const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['checksPassed', 'userConfirmed', 'reason', 'expectedVersion']); const row = recoverRun(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, body); audit(store, 'user', actor.user_id, 'workflow.recover', actor.user_id, { runId: row.id, recoveryAttempts: row.recovery_attempts }); return { run: runResponse(row) }; };
   app.post('/v1/workflow-runs/:id/recover', recoverHandler);
   app.post('/v1/workflow-runs/:id/human-wait/resolve', recoverHandler);
+  app.post('/v1/workflow-runs/:id/result-decision', async (request) => {
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['status', 'summary', 'idempotencyKey']);
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
+    const old = store.get<RecordValue>('SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope=\'workflow.result-decision\' AND idem_key=?', actor.user_id, key); if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同结果'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
+    if (!deps.resultDecider) throw new AppError(503, 'RESULT_DECIDER_NOT_CONFIGURED', '结果决策器未配置');
+    const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary }); const decision = stringValue(result.decision, 'decision', 40, true) as string; if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || Object.keys(result).some((key) => key !== 'decision')) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策无效');
+    const response = { runId, workflowId: run.workflow_id, version: run.workflow_version, decision };
+    store.transaction(() => { store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.result-decision', key, hashPayload(payload), 'completed', json(response), store.now()); audit(store, 'user', actor.user_id, 'workflow.result-decision', actor.user_id, { runId, decision }); });
+    return response;
+  });
 }

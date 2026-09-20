@@ -53,11 +53,12 @@ function normalizeDefinition(definition) {
 }
 
 class WorkflowRuntime {
-  constructor({ store, accountId, modelDecider, workflows = [], stepExecutor, reconcileAction, healthCheck, onStateChange, clock = now, sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)), retryBackoffMs = DEFAULT_RETRY_BACKOFF_MS } = {}) {
+  constructor({ store, accountId, modelDecider, resultDecider, workflows = [], stepExecutor, reconcileAction, healthCheck, onStateChange, clock = now, sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)), retryBackoffMs = DEFAULT_RETRY_BACKOFF_MS } = {}) {
     if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') throw new TypeError('workflow store is required');
     this.store = store;
     this.accountId = requiredText(accountId || 'guest', 'accountId', 200);
     this.modelDecider = modelDecider;
+    this.resultDecider = resultDecider;
     this.stepExecutor = stepExecutor;
     this.reconcileAction = reconcileAction;
     this.healthCheck = healthCheck;
@@ -104,6 +105,17 @@ class WorkflowRuntime {
     if (typeof this.modelDecider !== 'function') throw new Error('workflow model decision is unavailable');
     const decision = await this.modelDecider({ intent: intent.trim(), context: clone(context), accountId: this.accountId });
     return this.#normalizePlan(decision, true);
+  }
+
+  async decideResult(runId, summary = {}) {
+    const run = this.getRun(runId);
+    if (run.status === RUN_STATES.RUNNING) throw new Error('result decision is forbidden while workflow is RUNNING');
+    if (typeof this.resultDecider !== 'function') throw new Error('workflow result decision is unavailable');
+    plainObject(summary, 'workflow result summary');
+    const decision = await this.resultDecider({ run: clone(run), workflowId: run.workflowId, version: run.version, status: run.status, summary: clone(summary) });
+    plainObject(decision, 'workflow result decision');
+    if (!['continue', 'retry', 'complete', 'wait_human'].includes(decision.decision) || Object.keys(decision).some((key) => key !== 'decision')) throw new Error('workflow result decision is invalid');
+    return { decision: decision.decision };
   }
 
   startPlan(plan) {

@@ -157,6 +157,18 @@ function emitState() {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, platformAccounts, platformAccountId: currentPlatformAccountId });
 }
 
+async function requestResultDecision(remoteRunId, result) {
+  if (!remoteRunId || !result || result.status === 'RUNNING') return null;
+  if (typeof api?.resultDecision !== 'function') return { state: 'unavailable', reason: 'result_decision_api_unavailable', requiresManualGate: true };
+  const idempotencyKey = safeIdempotencyKey(`result:${remoteRunId}:${result.status}:${result.currentStep ?? 'final'}`);
+  try {
+    const response = await api.resultDecision(remoteRunId, { status: result.status, summary: { currentStep: result.currentStep, checkpoint: result.checkpoint || null, failure: result.lastError || null }, idempotencyKey });
+    return { ...response, requiresManualGate: result.status === 'UNKNOWN' || result.status === 'WAITING_HUMAN' };
+  } catch (error) {
+    return { state: 'unavailable', code: error.code || 'RESULT_DECISION_FAILED', reason: error.message, requiresManualGate: true };
+  }
+}
+
 function currentProfile() { return dataStore.get().selectorProfile || DEFAULT_SELECTOR_PROFILE; }
 
 function normalizedPlatformAccounts(payload) {
@@ -352,9 +364,10 @@ function registerIpc() {
     dataStore.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
     const result = await workflowRuntime.run(run.runId);
     await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: 1, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+    const nextDecision = await requestResultDecision(remoteRunId, result);
     dataStore.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: message, at: new Date().toISOString() }, { role: 'assistant', content: `已选择固定流程 ${plan.workflowId}@${plan.version}，当前状态：${result.status}`, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
     emitState();
-    return { plan, run: result };
+    return { plan, run: result, nextDecision };
   }));
   ipcMain.handle('agent:resume-workflow', wrap(async (_event, runId) => {
     const local = workflowRuntime.getRun(text(runId, 'run id', 160));
@@ -366,7 +379,8 @@ function registerIpc() {
     }
     const result = await workflowRuntime.resumeRun(local.runId, { skipHealthCheck: true });
     if (local.remoteRunId && remoteVersion != null) await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
-    emitState(); return result;
+    const nextDecision = await requestResultDecision(local.remoteRunId, result);
+    emitState(); return { ...result, nextDecision };
   }));
   ipcMain.handle('agent:pause-workflow', wrap((_event, runId) => { const result = workflowRuntime.pauseRun(text(runId, 'run id', 160)); emitState(); return result; }));
   ipcMain.handle('agent:login', wrap(handleLogin));
