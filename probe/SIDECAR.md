@@ -136,6 +136,26 @@ selectors remain fixture-validated only, the platform has not been observed to
 publish an author id for every live comment, and phase-two delivery keeps the
 same `unknown` semantics as the other send paths.
 
+## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
+
+* **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
+  以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
+  续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
+  响应 `filter` 新增 `kept`（实际返回条数）与 `poolAdded`（本页新增进池的条数）便于对账。
+  回归：`test_relevance_filtered_videos_stay_in_the_cursor_pool`。
+* **验证码是终止状态**：命中验证码时返回 `status: "captcha"`、`hasMore: false`、`cursor: null`
+  与 `stoppedReason: "captcha_requires_manual_action"` —— 不再给可翻页信号，
+  避免上层据此自动继续请求、在风控点上越撞越深。
+  回归：`test_captcha_is_terminal_and_offers_no_next_page`。
+* **评论区两阶段契约**：`comment_private_candidates` 把一个批次按「公屏是否确认成功」分成
+  `allowed` / `rejected`；`send_private` 也接受 `publicSendId`，给出时**必须**是
+  `sent_confirmed`，否则在**打开浏览器之前**以稳定原因拒绝：
+  `public_missing` / `public_not_found` / `public_not_a_reply` / `public_pending` /
+  `public_unknown` / `public_failed` / `public_blocked` / `missing_author_id`。
+  ⚠️ `send_gate.result()` 会把 `sent_confirmed` 映射成 `unknown`（避免过度宣称），
+  所以契约判定读的是 **`SendGate.lookup()` 返回的原始状态**。
+  回归：`CommentFlowContractTests`（5 项，含"不通过就不许打开浏览器"）。
+
 ### 采集数据源与「回复弹幕」（2026-09-20 真机）
 
 * **采集优先读页面内存**：弹幕虚拟列表组件的 React fiber props 里有 originalList（消息数组），

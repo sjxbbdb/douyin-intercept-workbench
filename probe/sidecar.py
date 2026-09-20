@@ -166,6 +166,44 @@ def _dedupe_by_author(rows):
     return [best[k] for k in order], dropped
 
 
+# 两阶段契约（评论区固定流程）：公屏回复确认成功之前，不允许进入私信阶段。
+PUBLIC_CONFIRMED = "sent_confirmed"
+PUBLIC_REPLY_KINDS = ("comment", "danmaku_reply")
+
+
+def _public_guard(gate, public_send_id):
+    """只有「公屏回复确认成功」才允许私信；返回 None 表示放行。
+
+    为什么看原始状态：send_gate 的对外 result() 会把 sent_confirmed 映射成 unknown
+    （避免过度宣称），但两阶段契约必须按【落库的原始状态】判断，否则永远进不了私信。
+
+    稳定拒绝原因（宿主可直接据此决定重试或放弃）：
+      public_missing    宿主没给 publicSendId（批量清单里属于必修项）
+      public_not_found  这个 sendId 在本地台账里不存在
+      public_not_a_reply 这个 sendId 不是公屏回复（比如私信记录）
+      public_pending    公屏回复尚未有结论（reserved / started）
+      public_unknown    公屏结果未知（红线：未知不得自动重试，更不得转私信）
+      public_failed     公屏发送失败
+      public_blocked    公屏被平台/校验拦下
+    """
+    send_id = str(public_send_id or "").strip()
+    if not send_id:
+        return None
+    row = gate.lookup(send_id)
+    if row is None:
+        return ("public_not_found", "the public reply sendId is unknown; private is refused")
+    if str(row.get("kind") or "") not in PUBLIC_REPLY_KINDS:
+        return ("public_not_a_reply", "that sendId is not a public reply")
+    status = str(row.get("status") or "")
+    if status in ("reserved", "started"):
+        status = "pending"
+    if status != PUBLIC_CONFIRMED:
+        return ("public_" + status,
+                "public reply is %s; only %s allows a private message"
+                % (status, PUBLIC_CONFIRMED))
+    return None
+
+
 def _live_batch_items(params):
     """Validate the per-item send plan of one live batch phase.
 
@@ -328,6 +366,20 @@ class Sidecar:
                                                        "mention": "text_must_start_with_at_nickname",
                                                        "target": "danmaku_must_be_visible_and_unique",
                                                        "sendMechanism": "unverified_button_or_enter"}},
+                # 评论区固定流程：关键词匹配评论 -> 公开回复 -> 只有 sent_confirmed 才允许私信。
+                # 拒绝原因是稳定枚举（见模块级 _public_guard），宿主可直接据此决策。
+                "comment_flow": {"implemented": True, "autoEligible": False,
+                                  "validation": {"status": "offline_unit_tests",
+                                                 "delivery": "unknown",
+                                                 "privateGate": "sent_confirmed_only",
+                                                 "rejectReasons": ["public_missing",
+                                                                   "public_not_found",
+                                                                   "public_not_a_reply",
+                                                                   "public_pending",
+                                                                   "public_unknown",
+                                                                   "public_failed",
+                                                                   "public_blocked",
+                                                                   "missing_author_id"]}},
                 # 采集数据源：优先读页面内存里的弹幕数据模型（带 sec_uid），DOM 文本兜底。
                 "live_capture_source": {"implemented": True, "autoEligible": False,
                                          "validation": {"status": "page_memory_verified_2026_09_19",
@@ -500,22 +552,50 @@ class Sidecar:
                                                 navigate=navigate, seen_ids=seen)
             out = []
             filtered = 0
+            kept = 0
+            # 🔴 游标池 = 本页【见过的全部视频】，包含被相关度筛掉的、以及超出 maxVideos 没返回的。
+            #    原实现只把"保留下来的"放进池里：被筛掉的视频不在池中，续页时假源（或平台的
+            #    滚动重渲染）再给出它们就会被当成新视频重复处理一遍 —— 相关度越高这类样本越多。
+            pool = set(seen)
             for video in videos:
+                video_id = str(video.get("aweme_id") or "")
+                if video_id:
+                    pool.add(video_id)
                 relevance = crawlmod.video_relevance(video.get("desc"), keyword)
                 if relevance["score"] < min_relevance:
                     filtered += 1
                     continue
                 if len(out) >= max_videos:
-                    break
-                out.append({"id": str(video.get("aweme_id") or ""),
+                    # 超出本页返回上限：仍然留在池里（见过就不再当新视频），继续扫描以补全池子。
+                    continue
+                kept += 1
+                out.append({"id": video_id,
                             "url": safe_url(video.get("url"), "video.url"),
                             "title": str(video.get("desc") or "")[:200],
                             "author": str(video.get("author") or "")[:120],
                             "authorId": str(video.get("author_sec_uid") or "")[:200],
                             "relevance": relevance})
-            pool = set(seen) | {v["id"] for v in out if v["id"]}
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
-            return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
+            captcha = meta.get("stopped_reason") == "captcha"
+            if captcha:
+                # 🔴 第 2 项：验证码是【终止状态】。原来这里仍然返回可续页的 cursor 与
+                #    hasMore=true，上层会据此自动继续翻页，在风控点上越撞越深。
+                #    现在明确：不给 cursor、hasMore 恒为 false，并给出停止原因。
+                return {"status": "captcha",
+                        "videos": out,
+                        "cursor": None,
+                        "hasMore": False,
+                        "stoppedReason": "captcha_requires_manual_action",
+                        "page": page_no,
+                        "poolSize": len(pool),
+                        "skippedSeen": int(meta.get("skipped_seen") or 0),
+                        "platformHasMore": meta.get("platform_has_more"),
+                        "platformCursor": meta.get("platform_cursor"),
+                        "filter": {"collected": len(videos), "returned": len(out),
+                                   "filteredByRelevance": filtered, "kept": kept,
+                                   "poolAdded": len(pool) - len(seen),
+                                   "minRelevance": min_relevance}}
+            return {"status": "ok",
                     "videos": out,
                     "cursor": _encode_cursor(keyword, pool, page_no + 1),
                     "hasMore": bool(out),
@@ -525,7 +605,8 @@ class Sidecar:
                     "platformHasMore": meta.get("platform_has_more"),
                     "platformCursor": meta.get("platform_cursor"),
                     "filter": {"collected": len(videos), "returned": len(out),
-                               "filteredByRelevance": filtered,
+                               "filteredByRelevance": filtered, "kept": kept,
+                               "poolAdded": len(pool) - len(seen),
                                "minRelevance": min_relevance}}
         finally:
             page.close()
@@ -646,14 +727,57 @@ class Sidecar:
             page.close()
 
     def send_private(self, params):
+        """私信。可选 publicSendId：给出时必须已确认成功，否则在打开浏览器之前就拒绝。"""
         send_id = str(params.get("sendId") or "")
         target = params.get("target")
         text = params.get("text")
+        # 🔴 两阶段契约在【打开浏览器之前】判定（fail-closed）：
+        #    不该发的连页面都不开，既省一次风控暴露，也不会留下"点了一半"的现场。
+        refusal = _public_guard(self.gate, params.get("publicSendId"))
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         page, _ = self._page()
         try:
             return send_private(page, self.gate, send_id, target, text)
         finally:
             page.close()
+
+    def comment_private_candidates(self, params):
+        """把一个批次按「公屏是否确认成功」分成 allowed / rejected（只读，不碰浏览器）。
+
+        架构依据：评论区固定流程 —— 关键词匹配评论 -> 公开回复 -> **只有 sent_confirmed
+        才允许私信**；unknown / failed / blocked 一律禁止进入私信。
+        每条拒绝都给稳定的原因，宿主据它决定重试、人工处理还是放弃。
+
+        items[i] 需要 {eventId, authorId, authorName, publicSendId}；缺 publicSendId 的按
+        public_missing 拒绝 —— 批量清单的存在意义就是替宿主守住这条流程契约。
+        （单发 send_private 仍可不带 publicSendId：那是宿主自己已经确认过时的低层入口。）
+        """
+        items = params.get("items")
+        if not isinstance(items, list) or not items:
+            raise SidecarError("invalid_input", "items must be a non-empty list")
+        allowed, rejected = [], []
+        for item in items:
+            if not isinstance(item, dict):
+                raise SidecarError("invalid_input", "each item must be an object")
+            event_id = str(item.get("eventId") or "").strip()
+            author_id = str(item.get("authorId") or "").strip()
+            public_send_id = str(item.get("publicSendId") or "").strip()
+            if not public_send_id:
+                rejected.append({"eventId": event_id, "reason": "public_missing"})
+                continue
+            refusal = _public_guard(self.gate, public_send_id)
+            if refusal:
+                rejected.append({"eventId": event_id, "reason": refusal[0]})
+                continue
+            if not author_id:
+                rejected.append({"eventId": event_id, "reason": "missing_author_id"})
+                continue
+            allowed.append({"eventId": event_id, "authorId": author_id,
+                            "authorName": str(item.get("authorName") or "")[:120],
+                            "publicSendId": public_send_id})
+        return {"status": "ok", "allowed": allowed, "rejected": rejected,
+                "policy": {"allowPublicStates": [PUBLIC_CONFIRMED]}}
 
     def send_comment(self, params):
         send_id = str(params.get("sendId") or "")
@@ -887,6 +1011,7 @@ class Sidecar:
     def dispatch(self, method, params):
         allowed = {"capabilities", "launch", "doctor", "open", "search",
                    "collect_comments", "collect_live", "send_private", "send_comment",
+                   "comment_private_candidates",
                    "live_listen", "live_plan", "live_reply", "live_private", "live_result",
                    "close"}
         if method not in allowed:

@@ -1632,6 +1632,64 @@ class SearchPagingTests(unittest.TestCase):
             instance.search({"keyword": "宝宝辅食", "cursor": token})
 
 
+    def test_relevance_filtered_videos_stay_in_the_cursor_pool(self):
+        """回归（第 1 项）：被相关度筛掉的视频【也必须】进游标池，否则续页会重复处理它们。
+
+        原实现的池子只装"保留下来的"视频：低相关视频不在池里，续页时数据源（或平台的滚动
+        重渲染）再把它们摆出来，就会被当成新视频重新处理一遍。
+        """
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_mixed_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 10,
+                                     "minRelevance": 60})
+            second = instance.search({"keyword": "宝宝辅食", "maxVideos": 10,
+                                      "minRelevance": 60, "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+        self.assertEqual([v["id"] for v in first["videos"]], ["h1", "h2", "h3"])
+        self.assertEqual(first["filter"]["filteredByRelevance"], 3)
+        self.assertEqual(first["filter"]["kept"], 3)
+        self.assertEqual(first["filter"]["poolAdded"], 6,
+                         "被相关度筛掉的视频也必须进游标池")
+        self.assertEqual(first["poolSize"], 6)
+        # 续页：数据源又把同一批 6 条摆出来，池子必须把它们全部拦住（一条都不再处理）
+        self.assertEqual(second["videos"], [])
+        self.assertEqual(second["skippedSeen"], 6)
+        self.assertFalse(second["hasMore"])
+
+    def test_captcha_is_terminal_and_offers_no_next_page(self):
+        """回归（第 2 项）：命中验证码必须收敛成终止状态，不能再给可翻页信号。
+
+        原来这里仍然返回可续页的 cursor 且 hasMore=true，上层会据此自动继续请求，
+        在风控点上越撞越深。
+        """
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_captcha_search(calls)
+        try:
+            result = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+        self.assertEqual(result["status"], "captcha")
+        self.assertFalse(result["hasMore"], "验证码是终止状态，不能再给可翻页信号")
+        self.assertIsNone(result["cursor"], "验证码后不给续页游标，避免上层自动继续请求")
+        self.assertEqual(result["stoppedReason"], "captcha_requires_manual_action")
+
+
 class FakeSearchPage:
     """search 只需要 location.href；续页时靠它判断"还在不在搜索页上"。"""
 
@@ -1668,6 +1726,62 @@ def make_fake_search(calls):
             meta["platform_cursor"] = "pc-1"
             meta["platform_has_more"] = 1
         return out
+
+    return fake
+
+
+def make_mixed_search(calls):
+    """假的 search_videos：一页固定 6 条（3 条高相关 + 3 条低相关），按 seen_ids 跳过见过的。
+
+    用途：相关度筛选 × 分页游标的组合回归 —— 被 minRelevance 筛掉的视频也必须进池。
+    """
+
+    pool = [
+        {"aweme_id": "h1", "url": "https://www.douyin.com/video/h1",
+         "desc": "宝宝辅食怎么做 一周不重样", "author": "作者", "author_sec_uid": "SEC"},
+        {"aweme_id": "h2", "url": "https://www.douyin.com/video/h2",
+         "desc": "宝宝辅食 教程 合集", "author": "作者", "author_sec_uid": "SEC"},
+        {"aweme_id": "h3", "url": "https://www.douyin.com/video/h3",
+         "desc": "宝宝辅食 第一口怎么加", "author": "作者", "author_sec_uid": "SEC"},
+        {"aweme_id": "l1", "url": "https://www.douyin.com/video/l1",
+         "desc": "今天分享一个家常菜做法", "author": "作者", "author_sec_uid": "SEC"},
+        {"aweme_id": "l2", "url": "https://www.douyin.com/video/l2",
+         "desc": "完全无关的内容", "author": "作者", "author_sec_uid": "SEC"},
+        {"aweme_id": "l3", "url": "https://www.douyin.com/video/l3",
+         "desc": "随便拍拍", "author": "作者", "author_sec_uid": "SEC"},
+    ]
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        seen = set(str(x) for x in (seen_ids or ()))
+        calls.append({"navigate": navigate, "seen": seen})
+        fresh = [v for v in pool if v["aweme_id"] not in seen]
+        if isinstance(meta, dict):
+            meta["skipped_seen"] = len(pool) - len(fresh)
+            meta["api_cursor"] = "pc-mixed"
+            meta["api_has_more"] = 1
+            meta["platform_cursor"] = "pc-mixed"
+            meta["platform_has_more"] = 1
+        return fresh
+
+    return fake
+
+
+def make_captcha_search(calls):
+    """假的 search_videos：命中验证码，stopped_reason=captcha。"""
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        calls.append({"navigate": navigate})
+        if isinstance(meta, dict):
+            meta["skipped_seen"] = 0
+            meta["api_cursor"] = "pc-captcha"
+            meta["api_has_more"] = 1
+            meta["platform_cursor"] = "pc-captcha"
+            meta["platform_has_more"] = 1
+            meta["stopped_reason"] = "captcha"
+        return [{"aweme_id": "c1", "url": "https://www.douyin.com/video/c1",
+                 "desc": "宝宝辅食 教程", "author": "作者", "author_sec_uid": "SEC"}]
 
     return fake
 
@@ -1771,8 +1885,11 @@ class SearchRelevanceTests(unittest.TestCase):
         self.assertEqual(result["videos"][0]["relevance"]["score"], 100)
         self.assertEqual(result["videos"][0]["relevance"]["reason"], "exact_phrase")
         self.assertEqual(result["videos"][2]["relevance"]["reason"], "no_match")
+        # filter 里新增 kept / poolAdded：池子装的是【本页见过的全部视频】，
+        # 不只是返回给宿主的那些（见 test_relevance_filtered_videos_stay_in_the_cursor_pool）。
         self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
-                                            "filteredByRelevance": 0, "minRelevance": 0})
+                                            "filteredByRelevance": 0, "kept": 3,
+                                            "poolAdded": 3, "minRelevance": 0})
         # 边界：只发现与筛选，不产生任何发送动作
         for key in ("sent", "sendId", "private", "reply"):
             self.assertNotIn(key, result)
@@ -1781,7 +1898,11 @@ class SearchRelevanceTests(unittest.TestCase):
         result = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
         self.assertEqual([v["id"] for v in result["videos"]], ["1"])
         self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
-                                            "filteredByRelevance": 2, "minRelevance": 60})
+                                            "filteredByRelevance": 2, "kept": 1,
+                                            "poolAdded": 3, "minRelevance": 60})
+        # 第 1 项契约：被相关度筛掉的 2 条也在游标池里（poolAdded=3 而不是 1），
+        # 否则续页会把它们当新视频重复处理。
+        self.assertEqual(result["poolSize"], 3)
 
     def test_min_relevance_is_validated(self):
         import sidecar
@@ -1790,6 +1911,125 @@ class SearchRelevanceTests(unittest.TestCase):
             instance.search({"keyword": "宝宝辅食", "minRelevance": 101})
         with self.assertRaises(sidecar.SidecarError):
             instance.search({"keyword": "宝宝辅食", "minRelevance": -1})
+
+
+class CommentFlowContractTests(unittest.TestCase):
+    """评论区两阶段契约（第 3 项）：公开回复确认成功之前，一律不许私信。
+
+    架构依据：评论区固定流程 —— 关键词匹配评论 -> 公开回复 -> 只有 sent_confirmed
+    才允许私信；unknown / failed / blocked 明确禁止进入私信，且拒绝必须发生在
+    打开浏览器之前（fail-closed）。
+    """
+
+    class _Page:
+        def __init__(self, url="https://www.douyin.com/user/other"):
+            self.url = url
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return self.url
+            return None
+
+        def close(self):
+            pass
+
+    def _instance(self, explode=False):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        if explode:
+            def boom():
+                raise AssertionError("契约不通过时不得打开浏览器")
+            instance._page = boom
+        else:
+            instance._page = lambda: (self._Page(), {"pid": 1})
+        return sidecar, instance
+
+    @staticmethod
+    def _public_reply(gate, send_id, status):
+        gate.reserve(send_id, "comment:%s:author-1" % send_id, "public text", kind="comment")
+        if status in ("unknown", "sent_confirmed"):
+            # 这两类是"点下去之后"才可能有的结果；failed / blocked 属于开始之前就被拦下，
+            # 不能先 mark_started —— send_gate 会把 started+failed 升级成 unknown（正确行为）。
+            gate.mark_started(send_id)
+        gate.finish(send_id, status, "platform_response_unavailable")
+        return send_id
+
+    def _refuse(self, status):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            public_id = self._public_reply(gate, "pub-%s" % status, status)
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-1", "publicSendId": public_id,
+                                       "target": {"authorId": "author-1"}, "text": "你好"})
+            return raised.exception.code
+
+    def test_unresolved_public_reply_blocks_the_private_message(self):
+        """unknown（本通道常态）不得转成私信 —— 这是红线 2/3 的直接体现。"""
+        self.assertEqual(self._refuse("unknown"), "public_unknown")
+
+    def test_failed_and_blocked_public_replies_block_the_private_message(self):
+        self.assertEqual(self._refuse("failed"), "public_failed")
+        self.assertEqual(self._refuse("blocked"), "public_blocked")
+
+    def test_unknown_send_id_and_wrong_kind_are_refused(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-2", "publicSendId": "does-not-exist",
+                                       "target": {"authorId": "author-1"}, "text": "你好"})
+            self.assertEqual(raised.exception.code, "public_not_found")
+            # 把"私信记录"当成公屏回复来用 -> 也必须拒绝
+            gate.reserve("dm-1", "author-1", "你好", kind="private")
+            gate.mark_started("dm-1")
+            gate.finish("dm-1", "sent_confirmed", "platform_response_recorded")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-3", "publicSendId": "dm-1",
+                                       "target": {"authorId": "author-1"}, "text": "你好"})
+            self.assertEqual(raised.exception.code, "public_not_a_reply")
+
+    def test_confirmed_public_reply_lets_the_private_stage_start(self):
+        """sent_confirmed 才放行：放行后确实进入了浏览器阶段（用假页面走到画像校验）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            public_id = self._public_reply(gate, "pub-ok", "sent_confirmed")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            result = instance.send_private({"sendId": "priv-ok", "publicSendId": public_id,
+                                            "target": {"authorId": "author-1"}, "text": "你好"})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "target_profile_mismatch",
+                         "放行后应当继续走到成像校验（证明守卫已通过）")
+
+    def test_batch_listing_gives_stable_reasons(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            ok = self._public_reply(gate, "pub-batch-ok", "sent_confirmed")
+            unknown = self._public_reply(gate, "pub-batch-unknown", "unknown")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            listing = instance.dispatch("comment_private_candidates", {"items": [
+                {"eventId": "e1", "authorId": "author-1", "authorName": "A", "publicSendId": ok},
+                {"eventId": "e2", "authorId": "author-2", "publicSendId": unknown},
+                {"eventId": "e3", "authorId": "author-3"},
+                {"eventId": "e4", "authorId": "", "publicSendId": ok}]})
+        self.assertEqual([item["eventId"] for item in listing["allowed"]], ["e1"])
+        self.assertEqual([(item["eventId"], item["reason"]) for item in listing["rejected"]],
+                         [("e2", "public_unknown"), ("e3", "public_missing"),
+                          ("e4", "missing_author_id")])
+        self.assertEqual(listing["policy"]["allowPublicStates"], ["sent_confirmed"])
 
 
 if __name__ == "__main__":

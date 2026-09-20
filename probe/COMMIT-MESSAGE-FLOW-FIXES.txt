@@ -1,0 +1,22 @@
+fix(probe): 游标池完整性、验证码终止态、评论区两阶段契约（协作反馈第 1/2/3 项）
+
+第 1 项 分页 + 相关度
+- 相关度筛掉的视频原来没有进游标池，续页时会被当成新视频重复处理。
+  现在池子 = 本页【见过的全部视频】（含被筛掉的与超出 maxVideos 未返回的），
+  filter 里新增 kept / poolAdded 便于对账。
+- 回归：test_relevance_filtered_videos_stay_in_the_cursor_pool；
+  同时把上游两条精确断言补齐新键（行为断言不变）。
+
+第 2 项 验证码状态收敛
+- 命中验证码时明确终止：status=captcha、hasMore=false、cursor=null、
+  stoppedReason=captcha_requires_manual_action，不再给可翻页信号。
+- 回归：test_captcha_is_terminal_and_offers_no_next_page。
+
+第 3 项 评论区两阶段契约
+- 新增 comment_private_candidates：按"公屏是否确认成功"给出 allowed / rejected 与稳定原因。
+- send_private 接受 publicSendId：给出时必须 sent_confirmed，否则在打开浏览器之前拒绝。
+- send_gate 新增 lookup()：契约判定读原始状态（result() 会把 sent_confirmed 映射成 unknown）。
+- 回归：CommentFlowContractTests 5 项，含"契约不通过不得打开浏览器"。
+
+本地全量离线回归：78 项 77 通过；唯一未通过的是多进程用例（沙箱 WinError 5，环境限制）。
+真实平台验证仍需真机，autoEligible 保持 false。
