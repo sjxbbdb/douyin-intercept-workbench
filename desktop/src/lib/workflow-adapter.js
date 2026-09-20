@@ -21,6 +21,75 @@ function optionalText(value, max = 1000) {
   return value.trim();
 }
 
+function resultText(value, max = 1000) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text ? text.slice(0, max) : null;
+}
+
+function resultInteger(value, min = 0, max = 1000000) {
+  return Number.isInteger(value) && value >= min && value <= max ? value : null;
+}
+
+function resultIdList(value, max = 20000) {
+  if (!Array.isArray(value)) return null;
+  return [...new Set(value.filter((item) => typeof item === 'string').map((item) => item.trim()).filter(Boolean))].slice(0, max);
+}
+
+function searchVideos(value) {
+  return (Array.isArray(value) ? value : []).slice(0, 100).map((video) => ({
+    id: optionalText(video?.id || video?.awemeId, 240),
+    url: optionalText(video?.url, 2048),
+    title: optionalText(video?.title || video?.desc, 500),
+    author: optionalText(video?.author, 200),
+    relevance: video?.relevance?.score ?? video?.relevanceScore ?? null
+  }));
+}
+
+function searchEnvelope(result) {
+  const envelope = {
+    kind: 'video_search',
+    videos: searchVideos(result?.videos),
+    cursor: result?.cursor || null,
+    hasMore: result?.hasMore === true
+  };
+  const poolIds = resultIdList(result?.poolIds);
+  if (poolIds) envelope.poolIds = poolIds;
+  for (const key of ['poolSize', 'page', 'skippedSeen']) {
+    const value = resultInteger(result?.[key]);
+    if (value != null) envelope[key] = value;
+  }
+  const stoppedReason = resultText(result?.stoppedReason, 120);
+  if (stoppedReason) envelope.stoppedReason = stoppedReason;
+  if (typeof result?.platformHasMore === 'boolean') envelope.platformHasMore = result.platformHasMore;
+  else if (result?.platformHasMore === 0 || result?.platformHasMore === 1) envelope.platformHasMore = result.platformHasMore === 1;
+  const platformCursor = resultText(result?.platformCursor, 500);
+  if (platformCursor) envelope.platformCursor = platformCursor;
+  if (result?.filter && typeof result.filter === 'object' && !Array.isArray(result.filter)) {
+    const filter = {};
+    for (const key of ['collected', 'returned', 'filteredByRelevance', 'minRelevance', 'kept', 'poolAdded']) {
+      const value = resultInteger(result.filter[key], 0, 1000000);
+      if (value != null) filter[key] = value;
+    }
+    if (Object.keys(filter).length) envelope.filter = filter;
+  }
+  return envelope;
+}
+
+function searchCheckpoint(envelope, status) {
+  const checkpoint = {
+    phase: 'search',
+    status,
+    count: envelope.videos.length,
+    cursor: envelope.cursor,
+    hasMore: envelope.hasMore
+  };
+  for (const key of ['stoppedReason', 'poolIds', 'poolSize', 'page', 'skippedSeen', 'platformHasMore', 'platformCursor', 'filter']) {
+    if (envelope[key] !== undefined) checkpoint[key] = envelope[key];
+  }
+  return checkpoint;
+}
+
 function sourceForWorkflow(workflowId) {
   if (workflowId === 'comment.reply_then_private') return 'video';
   if (workflowId === 'live.reply_then_private') return 'live';
@@ -100,16 +169,10 @@ function createWorkflowAdapter({ browser, state = new Map() } = {}) {
         strict: params.strict === true
       });
       const status = String(result?.status || 'unknown');
-      if (status === 'captcha' || status === 'login_required' || status === 'unsupported') return { status: 'wait_human', checkpoint: { phase: 'search', status, cursor: result?.cursor || null }, error: { code: 'SEARCH_REQUIRES_HUMAN', message: '搜索需要人工处理后继续' } };
+      const envelope = searchEnvelope(result);
+      if (status === 'captcha' || status === 'login_required' || status === 'unsupported') return { status: 'wait_human', result: envelope, checkpoint: searchCheckpoint(envelope, status), error: { code: 'SEARCH_REQUIRES_HUMAN', message: '搜索需要人工处理后继续' } };
       if (status !== 'ok') return { status: 'unknown', checkpoint: { phase: 'search', status }, error: { code: 'SEARCH_RESULT_UNKNOWN', message: '搜索结果未确认' } };
-      const videos = (Array.isArray(result.videos) ? result.videos : []).slice(0, 100).map((video) => ({
-        id: optionalText(video?.id || video?.awemeId, 240),
-        url: optionalText(video?.url, 2048),
-        title: optionalText(video?.title || video?.desc, 500),
-        author: optionalText(video?.author, 200),
-        relevance: video?.relevance?.score ?? video?.relevanceScore ?? null
-      }));
-      return { status: 'completed', result: { kind: 'video_search', videos, cursor: result.cursor || null, hasMore: result.hasMore === true }, checkpoint: { phase: 'search', status, count: videos.length, cursor: result.cursor || null, hasMore: result.hasMore === true } };
+      return { status: 'completed', result: envelope, checkpoint: searchCheckpoint(envelope, status) };
     }
 
     const source = sourceForWorkflow(workflowId);

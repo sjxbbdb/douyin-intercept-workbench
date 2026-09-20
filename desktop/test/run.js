@@ -32,6 +32,8 @@ testAsync('platform workflow adapter forwards search paging and keeps unverified
   const adapter = createWorkflowAdapter({ browser });
   const search = await adapter.execute({ run: { runId: 'search-1', workflowId: 'video.search' }, plan: { params: { keyword: '暴雨末日', maxVideos: 10, cursor: 'cursor-1', minRelevance: 70 } }, step: { stepId: 'search' } });
   assert.equal(search.status, 'completed');
+  assert.deepEqual(search.result.poolIds, undefined);
+  assert.deepEqual(search.checkpoint, { phase: 'search', status: 'ok', count: 1, cursor: 'next', hasMore: true });
   assert.deepEqual(calls[0], { type: 'search', params: { keyword: '暴雨末日', maxVideos: 10, scrollRounds: 2, cursor: 'cursor-1', page: undefined, minRelevance: 70, strict: false } });
   const blocked = await adapter.execute({ run: { runId: 'comment-1', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c1', roomId: 'https://www.douyin.com/video/1', authorId: 'u1', text: '多少钱' }, publicReply: '请问您想了解哪个型号？' } }, step: { stepId: 'reply_comment' } });
   assert.equal(blocked.status, 'wait_human');
@@ -42,6 +44,47 @@ testAsync('platform workflow adapter forwards search paging and keeps unverified
   const privateBlocked = await publicOnly.execute({ run: { runId: 'private-missing', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c3', roomId: 'https://www.douyin.com/video/1', authorId: 'u3', text: '价格' }, keywords: ['价格'], privateReply: '不应公开发送' } }, step: { stepId: 'private_message' }, action: { actionId: 'a-private-missing', idempotencyKey: 'idem-private-missing' } });
   assert.equal(privateBlocked.error.code, 'PRIVATE_ADAPTER_UNAVAILABLE');
   assert.equal(calls.filter((item) => item.type === 'public-fallback').length, 0);
+});
+testAsync('platform workflow adapter preserves terminal search evidence for human recovery', async () => {
+  const browser = {
+    search: async () => ({
+      status: 'captcha',
+      videos: [{ id: 'v1', url: 'https://www.douyin.com/video/1', title: '候选', author: '作者', relevance: { score: 80 } }],
+      cursor: null,
+      hasMore: false,
+      stoppedReason: 'captcha',
+      poolIds: ['v1', 'v2', 'v1'],
+      poolSize: 2,
+      page: 3,
+      skippedSeen: 1,
+      platformHasMore: true,
+      platformCursor: 'telemetry-only',
+      filter: { collected: 2, returned: 1, filteredByRelevance: 1, minRelevance: 70 }
+    })
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const result = await adapter.execute({ run: { runId: 'search-captcha', workflowId: 'video.search' }, plan: { params: { keyword: '暴雨末日' } }, step: { stepId: 'search' } });
+  assert.equal(result.status, 'wait_human');
+  assert.deepEqual(result.result, {
+    kind: 'video_search',
+    videos: [{ id: 'v1', url: 'https://www.douyin.com/video/1', title: '候选', author: '作者', relevance: 80 }],
+    cursor: null,
+    hasMore: false,
+    poolIds: ['v1', 'v2'],
+    poolSize: 2,
+    page: 3,
+    skippedSeen: 1,
+    stoppedReason: 'captcha',
+    platformHasMore: true,
+    platformCursor: 'telemetry-only',
+    filter: { collected: 2, returned: 1, filteredByRelevance: 1, minRelevance: 70 }
+  });
+  assert.deepEqual(result.checkpoint, {
+    phase: 'search', status: 'captcha', count: 1, cursor: null, hasMore: false,
+    stoppedReason: 'captcha', poolIds: ['v1', 'v2'], poolSize: 2, page: 3,
+    skippedSeen: 1, platformHasMore: true, platformCursor: 'telemetry-only',
+    filter: { collected: 2, returned: 1, filteredByRelevance: 1, minRelevance: 70 }
+  });
 });
 testAsync('platform workflow adapter exposes only explicit confirmed delivery', async () => {
   const browser = { canSend: () => true, isOpenFor: () => true, sendReply: async () => ({ status: 'sent_confirmed', sendId: 's1' }), sendPrivate: async () => ({ status: 'sent_confirmed', sendId: 's2' }) };
