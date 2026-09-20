@@ -49,6 +49,8 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。服务端不会因为恢复请求自动重发未知发送动作。
 
+流程上报非 `RUNNING` 结果后，客户端可调用 `POST /v1/workflow-runs/:id/result-decision`，请求携带当前服务端状态、脱敏 `summary` 和幂等键。服务端只接受与数据库运行状态一致的 `FAILED`、`COMPLETED`、`STOPPED`、`UNKNOWN`、`CHECKPOINT`、`WAITING_HUMAN` 或 `PAUSED`；运行中的流程返回 `RESULT_DECISION_RUNNING`。结果模型只能返回 `continue`、`retry`、`complete` 或 `wait_human`，该响应不会直接修改流程状态。桌面端把 `retry` 作为下一步建议，未知发送结果和人工等待继续保持人工门控，不会自动重发。
+
 ### `knowledge-sets`
 
 `POST/GET/PATCH /v1/knowledge-sets` 只管理当前工作台账号的知识集元数据和版本。运行实例可冻结 `knowledgeSetId + knowledgeSetVersion`；任何跨账号访问返回 `KNOWLEDGE_SET_NOT_FOUND`。向量内容和 provider key 不通过桌面端接口暴露。

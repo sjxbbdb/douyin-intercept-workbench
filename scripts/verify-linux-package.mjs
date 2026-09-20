@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -13,6 +13,19 @@ const dbPath = join(databaseRoot, 'license.sqlite');
 const envFile = join(packageRoot, '.env');
 const bootstrapUser = `package-admin-${Date.now()}`;
 const bootstrapPassword = `package-password-${Date.now()}`;
+
+function ensureRuntimeDependencies() {
+  if (existsSync(join(packageRoot, 'node_modules', 'fastify', 'package.json'))) return;
+  const npmCommand = process.platform === 'win32' ? process.execPath : 'npm';
+  const npmArgs = process.platform === 'win32' ? [join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'), 'ci', '--omit=dev', '--ignore-scripts'] : ['ci', '--omit=dev', '--ignore-scripts'];
+  const result = spawnSync(npmCommand, npmArgs, {
+    cwd: packageRoot,
+    encoding: 'utf8',
+    windowsHide: true,
+    stdio: 'pipe'
+  });
+  if (result.status !== 0) throw new Error(`production dependency install failed: ${result.error?.message || result.stderr || result.stdout}`);
+}
 
 function freePort() {
   return new Promise((resolvePort, reject) => {
@@ -66,6 +79,7 @@ async function start(port) {
 async function main() {
   assert.equal(existsSync(join(packageRoot, 'dist', 'main.js')), true);
   assert.equal(existsSync(join(packageRoot, 'package-lock.json')), true);
+  ensureRuntimeDependencies();
   writeFileSync(envFile, [
     'NODE_ENV=production',
     'DB_PATH=./data/license.sqlite',

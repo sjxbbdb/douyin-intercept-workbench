@@ -12,7 +12,7 @@
     "admin": "tsx src/cli.ts",
     "bootstrap:dist": "node dist/bootstrap.js",
     "admin:dist": "node dist/cli.js",
-    "test": "tsx --test test/**/*.test.ts"
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@fastify/rate-limit": "^10.2.1",

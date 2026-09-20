@@ -11,6 +11,7 @@ const { TaskEngine } = require('../src/lib/task-engine');
 const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
 const { AuthStore } = require('../src/lib/auth-store');
 const { platformScope, accountDataPath, browserPartition, sidecarPort } = require('../src/lib/platform-account');
+const { AccountRuntimeManager } = require('../src/lib/account-runtime-manager');
 
 let passed = 0;
 function test(name, fn) { try { fn(); passed += 1; console.log(`PASS ${name}`); } catch (error) { console.error(`FAIL ${name}`); throw error; } }
@@ -61,6 +62,55 @@ testAsync('workflow runtime isolates two platform accounts under one workbench u
   assert.equal(accountB.snapshot().runs.length, 1);
   assert.equal(accountA.snapshot().runs[0].accountId, 'workbench-a:platform-a');
   assert.equal(accountB.snapshot().runs[0].accountId, 'workbench-a:platform-b');
+});
+
+testAsync('account runtime manager serializes one account and runs different accounts in parallel', async () => {
+  const contexts = [];
+  const starts = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const manager = new AccountRuntimeManager({
+    contextFactory: async ({ accountId }) => { const context = { accountId, created: contexts.length + 1 }; contexts.push(context); return context; }
+  });
+  manager.register('douyin-a', { profile: 'a' });
+  manager.register('douyin-b', { profile: 'b' });
+  const first = manager.run('douyin-a', async ({ accountId, context }) => { starts.push(`${accountId}:first`); await firstGate; return context.created; }, { taskId: 'a-first' });
+  const second = manager.run('douyin-a', async ({ accountId }) => { starts.push(`${accountId}:second`); return 'second'; }, { taskId: 'a-second' });
+  const parallel = manager.run('douyin-b', async ({ accountId, context }) => { starts.push(`${accountId}:first`); return context.created; }, { taskId: 'b-first' });
+  for (let attempt = 0; attempt < 20 && !starts.includes('douyin-b:first'); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.deepEqual(starts, ['douyin-a:first', 'douyin-b:first']);
+  assert.equal(manager.snapshot().accounts.find((account) => account.accountId === 'douyin-a').queued, 1);
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second, parallel]), [1, 'second', 2]);
+  assert.deepEqual(starts, ['douyin-a:first', 'douyin-b:first', 'douyin-a:second']);
+  assert.equal(contexts.length, 2);
+});
+
+testAsync('account runtime manager deduplicates task keys and invalidates only one account', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const manager = new AccountRuntimeManager({ contextFactory: async ({ accountId }) => ({ accountId }) });
+  const first = manager.run('douyin-a', async ({ signal }) => { await gate; return signal.aborted ? 'aborted' : 'completed'; }, { idempotencyKey: 'same-task' });
+  const duplicate = manager.run('douyin-a', async () => 'must-not-run', { idempotencyKey: 'same-task' });
+  assert.strictEqual(duplicate, first);
+  const other = manager.run('douyin-b', async ({ accountId }) => accountId, { idempotencyKey: 'other-task' });
+  assert.equal(await other, 'douyin-b');
+  assert.equal(manager.invalidate('douyin-a', '切换账号'), true);
+  await assert.rejects(first, (error) => error.code === 'ACCOUNT_INVALIDATED');
+  assert.equal(manager.snapshot().accounts.find((account) => account.accountId === 'douyin-a').status, 'invalidated');
+  release();
+  assert.equal(manager.snapshot().accounts.find((account) => account.accountId === 'douyin-b').status, 'active');
+});
+
+testAsync('account runtime manager closes created contexts and rejects new work', async () => {
+  let closeCalls = 0;
+  const manager = new AccountRuntimeManager({ contextFactory: async () => ({ close: async () => { closeCalls += 1; } }) });
+  await manager.getContext('douyin-a');
+  const snapshot = await manager.close();
+  assert.equal(closeCalls, 1);
+  assert.equal(snapshot.closed, true);
+  assert.equal(snapshot.accounts[0].status, 'closed');
+  assert.throws(() => manager.run('douyin-b', async () => {}), (error) => error.code === 'MANAGER_CLOSED');
 });
 
 testAsync('workflow decision is frozen before execution and never called while running', async () => {
