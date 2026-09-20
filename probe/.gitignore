@@ -13,9 +13,6 @@ __pycache__/
 vendor/
 chrome-profile/
 chrome-test/
-.pyinstaller-venv/
-build/
-dist/
 .tmp-*
 _*.py
 _fetch.js

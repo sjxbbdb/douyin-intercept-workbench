@@ -1,0 +1,151 @@
+﻿=== A. 环境自检 ===
+=== 抖音自动私信探针 · 自检 ===
+Chrome            : C:\Program Files\Google\Chrome\Application\chrome.exe
+配置目录          : C:\Users\Administrator\Desktop\agent截流\probe\chrome-profile
+CDP 端口 9222    : [OK] 已连通
+  浏览器          : Chrome/153.0.8010.50
+页面标签          : 3 个
+当前标签 URL      : https://www.douyin.com/video/7540497830604770595
+登录态            : [OK] 未发现登录提示
+验证码            : [OK] 未检测到
+页面用户信息      : 八宝辅食日常粉丝63.3万获赞322.8万关注
+
+=== 额度（官方口径） ===
+今日已触达        : 20 / 100 人
+本小时已触达      : 0 / 40 人
+单用户上限        : 1 条
+
+=== 选择器状态（诚实标注） ===
+commentList      confidence=high   live=[未真机验证]  [data-e2e="comment-list"]
+commentItem      confidence=high   live=[未真机验证]  [data-e2e="comment-item"]
+commentContent   confidence=high   live=[未真机验证]  [data-e2e="comment-content"]
+dmPanelEditors   confidence=medium live=[未真机验证]  [contenteditable=true],textarea,input
+dmEditorScope    confidence=high   live=2026-09-19  [class*="messageEditor"]
+searchBar        confidence=high   live=2026-09-19  [data-e2e="searchbar-input"]
+dmSendButton     confidence=high   live=2026-09-19  [class*="e2e-send-msg-btn"]
+noteDetail       confidence=high   live=[未真机验证]  .note-detail-container
+liveChatBox      confidence=high   live=2026-09-19  [class*="webcast-chatroom"]
+liveChatList     confidence=high   live=2026-09-19  [class*="webcast-chatroom___list"]
+liveChatRow      confidence=high   live=2026-09-19  [class*="webcast-chatroom___item"]
+liveChatContent  confidence=high   live=2026-09-19  [class*="webcast-chatroom___content-with-emoji-text"]
+liveChatNodes    confidence=low    live=2026-09-19  （模糊全集，含未观察到的 danmu/bullet/message 等）
+liveRowKeyAttrs  confidence=low    live=[未真机验证]  data-id,data-msg-id,data-message-id,data-comment-id,data-key
+liveSecUidAttrs  confidence=low    live=2026-09-19  data-sec-uid,data-secuid,data-sec-open-id（真机实测：弹幕行内不存在）
+liveNoiseRe      confidence=medium live=2026-09-19  ^(进入直播间|加入了直播间|点赞了|为主播点赞了|关注了主播|分享了直播间|送出|赠送|来了|拍了拍|加入了粉丝团|点亮了粉丝团)
+liveNickFallbackRe confidence=high   live=2026-09-19  ^(.{1,32})[:：]\s*(.{1,220})$
+liveRoomStatus   confidence=low    live=[未真机验证]  (?:在线人数|在线|观看|人气)\s*[:：]?\s*([0-9.,万千]+)
+
+[!] 是否企业号、网页端能否私信陌生人，只有真机运行 v4 才能确认。
+=== B. 按视频关键词搜视频（真机运行） ===
+已把 Chrome 窗口置前 : 秋天是宝宝长身体的黄金期，可以多吃健脾胃的食物，今天做个无蛋版山药软饼，软软糯糯，清甜好吃，对宝宝肚
+达到 max_videos=60，停止滚动
+搜索关键词          : 宝宝辅食
+关键词分词          : ['宝宝辅食']
+搜索接口响应        : 8 个 (status_code!=0 的 0 个)
+响应体里的视频      : 61 个
+DOM 兜底卡片        : 0 个
+标题命中关键词      : 61 个
+滚动通道            : {'wheel': 5}
+最终保留            : 61 个
+
+=== 前 12 条 ===
+ 1. 7686762132885052666 | 是小六一呀          | 赞1723    评50      | 1岁+辅食｜肉沫不柴不结块的小技巧 很多姐妹炒肉沫容易结块、发干发柴，宝宝不爱吃，分享一个简
+ 2. 7687138969822081969 | 静静的辅食日常        | 赞78      评14      | 1岁3个月宝宝辅食教程 今日辅食排骨蒸苹果➕苹果红枣汤➕白米饭 #宝宝辅食的正确打开方式 #
+ 3. 7687135005467213681 | 七喜妹妹💕          | 赞100     评5       | 1岁+宝宝午餐｜白蘑菇酿肉✨一口爆汁 🍄白蘑菇酿肉｜1岁+辅食 软嫩鲜香，蘑菇吸满肉汁，一口
+ 4. 7686492540984665317 | 小宝宝爱吃饭         | 赞245     评3       | 宝宝辅食100天不重样。 #宝宝辅食 #宝宝吃饭 #宝妈推荐 #宝妈带娃
+ 5. 7540497830604770595 | 八宝辅食日常         | 赞38897   评505     | 秋天是宝宝长身体的黄金期，可以多吃健脾胃的食物，今天做个无蛋版山药软饼，软软糯糯，清甜好吃，
+ 6. 7686844768018539685 | 奕泽妈妈（辅食记）      | 赞325     评41      | 宝宝第一个月辅食该如何添加？新手妈妈来直接抄作业了 #婴儿米粉辅食做法 #宝宝米粉怎么冲泡 
+ 7. 7687143853384699978 | 小屁吨吨           | 赞89      评5       | 8个月以上的宝宝不要总吃糊糊啦 这个菠菜苹果蒸糕 松软香甜 像蛋糕一样好吃 菠菜富含丰富的膳
+ 8. 7687077875942429283 | 小布丁辅食记         | 赞194     评12      | 排骨怎么做软嫩不柴呢，一定要试试这个粉蒸排骨，排骨软烂好脱骨，宝宝好入口好咀嚼，真的巨巨好吃
+ 9. 7686939225849122094 | 丞丞辅食记          | 赞400     评22      | 分享一个10月龄以上宝宝就能吃的奶香大米发糕 米香搭配浓郁的奶香，吃起来香甜浓郁。发糕蓬松软
+10. 7686815621379682906 | 是米乐吖～（辅食版）     | 赞419     评4       | 8月龄宝宝辅食｜八月龄宝宝打完麻腮风后一周辅食粥不重样 不会做辅食的妈妈建议收藏！ 做法简单
+11. 7686851630725074212 | 瑶爸辅食记          | 赞119     评0       | 10月龄+宝宝辅食 | 香蕉鸡蛋饼 宝宝早餐不知道吃什么？试试这个香蕉鸡蛋饼，香蕉搭配鸡蛋，
+12. 7686802430377364393 | 小小王            | 赞89      评1       | 分享1岁宝宝一周辅食不重样，每天都是新口味，做法简单又营养，宝宝爱吃#宝宝辅食 #不重样宝宝
+
+共 61 条，已写入 C:\Users\Administrator\Desktop\agent截流\probe\state\search_videos.json
+下一步： python probe.py crawl --keyword "宝宝辅食" --comment-keywords "..." --videos 5
+=== C. 评论筛选 CLI 参数 ===
+usage: probe.py crawl [-h] --keyword KEYWORD
+                      [--comment-keywords COMMENT_KEYWORDS]
+                      [--match-mode {phrase,seg,all,any}] [--videos VIDEOS]
+                      [--max-videos MAX_VIDEOS] [--scroll SCROLL]
+                      [--min-digg MIN_DIGG] [--strict] [--quiet]
+                      [--scroll-pause SCROLL_PAUSE] [--no-focus]
+                      [--order {comments,digg,default}]
+
+options:
+  -h, --help            show this help message and exit
+  --keyword KEYWORD     视频搜索关键词
+  --comment-keywords COMMENT_KEYWORDS
+                        评论关键词，逗号分隔；留空则全收
+  --match-mode {phrase,seg,all,any}
+                        评论匹配档位：seg(默认,词级) / phrase(整串) / all(全词) / any(任意字)
+  --videos VIDEOS       最多抓几条视频的评论
+  --max-videos MAX_VIDEOS
+                        搜索页最多收集多少条视频
+  --scroll SCROLL       搜索页滚动轮数
+  --min-digg MIN_DIGG   评论最低点赞数（过滤零互动）
+  --strict              视频先按标题命中关键词收紧
+  --quiet               不逐条打印评论样例
+  --scroll-pause SCROLL_PAUSE
+                        每屏之间基础停顿秒数（对数正态抖动；调大更安全、更慢）
+  --no-focus            不要自动把 Chrome 窗口置前（默认会置前，否则懒加载不触发、结果静默变少）
+  --order {comments,digg,default}
+                        挑哪几条视频抓评论：comments(评论数降序,默认) / digg / default(发现顺序)
+
+=== D. 评论筛选结果（脱敏：昵称→用户NN，sec_uid 只留前 16 位）===
+评论关键词命中 11 条（--match-mode seg）:
+  [几个月] 用户01     | 几个月能吃
+        用户标识: MS4wLjABAAAAcF78…   来源: dom
+  [求] 用户02     | 这个求链接谢谢[抱抱你]
+        用户标识: MS4wLjABAAAAjkwh…   来源: api
+  [几个月] 用户03     | 几个月宝宝可以吃
+        用户标识: MS4wLjABAAAAl3rl…   来源: dom
+  [可以吃吗] 用户04     | 没牙可以吃吗？
+        用户标识: MS4wLjABAAAABRxP…   来源: api
+  [几个月] 用户05     | 宝宝几个月可以吃盐
+        用户标识: MS4wLjABAAAARLWY…   来源: dom
+  [可以吃吗] 用户06     | 七个月宝宝可以吃吗
+        用户标识: MS4wLjABAAAAw1NH…   来源: dom
+  [几个月] 用户07     | 几个月可以吃
+        用户标识: MS4wLjABAAAABMTX…   来源: dom
+  [几个月] 用户08     | 这个几个月可以吃了。
+        用户标识: MS4wLjABAAAAkz1i…   来源: dom
+  [几个月] 用户09     | @几个月可以吃面
+        用户标识: MS4wLjABAAAAUWY4…   来源: dom
+  [可以吃吗] 用户10     | 海苔碎也可以吃吗
+        用户标识: MS4wLjABAAAAgHoa…   来源: api
+  [几个月] 用户11     | 几个月
+        用户标识: MS4wLjABAAAA1lCa…   来源: api
+
+=== E. 私信触达台账（脱敏）===
+最近一次批次的汇总字段:
+  total               : 5
+  sent_confirmed      : 0
+  sent_dom_confirmed  : 2
+  submitted           : 0
+  unverified          : 0
+  prepared_only       : 0
+  skipped             : 3
+  failed              : 0
+  stopped_reason      : None
+
+账本 verdict 分布（累计 82 条结果）: {'failed': 20, 'sent_confirmed': 1, 'skipped': 19, 'unverified': 6, 'submitted': 2, 'sent_dom_confirmed': 20, 'prepared_only': 14}
+逐条（最近 12 条）:
+  prepared_only dry_run_no_send                    template=T7   visibility=visible
+  prepared_only dry_run_no_send                    template=T3   visibility=visible
+  sent_dom_confirmed message_in_conversation_panel      template=-    visibility=visible
+  sent_dom_confirmed message_in_conversation_panel      template=-    visibility=visible
+  failed   dm_composer_not_open_after_retries template=-    visibility=visible
+  sent_dom_confirmed message_in_conversation_panel      template=-    visibility=visible
+  failed   dm_composer_not_open_after_retries template=-    visibility=visible
+  skipped  quota_user_exceeded                template=-    visibility=-
+  skipped  quota_user_exceeded                template=-    visibility=-
+  sent_dom_confirmed message_in_conversation_panel      template=-    visibility=visible
+  skipped  quota_user_exceeded                template=-    visibility=-
+  sent_dom_confirmed message_in_conversation_panel      template=-    visibility=visible
+
+=== F. 说明 ===
+· 本文件为真机运行的真实输出（A/B/C 段为 2026-09-20 现场重跑，D/E 段取自 state/ 产物并已脱敏）。
+· 不含任何 sec_uid 原值、不含任何用户昵称、不含 Cookie/token。
+· 采集类动作不消耗私信额度；发送类动作受 dm.py: LIMITS 约束。

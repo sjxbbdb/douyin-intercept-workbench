@@ -1,0 +1,37 @@
+# 推送与开 PR 的尝试记录（2026-09-20）
+# 已脱敏：不含任何 token / 凭据
+
+## 本 PR 的提交
+分支: feat/keyword-video-comment-crawl
+基线: rewrite/v4-agent @ 74cb9b7（本分支直接从它拉出，未基于任何其它功能分支）
+改动: 22 files changed, 4330 insertions(+)
+（本分支 HEAD 的完整哈希请用 git log -1 查看；本文不写死自身哈希 —— amend 会让它失效。）
+
+## 推送结果（本沙箱内失败）
+命令: git -c http.sslBackend=openssl push -u origin feat/keyword-video-comment-crawl
+exit = 128
+fatal: could not read Username for 'https://github.com': terminal prompts disabled
+
+原因链（两层，缺一不可）：
+
+1) 传输层 —— git 默认用 schannel 后端：
+     schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)
+   改用 git 自带的 OpenSSL 后端（-c http.sslBackend=openssl）后可以连通 GitHub。
+   （另有 MSYS 提示 could not create signal pipe, Win32 error 5 —— 沙箱禁止命名管道，
+     不改变本结论，一并留证。）
+
+2) 凭据层 —— 本机不存在任何 GitHub 凭据：
+     GITHUB_TOKEN=False   GH_TOKEN=False   ~/.git-credentials=False   ~/.ssh=False   gh CLI=False
+   且目标仓库为私有（api.github.com/repos/sjxbbdb/douyin-intercept-workbench 返回 404，匿名不可读），
+   因此无法匿名推送。
+
+## 可用的替代通道
+git bundle 已生成: keyword-video-comment-crawl.bundle
+  contains: refs/heads/feat/keyword-video-comment-crawl
+  requires: 74cb9b7（rewrite/v4-agent，即目标分支当前 HEAD）
+
+在有凭据的机器上、目标仓库的克隆里执行：
+    git fetch <bundle路径> feat/keyword-video-comment-crawl:feat/keyword-video-comment-crawl
+    git push -u origin feat/keyword-video-comment-crawl
+
+然后向 rewrite/v4-agent 发起 PR，正文用 probe/PR-BODY.md。

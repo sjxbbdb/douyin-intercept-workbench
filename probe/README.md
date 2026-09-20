@@ -8,7 +8,7 @@
 
 1. **可行性探针** —— 回答"企业号在网页端到底能不能私信陌生人"。这是整个方案的生死线，
    没有任何文档能替代真机验证。
-2. **自动私信执行器** —— 通过本地保守限额与发送前台账后，按队列执行一次点击。
+2. **自动私信执行器** —— 验证通过后，直接用它按队列批量私信，遵守官方额度。
 
 ## 安全默认值（重要）
 
@@ -95,13 +95,13 @@ python probe.py v4 --sec-uid <id> --send --text "你好"
 |---|---|---|
 | `found: true` | ✅ 网页端能私信该用户 | 路线 1 成立，继续 |
 | `blocked: true` (stranger_dm_disabled) | ❌ 被平台拦 | 若非企业号，**换企业号重测**；企业号也被拦则路线 1 不成立 |
-| `dm_button_not_found` | 选择器失效或页面结构变了 | 检查 `douyin_selectors.py` 后重试 |
+| `dm_button_not_found` | 选择器失效或页面结构变了 | 回填 `selectors.py` 后重试 |
 
-真发模式下只保留脱敏的响应计数；`DM_SEND_URL_MARK` 未确认时结果保持 `unknown`。
+真发模式下会打印**实际命中的 POST 接口**，用它回填 `selectors.py` 的 `DM_SEND_URL_MARK`。
 
 ### 完整链路：搜视频 -> 抓评论 -> 筛人 -> 私信
 
-采集与筛选链路来自本目录的可验证实现。关键点：
+移植自 `D:/deep seek/pipeline.js`（已跑通的实现）。关键点：
 **评论不从 DOM 抓，而是抓平台接口响应体**（`Network.getResponseBody` -> `j.comments[]`），
 里面**直接带 `user.sec_uid`** —— 这正是私信环节最需要的字段，在评论路径上是白送的。
 
@@ -134,13 +134,13 @@ python probe.py dm --queue queue.json --text "您好{nick}，看到您在评论�
 python probe.py dm --queue queue.json --text "..." --allow-send                        # 真发
 ```
 
-## 本地保守额度（`dm.py: LIMITS`，不替代平台规则）
+## 额度（官方口径，`dm.py: LIMITS`）
 
 | 项 | 值 |
 |---|---|
-| 同一用户 | ≤ 1 条 |
-| 每小时 | ≤ 20 人 |
-| 每日 | ≤ 50 人 |
+| 同一用户 | ≤ 3 条 |
+| 每小时 | ≤ 40 人 |
+| 每日 | ≤ 100 人 |
 | 活跃时段 | 08:00–23:00 |
 | 间隔 | 对数正态随机化 |
 
@@ -152,13 +152,13 @@ python probe.py dm --queue queue.json --text "..." --allow-send                 
 |---|---|
 | `dsh_ws.py` | 最小 RFC6455 WebSocket 客户端（标准库） |
 | `cdp.py` | CDP 客户端 + Network 响应体录制（红线 2 的基础） |
-| `douyin_selectors.py` | 选择器唯一来源，带"离线/真机"双验证日期 |
+| `selectors.py` | 选择器唯一来源，带"离线/真机"双验证日期 |
 | `douyin.py` | 页面操作原语（可见容器筛选、私信入口、编辑器） |
 | `crawl.py` | 关键词搜视频（接口优先）-> 抓评论（接口优先）-> 按关键词筛评论（4 档）-> 出私信队列 |
 | `dm.py` | 私信执行器（额度 / 台账 / 熔断 / 间隔） |
 | `probe.py` | 命令行入口 |
 | `selftest.py` | 传输层自检（WebSocket / CDP / 大包 / 导航） |
-| 外部 `state-dir` | 台账与结果（jsonl 追加写 + fsync）；由宿主按账号隔离传入 |
+| `state/` | 台账与结果（jsonl 追加写 + fsync） |
 
 ## 已沉淀的抖音 DOM 知识（来自 legacy 真机试错）
 

@@ -13,7 +13,7 @@
 
 安全默认值：
     · 不带 --allow-send 时【绝不点击发送】，只做预填与探测
-    · 任何一次真实发送都会先落 send_id 台账，并经过本地保守额度
+    · 任何一次真实发送都会先落 send_id 台账，并计入官方额度
     · 检测到验证码 / 登录失效 / 空响应 -> 立即熔断退出，不做任何绕过
 
 Windows 注意：输出统一强制 UTF-8（默认 GBK 控制台会直接崩），
@@ -25,7 +25,6 @@ import os
 import subprocess
 import sys
 import time
-import uuid
 
 # --- Windows 控制台编码兜底：必须在任何输出之前 ---
 for _stream in ("stdout", "stderr"):
@@ -45,20 +44,14 @@ import winfocus              # noqa: E402
 import crawl as crawlmod      # noqa: E402
 import douyin                # noqa: E402
 import dm as dmmod           # noqa: E402
-import douyin_selectors as S        # noqa: E402
-from send_actions import send_private  # noqa: E402
-from send_gate import SendGate  # noqa: E402
+import dyselectors as S        # noqa: E402
 
 CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
-USER_ROOT = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-AGENT_ROOT = os.path.join(USER_ROOT, "DouyinInterceptAgent")
-PROFILE_DIR = os.path.join(AGENT_ROOT, "chrome-profile")
-STATE_DIR = os.path.join(AGENT_ROOT, "state")
-RUNTIME_STATE_DIR = STATE_DIR
+PROFILE_DIR = os.path.join(HERE, "chrome-profile")
 
 OK = "[OK]"
 BAD = "[X]"
@@ -131,7 +124,7 @@ def cmd_doctor(args):
     p("=== 抖音自动私信探针 · 自检 ===")
     chrome = find_chrome()
     p("Chrome            : %s" % (chrome or "未找到"))
-    p("配置目录          : %s" % getattr(args, "profile_dir", PROFILE_DIR))
+    p("配置目录          : %s" % PROFILE_DIR)
     connected = False
     try:
         raw = cdpmod._http_json("http://127.0.0.1:%d/json/version" % args.port, timeout=6)
@@ -164,12 +157,11 @@ def cmd_doctor(args):
         finally:
             page.close(); browser.close()
 
-    dmmod.STATE_DIR = os.path.abspath(getattr(args, "state_dir", RUNTIME_STATE_DIR))
     ledger = dmmod.Ledger()
     quota = dmmod.Quota(ledger)
     snap = quota.snapshot()
     p()
-    p("=== 额度（本地保守口径） ===")
+    p("=== 额度（官方口径） ===")
     p("今日已触达        : %d / %d 人" % (snap["day_used"], snap["day_limit"]))
     p("本小时已触达      : %d / %d 人" % (snap["hour_used"], snap["hour_limit"]))
     p("单用户上限        : %d 条" % snap["per_user_max"])
@@ -185,12 +177,11 @@ def cmd_launch_chrome(args):
     chrome = find_chrome()
     if not chrome:
         raise SystemExit("未找到 Chrome，请手动指定路径")
-    profile_dir = os.path.abspath(args.profile_dir)
-    os.makedirs(profile_dir, exist_ok=True)
+    os.makedirs(PROFILE_DIR, exist_ok=True)
     cmd = [
         chrome,
         "--remote-debugging-port=%d" % args.port,
-        "--user-data-dir=%s" % profile_dir,
+        "--user-data-dir=%s" % PROFILE_DIR,
         "--no-first-run",
         "--no-default-browser-check",
         "https://www.douyin.com/",
@@ -226,7 +217,7 @@ def cmd_v1(args):
         for i, r in enumerate(rows[: args.limit], 1):
             tag = "有UID" if r.get("sec_uid") else "无UID"
             p("%2d. [%s] %s" % (i, tag, (r.get("text") or "")[:60].replace("\n", " ")))
-        out = os.path.join(RUNTIME_STATE_DIR, "v1_comments.json")
+        out = os.path.join(HERE, "state", "v1_comments.json")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(rows, fh, ensure_ascii=False, indent=2)
@@ -264,17 +255,51 @@ def cmd_v4(args):
             p("（未加 --send，只探测不发送）")
             return 0
         text = args.text or "你好"
-        gate = SendGate(args.state_dir, "legacy:%s" % os.path.abspath(args.profile_dir))
-        result = send_private(page, gate, args.send_id or uuid.uuid4().hex,
-                              {"authorId": args.sec_uid, "authorName": ""}, text)
-        p(json.dumps(result, ensure_ascii=False))
-        return 0 if result.get("status") in ("unknown", "sent_confirmed") else 1
+        page.click_at(entry["x"], entry["y"])
+        time.sleep(2.5)
+        comp = {"found": False}
+        for _ in range(4):
+            comp = douyin.dm_composer(page)
+            if comp.get("found"):
+                break
+            time.sleep(1.5)
+        if not comp.get("found"):
+            p("%s 未找到输入框" % BAD)
+            return 1
+        page.click_at(comp["x"], comp["y"]); time.sleep(0.6)
+        page.insert_text(text); time.sleep(1.2)
+        p("已预填            : %s" % text)
+        btn = douyin.dm_send_button(page)
+        p("发送按钮          : %s" % json.dumps(btn, ensure_ascii=False))
+        if not btn.get("found"):
+            p("%s 未找到发送按钮（selectors.py 里的发送按钮判据需按真机回填）" % BAD)
+            return 1
+        try:
+            page.call("Network.enable", {}, timeout=10)
+        except Exception:
+            pass
+        rec = douyin.make_network_recorder(page, "douyin.com")
+        page.click_at(btn["x"], btn["y"])
+        records = rec.collect(wait_seconds=10.0)
+        posts = [r for r in records if (r.get("method") or "").upper() == "POST"]
+        p()
+        p("捕获到的 POST 接口（用于回填 DM_SEND_URL_MARK）：")
+        for r in posts:
+            sc = None
+            parsed = r.get("parsed") or {}
+            if isinstance(parsed, dict):
+                data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                sc = data.get("status_code", parsed.get("status_code"))
+            p("  %s  http=%s status_code=%s" % (r.get("url"), r.get("httpStatus"), sc))
+        if not posts:
+            p("  %s 未捕获到任何 POST —— 无法确认发送结果（红线 2 不成立）" % WARN)
+        return 0
     finally:
         page.close(); browser.close()
 
 
 def _dump(name, obj):
-    out_dir = RUNTIME_STATE_DIR
+    out_dir = os.path.join(HERE, "state")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
     with open(path, "w", encoding="utf-8") as fh:
@@ -396,7 +421,7 @@ def cmd_crawl(args):
         fp = _dump("filtered_comments.json", matched)
         qp = _dump("dm_queue.json", queue)
         p()
-        p("视频列表 : %s" % os.path.join(RUNTIME_STATE_DIR, "search_videos.json"))
+        p("视频列表 : %s" % os.path.join(HERE, "state", "search_videos.json"))
         p("评论明细 : %s  (%d 条)" % (cp, len(all_comments)))
         p("命中评论 : %s  (%d 条)" % (fp, len(matched)))
         p("私信队列 : %s  (%d 人，去重掉同一个人 %d)" % (qp, len(queue), qstats["dup_commenter"]))
@@ -420,7 +445,7 @@ def cmd_dm(args):
     p("模式              : %s" % ("真实发送" if args.allow_send else "仅预填（不发送）"))
     if args.allow_send:
         p()
-        p("%s 真实发送会消耗账号风险，且会计入本地保守额度；发了就收不回。" % WARN)
+        p("%s 真实发送会消耗账号风险，且会计入官方额度。未互关上限 = 1 条/人，发了就收不回。" % WARN)
         if not getattr(args, "yes", False):
             p("   连续输入 yes 确认：")
             if input("   > ").strip().lower() != "yes":
@@ -432,9 +457,7 @@ def cmd_dm(args):
         bring_chrome_front()
     browser, page = connect(args.port)
     try:
-        gate = SendGate(args.state_dir, "legacy:%s" % os.path.abspath(args.profile_dir)) if args.allow_send else None
-        summary = dmmod.run_batch(page, queue, args.text, args.allow_send, log=p,
-                                  use_templates=args.use_template, gate=gate)
+        summary = dmmod.run_batch(page, queue, args.text, args.allow_send, log=p)
     finally:
         page.close(); browser.close()
     p()
@@ -442,7 +465,7 @@ def cmd_dm(args):
     for k in ("total", "sent_confirmed", "sent_dom_confirmed", "submitted", "unverified",
               "prepared_only", "skipped", "failed", "stopped_reason"):
         p("%-16s: %s" % (k, summary.get(k)))
-    out = os.path.join(RUNTIME_STATE_DIR, "dm_summary.json")
+    out = os.path.join(HERE, "state", "dm_summary.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=2)
@@ -453,8 +476,6 @@ def cmd_dm(args):
 def build_parser():
     ap = argparse.ArgumentParser(description="抖音自动私信 / 可行性探针")
     ap.add_argument("--port", type=int, default=9222)
-    ap.add_argument("--state-dir", default=STATE_DIR)
-    ap.add_argument("--profile-dir", default=PROFILE_DIR)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="自检（不发送）").set_defaults(func=cmd_doctor)
@@ -470,7 +491,6 @@ def build_parser():
     b.add_argument("--sec-uid", required=True)
     b.add_argument("--send", action="store_true", help="真实发送一条（消耗额度与账号风险）")
     b.add_argument("--text", default=None)
-    b.add_argument("--send-id", default=None)
     b.set_defaults(func=cmd_v4)
 
     s = sub.add_parser("search", help="按视频关键词搜视频（只读，不打开视频、不抓评论）")
@@ -513,19 +533,12 @@ def build_parser():
     c.add_argument("--yes", action="store_true", help="跳过交互确认（等价于输入 yes）")
     c.add_argument("--no-focus", action="store_true", help="不要自动把 Chrome 窗口置前")
     c.add_argument("--limit", type=int, default=0)
-    c.add_argument("--use-template", action="store_true",
-                   help="显式启用内置模板；默认严格使用 --text")
     c.set_defaults(func=cmd_dm)
     return ap
 
 
 def main():
     args = build_parser().parse_args()
-    global RUNTIME_STATE_DIR
-    RUNTIME_STATE_DIR = os.path.abspath(args.state_dir)
-    os.makedirs(RUNTIME_STATE_DIR, exist_ok=True)
-    dmmod.STATE_DIR = RUNTIME_STATE_DIR
-    crawlmod.STATE_DIR = RUNTIME_STATE_DIR
     return args.func(args)
 
 
