@@ -10,7 +10,8 @@ python sidecar.py --state-dir C:\AgentData\account-a\state --profile-dir C:\Agen
 
 The supported methods are `capabilities`, `launch`, `doctor`, `open`,
 `search`, `collect_comments`, `collect_live`, `send_private`,
-`send_comment`, and owned-browser `close`. `v.douyin.com` query strings are
+`send_comment`, the live batch methods `live_listen`, `live_plan`, `live_reply`,
+`live_private`, `live_result`, and owned-browser `close`. `v.douyin.com` query strings are
 kept only while navigating a short link; the response returns the resolved
 URL without its query string. `state-dir` and `profile-dir` must be absolute
 and outside the source directory.
@@ -32,3 +33,52 @@ delivery validation remains pending.
 For an onedir Windows bundle, run `build_sidecar.cmd` from this directory.
 It creates an isolated `.pyinstaller-venv` and writes
 `dist\probe-agent\probe-agent.exe`; PyInstaller is a build-only dependency.
+
+## Live batch flow (images/12-live-room-business)
+
+Five further methods implement the collaborator half of the live flow, between
+the platform boundary of images/18 and the script boundary of images/09:
+
+| method | phase | needs a browser |
+|---|---|---|
+| `live_listen` | collect one listening round and enqueue it | yes |
+| `live_plan` | take a batch, check the window, freeze host scripts | no |
+| `live_reply` | phase one: public reply per accepted item | only when something is sendable |
+| `live_private` | phase two: private message per derived candidate | only when something is sendable |
+| `live_result` | batch report, counts and resume checkpoint | no |
+
+`live_listen` deduplicates by room plus author plus text and trims the queue to
+its capacity, so the host may call it repeatedly. `live_plan` takes a
+count-bounded batch inside `windowSeconds`; anything older is marked `expired`
+and is never replayed by a later batch (the platform rule 过期处理，不集中补发).
+An open batch is reused on retry, so a repeated request cannot create two
+batches at once.
+
+Scripts are the platform artifact. `live_plan` accepts `scripts` keyed by
+event id (or fingerprint), each carrying `publicText` and `privateText`; a
+missing or out-of-bounds script moves that target to `blocked` before any
+browser action and the plan reports it under `blocked`. The sidecar never
+writes, rewrites or repairs a script, and `live_reply` / `live_private` refuse
+a text that differs from the frozen script (`script_mismatch`) instead of
+sending it.
+
+Phase two is derived, never assumed. `live_private` only sends for targets the
+queue returns as private candidates: the phase-one public reply must be in
+`policy.allowPublicStates` (default `["sent_confirmed"]`), the target must
+carry an author id, and `policy.maxPrivate` caps the list. Everything else is
+refused with a reason - `public_unknown`, `public_blocked`, `public_failed`,
+`missing_author_id`, `over_private_capacity` - so an unresolved public click
+never turns into a second, blind contact.
+
+Each item carries the host-supplied `sendId`; the durable reservation, the local
+quotas and the never-retry-an-unresolved-click rule stay in `send_gate.py`.
+Batch state lives in `live_flow.sqlite3` next to `send_state.sqlite3`.
+`live_result` returns per-state counts, the private candidate list and a
+checkpoint (phase, pending events, frozen plan size), which is what the host
+needs to resume after a restart.
+
+Unverified boundaries, to be resolved before any release switch: the live
+selectors remain fixture-validated only, the platform has not been observed to
+publish an author id for every live comment, and phase-two delivery keeps the
+same `unknown` semantics as the other send paths.
+

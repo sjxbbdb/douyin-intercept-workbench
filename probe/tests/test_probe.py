@@ -604,6 +604,193 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(send["containerKey"], "target-panel")
 
 
+class LiveFlowTests(unittest.TestCase):
+    """Offline coverage for the live batch flow (images/12) and its two
+    boundaries: host-provided scripts (images/09) and per-action idempotency
+    with no replay of unresolved results (images/17)."""
+
+    @staticmethod
+    def _event(event_id, author_id=None, text=None, room="room-1"):
+        """Build one live event.  Identity and text default to the event id so
+        two different events never collapse into one fingerprint."""
+        import sidecar
+        author_id = "live-%s" % event_id if author_id is None else author_id
+        text = "question %s" % event_id if text is None else text
+        return sidecar._event("live", room, {"id": event_id, "authorId": author_id,
+                                             "authorName": author_id.upper(), "text": text})
+
+    @staticmethod
+    def _scripts(event_ids, public="public reply text", private="private message text"):
+        return {event_id: {"publicText": public, "privateText": private} for event_id in event_ids}
+
+    def test_queue_dedupes_by_identity_and_enforces_capacity(self):
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", capacity=3, clock=lambda: now[0])
+            first = queue.append([self._event("e1"), self._event("e1"), self._event("e2")])
+            self.assertEqual((first["added"], first["duplicates"]), (2, 1))
+            for index in range(3, 7):
+                now[0] += 1
+                queue.append([self._event("e%d" % index)])
+            states = queue.stats()["states"]
+            self.assertEqual(states.get(live_flow.QUEUED), 3)
+            self.assertEqual(states.get(live_flow.EXPIRED), 3)
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+
+    def test_batch_window_expires_old_events_and_never_replays_them(self):
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("old")])
+            now[0] += 120
+            queue.append([self._event("fresh")])
+            batch = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual([event["id"] for event in batch["events"]], ["fresh"])
+            self.assertEqual(batch["expiredCount"], 1)
+            self.assertEqual(queue.find_event("old")["state"], live_flow.EXPIRED)
+            again = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual([event["id"] for event in again["events"]], ["fresh"])
+            self.assertEqual(again["expiredCount"], 0)
+
+    def test_open_batch_is_reused_so_a_retry_cannot_plan_twice(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1"), self._event("e2")])
+            first = queue.take_batch(max_items=1, window_seconds=600)
+            second = queue.take_batch(max_items=1, window_seconds=600)
+            self.assertEqual(first["batchId"], second["batchId"])
+            self.assertEqual(len(queue.batch_events(first["batchId"])), 1)
+
+    def test_plan_requires_both_host_scripts(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1"), self._event("e2")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            plan = queue.freeze_plan(batch["batchId"], {
+                "e1": {"publicText": "ok reply", "privateText": "ok private"},
+                "e2": {"publicText": "only public"},
+            })
+            self.assertEqual([item["eventId"] for item in plan["targets"]], ["e1"])
+            self.assertEqual(plan["blocked"], [{"eventId": "e2", "reason": "private_text_missing"}])
+            self.assertEqual(queue.find_event("e2")["state"], live_flow.BLOCKED)
+            self.assertEqual(plan["scriptSource"], "host")
+
+    def test_private_candidates_follow_phase_one_states(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("confirmed"), self._event("unresolved"),
+                          self._event("anonymous", author_id="")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            ids = ["confirmed", "unresolved", "anonymous"]
+            queue.freeze_plan(batch["batchId"], self._scripts(ids))
+            queue.mark("confirmed", live_flow.SENT_CONFIRMED, batch["batchId"])
+            queue.mark("unresolved", live_flow.UNKNOWN, batch["batchId"])
+            queue.mark("anonymous", live_flow.SENT_CONFIRMED, batch["batchId"])
+            allowed, rejected = queue.private_candidates(batch["batchId"])
+            self.assertEqual([item["eventId"] for item in allowed], ["confirmed"])
+            reasons = {item["eventId"]: item["reason"] for item in rejected}
+            self.assertEqual(reasons["unresolved"], "public_unknown")
+            self.assertEqual(reasons["anonymous"], "missing_author_id")
+            opt_in, opt_rejected = queue.private_candidates(
+                batch["batchId"],
+                {"allowPublicStates": ["sent_confirmed", "unknown"], "maxPrivate": 1})
+            self.assertEqual([item["eventId"] for item in opt_in], ["confirmed"])
+
+    def test_sidecar_live_plan_and_guards_need_no_browser(self):
+        import sidecar
+
+        def explode():
+            raise AssertionError("browser must not be opened for planning or for guarded items")
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19225)
+            instance._page = explode
+            instance.live_queue.append([self._event("e1"), self._event("e2")])
+            planned = instance.dispatch("live_plan", {"maxItems": 10, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1", "e2"])})
+            self.assertEqual(planned["status"], "ok")
+            batch_id = planned["batch"]["batchId"]
+            reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "s1", "text": "different text"}]})
+            self.assertEqual(reply["status"], "blocked")
+            self.assertEqual(reply["results"][0]["reason"], "script_mismatch")
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "blocked")
+            private = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e2", "sendId": "s2"}]})
+            self.assertEqual(private["status"], "blocked")
+            self.assertEqual(private["results"][0]["reason"], "public_planned")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_result", {"batchId": "does-not-exist"})
+            self.assertEqual(raised.exception.code, "unknown_batch")
+
+    def test_sidecar_live_result_reports_counts_and_checkpoint(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19226)
+            caps = instance.dispatch("capabilities", {})
+            self.assertIn("live_plan", caps["methods"])
+            self.assertIn("live_result", caps["methods"])
+            self.assertFalse(caps["capability"]["live_batch"]["autoEligible"])
+            self.assertEqual(caps["capability"]["live_batch"]["validation"]["scripts"],
+                             "host_provided_only")
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance.live_queue.mark("e1", "sent_confirmed", batch_id)
+            report = instance.dispatch("live_result", {"batchId": batch_id})
+            self.assertEqual(report["counts"]["sent_confirmed"], 1)
+            self.assertEqual(report["privateCandidates"], 1)
+            self.assertEqual(report["checkpoint"]["planTargets"], 1)
+            self.assertEqual(report["checkpoint"]["phase"], "private")
+
+    def test_live_listen_enqueues_deduped_events(self):
+        import sidecar
+
+        class Page:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://live.douyin.com/room-1"
+                return None
+
+            def call(self, method, *_args, **_kwargs):
+                self.calls.append(method)
+
+            def close(self):
+                pass
+
+        old = sidecar.live.collect_events, sidecar.douyin.login_state
+        try:
+            sidecar.live.collect_events = lambda _page, max_items=100: [
+                {"id": "live-c1", "authorId": "u1", "authorName": "A", "text": "same"},
+                {"id": "live-c1", "authorId": "u1", "authorName": "A", "text": "same"}]
+            sidecar.douyin.login_state = lambda _page: "verified"
+            with tempfile.TemporaryDirectory() as td:
+                instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                           os.path.join(td, "profile"), 19227)
+                page = Page()
+                instance._page = lambda: (page, {"pid": 1})
+                result = instance.dispatch("live_listen", {"url": "https://live.douyin.com/room-1",
+                                                           "maxItems": 10})
+        finally:
+            sidecar.live.collect_events, sidecar.douyin.login_state = old
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["queue"]["added"], 1)
+        self.assertEqual(result["queue"]["duplicates"], 1)
+        self.assertEqual(result["queue"]["queued"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

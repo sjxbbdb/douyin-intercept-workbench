@@ -20,6 +20,7 @@ import crawl as crawlmod
 import douyin
 import douyin_selectors as S
 import live
+import live_flow
 import winfocus
 from send_actions import send_comment, send_private
 from send_gate import SendGate
@@ -74,6 +75,30 @@ def _event(source, room_id, row):
     }
 
 
+def _live_batch_items(params):
+    """Validate the per-item send plan of one live batch phase.
+
+    Every item carries the host-supplied idempotency key, so a retried request
+    can only ever replay the same action.
+    """
+    batch_id = str(params.get("batchId") or "").strip()
+    if not batch_id:
+        raise SidecarError("invalid_input", "batchId is required")
+    items = params.get("items")
+    if not isinstance(items, list) or not items:
+        raise SidecarError("invalid_input", "items must be a non-empty array")
+    out = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise SidecarError("invalid_input", "each item must be an object")
+        event_id = str(raw.get("eventId") or "").strip()
+        send_id = str(raw.get("sendId") or "").strip()
+        if not event_id or not send_id:
+            raise SidecarError("invalid_input", "each item needs eventId and sendId")
+        out.append({"eventId": event_id, "sendId": send_id, "text": raw.get("text")})
+    return batch_id, out
+
+
 def _find_browser():
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -121,6 +146,7 @@ class Sidecar:
         os.makedirs(self.state_dir, exist_ok=True)
         self.account_scope = hashlib.sha256(self.profile_dir.encode("utf-8")).hexdigest()[:32]
         self.gate = SendGate(self.state_dir, self.account_scope)
+        self.live_queue = live_flow.LiveQueue(self.state_dir, self.account_scope)
         self.marker_path = os.path.join(self.state_dir, "browser-owner.json")
 
     @staticmethod
@@ -175,7 +201,9 @@ class Sidecar:
         return {
             "protocolVersion": 1,
             "methods": ["capabilities", "launch", "doctor", "open", "search",
-                         "collect_comments", "collect_live", "send_private", "send_comment", "close"],
+                         "collect_comments", "collect_live", "send_private", "send_comment",
+                         "live_listen", "live_plan", "live_reply", "live_private", "live_result",
+                         "close"],
             "sendStatuses": ["unknown", "failed", "blocked"],
             "capability": {
                 "video_capture": {"implemented": True, "autoEligible": True,
@@ -189,6 +217,11 @@ class Sidecar:
                                   "validation": {"status": "offline_dom_fixture", "delivery": "capture_only"}},
                 "live_reply": {"implemented": True, "autoEligible": False,
                                 "validation": {"status": "offline_dom_fixture", "delivery": "unknown"}},
+                "live_batch": {"implemented": True, "autoEligible": False,
+                                "validation": {"status": "offline_unit_tests",
+                                               "delivery": "queued_batch_two_phase",
+                                               "scripts": "host_provided_only",
+                                               "window": "expired_events_are_not_replayed"}},
             },
             "limits": dict(self.gate.limits),
             "accountScope": self.account_scope,
@@ -397,15 +430,181 @@ class Sidecar:
         finally:
             page.close()
 
+    # ---- live batch flow: images/12-live-room-business ----
+
+    def live_listen(self, params):
+        """One listening round: collect visible live comments and enqueue them.
+
+        The queue deduplicates by room/author/text and trims itself to its
+        configured capacity, so the host may call this repeatedly and plan a
+        batch from the accumulated events afterwards.
+        """
+        url = safe_url(params.get("url"), "url")
+        if not url.startswith("https://live.douyin.com/"):
+            raise SidecarError("unsupported", "live_listen requires a live.douyin.com URL")
+        max_items = int(params.get("maxItems", 100))
+        if not 1 <= max_items <= 500:
+            raise SidecarError("invalid_input", "live comment bounds are invalid")
+        page, _ = self._page()
+        try:
+            if douyin.login_state(page) == "required":
+                return {"status": "login_required", "events": [],
+                        "queue": self.live_queue.stats(),
+                        "capability": {"verified": False, "source": "visible_login_modal",
+                                       "detail": "manual login required"}}
+            _navigate(page, url)
+            final_url = safe_url(page.evaluate("location.href") or url, "final live url")
+            if not final_url.startswith("https://live.douyin.com/"):
+                raise SidecarError("unsupported", "resolved page is not a live room")
+            rows = live.collect_events(page, max_items=max_items)
+            events = [_event("live", final_url, row) for row in rows]
+            queue = self.live_queue.append(events)
+            return {"status": "ok", "events": events, "queue": queue,
+                    "capability": {"verified": bool(events), "source": "visible_dom",
+                                   "detail": "queue dedupes by room/author/text; the batch window is enforced at planning"}}
+        finally:
+            page.close()
+
+    def live_plan(self, params):
+        """Form one batch and freeze the host-provided two-channel scripts.
+
+        Events outside the window are reported as expired and never replayed.
+        A target whose scripts are missing or out of bounds is blocked here,
+        before any browser action happens.
+        """
+        try:
+            max_items = int(params.get("maxItems", 20))
+            window_seconds = int(params.get("windowSeconds", live_flow.WINDOW_DEFAULT))
+        except (TypeError, ValueError):
+            raise SidecarError("invalid_input", "livePlan bounds are invalid")
+        if not 1 <= max_items <= live_flow.MAX_BATCH:
+            raise SidecarError("invalid_input", "livePlan maxItems is out of range")
+        batch = self.live_queue.take_batch(max_items=max_items, window_seconds=window_seconds)
+        summary = {key: batch[key] for key in
+                   ("batchId", "createdAt", "expiresAt", "expiredCount", "frozen", "status")}
+        if not batch["events"]:
+            return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
+                    "expired": batch["expired"]}
+        plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
+                                           params.get("policy"))
+        return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
+                "targets": plan["targets"], "blocked": plan["blocked"],
+                "expired": batch["expired"], "policy": plan["policy"]}
+
+    def live_reply(self, params):
+        """Phase one: public reply for accepted items of a frozen batch.
+
+        The text must equal the frozen public script.  A different text is
+        blocked instead of sent, because the scripts are the platform artifact
+        (images/09) and this side never rewrites them.
+        """
+        batch_id, items = _live_batch_items(params)
+        plan = self.live_queue.plan(batch_id)
+        if not plan.get("targets"):
+            raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        results, sendable = [], []
+        for item in items:
+            target = self.live_queue.target(batch_id, item["eventId"])
+            if target is None:
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "event_not_in_plan"})
+                continue
+            text = item.get("text") or target["publicText"]
+            if text != target["publicText"]:
+                self.live_queue.mark(item["eventId"], live_flow.BLOCKED, batch_id,
+                                     {"reason": "script_mismatch"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "script_mismatch"})
+                continue
+            sendable.append((item, target, text))
+        if sendable:
+            page, _ = self._page()
+            try:
+                for item, target, text in sendable:
+                    comment_target = {"id": target["eventId"], "roomId": target["roomId"],
+                                      "authorId": target["authorId"],
+                                      "authorName": target["authorName"], "text": target["text"]}
+                    outcome = send_comment(page, self.gate, item["sendId"], comment_target, text, "live")
+                    self.live_queue.mark(item["eventId"], str(outcome.get("status") or "unknown"),
+                                         batch_id, {"sendId": item["sendId"],
+                                                    "reason": outcome.get("reason")})
+                    results.append(dict(outcome, eventId=item["eventId"]))
+            finally:
+                page.close()
+        allowed, rejected = self.live_queue.private_candidates(batch_id)
+        return {"status": "ok" if sendable else "blocked", "phase": "public", "results": results,
+                "privateCandidates": [{"eventId": t["eventId"], "authorId": t["authorId"],
+                                       "authorName": t["authorName"]} for t in allowed],
+                "privateRejected": rejected,
+                "checkpoint": self.live_queue.result(batch_id)["checkpoint"]}
+
+    def live_private(self, params):
+        """Phase two: private message, only for the derived candidate list.
+
+        Anything outside that list - unresolved public reply, blocked target,
+        missing author id, over the private capacity - is refused with a reason
+        instead of being sent.
+        """
+        batch_id, items = _live_batch_items(params)
+        allowed, rejected = self.live_queue.private_candidates(batch_id)
+        by_id = {item["eventId"]: item for item in allowed}
+        results, sendable = [], []
+        for item in items:
+            target = by_id.get(item["eventId"])
+            if target is None:
+                reason = next((r["reason"] for r in rejected
+                               if r["eventId"] == item["eventId"]), "not_a_private_candidate")
+                results.append({"eventId": item["eventId"], "status": "blocked", "reason": reason})
+                continue
+            text = item.get("text") or target["privateText"]
+            if text != target["privateText"]:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": "script_mismatch"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "script_mismatch"})
+                continue
+            sendable.append((item, target, text))
+        if sendable:
+            page, _ = self._page()
+            try:
+                for item, target, text in sendable:
+                    profile_target = {"authorId": target["authorId"],
+                                      "authorName": target["authorName"]}
+                    outcome = send_private(page, self.gate, item["sendId"], profile_target, text)
+                    self.live_queue.mark_private(item["eventId"],
+                                                 str(outcome.get("status") or "unknown"), batch_id,
+                                                 {"sendId": item["sendId"],
+                                                  "reason": outcome.get("reason")})
+                    results.append(dict(outcome, eventId=item["eventId"]))
+            finally:
+                page.close()
+        return {"status": "ok" if sendable else "blocked", "phase": "private", "results": results,
+                "checkpoint": self.live_queue.result(batch_id)["checkpoint"]}
+
+    def live_result(self, params):
+        """Batch report: per-phase states, the private list and the checkpoint."""
+        batch_id = str(params.get("batchId") or "").strip()
+        if not batch_id:
+            raise SidecarError("invalid_input", "batchId is required")
+        report = self.live_queue.result(batch_id)
+        report["queue"] = self.live_queue.stats()
+        report["limits"] = dict(self.gate.limits)
+        return report
+
     def dispatch(self, method, params):
         allowed = {"capabilities", "launch", "doctor", "open", "search",
-                   "collect_comments", "collect_live", "send_private", "send_comment", "close"}
+                   "collect_comments", "collect_live", "send_private", "send_comment",
+                   "live_listen", "live_plan", "live_reply", "live_private", "live_result",
+                   "close"}
         if method not in allowed:
             raise SidecarError("unknown_method", "method is not supported")
         fn = getattr(self, method)
         if not isinstance(params, dict):
             raise SidecarError("invalid_input", "params must be an object")
-        return fn(params)
+        try:
+            return fn(params)
+        except live_flow.LiveFlowError as exc:
+            raise SidecarError(exc.code, exc.message)
 
 
 def _emit(value):
