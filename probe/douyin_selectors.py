@@ -103,7 +103,18 @@ LIVE_CHAT_SEND_CANDIDATES = [
     '[data-e2e*="chat-send"]',
     '[data-e2e*="send-btn"]',
 ]
-LIVE_CHAT_NODE_SELECTORS = [LIVE_CHAT_ROW, LIVE_CHAT_LIST, LIVE_CHAT_BOX]
+# 作者/正文专用节点：真机结构把正文放在专用 span 里；离线夹具（tests/fixtures/live.html）
+# 用 data-e2e 占位值把作者与正文分成两个节点。两条路都支持，顺序都是"真机在前、夹具在后"。
+# 行标识属性（真机行上没有这些属性，夹具用 id/data-comment-id；取不到时才退化成 昵称|正文 指纹）
+LIVE_ROW_KEY_ATTRS = ["data-comment-id", "data-id", "data-msg-id", "data-message-id", "data-key"]
+LIVE_CHAT_AUTHOR_NODES = ['[data-e2e="live-chat-author"]', '[data-e2e="chat-author"]']
+LIVE_CHAT_CONTENT_NODES = ['[data-e2e="live-chat-content"]', '[data-e2e="chat-content"]',
+                           LIVE_CHAT_CONTENT]
+# 候选顺序：真机结构在前，夹具/legacy 的 data-e2e 占位值在后 —— 同一段采集 JS 同时兼容两者，
+# 不需要为夹具单独维护一套解析逻辑。
+LIVE_CHAT_NODE_SELECTORS = [LIVE_CHAT_ROW, LIVE_CHAT_LIST, LIVE_CHAT_BOX,
+                            '[data-e2e="live-chat-item"]', '[data-e2e="chat-item"]',
+                            '[class*="webcast-chatroom___item"]']
 LIVE_CHAT_FEED_MAX_HOPS = 30      # 从弹幕行沿 fiber.return 往上找 originalList 的最大层数
 LIVE_NICK_MAX = 48
 LIVE_TEXT_MAX = 260

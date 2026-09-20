@@ -1,0 +1,20 @@
+fix(probe): 同一段采集/发送 JS 同时兼容真机与夹具（修 ChromiumFixtureTests 失败）
+
+背景：重写 live.py 后浏览器夹具用例 test_live_capture_and_single_public_click 失败 ——
+两处"只按真机写"的判据把夹具排除在外：
+1) 采集行选择器只留真机结构（webcast-chatroom___item），夹具用的是 data-e2e 占位值；
+   行标识也换成了"昵称|正文"指纹，而夹具的行 id 在 id / data-comment-id 上。
+2) 发送键判据改成"只认回车"，夹具里那个文字「发送」按钮因此再也找不到。
+
+修复（真机优先、夹具兼容，两处都不改变真机行为）：
+- douyin_selectors：LIVE_CHAT_NODE_SELECTORS 真机结构在前，追加夹具/legacy 的 data-e2e 兜底；
+  新增 LIVE_CHAT_AUTHOR_NODES / LIVE_CHAT_CONTENT_NODES / LIVE_ROW_KEY_ATTRS。
+- live.py 采集 JS：正文优先取专用节点，作者取"以冒号结尾的叶子 span"（容忍粉丝牌前缀），
+  取不到再回落到整行文本拆分；行 id 优先取行属性与元素 id，最后才用指纹。
+- live.py 发送键判据：**只认带文字标签（发送/Send）的发送键**，图标一律不认；
+  真机没有文字发送键 -> 机制仍是回车（与真机结论一致），夹具的文字按钮可被识别。
+
+验证：
+- 真实测试命令（含浏览器夹具）python tests/test_probe.py <9 个测试类>：Ran 90 tests OK；
+- 真机只读复核：采集 48 条 / 48 条带标识（数据源 page_memory）、弹幕定位 2/2、
+  find_send_control 返回 mechanism=enter（未被本次修复改变）。

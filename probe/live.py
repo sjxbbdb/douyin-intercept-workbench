@@ -83,6 +83,9 @@ def collect_feed(cdp):
 COLLECT_JS = (
     "(function(){"
     "var SEL=" + _js_array(S.LIVE_CHAT_NODE_SELECTORS) + ";"
+    "var AUTHOR_SEL=" + _js_array(S.LIVE_CHAT_AUTHOR_NODES) + ";"
+    "var CONTENT_SEL=" + _js_array(S.LIVE_CHAT_CONTENT_NODES) + ";"
+    "var KEY_ATTRS=" + _js_array(S.LIVE_ROW_KEY_ATTRS) + ";"
     "var NICK_MAX=" + str(int(S.LIVE_NICK_MAX)) + ",TEXT_MAX=" + str(int(S.LIVE_TEXT_MAX)) + ";"
     "var NICK_FALLBACK=new RegExp(" + json.dumps(S.LIVE_NICK_FALLBACK_RE) + ");"
     "var NOISE_TEXT=new RegExp(" + json.dumps(S.LIVE_NOISE_TEXT_RE) + ");"
@@ -90,6 +93,8 @@ COLLECT_JS = (
     "function textOf(el){return String((el&&(el.innerText||el.textContent))||'')"
     ".replace(/\\u00a0/g,' ').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
     ".replace(/\\s+/g,' ').trim();}"
+    "function first(el,sels){for(var i=0;i<sels.length;i++){var n=el.querySelector(sels[i]);if(n)return n;}return null;}"
+    "function attrOf(el,names){for(var i=0;i<names.length;i++){var v=el.getAttribute(names[i]);if(v)return v;}return '';}"
     "function visible(el){if(!el)return false;var r=el.getBoundingClientRect();"
     "if(!r.width||!r.height)return false;"
     "if(r.bottom<0||r.top>(window.innerHeight||0))return false;"
@@ -107,16 +112,28 @@ COLLECT_JS = (
     "function isNoiseText(t){if(NOISE_TEXT.test(t))return true;"
     "var k=Math.max(t.lastIndexOf('：'),t.lastIndexOf(':'));"
     "return k>=0&&NOISE_TEXT.test(t.slice(k+1).replace(/^\\s+/,''));}"
-    "function parseRow(el){var lines=getLines(el);"
+    "function parseRow(el){"
+    "var user='',text='';"
+    "var contentNode=first(el,CONTENT_SEL);"
+    "if(contentNode)text=textOf(contentNode);"
+    "var spans=el.querySelectorAll('span');"
+    "for(var i=0;i<spans.length;i++){var sp=spans[i];"
+    "if(sp.querySelector('span'))continue;"
+    "if(contentNode&&(sp===contentNode||contentNode.contains(sp)))continue;"
+    "var t=textOf(sp);if(/[:：]$/.test(t)){user=t.slice(0,-1).trim();break;}}"
+    "if(!user){var authorNode=first(el,AUTHOR_SEL);if(authorNode)user=textOf(authorNode).replace(/^@/,'').trim();}"
+    "if(!user||!text){var lines=getLines(el);"
     "if(lines.length===1){var m=lines[0].match(NICK_FALLBACK);if(m)lines=[m[1].trim(),m[2].trim()];}"
     "if(lines.length<2)return {why:'one_line'};"
-    "var user=lines[0].replace(/^@/,'').trim();"
-    "var text=lines.slice(1).join(' ').trim();"
+    "if(!user)user=lines[0].replace(/^@/,'').trim();"
+    "if(!text)text=lines.slice(1).join(' ').trim();}"
     "if(!user||!text)return {why:'empty'};"
     "if(user.length>NICK_MAX||text.length>TEXT_MAX)return {why:'shape'};"
     "if(isNoiseText(text))return {why:'noise_text'};"
     "if(NOISE_NICK.test(user))return {why:'noise_nick'};"
-    "return {row:{authorName:user,text:text,id:(user+'|'+text).slice(0,120)}};}"
+    "var key=attrOf(el,KEY_ATTRS)||el.id||'';"
+    "if(!key)key=(user+'|'+text).slice(0,120);"
+    "return {row:{id:key,authorName:user,text:text}};}"
     "var nodes=[],seen=[];"
     "for(var s=0;s<SEL.length;s++){var found=[];"
     "try{found=Array.prototype.slice.call(document.querySelectorAll(SEL[s]));}catch(e){continue;}"
@@ -138,7 +155,6 @@ COLLECT_JS = (
     "if(isAncestor){stats.drop_ancestor++;continue;}"
     "var row=accepted[a].row;"
     "if(seenKey[row.id]){continue;}seenKey[row.id]=true;"
-    "if(!onTop(accepted[a].el))stats.covered++;"
     "row.onTop=onTop(accepted[a].el);row.source='dom';"
     "rows.push(row);}"
     "return {rows:rows,diagnostics:stats};"
@@ -280,39 +296,49 @@ SEND_JS = (
     "(function(){"
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
-    "var box=document.querySelector(" + json.dumps(S.LIVE_CHAT_EDITOR_BOX) + ");"
-    "if(!box)return {found:false,reason:'composer_box_not_found'};"
+    "function label(e){return String((e&&(e.innerText||e.textContent))||'')"
+    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'').replace(/\\s+/g,'').trim();}"
     "var sels=" + _js_array(S.LIVE_CHAT_SEND_CANDIDATES) + ".concat(" + _js_array(S.LIVE_PUBLIC_SEND_BUTTONS) + ");"
-    "for(var i=0;i<sels.length;i++){var ns=box.querySelectorAll(sels[i]);"
-    "for(var j=0;j<ns.length;j++){var e=ns[j];if(!vis(e))continue;"
+    "var nodes=[],seen=[];"
+    "for(var i=0;i<sels.length;i++){var ns=document.querySelectorAll(sels[i]);"
+    "for(var j=0;j<ns.length;j++){if(seen.indexOf(ns[j])<0){seen.push(ns[j]);nodes.push(ns[j]);}}}"
+    # 🔴 真机结论（2026-09-20）：输入框右侧只有 emoji 与 svg 图标，**没有文字发送键**；
+    #    按候选坐标点下去内容原样留在框里。所以这里【只认带文字标签的发送键】，
+    #    图标一律不认（宁可回落到回车，也不乱点一个不知道干什么的控件）。
+    "for(var k=0;k<nodes.length;k++){var e=nodes[k];if(!vis(e))continue;"
+    "var t=label(e);if(t!=='" + S.DM_SEND_TEXT + "'&&t!=='Send'&&t!=='send')continue;"
     "var r=e.getBoundingClientRect();"
     "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
-    "disabled:!!(e.disabled||e.getAttribute('aria-disabled')==='true')};}}"
+    "disabled:!!(e.disabled||e.getAttribute('aria-disabled')==='true'),label:t};}"
     "return {found:false,reason:'send_control_not_found',enterFallback:true};"
     "})()"
 )
 
 
 def find_send_control(cdp):
-    """公屏发送方式（真机结论：回车）。
+    """公屏发送方式。
 
     🔴 真机实测（2026-09-20，真实直播间）：
-      · 输入框右侧只有 emoji 与两个 svg 图标，没有文字「发送」按钮；
-      · 按"候选控件"的坐标点下去之后，输入框内容【原样留在框里】= 它根本不是发送键；
+      · 输入框右侧只有 emoji 与两个 svg 图标，**没有**文字发送键；
+      · 按候选控件的坐标点下去之后，输入框内容【原样留在框里】= 它根本不是发送键；
       · 改用回车发送，输入框立刻清空，随后能在房间消息流里看到自己发的那条。
-    所以机制固定为回车；候选控件只作为诊断信息返回，不参与发送
+    因此规则是：**只认带文字标签（发送 / Send）的发送键**，图标一律不认；
+    没有可用的文字发送键时机制为回车，候选控件只作为诊断信息返回
     （宁可发不出去，也不要乱点一个不知道干什么的控件）。
     """
     found = cdp.eval_json(SEND_JS) or {"found": False}
+    if found.get("found") and not found.get("disabled"):
+        found["mechanism"] = "button"
+        return found
     return {"found": False, "mechanism": "enter",
-            "reason": "enter_is_the_verified_mechanism",
+            "reason": found.get("reason") or "send_control_disabled",
             "diagnostic": {"candidateFound": bool(found.get("found")),
                            "candidateDisabled": bool(found.get("disabled")),
-                           "note": "候选控件经真机确认不是发送键（点击后输入框不清空）"}}
+                           "note": "只认带文字标签的发送键；真机上没有，故用回车"}}
 
 
 def find_send_button(cdp):
-    """兼容旧调用名：返回发送方式（mechanism='enter'）。"""
+    """兼容旧调用名：返回发送方式（有文字发送键时是 button，否则 enter）。"""
     return find_send_control(cdp)
 
 
