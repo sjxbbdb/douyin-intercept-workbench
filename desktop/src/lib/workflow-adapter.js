@@ -200,10 +200,12 @@ function createWorkflowAdapter({ browser, state = new Map() } = {}) {
     const actionState = state.get(run.runId) || {};
     const sendId = actionState[step.stepId === 'private_message' ? 'privateSendId' : 'publicSendId'] || action?.idempotencyKey || action?.actionId;
     if (!sendId) return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'send_id_missing' }, error: { code: 'SEND_ID_MISSING', message: '副作用动作缺少幂等发送 ID' } };
+    const publicSendId = step.stepId === 'private_message' ? actionState.publicSendId : null;
+    if (step.stepId === 'private_message' && !publicSendId) return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'public_delivery_id_missing' }, error: { code: 'PUBLIC_DELIVERY_ID_MISSING', message: '私信必须绑定已确认的公屏发送记录' } };
     if (step.stepId === 'private_message' && typeof browser.sendPrivate !== 'function') return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'private_adapter_unavailable' }, error: { code: 'PRIVATE_ADAPTER_UNAVAILABLE', message: '私信适配器不可用，已转人工' } };
     if (step.stepId !== 'private_message' && typeof browser.sendReply !== 'function') return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'public_adapter_unavailable' }, error: { code: 'PUBLIC_ADAPTER_UNAVAILABLE', message: '公屏回复适配器不可用，已转人工' } };
     const result = step.stepId === 'private_message'
-      ? await browser.sendPrivate(reply, { ...resolvedTarget, sendId })
+      ? await browser.sendPrivate(reply, { ...resolvedTarget, sendId, publicSendId })
       : await browser.sendReply(reply, source, { ...resolvedTarget, sendId });
     const current = state.get(run.runId) || {};
     state.set(run.runId, { ...current, target: resolvedTarget, [step.stepId === 'private_message' ? 'privateSendId' : 'publicSendId']: sendId, [step.stepId === 'private_message' ? 'privateResult' : 'publicResult']: { status: result?.status || 'unknown', reason: result?.reason || null } });

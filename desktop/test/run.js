@@ -42,7 +42,7 @@ testAsync('platform workflow adapter forwards search paging and keeps unverified
   assert.equal(mismatch.error.code, 'TARGET_KEYWORD_MISMATCH');
   const publicOnly = createWorkflowAdapter({ browser: { canSend: () => true, sendReply: async () => { calls.push({ type: 'public-fallback' }); return { status: 'sent_confirmed' }; } } });
   const privateBlocked = await publicOnly.execute({ run: { runId: 'private-missing', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c3', roomId: 'https://www.douyin.com/video/1', authorId: 'u3', text: '价格' }, keywords: ['价格'], privateReply: '不应公开发送' } }, step: { stepId: 'private_message' }, action: { actionId: 'a-private-missing', idempotencyKey: 'idem-private-missing' } });
-  assert.equal(privateBlocked.error.code, 'PRIVATE_ADAPTER_UNAVAILABLE');
+  assert.equal(privateBlocked.error.code, 'PUBLIC_DELIVERY_ID_MISSING');
   assert.equal(calls.filter((item) => item.type === 'public-fallback').length, 0);
 });
 testAsync('platform workflow adapter preserves terminal search evidence for human recovery', async () => {
