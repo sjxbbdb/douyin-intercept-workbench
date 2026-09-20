@@ -95,6 +95,12 @@ testAsync('platform workflow adapter exposes only explicit confirmed delivery', 
   assert.deepEqual(publicResult.result, { deliveryStatus: 'sent_confirmed', reason: null, sendId: 's1' });
   const privateResult = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { actionId: 'a-private', idempotencyKey: 'idem-private' } });
   assert.deepEqual(privateResult.result, { deliveryStatus: 'sent_confirmed', reason: null, sendId: 's2' });
+  const unknownAdapter = createWorkflowAdapter({ browser: { canSend: () => true, sendReply: async () => ({ status: 'unknown', sendId: 's-unknown' }), sendPrivate: async () => { throw new Error('private send must be gated'); } } });
+  const unknownRun = { runId: 'comment-unknown-public', workflowId: 'comment.reply_then_private' };
+  const unknownPublic = await unknownAdapter.execute({ run: unknownRun, plan, step: { stepId: 'reply_comment' }, action: { actionId: 'a-public-unknown', idempotencyKey: 'idem-public-unknown' } });
+  assert.equal(unknownPublic.status, 'unknown');
+  const unknownPrivate = await unknownAdapter.execute({ run: unknownRun, plan, step: { stepId: 'private_message' }, action: { actionId: 'a-private-unknown', idempotencyKey: 'idem-private-unknown' } });
+  assert.equal(unknownPrivate.error.code, 'PUBLIC_DELIVERY_NOT_CONFIRMED');
 });
 test('JsonStore commits only after atomic flush', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { events: [] }); store.set({ events: [{ id: 'one' }] }); const reopened = new JsonStore(file, { events: [] }); assert.equal(reopened.get().events[0].id, 'one'); });
 test('JsonStore refuses corrupted or inaccessible data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const broken = path.join(dir, 'broken.json'); fs.writeFileSync(broken, '{bad'); assert.throws(() => new JsonStore(broken, {}), /存储损坏/); const parentFile = path.join(dir, 'parent'); fs.writeFileSync(parentFile, 'file'); assert.throws(() => new JsonStore(path.join(parentFile, 'data.json'), { value: 1 }), /目录不可读/); });
