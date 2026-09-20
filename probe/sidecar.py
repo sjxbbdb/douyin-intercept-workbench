@@ -437,6 +437,19 @@ class Sidecar:
         新增字段（都是加法式，老调用方只看 videos 也不受影响）：
           cursor / hasMore / page / poolSize / skippedSeen
           platformHasMore / platformCursor（平台响应体的观测值，只读，不用来直调接口）
+
+        同时返回每条候选的【相关度】记录并支持 `minRelevance` 筛选。
+
+        模块边界（找视频）：只负责【发现与筛选】视频 —— 不回复评论、不私信。
+        固定流程第 4 步要求返回「标题、作者、链接、相关度等候选结果」；
+        第 5 步「用户选择，或 Agent 按规则交给评论区模块」由宿主决定，
+        所以这里只给候选和相关度，不做任何跨模块动作。
+
+        相关度由 crawl.video_relevance 计算：整串命中 > 分词全命中 > 部分命中 > 不命中，
+        规则确定、可解释、纯离线。宿主可以用 minRelevance 直接筛，也可以自己排序。
+
+        注意：相关度衡量的是【标题与关键词的字面相关】，不是视频质量；
+        热度（点赞/评论数）是另一个维度，需要时由宿主另行获取。
         """
         keyword = params.get("keyword")
         if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > MAX_KEYWORD:
@@ -446,10 +459,12 @@ class Sidecar:
         rounds = int(params.get("scrollRounds", 6))
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
-
         cursor_in = params.get("cursor")
         seen, page_no = _decode_cursor(cursor_in, keyword)
 
+        min_relevance = int(params.get("minRelevance", 0) or 0)
+        if not 0 <= min_relevance <= 100:
+            raise SidecarError("invalid_input", "minRelevance must be between 0 and 100")
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
@@ -470,12 +485,20 @@ class Sidecar:
                                                 strict=False, meta=meta,
                                                 navigate=navigate, seen_ids=seen)
             out = []
-            for video in videos[:max_videos]:
+            filtered = 0
+            for video in videos:
+                relevance = crawlmod.video_relevance(video.get("desc"), keyword)
+                if relevance["score"] < min_relevance:
+                    filtered += 1
+                    continue
+                if len(out) >= max_videos:
+                    break
                 out.append({"id": str(video.get("aweme_id") or ""),
                             "url": safe_url(video.get("url"), "video.url"),
                             "title": str(video.get("desc") or "")[:200],
                             "author": str(video.get("author") or "")[:120],
-                            "authorId": str(video.get("author_sec_uid") or "")[:200]})
+                            "authorId": str(video.get("author_sec_uid") or "")[:200],
+                            "relevance": relevance})
             pool = set(seen) | {v["id"] for v in out if v["id"]}
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
             return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
@@ -486,7 +509,10 @@ class Sidecar:
                     "poolSize": len(pool),
                     "skippedSeen": int(meta.get("skipped_seen") or 0),
                     "platformHasMore": meta.get("platform_has_more"),
-                    "platformCursor": meta.get("platform_cursor")}
+                    "platformCursor": meta.get("platform_cursor"),
+                    "filter": {"collected": len(videos), "returned": len(out),
+                               "filteredByRelevance": filtered,
+                               "minRelevance": min_relevance}}
         finally:
             page.close()
 
@@ -665,8 +691,10 @@ class Sidecar:
         """Form one batch and freeze the host-provided two-channel scripts.
 
         Events outside the window are reported as expired and never replayed.
-        A target whose scripts are missing or out of bounds is blocked here,
-        before any browser action happens.
+        Keywords - when the host supplies them - are matched before the batch is
+        formed, so a comment that does not match is marked 'filtered' and never
+        takes a batch slot.  A target whose scripts are missing or out of bounds
+        is blocked here, before any browser action happens.
         """
         try:
             max_items = int(params.get("maxItems", 20))
@@ -675,17 +703,30 @@ class Sidecar:
             raise SidecarError("invalid_input", "livePlan bounds are invalid")
         if not 1 <= max_items <= live_flow.MAX_BATCH:
             raise SidecarError("invalid_input", "livePlan maxItems is out of range")
-        batch = self.live_queue.take_batch(max_items=max_items, window_seconds=window_seconds)
+        if params.get("policy") is not None:
+            # 策略（allowPublicStates / maxPrivate 等）必须由授权服务端签发并校验；
+            # 在这个接线完成之前，边界一律拒绝调用方自带策略，改用内置的保守默认值。
+            raise SidecarError("policy_not_server_issued",
+                               "policy must be issued by the authorization service, not by the caller")
+        spec = live_flow.normalize_filter(params.get("keywords"),
+                                          params.get("excludeKeywords"),
+                                          params.get("matchMode") or "seg")
+        batch = self.live_queue.take_batch(
+            max_items=max_items, window_seconds=window_seconds,
+            filters=spec if live_flow.filter_is_active(spec) else None)
         summary = {key: batch[key] for key in
                    ("batchId", "createdAt", "expiresAt", "expiredCount", "frozen", "status")}
+        summary["filter"] = batch.get("filter") or {}
         if not batch["events"]:
+            # 关键词未命中或队列为空：都不建立批次，下一次监听到达后会形成新的批次
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
-                    "expired": batch["expired"]}
+                    "expired": batch["expired"], "filter": batch["filter"]}
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
                                            params.get("policy"))
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
-                "expired": batch["expired"], "policy": plan["policy"]}
+                "expired": batch["expired"], "filter": batch["filter"],
+                "policy": plan["policy"], "policySource": plan.get("policySource")}
 
     def live_reply(self, params):
         """Phase one: public reply for accepted items of a frozen batch.
@@ -695,6 +736,7 @@ class Sidecar:
         (images/09) and this side never rewrites them.
         """
         batch_id, items = _live_batch_items(params)
+        self.live_queue.ensure_active(batch_id)
         plan = self.live_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
@@ -742,6 +784,7 @@ class Sidecar:
         instead of being sent.
         """
         batch_id, items = _live_batch_items(params)
+        self.live_queue.ensure_active(batch_id)
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         by_id = {item["eventId"]: item for item in allowed}
         results, sendable = [], []

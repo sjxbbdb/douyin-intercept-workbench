@@ -139,6 +139,7 @@ def comment_segments(keyword):
 
 
 def video_matches_keyword(video_text, keyword):
+    """视频标题是否匹配关键词（bool）。保留给老调用方；新代码用 video_relevance。"""
     src = normalize_search_text(video_text)
     target = normalize_search_text(keyword)
     if not target:
@@ -149,6 +150,102 @@ def video_matches_keyword(video_text, keyword):
     if not segs:
         return False
     return all(s in src for s in segs)
+
+
+# ===================== 视频相关度（找视频模块的「相关度」） =====================
+#
+# 架构依据：找视频模块固定流程第 4 步要求返回
+#     「视频标题、作者、链接、【相关度】等候选结果」，
+# 并且模块的职责就是「发现和筛选视频」。
+#
+# 基线只有 video_matches_keyword 的一个 bool —— 宿主既没法排序候选，
+# 也没法按阈值筛选（要么全要、要么按 bool 一刀切）。
+#
+# 打分只用【我们自己就能观察到的信号】（搜索关键词 vs 视频标题），
+# 不引入任何平台接口之外的推断；规则确定、可解释、纯离线可测。
+#
+#   1. 用户写的【每个关键词都整串连续】出现在标题里：基础 70，再按首次出现位置加分
+#        （开头 +30 / 前 10 字 +20 / 其它 +10），最高 100；
+#   2. 否则退化为分词命中：全部分词都出现（顺序无关）给 60；
+#   3. 只命中部分分词：按命中比例给分（40 × 比例，四舍五入，上限 39）；
+#   4. 一个都没命中：0。
+#
+# 为什么退化那一层必须存在：抖音标题几乎不会连续包含「怎么充值codex」这种提问式关键词，
+# 只认整串会把结果清成 0（这条来自 pipeline.js 的真机结论）。
+#
+# ⚠️ 相关度衡量的是【标题与关键词的字面相关】，不是视频质量。
+#    热度（点赞/评论数）是另一个维度，已经在候选结果里单独给出，不混进这个分数。
+RELEVANCE_EXACT_BASE = 70
+RELEVANCE_EXACT_BONUS_HEAD = 30
+RELEVANCE_EXACT_BONUS_EARLY = 20
+RELEVANCE_EXACT_BONUS_LATE = 10
+RELEVANCE_ALL_SEGMENTS = 60
+RELEVANCE_PARTIAL_BASE = 40
+RELEVANCE_EARLY_CHARS = 10
+
+
+def video_relevance(video_text, keyword):
+    """视频与关键词的相关度（0-100）。返回 dict，字段见下面的注释。
+
+    返回：
+      score            0-100 的整数
+      reason           exact_phrase / all_segments / partial_segments / no_match / empty_keyword
+      matchedSegments  命中的分词
+      missingSegments  未命中的分词
+      exact            是否整串连续命中
+      position         整串首次出现的字符位置（未整串命中时为 None）
+    """
+    parts = split_keywords(keyword)          # 用户实际写下的每个关键词
+    segs = keyword_segments(keyword)         # 分词（中文↔英文边界 + 剥疑问前缀）
+    out = {"score": 0, "reason": "no_match", "matchedSegments": [],
+           "missingSegments": list(segs), "exact": False, "position": None,
+           "matchedKeywords": [], "missingKeywords": list(parts)}
+    if not normalize_search_text(keyword):
+        out["reason"] = "empty_keyword"
+        return out
+    src = normalize_search_text(video_text)
+    if not src:
+        return out
+
+    # 第 1 档：用户写的每个关键词都【整串连续】出现在标题里
+    hits, miss = [], []
+    for part in parts:
+        (hits if normalize_search_text(part) in src else miss).append(part)
+    if parts and not miss:
+        position = min(src.find(normalize_search_text(part)) for part in hits)
+        if position == 0:
+            bonus = RELEVANCE_EXACT_BONUS_HEAD
+        elif position <= RELEVANCE_EARLY_CHARS:
+            bonus = RELEVANCE_EXACT_BONUS_EARLY
+        else:
+            bonus = RELEVANCE_EXACT_BONUS_LATE
+        out.update({"score": min(100, RELEVANCE_EXACT_BASE + bonus),
+                    "reason": "exact_phrase", "exact": True, "position": position,
+                    "matchedSegments": list(segs), "missingSegments": [],
+                    "matchedKeywords": hits, "missingKeywords": []})
+        return out
+
+    # 第 2/3 档：退化为分词命中（顺序无关）——视频标题几乎不会连续包含长提问式关键词
+    if not segs:
+        out.update({"matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    seg_hit = [s for s in segs if s in src]
+    seg_miss = [s for s in segs if s not in src]
+    if not seg_miss:
+        out.update({"score": RELEVANCE_ALL_SEGMENTS, "reason": "all_segments",
+                    "matchedSegments": seg_hit, "missingSegments": [],
+                    "matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    if seg_hit:
+        ratio = len(seg_hit) / float(len(segs))
+        score = int(round(RELEVANCE_PARTIAL_BASE * ratio))
+        out.update({"score": min(score, RELEVANCE_PARTIAL_BASE - 1),
+                    "reason": "partial_segments",
+                    "matchedSegments": seg_hit, "missingSegments": seg_miss,
+                    "matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    out.update({"matchedKeywords": hits, "missingKeywords": miss})
+    return out
 
 
 def split_keywords(raw):
