@@ -359,7 +359,7 @@ class CommentQueue:
                 " ORDER BY seen_at ASC", (self.account_scope, PLANNED, EXPIRED)).fetchall()
         out = []
         for row in rows:
-            item = {"id": row["target_id"], "targetKey": row["target_key"],
+            item = {"targetId": row["target_id"], "targetKey": row["target_key"],
                     "roomId": row["room_id"], "authorId": row["author_id"],
                     "authorName": row["author_name"], "text": row["text"],
                     "state": row["state"],
@@ -386,7 +386,7 @@ class CommentQueue:
         items = []
         rejected = []
         for target in plan.get("targets") or []:
-            row = self.find_target(target.get("targetKey") or target.get("id"))
+            row = self.find_target(target.get("targetKey") or target.get("targetId"))
             state = str((row or {}).get("state") or "")
             detail = json.loads((row or {}).get("detail_json") or "{}")
             attempts = int(detail.get("attempts") or 0)
@@ -500,7 +500,7 @@ class CommentQueue:
         for item in self.batch_targets(batch_id):
             if item.get("state") == EXPIRED:
                 continue
-            entry = scripts.get(item.get("id")) or scripts.get(item.get("targetKey"))
+            entry = scripts.get(item.get("targetId")) or scripts.get(item.get("targetKey"))
             reason = ""
             if not isinstance(entry, dict):
                 reason = "script_missing"
@@ -514,7 +514,7 @@ class CommentQueue:
                 continue
             targets.append({
                 "targetKey": item.get("targetKey"),
-                "targetId": item.get("id"),
+                "targetId": item.get("targetId"),
                 "roomId": item.get("roomId") or "",
                 "authorId": item.get("authorId") or "",
                 "authorName": item.get("authorName") or "",

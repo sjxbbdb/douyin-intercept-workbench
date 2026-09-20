@@ -804,10 +804,19 @@ class CommentFlowTests(unittest.TestCase):
         self.assertIn("over_private_capacity", {r["reason"] for r in rejected})
 
     def test_phase_two_requires_author_id(self):
-        queue, batch_id = self._prep(1)
+        """没有作者标识就不能私信。
+
+        门控读的是【冻结计划】里的 authorId，所以必须在冻结前就缺失；
+        事后改数据库行不会影响已经不认那个字段的判定。
+        """
+        queue = self._queue()
+        no_author = self._target(1)
+        no_author["authorId"] = ""
+        queue.append([no_author], now=self.T[0])
+        batch_id = queue.take_batch(now=self.T[0])["batchId"]
+        queue.freeze_plan(batch_id, {"tg-1": {"publicText": "看到你说求链接",
+                                            "privateText": "细节在我主页"}})
         queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
-        with queue._connection() as conn:  # 直接把 author_id 抹掉
-            conn.execute("UPDATE comment_targets SET author_id='' WHERE account_scope='account-a'")
         allowed, rejected = queue.private_candidates(batch_id)
         self.assertEqual(allowed, [])
         self.assertIn("missing_author_id", {r["reason"] for r in rejected})
