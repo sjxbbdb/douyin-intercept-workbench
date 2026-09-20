@@ -441,11 +441,18 @@ class BoundaryTests(unittest.TestCase):
     def test_sidecar_stdout_is_protocol_only(self):
         with tempfile.TemporaryDirectory() as td:
             state, profile = os.path.join(td, "state"), os.path.join(td, "profile")
+            # 必须显式 utf-8：sidecar 的 stdout 契约就是 UTF-8，而中文 Windows 的
+            # 默认 locale 是 GBK，父进程不指定 encoding 会在读取线程里解码失败，
+            # 表现为 proc.stdout 变成 None 而不是断言失败。
             proc = subprocess.run(
                 [sys.executable, str(PROBE / "sidecar.py"), "--state-dir", state,
                  "--profile-dir", profile, "--port", "19222"],
                 input=json.dumps({"id": "p1", "method": "capabilities", "params": {}}) + "\n",
-                text=True, capture_output=True, check=False)
+                text=True, encoding="utf-8", errors="replace",
+                capture_output=True, check=False)
+            self.assertIsNotNone(
+                proc.stdout,
+                "父进程未指定 encoding，中文 Windows 下会用 GBK 解码 UTF-8 输出并静默失败")
             lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
             self.assertEqual(proc.returncode, 0)
             self.assertEqual([line["id"] for line in lines], ["p1", "p1"])
@@ -702,10 +709,6 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(send["containerKey"], "target-panel")
 
 
-
-if __name__ == "__main__":
-    unittest.main()
-
 class CommentFlowTests(unittest.TestCase):
     """评论区两阶段流程的状态机（images/11-comment-area-business）。
 
@@ -871,3 +874,7 @@ class CommentFlowTests(unittest.TestCase):
         self.assertEqual(result["channel"], "comment")
         self.assertEqual(result["source"], "video_comment")
         self.assertIn("phase", result["checkpoint"])
+
+
+if __name__ == "__main__":
+    unittest.main()
