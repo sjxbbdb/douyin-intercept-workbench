@@ -10,6 +10,10 @@ intact:
   at most 'capacity' queued events by dropping the oldest beyond that.
 * Time-windowed batches.  A batch is taken by count, and every event older than
   the window is marked 'expired' and is never replayed later.
+* Keyword matching comes before a batch exists.  When the host supplies keywords,
+  a comment that does not match is marked 'filtered' and never takes a batch slot;
+  the same matcher as the video comment chain is reused, so both chains agree on
+  phrase / seg / all / any semantics and on exclude-keyword precedence.
 * Scripts come from the platform.  The trusted host supplies both channels per
   target - the public reply text and the private message text.  This module
   never writes, rewrites or repairs a script; a missing or out-of-bounds script
@@ -33,7 +37,10 @@ import time
 import uuid
 from contextlib import contextmanager
 
+import crawl as crawlmod
+
 QUEUED = "queued"
+FILTERED = "filtered"
 PLANNED = "planned"
 EXPIRED = "expired"
 BLOCKED = "blocked"
@@ -94,6 +101,42 @@ def normalize_policy(value):
             elif key in ("minTextLength", "maxTextLength"):
                 policy[key] = max(0, int(item))
     return policy
+
+
+def normalize_filter(keywords=None, exclude_keywords=None, mode="seg"):
+    """Keyword spec for one batch (same four modes as the video comment path).
+
+    Reusing crawl's matcher keeps one matching semantics across both chains:
+    phrase / seg / all / any, with exclude keywords taking precedence.
+    """
+    if mode not in crawlmod.MATCH_MODES:
+        raise LiveFlowError("invalid_input",
+                            "matchMode must be one of %s" % ", ".join(crawlmod.MATCH_MODES))
+    return {
+        "keywords": crawlmod.split_keywords(keywords) if not isinstance(keywords, (list, tuple))
+                    else [str(item).strip() for item in keywords if str(item).strip()],
+        "excludeKeywords": crawlmod.split_keywords(exclude_keywords)
+                           if not isinstance(exclude_keywords, (list, tuple))
+                           else [str(item).strip() for item in exclude_keywords if str(item).strip()],
+        "mode": mode,
+    }
+
+
+def filter_is_active(spec):
+    """True when the spec can reject something; an empty spec keeps every event."""
+    return bool(spec and (spec.get("keywords") or spec.get("excludeKeywords")))
+
+
+def match_event(text, spec):
+    """Return (matched, reason): reason is '', 'keyword_miss' or 'keyword_excluded'."""
+    source = crawlmod.normalize_search_text(text)
+    hit = crawlmod.comment_matches(text, spec["keywords"], spec["mode"])
+    if hit is None:
+        return False, "keyword_miss"
+    for word in spec.get("excludeKeywords") or []:
+        if crawlmod.normalize_search_text(word) and crawlmod.normalize_search_text(word) in source:
+            return False, "keyword_excluded"
+    return True, ""
 
 
 def _script_error(text, policy, label):
@@ -244,20 +287,66 @@ class LiveQueue:
                             {"reason": "queue_capacity_exceeded"}, now=now)
         return len(stale)
 
-    def take_batch(self, max_items=MAX_BATCH, window_seconds=WINDOW_DEFAULT, now=None):
+    def take_batch(self, max_items=MAX_BATCH, window_seconds=WINDOW_DEFAULT, now=None,
+                   filters=None):
         """Take a count-bounded batch inside a time window.
 
         Events older than the window are marked 'expired' first and can never be
         replayed by a later batch.  An open (planned, not yet frozen) batch is
-        returned as-is so a host retry cannot create two batches at once.
+        returned as-is so a host retry cannot create two batches at once — but
+        only while it is still inside its own window.
+
+        Three states the previous revision got wrong:
+
+        1. An open batch past its expires_at is retired, never reused. Otherwise
+           an expired batch could still be handed back and sent, which breaks
+           the time window; its planned events are expired with it ("packets
+           that are past the window are dropped, not replayed").
+        2. An empty queue creates no batch at all. The previous revision always
+           inserted one, and because open batches are reused the host then kept
+           receiving that same empty batch even after new events arrived.
+        3. Reuse is therefore limited to a live batch that still holds events.
+
+        'filters' is the keyword spec for this batch (see normalize_filter).  It is
+        applied while the events are still queued, before any slot is taken, so a
+        non-matching comment can never crowd out a matching one.
         """
         now = float(now if now is not None else self.clock())
         max_items = max(1, min(int(max_items), MAX_BATCH))
         window_seconds = max(1, int(window_seconds))
+        spec = filters if isinstance(filters, dict) else None
+        filter_stats = {"keywords": list((spec or {}).get("keywords") or []),
+                        "excludeKeywords": list((spec or {}).get("excludeKeywords") or []),
+                        "mode": (spec or {}).get("mode") or "",
+                        "matched": 0, "missed": 0, "excluded": 0}
         expired = []
+        batch_id = None
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # (1) 过期的 planned 批次先退休：既不能再被复用，也不能再被发送。
+                #     它名下已经 planned 的事件一并置为 expired。
+                stale_batches = conn.execute(
+                    "SELECT batch_id FROM live_batches "
+                    "WHERE account_scope=? AND status=? AND expires_at <= ?",
+                    (self.account_scope, "planned", now)).fetchall()
+                for stale in stale_batches:
+                    conn.execute(
+                        "UPDATE live_batches SET status=? WHERE account_scope=? AND batch_id=?",
+                        (EXPIRED, self.account_scope, stale["batch_id"]))
+                    for row in conn.execute(
+                            "SELECT event_key, payload_json FROM live_events "
+                            "WHERE account_scope=? AND batch_id=? AND state=?",
+                            (self.account_scope, stale["batch_id"], PLANNED)).fetchall():
+                        self._set_state(conn, row["event_key"], EXPIRED,
+                                        {"reason": "batch_window_expired"}, now=now)
+                        expired.append(json.loads(row["payload_json"] or "{}"))
+
+                # (2) 只复用【还在自己时间窗内】的 planned 批次
+                open_batch = conn.execute(
+                    "SELECT * FROM live_batches WHERE account_scope=? AND status=? "
+                    "AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+                    (self.account_scope, "planned", now)).fetchone()
                 expired_rows = conn.execute(
                     "SELECT event_key, payload_json FROM live_events "
                     "WHERE account_scope=? AND state=? AND seen_at <= ? ORDER BY seen_at ASC",
@@ -265,30 +354,34 @@ class LiveQueue:
                 for row in expired_rows:
                     self._set_state(conn, row["event_key"], EXPIRED,
                                     {"reason": "window_expired"}, now=now)
-                expired = [json.loads(row["payload_json"] or "{}") for row in expired_rows]
+                expired.extend(json.loads(row["payload_json"] or "{}") for row in expired_rows)
 
-                batch_id = None
-                open_batch = conn.execute(
-                    "SELECT * FROM live_batches WHERE account_scope=? AND status=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (self.account_scope, "planned")).fetchone()
-                if open_batch is not None:
-                    planned = conn.execute(
-                        "SELECT COUNT(*) AS n FROM live_events WHERE account_scope=? "
-                        "AND batch_id=? AND state=?",
-                        (self.account_scope, open_batch["batch_id"], PLANNED)).fetchone()["n"]
-                    if planned and now <= open_batch["expires_at"]:
-                        batch_id = open_batch["batch_id"]
-                    else:
-                        # 空批次或已超窗的批次一律关闭：否则空批次会被永久复用，
-                        # 超窗批次还能继续发送，两者都违反时间窗规则。
-                        reason = "batch_window_expired" if planned else "batch_left_empty"
-                        self._close_batch(conn, open_batch["batch_id"], reason, now)
-                if batch_id is None:
+                # (0) 关键词匹配发生在成批【之前】：不命中的事件标 filtered，
+                #     永不占用批次名额（九步流程：第 2 步匹配 → 第 3 步成批）。
+                if filter_is_active(spec):
+                    pending = conn.execute(
+                        "SELECT event_key, payload_json FROM live_events "
+                        "WHERE account_scope=? AND state=? ORDER BY seen_at ASC",
+                        (self.account_scope, QUEUED)).fetchall()
+                    for row in pending:
+                        event = json.loads(row["payload_json"] or "{}")
+                        matched, reason = match_event(event.get("text") or "", spec)
+                        if matched:
+                            filter_stats["matched"] += 1
+                            continue
+                        filter_stats["excluded" if reason == "keyword_excluded" else "missed"] += 1
+                        self._set_state(conn, row["event_key"], FILTERED,
+                                        {"reason": reason}, now=now)
+
+                if open_batch:
+                    batch_id = open_batch["batch_id"]
+                else:
                     rows = conn.execute(
                         "SELECT event_key FROM live_events "
                         "WHERE account_scope=? AND state=? ORDER BY seen_at ASC LIMIT ?",
                         (self.account_scope, QUEUED, max_items)).fetchall()
+                    # (3) 队列为空时【不创建批次】：空批次会被永久复用，
+                    #     之后即使采集到新事件，宿主也只会拿到那个空批次。
                     if rows:
                         batch_id = uuid.uuid4().hex[:32]
                         conn.execute(
@@ -301,8 +394,21 @@ class LiveQueue:
             except Exception:
                 conn.rollback()
                 raise
-        batch = self.batch(batch_id) if batch_id else None
-        events = self.batch_events(batch_id) if batch_id else []
+        if batch_id is None:
+            # 空队列：明确告诉宿主"现在没有可执行的批次"，而不是给一个空批次。
+            return {
+                "status": "empty",
+                "batchId": None,
+                "createdAt": None,
+                "expiresAt": None,
+                "frozen": False,
+                "expiredCount": len(expired),
+                "expired": expired[:50],
+                "filter": filter_stats,
+                "events": [],
+            }
+        batch = self.batch(batch_id)
+        events = self.batch_events(batch_id)
         return {
             "status": "ok" if events else "empty",
             "batchId": batch_id,
@@ -311,51 +417,68 @@ class LiveQueue:
             "frozen": bool(batch and batch["status"] == "frozen"),
             "expiredCount": len(expired),
             "expired": expired[:50],
+            "filter": filter_stats,
             "events": events,
         }
 
-    def _close_batch(self, conn, batch_id, reason, now):
-        """Close a batch and expire its events: an expired batch is never replayed."""
-        conn.execute("UPDATE live_batches SET status=? WHERE account_scope=? AND batch_id=?",
-                     ("expired", self.account_scope, str(batch_id)))
-        for row in conn.execute(
-                "SELECT event_key FROM live_events WHERE account_scope=? AND batch_id=?",
-                (self.account_scope, str(batch_id))).fetchall():
-            self._set_state(conn, row["event_key"], EXPIRED, {"reason": reason}, now=now)
-
     def ensure_active(self, batch_id, now=None):
-        """Fail closed when a batch may no longer be executed.
+        """Refuse to continue a batch whose window has already passed.
 
-        The phase methods call this before touching the browser, so a batch that
-        ran out of its window can never be sent after the fact.
+        Phase one and phase two both start here, so the rule that drops expired
+        events - "packets past the window are dropped, not replayed" - applies to
+        the batch carrying them as well: a batch past its expiresAt is retired,
+        the events that were still 'planned' are expired with it, and the caller
+        is refused with 'batch_expired' instead of quietly sending stale work.
+
+        Expiry is absolute, including for a frozen batch.  Freezing is not
+        evidence of freshness - live_plan freezes in the same call that takes the
+        batch - so treating a frozen batch as permanently sendable would let a
+        batch that expired hours ago still reach the platform, which is exactly
+        what review item 1 asked us to stop.
+
+        The trade-off is explicit: a reply phase that runs past its window has to
+        be re-planned from fresh events.  The ledger stays intact either way -
+        events that already recorded a result (sent_confirmed / unknown / failed)
+        keep it, because only events still in the 'planned' state are expired
+        here, so nothing is silently re-sent.
         """
         now = float(now if now is not None else self.clock())
         batch = self.batch(batch_id)
         if batch is None:
             raise LiveFlowError("unknown_batch", "batch does not exist")
-        if batch["status"] == "expired" or now > batch["expires_at"]:
-            with self._connection() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._close_batch(conn, batch_id, "batch_window_expired", now)
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    raise
-            raise LiveFlowError("batch_expired", "batch time window has passed")
-        return batch
+        if batch["status"] == EXPIRED:
+            raise LiveFlowError("batch_expired", "batch is expired and cannot continue")
+        if batch["status"] not in ("planned", "frozen"):
+            raise LiveFlowError("batch_not_sendable",
+                                "batch status %r cannot continue" % batch["status"])
+        if float(batch["expires_at"]) > now:
+            return batch
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE live_batches SET status=? WHERE account_scope=? AND batch_id=?",
+                    (EXPIRED, self.account_scope, str(batch_id)))
+                for row in conn.execute(
+                        "SELECT event_key FROM live_events "
+                        "WHERE account_scope=? AND batch_id=? AND state=?",
+                        (self.account_scope, str(batch_id), PLANNED)).fetchall():
+                    self._set_state(conn, row["event_key"], EXPIRED,
+                                    {"reason": "batch_window_expired"}, now=now)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        raise LiveFlowError("batch_expired",
+                            "batch window passed; its events were expired, not replayed")
 
     def batch(self, batch_id):
-        if not batch_id:
-            return None
         with self._connection() as conn:
             return self._row(conn.execute(
                 "SELECT * FROM live_batches WHERE account_scope=? AND batch_id=?",
                 (self.account_scope, str(batch_id))).fetchone())
 
     def batch_events(self, batch_id):
-        if not batch_id:
-            return []
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM live_events WHERE account_scope=? AND batch_id=? "
@@ -409,6 +532,10 @@ class LiveQueue:
                 if row is None:
                     conn.rollback()
                     raise LiveFlowError("unknown_event", "event is not in the queue")
+                # 🔴 这里必须用上面 SELECT 出来的 event_key，不能用调用方传进来的
+                #    event_id：live_events 的主键是 (account_scope, event_key)，
+                #    event_id 只是平台给的瞬时 DOM id。用错键的后果是
+                #    "接口返回成功、SQLite 里却没有记录"，断点恢复与防重复触达都会失效。
                 conn.execute(
                     "UPDATE live_events SET private_json=?, updated_at=? "
                     "WHERE account_scope=? AND event_key=?",
@@ -423,11 +550,21 @@ class LiveQueue:
         return {"eventId": str(event_id), "status": str(status)}
 
     def find_event(self, event_id):
-        """Look one event up by the host-facing id or by its queue fingerprint."""
+        """Look one event up by the host-facing id or by its queue fingerprint.
+
+        Parsed 'detail' / 'private' / 'payload' are included so callers do not
+        have to decode the stored JSON themselves.
+        """
         with self._connection() as conn:
-            return self._row(conn.execute(
+            row = self._row(conn.execute(
                 "SELECT * FROM live_events WHERE account_scope=? AND (event_id=? OR event_key=?)",
                 (self.account_scope, str(event_id), str(event_id))).fetchone())
+        if row is None:
+            return None
+        row["detail"] = json.loads(row.get("detail_json") or "{}")
+        row["private"] = json.loads(row.get("private_json") or "{}")
+        row["payload"] = json.loads(row.get("payload_json") or "{}")
+        return row
 
     # ------------------------------------------------------------------- plan
 
@@ -438,7 +575,6 @@ class LiveQueue:
         'publicText' and 'privateText'.  Both channels are required for a target
         to stay sendable; this module never fills them itself.
         """
-        policy_source = "request" if policy else "builtin_default"
         policy = normalize_policy(policy)
         batch = self.batch(batch_id)
         if batch is None:
@@ -473,8 +609,7 @@ class LiveQueue:
                     entry["publicText"].encode("utf-8")).hexdigest(),
             })
         plan = {"batchId": str(batch_id), "frozenAt": _iso(self.clock()), "policy": policy,
-                "targets": targets, "blocked": blocked, "scriptSource": "host",
-                "policySource": policy_source}
+                "targets": targets, "blocked": blocked, "scriptSource": "host"}
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(

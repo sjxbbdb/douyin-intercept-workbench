@@ -47,12 +47,22 @@ the platform boundary of images/18 and the script boundary of images/09:
 | `live_private` | phase two: private message per derived candidate | only when something is sendable |
 | `live_result` | batch report, counts and resume checkpoint | no |
 
+`live_plan` also takes the flow-step-2 filter: `keywords`, `excludeKeywords` and `matchMode`
+(`phrase` / `seg` / `all` / `any`), using the same matcher as the video comment path. Matching
+happens before a batch is formed: events that miss every keyword, or that match a keyword and an
+exclude keyword, are marked `filtered` and never occupy a batch slot. The response reports the
+counts under `filter` (`matched` / `missed` / `excluded`).
+
 `live_listen` deduplicates by room plus author plus text and trims the queue to
 its capacity, so the host may call it repeatedly. `live_plan` takes a
 count-bounded batch inside `windowSeconds`; anything older is marked `expired`
 and is never replayed by a later batch (the platform rule 过期处理，不集中补发).
 An open batch is reused on retry, so a repeated request cannot create two
-batches at once.
+batches at once - but only while it is still inside its own window: a batch past
+`expiresAt` is retired, its still-planned events are expired with it, and
+`live_reply` / `live_private` refuse it with `batch_expired` before any browser
+work. A `filtered` event is terminal: matching happens before a batch exists, so
+it never occupies a slot and is never picked up by a later batch.
 
 Scripts are the platform artifact. `live_plan` accepts `scripts` keyed by
 event id (or fingerprint), each carrying `publicText` and `privateText`; a
@@ -87,19 +97,23 @@ same `unknown` semantics as the other send paths.
 Three state-machine defects reported in review are fixed, each with a
 regression test in `LiveFlowTests`:
 
-1. An empty queue no longer leaves a reusable batch behind. `live_plan` on an
-   empty queue returns `status: "empty"` with `batchId: null`; a later
-   listening round therefore gets a fresh batch instead of inheriting the empty
-   one (`test_empty_batch_is_closed_instead_of_reused`).
-2. An open batch that ran past `expiresAt` is closed as `expired`, its events
-   are marked `expired`, and it is never handed back or sent. `live_reply` and
-   `live_private` call `ensure_active` before touching the browser and fail
-   with `batch_expired` (`test_open_batch_is_closed_once_its_window_passed`,
-   `test_phase_methods_refuse_an_expired_batch`).
-3. `mark_private` now updates the row by the resolved `event_key`. It previously
-   selected the right row and then wrote with the caller-facing event id, so the
-   private result was reported as saved while the row stayed empty
-   (`test_private_result_is_persisted`).
+1. An empty queue never leaves a reusable batch behind. `live_plan` on an empty
+   queue returns `status: "empty"` with `batchId: null`; a later listening round
+   therefore gets a fresh batch instead of inheriting the empty one
+   (`test_empty_queue_never_creates_a_reusable_empty_batch`).
+2. A batch that ran past `expiresAt` is retired as `expired`, its still-planned
+   events are expired with it, and it is never handed back or sent
+   (`test_expired_open_batch_is_retired_and_never_reused`). Both phases enforce
+   the window: `live_reply` and `live_private` call `LiveQueue.ensure_active`
+   before touching the browser and fail with `batch_expired`
+   (`test_sidecar_refuses_an_expired_batch_without_touching_the_browser`).
+   Expiry is absolute, a frozen batch included: `live_plan` freezes in the same
+   call that takes the batch, so "frozen" is not evidence of freshness. Only
+   events still in `planned` are expired, so an already recorded result
+   (`sent_confirmed` / `unknown` / `failed`) is never rewritten
+   (`test_expiry_never_rewrites_a_recorded_send_result`).
+3. `mark_private` updates the row by the resolved `event_key`
+   (`test_mark_private_persists_against_the_real_event_key`).
 
 Policy is refused at the boundary until the authorization service signs it:
 `live_plan` rejects a caller-supplied `policy` with
