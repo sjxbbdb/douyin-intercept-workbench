@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   plan_id TEXT NOT NULL,
+  platform_account_id TEXT,
   workflow_id TEXT NOT NULL,
   workflow_version TEXT NOT NULL,
   contract_json TEXT NOT NULL,
@@ -114,6 +115,31 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   FOREIGN KEY(workflow_id, workflow_version) REFERENCES workflow_definitions(workflow_id, version)
 );
 CREATE INDEX IF NOT EXISTS workflow_runs_user_idx ON workflow_runs(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS workflow_plans (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  workflow_id TEXT NOT NULL,
+  workflow_version TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'issued' CHECK(status IN ('issued','consumed','expired','revoked')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  consumed_at INTEGER,
+  FOREIGN KEY(workflow_id, workflow_version) REFERENCES workflow_definitions(workflow_id, version)
+);
+CREATE INDEX IF NOT EXISTS workflow_plans_user_idx ON workflow_plans(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS platform_accounts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL,
+  account_ref TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(user_id, platform, account_ref)
+);
+CREATE INDEX IF NOT EXISTS platform_accounts_user_idx ON platform_accounts(user_id, status);
 CREATE TABLE IF NOT EXISTS workflow_checkpoints (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
@@ -128,6 +154,20 @@ CREATE TABLE IF NOT EXISTS workflow_checkpoints (
   UNIQUE(run_id, version)
 );
 CREATE INDEX IF NOT EXISTS workflow_checkpoints_run_idx ON workflow_checkpoints(run_id, version DESC);
+CREATE TABLE IF NOT EXISTS credit_actions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  action_key TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  amount INTEGER NOT NULL CHECK(amount > 0),
+  status TEXT NOT NULL CHECK(status IN ('reserved','committed','released')),
+  ledger_id TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(user_id, action_key)
+);
+CREATE INDEX IF NOT EXISTS credit_actions_active_idx ON credit_actions(user_id, status);
 `;
 
 export class Store {
@@ -141,6 +181,7 @@ export class Store {
     // value for legacy rows; new runs always provide a plan id.
     const columns = this.all<{ name: string }>('PRAGMA table_info(workflow_runs)');
     if (!columns.some((column) => column.name === 'plan_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''");
+    if (!columns.some((column) => column.name === 'platform_account_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN platform_account_id TEXT");
   }
   now() { return Date.now(); }
   exec(sql: string) { this.db.exec(sql); }

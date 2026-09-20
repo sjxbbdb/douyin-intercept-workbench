@@ -53,8 +53,8 @@ function defaultData() {
 // verified executors later; an unregistered executor must fail closed.
 const PLATFORM_WORKFLOWS = [
   { workflowId: 'video.search', version: '1', steps: [{ stepId: 'search', retryLimit: 2 }] },
-  { workflowId: 'comment.reply_then_private', version: '1', steps: [{ stepId: 'reply_comment', retryLimit: 2 }, { stepId: 'private_message', retryLimit: 2 }] },
-  { workflowId: 'live.reply_then_private', version: '1', steps: [{ stepId: 'reply_public', retryLimit: 2 }, { stepId: 'private_message', retryLimit: 2 }] }
+  { workflowId: 'comment.reply_then_private', version: '1', steps: [{ stepId: 'reply_comment', retryLimit: 2, sideEffect: true }, { stepId: 'private_message', retryLimit: 2, sideEffect: true }] },
+  { workflowId: 'live.reply_then_private', version: '1', steps: [{ stepId: 'reply_public', retryLimit: 2, sideEffect: true }, { stepId: 'private_message', retryLimit: 2, sideEffect: true }] }
 ];
 
 function accountDataPath(userId) {
@@ -101,6 +101,13 @@ function createEngineForStore(nextStore, userId = null) {
     // No business adapter is implicitly trusted. Collaborators must inject a
     // verified executor before a workflow can perform any platform action.
     stepExecutor: null,
+    healthCheck: async ({ run }) => {
+      if (!run.remoteRunId) return { ok: true, source: 'local-checkpoint' };
+      if (typeof api?.workflowRun !== 'function') return { ok: false, reason: 'workflow_status_api_unavailable' };
+      const remote = await api.workflowRun(run.remoteRunId);
+      const status = remote?.run?.status;
+      return { ok: Boolean(status && status !== 'FAILED' && status !== 'COMPLETED'), status };
+    },
     onStateChange: emitState
   });
 }
@@ -272,11 +279,12 @@ function registerIpc() {
   ipcMain.handle('agent:resume-workflow', wrap(async (_event, runId) => {
     const local = workflowRuntime.getRun(text(runId, 'run id', 160));
     let remoteVersion = null;
+    const health = await workflowRuntime.checkHealth(local.runId);
     if (local.remoteRunId) {
-      const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: 2, userConfirmed: true, reason: 'desktop_manual_resume' });
+      const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: health.checksPassed, userConfirmed: true, reason: 'desktop_manual_resume' });
       remoteVersion = Number.isSafeInteger(recovered?.run?.checkpointVersion) ? recovered.run.checkpointVersion : null;
     }
-    const result = await workflowRuntime.resumeRun(local.runId);
+    const result = await workflowRuntime.resumeRun(local.runId, { skipHealthCheck: true });
     if (local.remoteRunId && remoteVersion != null) await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
     emitState(); return result;
   }));

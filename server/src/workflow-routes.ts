@@ -98,6 +98,7 @@ function runResponse(row: RecordValue) {
     version: row.workflow_version,
     contract: parseJson(row.contract_json, {}),
     planId: row.plan_id,
+    platformAccountId: row.platform_account_id,
     params: parseJson(row.params_json, {}),
     knowledgeSet: row.knowledge_set_id ? { id: row.knowledge_set_id, version: row.knowledge_set_version } : null,
     status: row.status,
@@ -183,6 +184,13 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const features = parseJson<RecordValue>(actor.features_json, {});
     if (features.workflow === false) throw forbidden('FEATURE_DISABLED', '该账号未开通固定流程功能');
   };
+  const platformAccount = (actor: RecordValue, value: unknown) => {
+    if (value === undefined) return undefined;
+    const id = stringValue(value, 'platformAccountId', 160, true) as string;
+    const row = store.get<RecordValue>('SELECT id,platform,account_ref,display_name,status FROM platform_accounts WHERE id=? AND user_id=?', id, actor.user_id);
+    if (!row || row.status !== 'active') throw new AppError(404, 'PLATFORM_ACCOUNT_NOT_FOUND', '平台账号不存在或未启用');
+    return row;
+  };
 
   app.post('/v1/agent/plan', async (request) => {
     const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body);
@@ -203,12 +211,28 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const result = await deps.planner({ intent, context, catalog });
     const id = workflowId(result.workflowId); const version = workflowVersion(result.version); const params = runParams(result.params);
     if (!store.get<RecordValue>("SELECT workflow_id FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version)) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
-    const response = { planId: randomId('plan'), workflowId: id, version, params };
+    const issuedAt = store.now(); const expiresAt = issuedAt + 10 * 60 * 1000;
+    const response = { planId: randomId('plan'), workflowId: id, version, params, issuedAt, expiresAt };
     store.transaction(() => {
+      store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', response.planId, actor.user_id, id, version, json(params), 'issued', issuedAt, expiresAt);
       store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'agent.plan', key, hashPayload(payload), 'completed', json(response), store.now());
       audit(store, 'user', actor.user_id, 'agent.plan', actor.user_id, { workflowId: id, version, paramsHash: hashPayload(params) });
     });
     return response;
+  });
+
+  app.post('/v1/platform-accounts', async (request) => {
+    const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body); rejectUnknown(body, ['platform', 'accountRef', 'displayName']);
+    const platform = stringValue(body.platform, 'platform', 40, true) as string; const accountRef = stringValue(body.accountRef, 'accountRef', 200, true) as string; const displayName = stringValue(body.displayName, 'displayName', 200) ?? '';
+    const id = randomId('platform'); const now = store.now();
+    try { store.run('INSERT INTO platform_accounts(id,user_id,platform,account_ref,display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,\'active\',?,?)', id, actor.user_id, platform, accountRef, displayName, now, now); }
+    catch (error) { if (String(error).includes('SQLITE_CONSTRAINT_UNIQUE')) throw conflict('PLATFORM_ACCOUNT_EXISTS', '平台账号已登记'); throw error; }
+    audit(store, 'user', actor.user_id, 'platform_account.create', actor.user_id, { platform, accountRefHash: hashPayload(accountRef) });
+    return { id, platform, accountRef, displayName, status: 'active', createdAt: now, updatedAt: now };
+  });
+
+  app.get('/v1/platform-accounts', async (request) => {
+    const actor = user(request); const rows = store.all<RecordValue>('SELECT id,platform,account_ref AS accountRef,display_name AS displayName,status,created_at AS createdAt,updated_at AS updatedAt FROM platform_accounts WHERE user_id=? ORDER BY created_at DESC,id DESC', actor.user_id); return { accounts: rows };
   });
 
   app.post('/v1/admin/workflows', async (request) => {
@@ -268,18 +292,22 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   });
 
   app.post('/v1/workflow-runs', async (request) => {
-    const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body); rejectUnknown(body, ['planId', 'workflowId', 'version', 'params', 'knowledgeSetId', 'idempotencyKey']);
-    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const plan = planId(body.planId); const params = runParams(body.params); const key = idempotencyKey(body.idempotencyKey);
-    const payload = { planId: plan, workflowId: id, version, params, knowledgeSetId: body.knowledgeSetId ?? null, idempotencyKey: key };
+    const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body); rejectUnknown(body, ['planId', 'workflowId', 'version', 'params', 'knowledgeSetId', 'platformAccountId', 'idempotencyKey']);
+    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const plan = planId(body.planId); const params = runParams(body.params); const key = idempotencyKey(body.idempotencyKey); const account = platformAccount(actor, body.platformAccountId);
+    const payload = { planId: plan, workflowId: id, version, params, knowledgeSetId: body.knowledgeSetId ?? null, platformAccountId: account?.id ?? null, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,status,payload_hash FROM idempotency WHERE user_id=? AND scope=\'workflow.run\' AND idem_key=?', actor.user_id, key);
     if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同请求'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     const definition = store.get<RecordValue>("SELECT * FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version); if (!definition) throw new AppError(404, 'WORKFLOW_NOT_FOUND', '流程版本不存在或未启用');
+    const issuedPlan = store.get<RecordValue>('SELECT * FROM workflow_plans WHERE id=? AND user_id=?', plan, actor.user_id);
+    if (!issuedPlan || issuedPlan.status !== 'issued' || issuedPlan.expires_at <= store.now()) throw new AppError(409, 'PLAN_INVALID', '流程计划不存在、已消费或已过期');
+    if (issuedPlan.workflow_id !== id || issuedPlan.workflow_version !== version || issuedPlan.params_json !== json(params)) throw conflict('PLAN_MISMATCH', '流程实例与服务端签发计划不一致');
     let knowledgeSet: RecordValue | undefined;
     if (body.knowledgeSetId !== undefined) { const knowledgeSetId = stringValue(body.knowledgeSetId, 'knowledgeSetId', 100, true) as string; knowledgeSet = store.get<RecordValue>("SELECT id,version,status FROM knowledge_sets WHERE id=? AND user_id=? AND status='active'", knowledgeSetId, actor.user_id); if (!knowledgeSet) throw new AppError(404, 'KNOWLEDGE_SET_NOT_FOUND', '知识集不存在或未启用'); }
     const runId = randomId('run'); const now = store.now();
     const result = store.transaction(() => {
       store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.run', key, hashPayload(payload), 'pending', now);
-      store.run('INSERT INTO workflow_runs(id,user_id,workflow_id,workflow_version,contract_json,plan_id,params_json,knowledge_set_id,knowledge_set_version,status,checkpoint_json,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,\'PLANNED\',\'{}\',?,?,?)', runId, actor.user_id, id, version, definition.contract_json, plan, json(params), knowledgeSet?.id ?? null, knowledgeSet?.version ?? null, key, now, now);
+      store.run('UPDATE workflow_plans SET status=\'consumed\',consumed_at=? WHERE id=? AND user_id=? AND status=\'issued\'', now, plan, actor.user_id);
+      store.run('INSERT INTO workflow_runs(id,user_id,workflow_id,workflow_version,contract_json,plan_id,platform_account_id,params_json,knowledge_set_id,knowledge_set_version,status,checkpoint_json,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?, ?,\'PLANNED\',\'{}\',?,?,?)', runId, actor.user_id, id, version, definition.contract_json, plan, account?.id ?? null, json(params), knowledgeSet?.id ?? null, knowledgeSet?.version ?? null, key, now, now);
       const row = getRun(store, actor.user_id, runId); const response = { run: runResponse(row) };
       store.run("UPDATE idempotency SET status='completed',response_json=? WHERE user_id=? AND scope='workflow.run' AND idem_key=?", json(response), actor.user_id, key);
       audit(store, 'user', actor.user_id, 'workflow.run.create', actor.user_id, { runId, workflowId: id, version, knowledgeSetId: knowledgeSet?.id ?? null, paramsHash: hashPayload(params) });

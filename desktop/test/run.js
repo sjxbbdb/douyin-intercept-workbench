@@ -35,12 +35,15 @@ testAsync('workflow decision is frozen before execution and never called while r
   const runtime = new WorkflowRuntime({
     store,
     accountId: 'account-a',
-    modelDecider: async ({ intent, accountId }) => { modelCalls += 1; assert.equal(intent, '整理待处理线索'); assert.equal(accountId, 'account-a'); return { workflowId: 'fixed.fixture', version: '1', params: { mode: 'manual' } }; },
+    modelDecider: async ({ intent, accountId }) => { modelCalls += 1; assert.equal(intent, '整理待处理线索'); assert.equal(accountId, 'account-a'); return { planId: 'server_plan_fixture_1', issuedAt: '2026-09-20T00:00:00.000Z', expiresAt: '2026-09-20T01:00:00.000Z', workflowId: 'fixed.fixture', version: '1', params: { mode: 'manual' } }; },
     workflows: [{ workflowId: 'fixed.fixture', version: '1', steps: ['collect', 'finish'] }],
     stepExecutor: async ({ plan, run, step }) => { stepCalls += 1; assert.equal(run.status, RUN_STATES.RUNNING); assert.equal(plan.params.mode, 'manual'); assert.match(step.stepId, /^(collect|finish)$/); return { status: 'completed' }; }
   });
   const plan = await runtime.planFromIntent('整理待处理线索');
   assert.equal(modelCalls, 1);
+  assert.equal(plan.planId, 'server_plan_fixture_1');
+  assert.equal(plan.issuedAt, '2026-09-20T00:00:00.000Z');
+  assert.equal(plan.expiresAt, '2026-09-20T01:00:00.000Z');
   const created = runtime.startPlan(plan);
   const completed = await runtime.run(created.runId);
   assert.equal(completed.status, RUN_STATES.COMPLETED);
@@ -61,22 +64,73 @@ testAsync('workflow short retry exhaustion becomes UNKNOWN and manual resume reu
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
   let attempts = 0;
   let modelCalls = 0;
+  const delays = [];
   const runtime = new WorkflowRuntime({
     store,
     accountId: 'account-a',
     modelDecider: async () => { modelCalls += 1; return { workflowId: 'recoverable.fixture', version: '1', params: { safe: true } }; },
     workflows: [{ workflowId: 'recoverable.fixture', version: '1', steps: [{ stepId: 'send', retryLimit: 2 }] }],
+    reconcileAction: async () => ({ status: 'not_found', safeToRetry: true }),
+    sleep: async (delayMs) => { delays.push(delayMs); },
     stepExecutor: async () => { attempts += 1; return attempts <= 3 ? { status: 'retryable', error: { code: 'TEMPORARY' } } : { status: 'completed' }; }
   });
   const created = runtime.startPlan(await runtime.planFromIntent('执行一次固定流程'));
   const unknown = await runtime.run(created.runId);
   assert.equal(unknown.status, RUN_STATES.UNKNOWN);
   assert.equal(unknown.steps[0].attempts, 3);
+  assert.deepEqual(delays, [5000, 15000]);
   assert.equal(modelCalls, 1);
   const recovered = await runtime.resumeRun(created.runId);
   assert.equal(recovered.status, RUN_STATES.COMPLETED);
   assert.equal(attempts, 4);
   assert.equal(modelCalls, 1);
+});
+
+testAsync('unknown side-effect action requires reconciliation and never blindly resends', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  let sends = 0;
+  let reconcileCalls = 0;
+  let firstAction = null;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async () => ({ workflowId: 'side-effect.fixture', version: '1', params: {} }),
+    workflows: [{ workflowId: 'side-effect.fixture', version: '1', steps: [{ stepId: 'send', sideEffect: true, retryLimit: 2 }] }],
+    stepExecutor: async ({ action }) => { sends += 1; firstAction ||= action; assert.deepEqual(action, firstAction); return { status: 'retryable', error: { code: 'NETWORK_UNKNOWN' } }; },
+    reconcileAction: async ({ action }) => { reconcileCalls += 1; assert.deepEqual(action, firstAction); return { status: 'not_found', safeToRetry: true }; },
+    sleep: async () => { throw new Error('side-effect retry must not sleep'); }
+  });
+  const created = runtime.startPlan(await runtime.planFromIntent('执行副作用步骤'));
+  const unknown = await runtime.run(created.runId);
+  assert.equal(unknown.status, RUN_STATES.UNKNOWN);
+  assert.equal(sends, 1);
+  const blocked = new WorkflowRuntime({ store, accountId: 'account-a', workflows: [{ workflowId: 'side-effect.fixture', version: '1', steps: [{ stepId: 'send', sideEffect: true }] }], stepExecutor: async () => ({ status: 'completed' }) });
+  await assert.rejects(blocked.resumeRun(created.runId), (error) => error.code === 'RECONCILE_REQUIRED');
+  const recovered = await runtime.resumeRun(created.runId);
+  assert.equal(recovered.status, RUN_STATES.UNKNOWN);
+  assert.equal(reconcileCalls, 1);
+  assert.equal(sends, 2);
+  await assert.rejects(new WorkflowRuntime({ store: new JsonStore(path.join(dir, 'other.json'), { workflowRuns: [] }), accountId: 'account-b', modelDecider: async () => ({ workflowId: 'side-effect.fixture', version: '1', params: {} }), workflows: [{ workflowId: 'side-effect.fixture', version: '1', steps: ['send'] }], stepExecutor: async () => ({ status: 'unknown' }) }).resumeRun('missing'), /workflow run not found/);
+});
+
+testAsync('workflow recovery health gate performs two injected checks', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const attempts = [];
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async () => ({ workflowId: 'health.fixture', version: '1', params: {} }),
+    workflows: [{ workflowId: 'health.fixture', version: '1', steps: ['wait'] }],
+    healthCheck: async ({ attempt }) => { attempts.push(attempt); return { ok: true, attempt }; },
+    stepExecutor: async () => ({ status: 'wait_human', checkpoint: { reason: 'fixture' } })
+  });
+  const run = runtime.startPlan(await runtime.planFromIntent('等待健康检查'));
+  await runtime.run(run.runId);
+  const health = await runtime.checkHealth(run.runId);
+  assert.equal(health.checksPassed, 2);
+  assert.deepEqual(attempts, [1, 2]);
 });
 
 testAsync('workflow account lock blocks same account while another account remains isolated', async () => {

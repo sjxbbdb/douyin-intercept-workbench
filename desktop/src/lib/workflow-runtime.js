@@ -22,6 +22,7 @@ const RESUMABLE_STATES = new Set([
   RUN_STATES.PAUSED
 ]);
 const RETRYABLE = 'retryable';
+const DEFAULT_RETRY_BACKOFF_MS = Object.freeze([5_000, 15_000, 30_000]);
 
 function now() { return new Date().toISOString(); }
 function clone(value) { return structuredClone(value); }
@@ -44,21 +45,28 @@ function normalizeDefinition(definition) {
     const value = typeof step === 'string' ? { stepId: step } : plainObject(step, `workflow step ${index}`);
     return {
       stepId: requiredText(value.stepId || value.id, `workflow step ${index}`, 120),
-      retryLimit: Number.isInteger(value.retryLimit) && value.retryLimit >= 0 && value.retryLimit <= 3 ? value.retryLimit : 2
+      retryLimit: Number.isInteger(value.retryLimit) && value.retryLimit >= 0 && value.retryLimit <= 3 ? value.retryLimit : 2,
+      sideEffect: value.sideEffect === true
     };
   });
   return { workflowId, version, steps };
 }
 
 class WorkflowRuntime {
-  constructor({ store, accountId, modelDecider, workflows = [], stepExecutor, onStateChange, clock = now } = {}) {
+  constructor({ store, accountId, modelDecider, workflows = [], stepExecutor, reconcileAction, healthCheck, onStateChange, clock = now, sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)), retryBackoffMs = DEFAULT_RETRY_BACKOFF_MS } = {}) {
     if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') throw new TypeError('workflow store is required');
     this.store = store;
     this.accountId = requiredText(accountId || 'guest', 'accountId', 200);
     this.modelDecider = modelDecider;
     this.stepExecutor = stepExecutor;
+    this.reconcileAction = reconcileAction;
+    this.healthCheck = healthCheck;
     this.onStateChange = onStateChange;
     this.clock = clock;
+    if (!Array.isArray(retryBackoffMs) || retryBackoffMs.length !== DEFAULT_RETRY_BACKOFF_MS.length || retryBackoffMs.some((value) => !Number.isSafeInteger(value) || value < 0)) throw new TypeError('retryBackoffMs must contain three non-negative integers');
+    this.retryBackoffMs = [...retryBackoffMs];
+    if (typeof sleep !== 'function') throw new TypeError('workflow sleep must be a function');
+    this.sleep = sleep;
     this.workflows = new Map(workflows.map((definition) => {
       const normalized = normalizeDefinition(definition);
       return [`${normalized.workflowId}@${normalized.version}`, normalized];
@@ -109,15 +117,16 @@ class WorkflowRuntime {
       error.code = 'ACCOUNT_LOCKED';
       throw error;
     }
+    const runId = id('run');
     const run = {
-      runId: id('run'),
+      runId,
       accountId: this.accountId,
       workflowId: normalizedPlan.workflowId,
       version: normalizedPlan.version,
       plan: normalizedPlan,
       status: RUN_STATES.PLANNED,
       currentStep: 0,
-      steps: definition.steps.map((step) => ({ stepId: step.stepId, status: 'pending', attempts: 0 })),
+      steps: definition.steps.map((step) => ({ stepId: step.stepId, status: 'pending', attempts: 0, sideEffect: step.sideEffect, actionId: id('action'), idempotencyKey: id('idem') })),
       checkpoint: null,
       lastError: null,
       createdAt: this.clock(),
@@ -136,10 +145,37 @@ class WorkflowRuntime {
     return promise;
   }
 
-  async resumeRun(runId) {
+  async resumeRun(runId, { skipHealthCheck = false } = {}) {
     const run = this.getRun(runId);
     if (!RESUMABLE_STATES.has(run.status)) throw new Error(`workflow cannot be resumed from ${run.status}`);
+    if (this.healthCheck && !skipHealthCheck) await this.checkHealth(run.runId);
+    if (run.status === RUN_STATES.UNKNOWN) {
+      const reconciled = await this.#reconcileUnknown(run);
+      if (!reconciled) return this.getRun(run.runId);
+    }
     return this.run(run.runId);
+  }
+
+  async checkHealth(runId) {
+    const run = this.getRun(runId);
+    if (typeof this.healthCheck !== 'function') {
+      const error = new Error('workflow health check is unavailable');
+      error.code = 'HEALTH_CHECK_UNAVAILABLE';
+      throw error;
+    }
+    const results = [];
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const result = await this.healthCheck({ accountId: this.accountId, run: clone(this.getRun(run.runId)), attempt });
+      const ok = result === true || (result && result.ok === true);
+      results.push(result);
+      if (!ok) {
+        const error = new Error('workflow health check failed');
+        error.code = 'HEALTH_CHECK_FAILED';
+        error.results = clone(results);
+        throw error;
+      }
+    }
+    return { checksPassed: 2, results };
   }
 
   pauseRun(runId, reason = 'manual_pause') {
@@ -172,6 +208,7 @@ class WorkflowRuntime {
     let data = this.#readData();
     let run = this.#findOwned(data, runId);
     if (TERMINAL_STATES.has(run.status)) return clone(run);
+    if (run.status === RUN_STATES.UNKNOWN) return clone(run);
     const definition = this.workflows.get(`${run.workflowId}@${run.version}`);
     if (!definition) throw new Error(`workflow is not registered: ${run.workflowId}@${run.version}`);
     run.status = RUN_STATES.RUNNING;
@@ -190,8 +227,9 @@ class WorkflowRuntime {
       this.#writeData(data);
 
       const maxAttempts = definitionStep.retryLimit + 1;
+      const attemptLimit = definitionStep.sideEffect ? 1 : maxAttempts;
       let outcome = null;
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      for (let attempt = 1; attempt <= attemptLimit; attempt += 1) {
         data = this.#readData();
         run = this.#findOwned(data, runId);
         if (run.status === RUN_STATES.PAUSED) return clone(run);
@@ -205,16 +243,18 @@ class WorkflowRuntime {
             accountId: this.accountId,
             run: clone(run),
             plan: clone(run.plan),
-            step: clone(definitionStep)
+            step: clone(definitionStep),
+            action: { actionId: run.steps[run.currentStep].actionId, idempotencyKey: run.steps[run.currentStep].idempotencyKey, sideEffect: definitionStep.sideEffect }
           });
         } catch (error) {
           outcome = { status: RETRYABLE, error: { code: error.code || 'STEP_ERROR', message: error.message || 'step failed' } };
         }
         const normalized = this.#normalizeOutcome(outcome);
-        if (normalized.status !== RETRYABLE || attempt >= maxAttempts) {
+        if (normalized.status !== RETRYABLE || attempt >= attemptLimit) {
           outcome = normalized;
           break;
         }
+        await this.sleep(this.retryBackoffMs[Math.min(attempt - 1, this.retryBackoffMs.length - 1)], { runId, stepId: definitionStep.stepId, attempt });
       }
 
       data = this.#readData();
@@ -234,7 +274,7 @@ class WorkflowRuntime {
       run.lastError = outcome.error || (outcome.reason ? { code: outcome.reason } : null);
       if (outcome?.status === RETRYABLE) {
         run.status = RUN_STATES.UNKNOWN;
-        run.lastError = { code: 'RETRY_EXHAUSTED', ...(outcome.error || {}) };
+        run.lastError = { code: definitionStep.sideEffect ? 'SIDE_EFFECT_RESULT_UNKNOWN' : 'RETRY_EXHAUSTED', ...(outcome.error || {}) };
       } else if (outcome?.status === 'unknown') {
         run.status = RUN_STATES.UNKNOWN;
       } else if (outcome?.status === 'checkpoint') {
@@ -258,6 +298,51 @@ class WorkflowRuntime {
     return clone(run);
   }
 
+  async #reconcileUnknown(run) {
+    if (typeof this.reconcileAction !== 'function') {
+      const error = new Error('unknown workflow action requires reconciliation before resume');
+      error.code = 'RECONCILE_REQUIRED';
+      throw error;
+    }
+    const definition = this.workflows.get(`${run.workflowId}@${run.version}`);
+    const step = definition?.steps[run.currentStep];
+    const action = run.steps[run.currentStep];
+    if (!definition || !step || !action) throw new Error('workflow action checkpoint is missing');
+    const result = await this.reconcileAction({
+      accountId: this.accountId,
+      run: clone(run),
+      plan: clone(run.plan),
+      step: clone(step),
+      action: { actionId: action.actionId, idempotencyKey: action.idempotencyKey, sideEffect: step.sideEffect }
+    });
+    plainObject(result, 'reconcile result');
+    const data = this.#readData();
+    const current = this.#findOwned(data, run.runId);
+    if (result.status === 'confirmed') {
+      current.steps[current.currentStep].status = 'completed';
+      current.currentStep += 1;
+      current.status = RUN_STATES.RUNNING;
+      current.lastError = null;
+      current.checkpoint = { reconciled: 'confirmed', actionId: action.actionId };
+    } else if (result.status === 'not_found' && result.safeToRetry === true) {
+      current.steps[current.currentStep].status = 'pending';
+      current.status = RUN_STATES.RUNNING;
+      current.lastError = null;
+      current.checkpoint = { reconciled: 'safe_to_retry', actionId: action.actionId };
+    } else if (result.status === 'wait_human') {
+      current.status = RUN_STATES.WAITING_HUMAN;
+      current.checkpoint = result.checkpoint == null ? null : clone(result.checkpoint);
+      current.lastError = { code: 'RECONCILE_WAITING_HUMAN' };
+    } else {
+      current.status = RUN_STATES.UNKNOWN;
+      current.checkpoint = { reconciled: 'unconfirmed', actionId: action.actionId };
+      current.lastError = { code: 'RECONCILE_UNCONFIRMED' };
+    }
+    current.updatedAt = this.clock();
+    this.#writeData(data);
+    return result.status === 'confirmed' || (result.status === 'not_found' && result.safeToRetry === true);
+  }
+
   #normalizeOutcome(outcome) {
     if (outcome == null || outcome.status === 'completed' || outcome.status === 'success' || outcome.status === 'done') return { status: 'completed' };
     plainObject(outcome, 'workflow step outcome');
@@ -275,19 +360,26 @@ class WorkflowRuntime {
     const value = plan?.plan && typeof plan.plan === 'object' ? plan.plan : plan;
     plainObject(value, 'workflow plan');
     if (strictDecision) {
-      const unexpected = Object.keys(value).filter((key) => !['workflowId', 'version', 'params'].includes(key));
+      const unexpected = Object.keys(value).filter((key) => !['planId', 'issuedAt', 'expiresAt', 'workflowId', 'version', 'params'].includes(key));
       if (unexpected.length) throw new Error(`workflow model decision contains unsupported fields: ${unexpected.join(',')}`);
     }
     const workflowId = requiredText(value.workflowId, 'workflowId', 120);
     const version = requiredText(value.version, 'workflow version', 40);
     const params = value.params == null ? {} : plainObject(value.params, 'workflow params');
-    return {
+    const normalized = {
       planId: requiredText(value.planId || id('plan'), 'planId', 160),
       workflowId,
       version,
       params: clone(params),
       createdAt: value.createdAt || this.clock()
     };
+    for (const key of ['issuedAt', 'expiresAt']) {
+      if (value[key] !== undefined && value[key] !== null) {
+        if (!['string', 'number'].includes(typeof value[key]) || (typeof value[key] === 'string' && !value[key].trim()) || (typeof value[key] === 'number' && !Number.isFinite(value[key]))) throw new TypeError(`${key} must be a valid server-issued value`);
+        normalized[key] = value[key];
+      }
+    }
+    return normalized;
   }
 
   #ensureState() {
