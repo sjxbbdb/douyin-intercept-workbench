@@ -16,6 +16,50 @@ kept only while navigating a short link; the response returns the resolved
 URL without its query string. `state-dir` and `profile-dir` must be absolute
 and outside the source directory.
 
+`collect_comments` accepts the flow-1 filter inputs `commentKeywords`,
+`excludeKeywords`, `matchMode` (`phrase` / `seg` / `all` / `any`), `minDigg`,
+`maxTargets`, and `dedupeAuthors` (default true). Its response is additive:
+`events` keeps the raw collected batch, while `targets` carries the filtered
+batch and `filter` reports counts (`collected`, `matched`, `excluded`,
+`lowDigg`, `noAuthor`, `dedupedAuthors`, `targetCount`, `modeCounts`). Each
+entry in `targets` has the same shape as an `events` entry, so it can be passed
+straight to `send_comment` / `send_private` in the two-stage flow.
+
+Exclusion runs after the keyword match: a comment that matches a keyword but
+also matches any exclude keyword is dropped, and `filter.excluded` counts only
+those. `dedupeAuthors` keeps one entry per commenter (highest `digg` wins);
+entries without an `authorId` are never merged with each other. This is the
+filter step of `images/11-comment-area-business`; it is covered by offline
+regression tests and needs no browser.
+`search` reads one page at a time. Call it without `cursor` to start from the
+first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
+`skippedSeen`. Pass that `cursor` back to read the next page: the tool keeps
+scrolling the same owned tab instead of reloading the first page, and any video
+already in the cursor pool is filtered out. The cursor is opaque to the host —
+the host only stores and returns it — but it is still validated on the
+boundary: a cursor issued for another keyword, an unsupported version, or a
+pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
+page yields no new video, which is the host signal to stop paging.
+`platformHasMore` / `platformCursor` mirror what the platform response body
+reported; they are read-only telemetry and are never replayed against the API.
+
+`search` returns one candidate per video with `id`, `url`, `title`, `author`,
+`authorId`, and a `relevance` record. Relevance is computed locally from the
+search keyword against the title and is deterministic: every keyword the user
+typed appearing contiguously in the title scores 70-100 (a hit at the head of
+the title scores highest), all keyword segments present scores 60, a partial
+segment match scores at most 39, and no match scores 0. The record carries
+`reason`, `matchedSegments` / `missingSegments`, `matchedKeywords` /
+`missingKeywords`, `exact`, and `position`, so a host can explain a ranking
+instead of trusting a bare number. `minRelevance` (0-100, default 0) filters
+candidates inside this module, and `filter` reports `collected`, `returned`, and
+`filteredByRelevance`.
+
+Relevance is the textual relatedness of the title, not video quality;
+popularity is a separate signal and is deliberately not mixed into the score.
+This method only discovers and filters candidates — it never replies to a
+comment and never sends a message.
+
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
 automation gate. `private_reply` records the collaborator account flow
@@ -92,6 +136,26 @@ selectors remain fixture-validated only, the platform has not been observed to
 publish an author id for every live comment, and phase-two delivery keeps the
 same `unknown` semantics as the other send paths.
 
+## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
+
+* **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
+  以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
+  续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
+  响应 `filter` 新增 `kept`（实际返回条数）与 `poolAdded`（本页新增进池的条数）便于对账。
+  回归：`test_relevance_filtered_videos_stay_in_the_cursor_pool`。
+* **验证码是终止状态**：命中验证码时返回 `status: "captcha"`、`hasMore: false`、`cursor: null`
+  与 `stoppedReason: "captcha_requires_manual_action"` —— 不再给可翻页信号，
+  避免上层据此自动继续请求、在风控点上越撞越深。
+  回归：`test_captcha_is_terminal_and_offers_no_next_page`。
+* **评论区两阶段契约**：`comment_private_candidates` 把一个批次按「公屏是否确认成功」分成
+  `allowed` / `rejected`；`send_private` 也接受 `publicSendId`，给出时**必须**是
+  `sent_confirmed`，否则在**打开浏览器之前**以稳定原因拒绝：
+  `public_missing` / `public_not_found` / `public_not_a_reply` / `public_pending` /
+  `public_unknown` / `public_failed` / `public_blocked` / `missing_author_id`。
+  ⚠️ `send_gate.result()` 会把 `sent_confirmed` 映射成 `unknown`（避免过度宣称），
+  所以契约判定读的是 **`SendGate.lookup()` 返回的原始状态**。
+  回归：`CommentFlowContractTests`（5 项，含"不通过就不许打开浏览器"）。
+
 ### 采集数据源与「回复弹幕」（2026-09-20 真机）
 
 * **采集优先读页面内存**：弹幕虚拟列表组件的 React fiber props 里有 originalList（消息数组），
@@ -160,5 +224,3 @@ Still open and deliberately not claimed as done: server-issued policy,
 credits / feature-switch / audit integration (the local `send_gate.py` remains
 the only local authority), and real-platform acceptance for live selectors,
 author identity, public reply delivery and private delivery.
-
-

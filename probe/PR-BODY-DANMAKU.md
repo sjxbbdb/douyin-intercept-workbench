@@ -1,69 +1,60 @@
-# PR：直播间「回复弹幕」（公屏 @观众）+ 采集真机适配
+# feat(probe): 直播间「原生回复弹幕」+「关键词命中 → 回复 → 滚动监测 → 私信」全链路（真机验证）
 
-堆叠在 #7（`feat/live-batch-flow`）之上 —— 本 PR 的 base 就是 #7 的分支；#7 合并后 GitHub 会自动改基。
+> 基线：`rewrite/v4-agent`。本文按仓库 `AGENTS.md`「新增平台能力必须同时提交：真机证据、能力矩阵、
+> 失败状态、脱敏测试、未验证边界和发行开关条件」的要求给出对应材料。
 
-## 1. 这次解决什么
+## 变更模块（按目录）
 
-两件事，都是**真机取证**驱动的：
-
-1. **采集在真机上拿不到用户标识**（也就进不了私信阶段）。原实现用的是离线 fixture 的
-   `data-e2e` 占位选择器，真机命中数 0/0/0；即使换成真实 DOM 选择器，弹幕行内也**没有**任何
-   用户标识属性。结果就是每条 live 事件 `authorId` 为空，第 6/8 步（私信）被
-   `missing_author_id` 全部拦下。
-2. **没有「回复弹幕」这个能力**。原 `live_reply` 只是在公屏发一条普通评论，不指向任何人。
-
-## 2. 真机结论与证据（2026-09-20，Chrome 153，真实直播间，只读探针）
-
-| 观察 | 结论 | 证据 |
+| 模块 | 文件 | 变更 |
 |---|---|---|
-| 弹幕行真实结构 | `div.webcast-chatroom___item` → `.___item-wrapper` → `[等级徽章][昵称：][正文]`，正文在 `.___content-with-emoji-text` | 只读结构 dump（`probe/live_danmaku_probe.py`） |
-| 行内用户标识 | **没有** `data-sec-uid`/`data-user-id`，也没有 `a[href]` | 同上；DOM 采集作者标识 0% |
-| 页面内存数据模型 | 弹幕虚拟列表组件 React fiber props 的 `originalList`，每条 `WebcastChatMessage.payload.user` 带 `sec_uid`/nickname | 采纳后实测 **42/42 带标识** |
-| 「点弹幕回复」入口 | **不存在**：全页 hover 扫描「回复」类元素恒为 0；点击弹幕不进入回复态；输入框 `@` 无提及联想 | 三个只读诊断脚本的输出 |
-| 输入框 | 富文本 `ace-line`（`webcast-chatroom___input-container`） | 输入 `@` 后 DOM 只有普通字符节点 |
-| 发送控件 | 输入框容器内存在可点击控件（真机定位到 x=1036），无文字「发送」按钮 | `live.find_send_control` 真机返回 `mechanism: button` |
+| 直播间适配 | `probe/live.py` | 原生「回复 TA」全流程；屏上可见行采集；房间号解析；菜单可见性判定；截断容忍匹配 |
+| 发送动作 | `probe/send_actions.py` | `send_danmaku_reply_native`（提及校验 + 真实按键输入 + 输入框残留清理 + 平台确认框处置） |
+| 点击护栏 | `probe/click_guard.py`（新增） | 命中测试 + 容器限制 + 文案指纹 + 每次尝试写审计 JSONL |
+| 流程编排 | `probe/live_flow.py` | `replyMode`/`replyVia` 冻结在计划里；`sent_echoed` 状态 |
+| 边界服务 | `probe/sidecar.py` | `live_plan` 返回并校验 `replyVia`；`live_reply` 按计划分派通道；能力矩阵回填 |
+| 选择器 | `probe/douyin_selectors.py` | 真机弹幕选择器；错误页选择器；直播间登录判据 |
+| 浏览器层 | `probe/cdp.py` | `press_key` 支持修饰键（Ctrl+A 清空输入框） |
+| 测试 | `probe/tests/test_probe.py` | 新增 `RoomUrlTests` / `RoomEchoTests` / `ReplyViaTests` / `SidecarReplyViaDispatchTests` / `IdentityVisibilityTests` / `ClickGuardTests` / `ChatScrollTests` |
+| 证据 | `probe/EVIDENCE.md` | 第 12 节：本轮全部真机事实、失败状态与未验证边界 |
 
-因此「回复弹幕」在本平台上的**真实落地形式**是：**公屏发一条以 `@昵称` 开头的消息**。
-这不是取巧，而是当前网页端唯一能做到「让对方收到提醒」的方式（移动端的长按回复是客户端能力，
-网页端对普通观众不开放）。
+## 关键真机事实（本轮修正）
 
-## 3. 改动清单
+1. **广场式直播间地址**：房间号在 `?live_web_rid=…`，路径为空 —— 直接取 path 会让
+   `target.roomId` 校验失败、并在"校验当前页面"处抛 `URLPolicyError`。现在按房间号归一。
+2. **虚拟列表**：页面内存 79~200 条，DOM 只渲染 11~17 行；上滚找旧弹幕会让最新弹幕落到
+   可视区下方。候选改从"此刻渲染在列表内"的行里取。
+3. **长弹幕被平台截断**：内存是完整正文、DOM 是截断形式 —— 定位改为"完全相同或前缀匹配（≥6 字）"。
+4. **隐藏浮层假阳性**：Semi 浮层隐藏时位于 `(-9947,-9941)` 但仍有尺寸，曾被当成"菜单已打开"。
+5. **平台确认框**「单次只支持艾特一个人，艾特其他人会清空内容，是否继续？」：上一次失败残留的
+   @提及会触发它，它是**全屏遮罩**，会挡住之后所有点击。现在回复前清空残留、插入提及后边等边看。
+6. **观众身份不一定可见**：有的房间观众行 `sec_uid` 为空、`uid` 是占位值 `111111`（昵称脱敏），
+   拼出来的主页是错误页（`data-e2e="error-page"`）。现在识别错误页并返回 `profile_not_found`，
+   身份不可见就不私信（fail-closed）。
+7. **真实按键输入**：正文逐字 `dispatchKeyEvent(type=char)`、每字 0.1~0.9 秒随机；不用 `insertText`。
 
-* `probe/douyin_selectors.py`：补上真机结构的选择器与噪音词表（并注明旧的 `LIVE_COMMENT_*` 只是
-  fixture 占位值，不是平台事实）。
-* `probe/live.py`：重写为「页面内存（首选，带 sec_uid）+ DOM 文本（兜底，无标识）」双数据源；
-  新增 `find_danmaku`（唯一命中 + 未被遮挡才算找到）、`find_send_control`（按钮/回车两种机制）。
-* `probe/send_actions.py`：新增 `send_danmaku_reply`（回复弹幕），幂等键
-  `live-danmaku:<eventId>:<authorName>`，失败一律在**动浏览器之前**判定。
-* `probe/live_flow.py`：计划冻结 `replyMode`；`danmaku` 模式在**计划期**校验昵称与 `@昵称` 前缀。
-* `probe/sidecar.py`：`live_plan` 接受 `replyMode`；`live_reply` 按冻结模式分发并拒绝中途改口；
-  `live_listen` 如实回报 `source` / `identityCoverage`；能力矩阵新增
-  `live_danmaku_reply` / `live_capture_source`（`autoEligible` 均为 `false`）。
-* `probe/cdp.py`：`type_text` 改为真人节奏（每字 0.1–0.9 秒随机，标点后略长）。
-* `probe/live_danmaku_probe.py`：只读探针（只 hover、不点击、不输入、不发送），用于复核选择器。
+## 真机执行结果（用户新开的直播间）
 
-## 4. 测试
+| 步骤 | 结果 |
+|---|---|
+| 关键词命中 | ✅ 自动派生关键词命中 2~9 行/轮 |
+| 原生回复弹幕 | ✅ 多条 `mentionInserted=true` + `roomEcho=true` |
+| 私信 | ✅ `conversationEcho=true`、`composerCleared=true`、收件人 `live_panel_header` 校验通过 |
+| 点击审计 | ✅ 每次尝试一行；被拒绝的落点含输入框、未读分隔条、平台遮罩 |
 
-```text
-LiveFlowTests + BoundaryTests 共 42 项：OK
+## 测试
+
+```
+python tests/test_probe.py            # 需要写系统临时目录
+python tests/_sandbox_runner.py       # 受限沙箱下用工作区临时目录
 ```
 
-新增 8 项：`replyMode` 冻结与非法模式、无昵称 blocked、缺 `@昵称` 前缀 blocked、冻结后改口
-`mode_mismatch`、弹幕不在屏上时**不输入不点击**、输入校验先于浏览器、拟人节奏落在 0.1–0.9 秒
-（显式固定节拍仍可用）、采集双数据源与回落。另有一项锁死定位器"只回报原因、不给近似坐标"。
+* 离线用例 **112 个全部通过**（`ChromiumFixtureTests` 需能派生 headless Chrome；
+  多进程用例需能创建命名管道 —— 这两类在受限沙箱下按环境跳过）。
+* 真机用例不放进自动回归：所有真机动作（点击/输入/发送）都需要授权，且结果一律保留 `unknown`。
 
-## 5. 真机验收（只读部分已做）
+## 未验证边界 / 发行开关
 
-* 采集：`42/42` 带 `sec_uid`，数据源 `page_memory`；昵称 `42/42`。
-* 定位器：连续 3 次在真实弹幕里精确命中（`onTop: true`）。
-* 输入框与发送控件：均能定位。
-
-## 6. 未验证边界（如实标注，fail-closed）
-
-1. **没有真机执行过一次发送**：本 PR 只做了只读验收。`@昵称` 是否真的让对方收到提醒、
-   发送到底该点按钮还是回车、以及发送后的平台响应证据，都还没有。
-2. 弹幕行会随虚拟列表滚动位移：定位是"发送前此刻仍然在屏上"，不做滚动回溯（找不到就拒发）。
-3. 昵称可能被平台脱敏（匿名/福袋场次）——此时 `danmaku` 模式会因匹配不到目标弹幕而拒发，
-   而不是退化成随便 @ 一个人。
-4. 仍未完成：积分 / 功能开关 / 服务端审计接线；`live_batch`、`live_danmaku_reply` 的
-   `autoEligible` 保持 `false`。
+* 发送频率阈值未实测（已知连续约 10 条后平台静默丢弃）。
+* 私信送达后的对方可见性（提醒、折叠、限流）未验证。
+* `roomEcho` / `conversationEcho` 是页面观测证据，不是平台响应；两阶段默认只放行 `sent_confirmed`。
+* 因此 `live_batch` / `live_danmaku_reply` / `live_private_reply` 继续保持 `autoEligible: false`。

@@ -136,8 +136,14 @@ class CDP:
                 pause = float(per_char_delay)
             time.sleep(pause)
 
-    def press_key(self, key, code=None, key_code=None):
-        base = {"key": key, "code": code or key, "windowsVirtualKeyCode": key_code or 0, "nativeVirtualKeyCode": key_code or 0}
+    def press_key(self, key, code=None, key_code=None, modifiers=0):
+        """真实按键。modifiers 用 CDP 位掩码：1=Alt 2=Ctrl 4=Meta 8=Shift。
+
+        为什么需要修饰键（真机 2026-09-20）：清空公屏输入框里残留的 @提及/草稿
+        要用 Ctrl+A 全选再删 —— 没有修饰键就只能一个字一个字退格，既慢又容易漏。
+        """
+        base = {"key": key, "code": code or key, "windowsVirtualKeyCode": key_code or 0,
+                "nativeVirtualKeyCode": key_code or 0, "modifiers": int(modifiers or 0)}
         self.call("Input.dispatchKeyEvent", dict(base, type="keyDown"), timeout=10)
         self.call("Input.dispatchKeyEvent", dict(base, type="keyUp"), timeout=10)
 

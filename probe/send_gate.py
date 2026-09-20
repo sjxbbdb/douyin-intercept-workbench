@@ -117,6 +117,15 @@ class SendGate:
             return None
         return dict(row)
 
+    def lookup(self, send_id):
+        """按 sendId 读一条原始记录（返回原始 status，不做 result() 的对外映射）。
+
+        用途：两阶段契约 —— 私信阶段要判断"公屏回复是否确认成功"，
+        必须看【落库的原始状态】（sent_confirmed / unknown / failed / blocked / reserved / started）。
+        """
+        with self._connection() as conn:
+            return self._row(self._existing(conn, str(send_id or "")))
+
     def _quota_used(self, conn, target_key, now):
         rows = conn.execute(
             "SELECT target_key, created_at, status FROM sends "

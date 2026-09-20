@@ -42,6 +42,10 @@ EXPIRED = "expired"
 BLOCKED = "blocked"
 FAILED = "failed"
 UNKNOWN = "unknown"
+# 房间消息流里出现了自己刚发的那条（真机 2026-09-20 起可用）。
+# ⚠️ 它不是平台响应，所以【不】等于 sent_confirmed：默认策略只放行 sent_confirmed，
+#    因此 sent_echoed 不会自动进入私信阶段 —— 要不要放行由平台侧的 policy 决定。
+SENT_ECHOED = "sent_echoed"
 SENT_CONFIRMED = "sent_confirmed"
 
 # Conservative on purpose: an unresolved public reply must not produce a
@@ -58,6 +62,10 @@ WINDOW_DEFAULT = 900
 MAX_BATCH = 50
 # 公屏回复的两种落地方式：普通公屏评论 / 带 @昵称 的回复弹幕（真机结论见 live.py）。
 REPLY_MODES = ("composer", "danmaku")
+# danmaku 模式的两种落地方式：
+#   native       = 点弹幕 -> 菜单「回复 TA」-> 平台自己插入 @昵称（原生回复，推荐）
+#   mention_text = 在公屏发一条以 @昵称 开头的纯文本消息（回落，脱敏昵称不可用）
+REPLY_VIAS = ("native", "mention_text")
 
 
 class LiveFlowError(Exception):
@@ -524,7 +532,8 @@ class LiveQueue:
 
     # ------------------------------------------------------------------- plan
 
-    def freeze_plan(self, batch_id, scripts, policy=None, reply_mode="composer"):
+    def freeze_plan(self, batch_id, scripts, policy=None, reply_mode="composer",
+                    reply_via="native"):
         """Freeze the two-channel plan for one batch.
 
         'scripts' maps an event id (or fingerprint) to an object carrying
@@ -537,6 +546,12 @@ class LiveQueue:
         if mode not in REPLY_MODES:
             raise LiveFlowError("invalid_input",
                                 "replyMode must be one of %s" % ", ".join(REPLY_MODES))
+        via = str(reply_via or "native")
+        if via not in REPLY_VIAS:
+            raise LiveFlowError("invalid_input",
+                                "replyVia must be one of %s" % ", ".join(REPLY_VIAS))
+        if mode != "danmaku" and via != "native":
+            raise LiveFlowError("invalid_input", "replyVia only applies to danmaku mode")
         batch = self.batch(batch_id)
         if batch is None:
             raise LiveFlowError("unknown_batch", "batch does not exist")
@@ -558,10 +573,19 @@ class LiveQueue:
             #   · 话术必须自带 @昵称 前缀（话术归平台侧，本模块不代写、不改写）。
             if not reason and mode == "danmaku":
                 name = str(event.get("authorName") or "").strip()
+                body = str(entry.get("publicText") or "")
                 if not name:
                     reason = "missing_author_name"
-                elif not str(entry.get("publicText") or "").lstrip().startswith("@" + name):
-                    reason = "mention_prefix_missing"
+                elif via == "mention_text":
+                    # 回落方式：话术必须自带 @昵称；脱敏昵称 @ 不到人，直接 blocked。
+                    if "*" in name:
+                        reason = "nickname_masked"
+                    elif not body.lstrip().startswith("@" + name):
+                        reason = "mention_prefix_missing"
+                else:
+                    # 原生方式：提及由平台插入，话术只能是【正文】，不能再带 @。
+                    if body.lstrip().startswith("@"):
+                        reason = "body_must_not_start_with_at"
             if reason:
                 blocked.append({"eventId": event.get("id"), "reason": reason})
                 self.mark(event["id"], BLOCKED, batch_id, {"reason": reason})
@@ -583,7 +607,7 @@ class LiveQueue:
                 "policySource": policy_source,
                 # 公屏回复的落地方式在【冻结时】定下来，之后不允许中途改：
                 # composer = 公屏发一条普通评论；danmaku = 公屏发一条 @该观众 的评论（回复弹幕）。
-                "replyMode": mode}
+                "replyMode": mode, "replyVia": via}
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
