@@ -216,13 +216,25 @@ def comment_matches(text, keywords, mode="seg"):
     return None
 
 
-def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0):
+def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0,
+                    exclude_keywords=""):
     """按评论关键词筛评论。返回 (命中列表, 统计)。
 
     统计里 modes 字段会给出【全部 4 个档位】的命中数，方便一眼看出该松还是该紧，
     不必来回试参数。
+
+    排除词（exclude_keywords）——架构依据 images/11-comment-area-business 流程一
+    「关键词、排除词与去重」：
+
+      · 语义：一条评论【先按关键词命中】，再看是否命中任一排除词；命中排除词就【丢弃】。
+        排除词优先级高于关键词，且与关键词共用同一个档位（mode）。
+      · 统计里的 excluded 只数【本来命中关键词、却被排除词挡掉】的条数 ——
+        这才是可调参的数字；不命中关键词的评论本来就不会进来，数进去只会误导。
+      · 为什么要排除词：关键词为了召回必然放宽（实测「可以」在 313 条里命中 44 条），
+        但公开回复与私信必须避开同行、广告、无关人群 —— 那些由排除词兜底。
     """
     keywords = split_keywords(comment_keywords)
+    exclude = split_keywords(exclude_keywords)
     if mode not in MATCH_MODES:
         raise ValueError("未知 match mode: %s（可选 %s）" % (mode, "/".join(MATCH_MODES)))
 
@@ -232,8 +244,10 @@ def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0):
         "empty_text": 0,
         "low_digg": 0,
         "no_sec_uid": 0,
+        "excluded": 0,
         "mode": mode,
         "keywords": keywords,
+        "exclude_keywords": exclude,
         "modes": {},
     }
     for m in MATCH_MODES:
@@ -246,6 +260,9 @@ def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0):
             continue
         hit = comment_matches(c.get("text"), keywords, mode)
         if hit is None:
+            continue
+        if exclude and comment_matches(c.get("text"), exclude, mode) is not None:
+            stats["excluded"] += 1
             continue
         if (c.get("digg") or 0) < min_digg:
             stats["low_digg"] += 1
@@ -689,9 +706,14 @@ def crawl_video_comments(page, video, log=print, scroll_rounds=7, settle=3.0, wa
 
 # ===================== 组装：关键词筛评论 -> 私信队列 =====================
 
-def build_queue(comments, comment_keywords, min_digg=0, mode="seg"):
-    """按评论关键词筛人，产出私信队列（按 sec_uid 去重）。"""
-    matched, stats = filter_comments(comments, comment_keywords, mode=mode, min_digg=min_digg)
+def build_queue(comments, comment_keywords, min_digg=0, mode="seg", exclude_keywords=""):
+    """按评论关键词筛人，产出私信队列（按 sec_uid 去重）。
+
+    exclude_keywords 语义见 filter_comments：命中排除词的评论在出队列前就被丢掉 ——
+    这是避免给同行/广告人群发私信的最后一道闸。
+    """
+    matched, stats = filter_comments(comments, comment_keywords, mode=mode, min_digg=min_digg,
+                                     exclude_keywords=exclude_keywords)
     queue, seen = [], set()
     for c in matched:
         uid = c.get("sec_uid")

@@ -74,6 +74,48 @@ def _event(source, room_id, row):
     }
 
 
+def _filter_text(value, label, limit=400):
+    """筛选类参数的校验：可选字符串，去空白、限长。空 = 不做该步筛选。
+
+    为什么单独抽出来：关键词/排除词来自宿主（客户端），属于【外部输入】，
+    必须和 url、sendId 一样在边界上校验，不能让超长串顺着流程带下去。
+    """
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise SidecarError("invalid_input", "%s must be a string" % label)
+    value = value.strip()
+    if len(value) > limit:
+        raise SidecarError("invalid_input", "%s is too long" % label)
+    return value
+
+
+def _dedupe_by_author(rows):
+    """按【评论者】去重：同一个人只留一条（优先留点赞最高的那条）。返回 (保留行, 丢弃数)。
+
+    架构依据 images/11-comment-area-business 流程一「关键词、排除词与去重」。
+    为什么按人而不是按评论去重：目标批次的下游是两阶段 ——
+      · 第一阶段逐条回复原评论：回复哪条都行，留曝光最高的那条更值；
+      · 第二阶段向评论者逐个私信：同一个人只有一条私信额度（未互关仅 1 条），
+        不去重就会把额度浪费在同一个人的多条评论上。
+
+    没有 authorId 的评论【不参与合并】—— 否则会把不同人的评论错误地并成一条；
+    它们按自身 id 各自保留（这类仍可用于公开回复，只是不能私信）。
+    """
+    best, order, dropped = {}, [], 0
+    for row in rows:
+        author = str(row.get("sec_uid") or row.get("author_sec_uid") or "")
+        key = ("author", author) if author else ("row", str(row.get("cid") or id(row)))
+        if key in best:
+            dropped += 1
+            if int(row.get("digg") or 0) > int(best[key].get("digg") or 0):
+                best[key] = row
+            continue
+        best[key] = row
+        order.append(key)
+    return [best[k] for k in order], dropped
+
+
 def _find_browser():
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -180,6 +222,12 @@ class Sidecar:
             "capability": {
                 "video_capture": {"implemented": True, "autoEligible": True,
                                    "validation": {"status": "api_or_visible_dom", "delivery": "capture_only"}},
+                # 流程一「关键词、排除词与去重」的筛选能力。
+                # 它不是发送动作，不涉及 autoEligible 的发送闸门；
+                # 标 offline_fixture 是因为它的验证来自离线回归，不需要真机页面。
+                "comment_filter": {"implemented": True, "autoEligible": True,
+                                    "validation": {"status": "offline_fixture",
+                                                   "delivery": "filter_only"}},
                 "private_reply": {"implemented": True, "autoEligible": True,
                                    "validation": {"status": "pr1_real_account_flow", "scope": "collaborator_account",
                                                    "delivery": "unknown_without_bound_platform_response"}},
@@ -320,10 +368,40 @@ class Sidecar:
             page.close()
 
     def collect_comments(self, params):
+        """采集一条视频的评论，并按「关键词 / 排除词 / 去重」给出目标批次。
+
+        架构依据 images/11-comment-area-business 固定流程一：
+          「采集评论 → 关联评论标识与评论者 → 关键词、排除词与去重 → 返回目标批次」
+
+        返回值是【加法式】的，老的调用方不受影响：
+          · events   —— 原样：本次采集到的评论事件（未筛选），语义不变；
+          · targets  —— 新增：筛选后的目标批次，每条与 events 同形状，
+                        可直接喂给 send_comment / send_private（两阶段发送）；
+          · filter   —— 新增：筛选统计，用来判断该松还是该紧。
+
+        为什么不直接把 events 筛掉：events 是"采集事实"，宿主可能需要原始批次做审计；
+        筛选是业务判断，必须能分开追溯（对应架构的审计与状态镜像）。
+        """
         requested_url = safe_url(params.get("url"), "url", keep_query=True)
         max_items, rounds = int(params.get("maxItems", 100)), int(params.get("scrollRounds", 6))
         if not 1 <= max_items <= 500 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "comment bounds are invalid")
+
+        # ---- 筛选参数（流程一的输入）----
+        comment_keywords = _filter_text(params.get("commentKeywords"), "commentKeywords")
+        exclude_keywords = _filter_text(params.get("excludeKeywords"), "excludeKeywords")
+        match_mode = str(params.get("matchMode") or "seg")
+        if match_mode not in crawlmod.MATCH_MODES:
+            raise SidecarError("invalid_input",
+                               "matchMode must be one of %s" % "/".join(crawlmod.MATCH_MODES))
+        min_digg = int(params.get("minDigg", 0) or 0)
+        if not 0 <= min_digg <= 1000000:
+            raise SidecarError("invalid_input", "minDigg is out of range")
+        max_targets = int(params.get("maxTargets", 200) or 200)
+        if not 1 <= max_targets <= 500:
+            raise SidecarError("invalid_input", "maxTargets is out of range")
+        dedupe_authors = bool(params.get("dedupeAuthors", True))
+
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
@@ -345,7 +423,35 @@ class Sidecar:
             if meta.get("skipped") and status == "ok":
                 status = "unsupported"
             events = [_event("video", url, row) for row in rows[:max_items]]
-            return {"status": status, "events": events,
+
+            # 流程一：关键词 -> 排除词 -> 点赞阈值 -> 按评论者去重
+            matched, fstats = crawlmod.filter_comments(
+                rows, comment_keywords, mode=match_mode, min_digg=min_digg,
+                exclude_keywords=exclude_keywords)
+            if dedupe_authors:
+                kept, deduped = _dedupe_by_author(matched)
+            else:
+                kept, deduped = matched, 0
+            targets = []
+            for row in kept[:max_targets]:
+                item = _event("video", url, row)
+                item["matchedKeyword"] = str(row.get("matched_keyword") or "")
+                item["digg"] = int(row.get("digg") or 0)
+                targets.append(item)
+            filtered = {
+                "collected": len(rows),
+                "matched": int(fstats.get("matched") or 0),
+                "excluded": int(fstats.get("excluded") or 0),
+                "lowDigg": int(fstats.get("low_digg") or 0),
+                "noAuthor": int(fstats.get("no_sec_uid") or 0),
+                "dedupedAuthors": int(deduped),
+                "targetCount": len(targets),
+                "matchMode": match_mode,
+                "keywords": list(fstats.get("keywords") or []),
+                "excludeKeywords": list(fstats.get("exclude_keywords") or []),
+                "modeCounts": dict(fstats.get("modes") or {}),
+            }
+            return {"status": status, "events": events, "targets": targets, "filter": filtered,
                     "capability": {"verified": bool(events), "source": "api_or_dom",
                                    "detail": "response bodies plus visible DOM fallback"}}
         finally:
