@@ -43,6 +43,23 @@ page yields no new video, which is the host signal to stop paging.
 `platformHasMore` / `platformCursor` mirror what the platform response body
 reported; they are read-only telemetry and are never replayed against the API.
 
+`search` returns one candidate per video with `id`, `url`, `title`, `author`,
+`authorId`, and a `relevance` record. Relevance is computed locally from the
+search keyword against the title and is deterministic: every keyword the user
+typed appearing contiguously in the title scores 70-100 (a hit at the head of
+the title scores highest), all keyword segments present scores 60, a partial
+segment match scores at most 39, and no match scores 0. The record carries
+`reason`, `matchedSegments` / `missingSegments`, `matchedKeywords` /
+`missingKeywords`, `exact`, and `position`, so a host can explain a ranking
+instead of trusting a bare number. `minRelevance` (0-100, default 0) filters
+candidates inside this module, and `filter` reports `collected`, `returned`, and
+`filteredByRelevance`.
+
+Relevance is the textual relatedness of the title, not video quality;
+popularity is a separate signal and is deliberately not mixed into the score.
+This method only discovers and filters candidates — it never replies to a
+comment and never sends a message.
+
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
 automation gate. `private_reply` records the collaborator account flow
@@ -165,4 +182,3 @@ Still open and deliberately not claimed as done: server-issued policy,
 credits / feature-switch / audit integration (the local `send_gate.py` remains
 the only local authority), and real-platform acceptance for live selectors,
 author identity, public reply delivery and private delivery.
-
