@@ -3,6 +3,7 @@ import rateLimit from '@fastify/rate-limit';
 import { randomId, randomToken, hashPayload, hashToken, hashPassword, verifyPassword } from './security.js';
 import { Store } from './store.js';
 import { AppError, badRequest, conflict, forbidden, unauthorized } from './errors.js';
+import { registerWorkflowRoutes } from './workflow-routes.js';
 
 export interface AppConfig {
   dbPath?: string;
@@ -87,7 +88,7 @@ function getPricing(store: Store) {
 
 function getFeatures(row: AnyRecord, providerConfigured: boolean) {
   const features = parseJson<AnyRecord>(row.features_json ?? '{}', { evaluate: true, draft: false });
-  return { evaluate: features.evaluate === true, draft: features.draft === true && providerConfigured };
+  return { evaluate: features.evaluate === true, draft: features.draft === true && providerConfigured, workflow: features.workflow !== false };
 }
 
 function recoverExpiredHolds(store: Store) {
@@ -198,6 +199,33 @@ async function providerDraft(cfg: AppConfig, input: AnyRecord): Promise<AnyRecor
     const parsed = JSON.parse(content) as AnyRecord;
     if (typeof parsed.matched !== 'boolean' || !['purchase', 'question', 'other'].includes(parsed.intent) || typeof parsed.confidence !== 'number' || !Number.isFinite(parsed.confidence) || parsed.confidence < 0 || parsed.confidence > 1 || typeof parsed.reason !== 'string' || parsed.reason.trim().length === 0 || parsed.reason.length > 1000 || typeof parsed.reply !== 'string' || (parsed.matched && parsed.reply.trim().length === 0) || parsed.reply.length > 2000) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 输出不符合契约');
     return { matched: parsed.matched, intent: parsed.intent, confidence: parsed.confidence, reason: parsed.reason, reply: parsed.reply };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, 'PROVIDER_FAILED', error instanceof Error && error.name === 'AbortError' ? 'AI provider 超时' : 'AI provider 不可用');
+  } finally { clearTimeout(timer); }
+}
+
+async function providerPlan(cfg: AppConfig, input: AnyRecord): Promise<AnyRecord> {
+  const provider = cfg.provider ?? {};
+  if (!provider.baseUrl || !provider.apiKey || !provider.model) throw new AppError(503, 'PROVIDER_NOT_CONFIGURED', 'AI provider 未配置');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.draftTimeoutMs ?? 30_000);
+  try {
+    const response = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${provider.apiKey}` },
+      body: JSON.stringify({ model: provider.model, temperature: 0, response_format: { type: 'json_object' }, messages: [
+        { role: 'system', content: '你是固定流程路由器。只从 catalog 中选择一个 workflowId 和 version，并返回 JSON：workflowId(string), version(integer), params(object)。不要返回 steps、actions、代码或发送内容。' },
+        { role: 'user', content: JSON.stringify(input) }
+      ] })
+    });
+    if (!response.ok) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 请求失败');
+    const raw = await response.text(); if (raw.length > 100_000) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 响应过大');
+    const content = (JSON.parse(raw) as AnyRecord).choices?.[0]?.message?.content;
+    if (typeof content !== 'string') throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 响应无效');
+    const parsed = JSON.parse(content) as AnyRecord;
+    if (typeof parsed.workflowId !== 'string' || (typeof parsed.version !== 'string' && !Number.isSafeInteger(parsed.version)) || !parsed.params || typeof parsed.params !== 'object' || Array.isArray(parsed.params) || Object.keys(parsed).some((key) => !['workflowId', 'version', 'params'].includes(key))) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 返回的流程计划无效');
+    return { workflowId: parsed.workflowId, version: parsed.version, params: parsed.params };
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw new AppError(503, 'PROVIDER_FAILED', error instanceof Error && error.name === 'AbortError' ? 'AI provider 超时' : 'AI provider 不可用');
@@ -318,9 +346,9 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
   });
   app.post('/v1/admin/auth/logout', async (request) => { const token = bearer(request.headers.authorization); if (token) store.run('UPDATE admin_sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL', store.now(), hashToken(token)); return { ok: true }; });
   app.get('/v1/admin/users', async (request) => { const admin = adminFromRequest(store, request); const users = store.all<AnyRecord>('SELECT id,username,status,expires_at AS expiresAt,max_devices AS maxDevices,created_at AS createdAt,features_json FROM users ORDER BY created_at DESC'); return { users: users.map((u) => ({ ...u, features: parseJson(u.features_json, {}) })), actor: admin.admin_id }; });
-  app.post('/v1/admin/users', async (request) => { const admin = adminFromRequest(store, request); const body = bodyObject(request.body); const username = text(body.username, 100) ?? `shop_${randomToken().slice(0, 10)}`; const expiresAt = integer(body.expiresAt ?? (store.now() + 30 * 24 * 60 * 60 * 1000), store.now() + 1); const maxDevices = integer(body.maxDevices ?? 1, 1); if (!expiresAt || !maxDevices) throw badRequest('用户参数无效'); const password = randomBytesPassword(); const passwordHash = await hashPassword(password); const id = randomId('user'); const features = body.features && typeof body.features === 'object' ? { evaluate: body.features.evaluate !== false, draft: body.features.draft === true } : { evaluate: true, draft: false }; store.transaction(() => { store.run('INSERT INTO users(id,username,password_hash,expires_at,max_devices,features_json,created_at) VALUES(?,?,?,?,?,?,?)', id, username, passwordHash, expiresAt, maxDevices, json(features), store.now()); audit(store, 'admin', admin.admin_id, 'user.create', id, { username, expiresAt, maxDevices, features }); }); return { id, username, password, expiresAt, maxDevices, features }; });
+  app.post('/v1/admin/users', async (request) => { const admin = adminFromRequest(store, request); const body = bodyObject(request.body); const username = text(body.username, 100) ?? `shop_${randomToken().slice(0, 10)}`; const expiresAt = integer(body.expiresAt ?? (store.now() + 30 * 24 * 60 * 60 * 1000), store.now() + 1); const maxDevices = integer(body.maxDevices ?? 1, 1); if (!expiresAt || !maxDevices) throw badRequest('用户参数无效'); const password = randomBytesPassword(); const passwordHash = await hashPassword(password); const id = randomId('user'); const features = body.features && typeof body.features === 'object' ? { evaluate: body.features.evaluate !== false, draft: body.features.draft === true, workflow: body.features.workflow !== false } : { evaluate: true, draft: false, workflow: true }; store.transaction(() => { store.run('INSERT INTO users(id,username,password_hash,expires_at,max_devices,features_json,created_at) VALUES(?,?,?,?,?,?,?)', id, username, passwordHash, expiresAt, maxDevices, json(features), store.now()); audit(store, 'admin', admin.admin_id, 'user.create', id, { username, expiresAt, maxDevices, features }); }); return { id, username, password, expiresAt, maxDevices, features }; });
 
-  app.patch('/v1/admin/users/:id', async (request) => { const admin = adminFromRequest(store, request); const id = text((request.params as AnyRecord).id, 100); if (!id) throw badRequest('用户 ID 无效'); const body = bodyObject(request.body); const changes: string[] = []; const args: unknown[] = []; if (body.status !== undefined) { if (body.status !== 'active' && body.status !== 'disabled') throw badRequest('status 无效'); changes.push('status=?'); args.push(body.status); } if (body.expiresAt !== undefined) { const v = integer(body.expiresAt, 1); if (!v) throw badRequest('expiresAt 无效'); changes.push('expires_at=?'); args.push(v); } if (body.maxDevices !== undefined) { const v = integer(body.maxDevices, 1); if (!v) throw badRequest('maxDevices 无效'); changes.push('max_devices=?'); args.push(v); } if (body.features !== undefined) { if (!body.features || typeof body.features !== 'object') throw badRequest('features 无效'); changes.push('features_json=?'); args.push(json({ evaluate: body.features.evaluate !== false, draft: body.features.draft === true })); } if (!changes.length) throw badRequest('没有可更新字段'); args.push(id); const result = store.transaction(() => { const updated = store.run(`UPDATE users SET ${changes.join(',')} WHERE id=?`, ...args); if (!updated.changes) throw new AppError(404, 'USER_NOT_FOUND', '用户不存在'); if (body.status === 'disabled') store.run('UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL', store.now(), id); audit(store, 'admin', admin.admin_id, 'user.update', id, { fields: changes.map((x) => x.split('=')[0]) }); return store.get<AnyRecord>('SELECT id,username,status,expires_at AS expiresAt,max_devices AS maxDevices,features_json FROM users WHERE id=?', id); }); return { ...result, features: parseJson(result?.features_json ?? '{}', {}) }; });
+  app.patch('/v1/admin/users/:id', async (request) => { const admin = adminFromRequest(store, request); const id = text((request.params as AnyRecord).id, 100); if (!id) throw badRequest('用户 ID 无效'); const body = bodyObject(request.body); const changes: string[] = []; const args: unknown[] = []; if (body.status !== undefined) { if (body.status !== 'active' && body.status !== 'disabled') throw badRequest('status 无效'); changes.push('status=?'); args.push(body.status); } if (body.expiresAt !== undefined) { const v = integer(body.expiresAt, 1); if (!v) throw badRequest('expiresAt 无效'); changes.push('expires_at=?'); args.push(v); } if (body.maxDevices !== undefined) { const v = integer(body.maxDevices, 1); if (!v) throw badRequest('maxDevices 无效'); changes.push('max_devices=?'); args.push(v); } if (body.features !== undefined) { if (!body.features || typeof body.features !== 'object') throw badRequest('features 无效'); changes.push('features_json=?'); args.push(json({ evaluate: body.features.evaluate !== false, draft: body.features.draft === true, workflow: body.features.workflow !== false })); } if (!changes.length) throw badRequest('没有可更新字段'); args.push(id); const result = store.transaction(() => { const updated = store.run(`UPDATE users SET ${changes.join(',')} WHERE id=?`, ...args); if (!updated.changes) throw new AppError(404, 'USER_NOT_FOUND', '用户不存在'); if (body.status === 'disabled') store.run('UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL', store.now(), id); audit(store, 'admin', admin.admin_id, 'user.update', id, { fields: changes.map((x) => x.split('=')[0]) }); return store.get<AnyRecord>('SELECT id,username,status,expires_at AS expiresAt,max_devices AS maxDevices,features_json FROM users WHERE id=?', id); }); return { ...result, features: parseJson(result?.features_json ?? '{}', {}) }; });
   app.post('/v1/admin/users/:id/renew', async (request) => { const admin = adminFromRequest(store, request); const id = text((request.params as AnyRecord).id, 100); const body = bodyObject(request.body); const expiresAt = integer(body.expiresAt, store.now() + 1); if (!id || !expiresAt) throw badRequest('续期参数无效'); const result = store.run('UPDATE users SET expires_at=?,status=\'active\' WHERE id=?', expiresAt, id); if (!result.changes) throw new AppError(404, 'USER_NOT_FOUND', '用户不存在'); audit(store, 'admin', admin.admin_id, 'user.renew', id, { expiresAt }); return { id, expiresAt, status: 'active' }; });
   app.post('/v1/admin/users/:id/disable', async (request) => { const admin = adminFromRequest(store, request); const id = text((request.params as AnyRecord).id, 100); if (!id) throw badRequest('用户 ID 无效'); const result = store.transaction(() => { const changed = store.run("UPDATE users SET status='disabled' WHERE id=?", id); if (!changed.changes) throw new AppError(404, 'USER_NOT_FOUND', '用户不存在'); store.run('UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL', store.now(), id); audit(store, 'admin', admin.admin_id, 'user.disable', id, {}); return { id, status: 'disabled' }; }); return result; });
   app.post('/v1/admin/users/:id/reset-password', async (request) => { const admin = adminFromRequest(store, request); const id = text((request.params as AnyRecord).id, 100); if (!id) throw badRequest('用户 ID 无效'); const password = randomBytesPassword(); const passwordHash = await hashPassword(password); const result = store.transaction(() => { const changed = store.run('UPDATE users SET password_hash=? WHERE id=?', passwordHash, id); if (!changed.changes) throw new AppError(404, 'USER_NOT_FOUND', '用户不存在'); store.run('UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL', store.now(), id); audit(store, 'admin', admin.admin_id, 'user.reset_password', id, {}); return { id, password }; }); return result; });
@@ -331,6 +359,13 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
   app.get('/v1/admin/users/:id/ledger', async (request) => { const admin = adminFromRequest(store, request); const id = text((request.params as AnyRecord).id, 100); if (!id) throw badRequest('用户 ID 无效'); const rows = store.all<AnyRecord>('SELECT id,delta,balance_after AS balanceAfter,kind,metadata_json,created_at AS createdAt FROM ledger WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 1000', id); return { entries: rows.map((x) => ({ ...x, metadata: parseJson(x.metadata_json, {}) })), balance: balance(store, id), actor: admin.admin_id }; });
   app.put('/v1/admin/settings/pricing', async (request) => { const admin = adminFromRequest(store, request); const body = bodyObject(request.body); const evaluateReplyPrice = integer(body.evaluateReplyPrice, 0); const draftPrice = integer(body.draftPrice, 0); if (evaluateReplyPrice === null || draftPrice === null) throw badRequest('价格必须是非负整数'); saveSetting(store, 'pricing', { evaluateReplyPrice, draftPrice }); audit(store, 'admin', admin.admin_id, 'pricing.update', null, { evaluateReplyPrice, draftPrice }); return { evaluateReplyPrice, draftPrice }; });
   app.get('/v1/admin/audit', async (request) => { const admin = adminFromRequest(store, request); const rows = store.all<AnyRecord>('SELECT id,actor_type AS actorType,actor_id AS actorId,action,target_user_id AS targetUserId,metadata_json AS metadata,created_at AS createdAt FROM audit ORDER BY id DESC LIMIT 1000'); return { entries: rows.map((x) => ({ ...x, metadata: parseJson(x.metadata, {}) })), actor: admin.admin_id }; });
+
+  registerWorkflowRoutes(app, {
+    store,
+    userFromRequest: (request) => userFromRequest(store, request, config),
+    adminFromRequest: (request) => adminFromRequest(store, request),
+    planner: (input) => providerPlan(config, input),
+  });
 
   app.addHook('onClose', async () => store.close());
   return app;

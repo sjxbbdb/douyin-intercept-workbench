@@ -25,6 +25,7 @@ desktop/
       auth-store.js             safeStorage 加密 token 与本地设备标识
       json-store.js             单写者、fsync、原子 JSON 存储与 Windows EXDEV 版本记录恢复
       task-engine.js            任务状态、事件去重、评估、冷却与发送门槛
+      workflow-runtime.js       Agent 计划冻结、固定步骤、检查点、恢复与账号级锁
       browser-bridge.js         allowlist BrowserWindow 与固定 DOM 采集脚本
       probe-client.js           单飞 JSONL sidecar 客户端、超时/取消/输出边界
       probe-bridge.js           专用 Chrome 侧车适配、采集调度与发送未知态
@@ -112,7 +113,7 @@ window.agentApi = {
 
 ## UI 设计规格
 
-采用 ADS utility profile。界面是中文的轻量工作台：固定左侧导航（任务、线索、回复记录、积分、设置），顶部显示授权状态、抖音窗口连接状态和当前余额；主区优先使用任务/事件数据表，不使用巨型聊天窗。背景为冷白，正文使用系统无衬线字体，蓝紫色只表示可执行动作或选中状态，状态必须同时显示文字。
+采用 ADS utility profile。界面是中文的轻量工作台：固定左侧导航（Agent、任务、线索、回复记录、积分、设置），顶部显示授权状态、抖音窗口连接状态和当前余额；Agent 页只负责提交意图、展示冻结的流程实例和人工恢复入口，任务/事件主区继续使用数据表，不把聊天内容当作执行控制。背景为冷白，正文使用系统无衬线字体，蓝紫色只表示可执行动作或选中状态，状态必须同时显示文字。
 
 必须实现的真实状态：首次空数据、加载、已加载、局部失败、网络错误、离线、未授权、选择器未校准、积分不足、任务暂停和发送结果 `unknown`。演示数据若启用只能显式带“演示数据”标记，并且不会开放评估、扣费或发送绕过。
 

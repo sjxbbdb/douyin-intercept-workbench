@@ -8,6 +8,7 @@ const { JsonStore, checksum } = require('../src/lib/json-store');
 const { targetUrl, selectorProfile } = require('../src/lib/validation');
 const { ApiClient, ApiError } = require('../src/lib/api-client');
 const { TaskEngine } = require('../src/lib/task-engine');
+const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
 
 let passed = 0;
 function test(name, fn) { try { fn(); passed += 1; console.log(`PASS ${name}`); } catch (error) { console.error(`FAIL ${name}`); throw error; } }
@@ -25,6 +26,135 @@ test('JsonStore rejects a directory containing only damaged versions', () => { c
 test('JsonStore EXDEV fallback is revision based and reopens latest data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated EFS rename'); error.code = 'EXDEV'; throw error; }; const store = new JsonStore(file, { state: 'initial' }); store.set({ state: 'one' }); store.set({ state: 'two' }); const reopened = new JsonStore(file, {}); assert.equal(reopened.get().state, 'two'); assert.equal(reopened.revision, 2); } finally { fs.renameSync = originalRename; } });
 test('JsonStore does not commit memory when disk write fails', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { state: 'initial' }); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated disk full'); error.code = 'ENOSPC'; throw error; }; assert.throws(() => store.set({ state: 'failed' }), /disk full/); assert.equal(store.get().state, 'initial'); assert.equal(store.revision, 0); } finally { fs.renameSync = originalRename; } });
 test('restarts pause persisted running tasks without an active collector', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [{ id: 'task-running', status: 'running', generation: 2 }], events: [], leads: [], logs: [], pending: [], selectorProfile: {} })); const authStore = { getLicense: () => null, setLicense: () => {} }; new TaskEngine({ store, api: {}, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {} }); const recovered = store.get(); assert.equal(recovered.tasks[0].status, 'paused'); assert.equal(recovered.tasks[0].generation, 3); assert.equal(recovered.logs.at(-1).detail.reason, 'desktop_restarted_without_active_collector'); });
+
+testAsync('workflow decision is frozen before execution and never called while running', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: {}, workflowRuns: [] });
+  let modelCalls = 0;
+  let stepCalls = 0;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async ({ intent, accountId }) => { modelCalls += 1; assert.equal(intent, '整理待处理线索'); assert.equal(accountId, 'account-a'); return { workflowId: 'fixed.fixture', version: '1', params: { mode: 'manual' } }; },
+    workflows: [{ workflowId: 'fixed.fixture', version: '1', steps: ['collect', 'finish'] }],
+    stepExecutor: async ({ plan, run, step }) => { stepCalls += 1; assert.equal(run.status, RUN_STATES.RUNNING); assert.equal(plan.params.mode, 'manual'); assert.match(step.stepId, /^(collect|finish)$/); return { status: 'completed' }; }
+  });
+  const plan = await runtime.planFromIntent('整理待处理线索');
+  assert.equal(modelCalls, 1);
+  const created = runtime.startPlan(plan);
+  const completed = await runtime.run(created.runId);
+  assert.equal(completed.status, RUN_STATES.COMPLETED);
+  assert.equal(stepCalls, 2);
+  assert.equal(modelCalls, 1);
+  assert.deepEqual(runtime.snapshot().runs[0].plan.params, { mode: 'manual' });
+});
+
+testAsync('workflow model decision rejects fields outside workflowId/version/params', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const runtime = new WorkflowRuntime({ store, accountId: 'account-a', modelDecider: async () => ({ workflowId: 'strict.fixture', version: '1', params: {}, steps: ['model-controlled'] }) });
+  await assert.rejects(runtime.planFromIntent('模型不能改步骤'), /unsupported fields/);
+});
+
+testAsync('workflow short retry exhaustion becomes UNKNOWN and manual resume reuses the frozen plan', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  let attempts = 0;
+  let modelCalls = 0;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async () => { modelCalls += 1; return { workflowId: 'recoverable.fixture', version: '1', params: { safe: true } }; },
+    workflows: [{ workflowId: 'recoverable.fixture', version: '1', steps: [{ stepId: 'send', retryLimit: 2 }] }],
+    stepExecutor: async () => { attempts += 1; return attempts <= 3 ? { status: 'retryable', error: { code: 'TEMPORARY' } } : { status: 'completed' }; }
+  });
+  const created = runtime.startPlan(await runtime.planFromIntent('执行一次固定流程'));
+  const unknown = await runtime.run(created.runId);
+  assert.equal(unknown.status, RUN_STATES.UNKNOWN);
+  assert.equal(unknown.steps[0].attempts, 3);
+  assert.equal(modelCalls, 1);
+  const recovered = await runtime.resumeRun(created.runId);
+  assert.equal(recovered.status, RUN_STATES.COMPLETED);
+  assert.equal(attempts, 4);
+  assert.equal(modelCalls, 1);
+});
+
+testAsync('workflow account lock blocks same account while another account remains isolated', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = { workflowId: 'isolated.fixture', version: '1', steps: ['wait'] };
+  const make = (accountId) => new WorkflowRuntime({ store, accountId, modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: {} }), workflows: [definition], stepExecutor: async () => ({ status: 'wait_human', checkpoint: { reason: 'fixture' } }) });
+  const first = make('account-a');
+  const second = make('account-b');
+  const firstRun = first.startPlan(await first.planFromIntent('账号 A 流程'));
+  assert.throws(() => first.startPlan(first.getRun(firstRun.runId).plan), (error) => error.code === 'ACCOUNT_LOCKED');
+  const secondRun = second.startPlan(await second.planFromIntent('账号 B 流程'));
+  const [firstWaiting, secondWaiting] = await Promise.all([first.run(firstRun.runId), second.run(secondRun.runId)]);
+  assert.equal(firstWaiting.status, RUN_STATES.WAITING_HUMAN);
+  assert.equal(secondWaiting.status, RUN_STATES.WAITING_HUMAN);
+  assert.equal(secondRun.accountId, 'account-b');
+  assert.equal(first.snapshot().runs.length, 1);
+  assert.equal(second.snapshot().runs.length, 1);
+  assert.equal(first.snapshot().runs[0].accountId, 'account-a');
+  assert.equal(second.snapshot().runs[0].accountId, 'account-b');
+});
+
+testAsync('workflow wait_human pauses at a checkpoint and resume never asks the model again', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  let modelCalls = 0;
+  let stepCalls = 0;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async () => { modelCalls += 1; return { workflowId: 'human.fixture', version: '1', params: {} }; },
+    workflows: [{ workflowId: 'human.fixture', version: '1', steps: ['approval'] }],
+    stepExecutor: async () => { stepCalls += 1; return stepCalls === 1 ? { status: 'wait_human', checkpoint: { prompt: '请确认' } } : { status: 'completed' }; }
+  });
+  const created = runtime.startPlan(await runtime.planFromIntent('等待人工确认'));
+  const waiting = await runtime.run(created.runId);
+  assert.equal(waiting.status, RUN_STATES.WAITING_HUMAN);
+  assert.deepEqual(waiting.checkpoint, { prompt: '请确认' });
+  const completed = await runtime.resumeRun(created.runId);
+  assert.equal(completed.status, RUN_STATES.COMPLETED);
+  assert.equal(modelCalls, 1);
+  assert.equal(stepCalls, 2);
+});
+
+testAsync('workflow runtime fails closed when no fixed executor is supplied', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const runtime = new WorkflowRuntime({ store, accountId: 'account-a', modelDecider: async () => ({ workflowId: 'no-executor.fixture', version: '1', params: {} }), workflows: [{ workflowId: 'no-executor.fixture', version: '1', steps: ['execute'] }] });
+  const run = runtime.startPlan(await runtime.planFromIntent('不能自动执行'));
+  const result = await runtime.run(run.runId);
+  assert.equal(result.status, RUN_STATES.FAILED);
+  assert.equal(result.lastError.code, 'EXECUTOR_UNAVAILABLE');
+});
+
+testAsync('workflow invalidation pauses the old account while preserving new-account isolation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = { workflowId: 'invalidate.fixture', version: '1', steps: ['hold'] };
+  const make = (accountId, stepExecutor) => new WorkflowRuntime({ store, accountId, modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: {} }), workflows: [definition], stepExecutor });
+  let signalStepStarted;
+  const stepStarted = new Promise((resolve) => { signalStepStarted = resolve; });
+  let releaseStep;
+  const oldAccount = make('account-old', async () => { signalStepStarted(); return new Promise((resolve) => { releaseStep = resolve; }); });
+  const newAccount = make('account-new', async () => ({ status: 'wait_human', checkpoint: { reason: 'fixture' } }));
+  const oldRun = oldAccount.startPlan(await oldAccount.planFromIntent('旧账号任务'));
+  const running = oldAccount.run(oldRun.runId);
+  await stepStarted;
+  oldAccount.invalidate('account_switch');
+  releaseStep({ status: 'completed' });
+  const paused = await running;
+  assert.equal(paused.status, RUN_STATES.PAUSED);
+  assert.equal(paused.lastError.code, 'SESSION_INVALIDATED');
+  const newRun = newAccount.startPlan(await newAccount.planFromIntent('新账号任务'));
+  assert.equal(newAccount.getRun(newRun.runId).status, RUN_STATES.PLANNED);
+  assert.equal(oldAccount.snapshot().runs.length, 1);
+  assert.equal(newAccount.snapshot().runs.length, 1);
+  assert.equal(newAccount.snapshot().runs[0].accountId, 'account-new');
+});
 
 testAsync('ApiClient rejects successful non-json responses', async () => {
   const fakeAuth = { getToken: () => 'token' };

@@ -39,6 +39,20 @@
 
 ## Agent 业务
 
+### `POST /v1/agent/plan`
+
+Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `params`，不会返回步骤、浏览器动作或发送内容。请求还必须带 `idempotencyKey`；服务端使用账号 feature、活动 workflow 目录和服务端 provider 重验结果。provider 未配置、目录为空或模型返回未注册版本时分别返回 `PLANNER_NOT_CONFIGURED`、`WORKFLOW_CATALOG_EMPTY` 或 `PLANNER_INVALID_WORKFLOW`。规划结果只是冻结计划，不能直接发送。
+
+### 固定流程运行与恢复
+
+管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；服务端保存契约快照和知识集版本。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
+
+需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。服务端不会因为恢复请求自动重发未知发送动作。
+
+### `knowledge-sets`
+
+`POST/GET/PATCH /v1/knowledge-sets` 只管理当前工作台账号的知识集元数据和版本。运行实例可冻结 `knowledgeSetId + knowledgeSetVersion`；任何跨账号访问返回 `KNOWLEDGE_SET_NOT_FOUND`。向量内容和 provider key 不通过桌面端接口暴露。
+
 ### `POST /v1/agent/evaluate`
 
 请求：

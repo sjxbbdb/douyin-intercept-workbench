@@ -66,6 +66,68 @@ CREATE TABLE IF NOT EXISTS audit (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workflow_definitions (
+  workflow_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+  contract_json TEXT NOT NULL,
+  created_by TEXT NOT NULL REFERENCES admins(id),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(workflow_id, version)
+);
+CREATE TABLE IF NOT EXISTS knowledge_sets (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+  version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(user_id, name)
+);
+CREATE INDEX IF NOT EXISTS knowledge_sets_user_idx ON knowledge_sets(user_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS workflow_runs (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  plan_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  workflow_version TEXT NOT NULL,
+  contract_json TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  knowledge_set_id TEXT REFERENCES knowledge_sets(id),
+  knowledge_set_version INTEGER,
+  status TEXT NOT NULL CHECK(status IN ('PLANNED','RUNNING','CHECKPOINT','UNKNOWN','WAITING_HUMAN','PAUSED','COMPLETED','FAILED','STOPPED')),
+  current_step TEXT,
+  checkpoint_version INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_version >= 0),
+  checkpoint_json TEXT NOT NULL DEFAULT '{}',
+  failure_json TEXT,
+  human_wait_json TEXT,
+  recovery_attempts INTEGER NOT NULL DEFAULT 0 CHECK(recovery_attempts >= 0),
+  idempotency_key TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  UNIQUE(user_id, idempotency_key),
+  FOREIGN KEY(workflow_id, workflow_version) REFERENCES workflow_definitions(workflow_id, version)
+);
+CREATE INDEX IF NOT EXISTS workflow_runs_user_idx ON workflow_runs(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK(version > 0),
+  status TEXT NOT NULL,
+  step_id TEXT,
+  cursor_json TEXT NOT NULL DEFAULT '{}',
+  target_state_json TEXT NOT NULL DEFAULT '{}',
+  failure_json TEXT,
+  human_wait_json TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(run_id, version)
+);
+CREATE INDEX IF NOT EXISTS workflow_checkpoints_run_idx ON workflow_checkpoints(run_id, version DESC);
 `;
 
 export class Store {
@@ -74,6 +136,11 @@ export class Store {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path, { timeout: 5000 });
     this.db.exec(schema);
+    // Keep databases created before the workflow slice readable. SQLite cannot
+    // add a NOT NULL column without a default, so the migration uses an empty
+    // value for legacy rows; new runs always provide a plan id.
+    const columns = this.all<{ name: string }>('PRAGMA table_info(workflow_runs)');
+    if (!columns.some((column) => column.name === 'plan_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''");
   }
   now() { return Date.now(); }
   exec(sql: string) { this.db.exec(sql); }

@@ -37,7 +37,13 @@ function renderHeader() {
   $('#license-status').dataset.kind = license.state === 'authorized' ? 'ok' : 'warn';
   $('#browser-status').textContent = browser.connected ? `抖音窗口已连接，本轮读取 ${browser.matchCount || 0} 条评论` : '抖音窗口未连接';
   $('#balance').textContent = `积分 ${license.balance ?? '--'}`;
-  $('#page-title').textContent = ({ tasks: '任务', leads: '线索', logs: '回复记录', credits: '积分', settings: '设置' }[state.view] || '任务');
+  $('#page-title').textContent = ({ agent: 'Agent', tasks: '任务', leads: '线索', logs: '回复记录', credits: '积分', settings: '设置' }[state.view] || '任务');
+}
+
+function renderAgent() {
+  const messages = Array.isArray(state.data?.chat) ? state.data.chat : [];
+  const runs = state.data?.workflow?.runs || [];
+  return `<div class="toolbar"><div><p class="eyebrow">固定流程入口</p><h2>Agent 对话</h2><p class="muted">Agent 只负责理解意图并选择已注册流程；流程开始后不会重新调用模型或改变步骤。</p></div></div><section class="panel chat-panel"><div class="chat-history">${messages.length ? messages.map((item) => `<div class="chat-bubble ${item.role === 'user' ? 'user' : 'assistant'}"><small>${item.role === 'user' ? '你' : 'Agent'} · ${escapeHtml(formatDate(item.at))}</small><p>${escapeHtml(item.content)}</p></div>`).join('') : '<div class="empty-state"><h3>还没有对话</h3><p>例如：帮我按固定流程处理一批待确认线索。</p></div>'}</div><form id="agent-chat-form" class="chat-composer"><label class="sr-only" for="agent-message">告诉 Agent 你要做什么</label><textarea id="agent-message" name="message" maxlength="4000" required placeholder="告诉 Agent 你要做什么"></textarea><button class="primary" type="submit">分析并进入固定流程</button></form></section><section class="table-panel"><table><thead><tr><th>流程实例</th><th>状态</th><th>当前步骤</th><th>操作</th></tr></thead><tbody>${runs.length ? runs.map((run) => `<tr><td>${escapeHtml(`${run.workflowId}@${run.version}`)}</td><td><span class="status-chip">${escapeHtml(run.status)}</span></td><td>${escapeHtml(run.currentStep ?? '--')}</td><td>${['WAITING_HUMAN', 'UNKNOWN', 'PAUSED'].includes(run.status) ? `<button class="quiet" data-action="resume-workflow" data-id="${escapeHtml(run.runId)}">人工继续</button>` : ''}</td></tr>`).join('') : '<tr><td colspan="4"><div class="empty-state"><p>暂无流程实例</p></div></td></tr>'}</tbody></table></section>`;
 }
 
 function renderLogin() {
@@ -91,7 +97,7 @@ function render() {
     state.taskEditor = null;
     state.draftUrl = '';
   }
-  $('#content').innerHTML = (!licensed && state.view !== 'settings') ? renderLogin() : state.view === 'tasks' ? renderTasks() : state.view === 'leads' ? renderLeads() : state.view === 'logs' ? renderLogs() : state.view === 'credits' ? renderCredits() : renderSettings();
+  $('#content').innerHTML = (!licensed && state.view !== 'settings') ? renderLogin() : state.view === 'agent' ? renderAgent() : state.view === 'tasks' ? renderTasks() : state.view === 'leads' ? renderLeads() : state.view === 'logs' ? renderLogs() : state.view === 'credits' ? renderCredits() : renderSettings();
   bind();
 }
 
@@ -101,6 +107,16 @@ function bind() {
   $('#nav').onclick = (event) => { const button = event.target.closest('[data-view]'); if (!button) return; state.taskEditor = null; state.draftUrl = ''; state.view = button.dataset.view; document.querySelectorAll('.nav-item').forEach((item) => item.classList.toggle('active', item === button)); render(); };
   $('#refresh').onclick = () => call(window.agentApi.refreshLicense);
   $('#content').onclick = async (event) => { const button = event.target.closest('[data-action]'); if (!button) return; const action = button.dataset.action; if (action === 'new-task') { state.draftUrl = ''; openTaskEditor(); return; } if (action === 'cancel-task') { state.taskEditor = null; state.view = 'tasks'; state.draftUrl = ''; render(); return; } if (action === 'edit-task') { const task = state.data.tasks.find((item) => item.id === button.dataset.id); openTaskEditor(task); return; } if (action === 'import-demo') { await call(window.agentApi.saveTask, { url: 'https://www.douyin.com/video/example', source: 'video', businessContext: '演示配置，不含真实数据', targetCustomer: '待配置', keywords: ['价格'], excludeKeywords: ['投诉'], replyTemplate: '这是演示模板，请先完成配置。', replyInstructions: '演示配置，不会自动发送', mode: 'manual', decisionMode: 'rule', intervalMs: 30000, dailyLimit: 20, maxActions: 20, status: 'stopped' }); notify('示例配置已导入，未创建演示评论或发送记录'); return; } if (action === 'search-open') { await call(window.agentApi.openTarget, button.dataset.url); notify('目标页面已打开；登录后点击启动任务'); return; } if (action === 'search-use') { state.draftUrl = button.dataset.url; state.view = 'tasks'; openTaskEditor({ url: button.dataset.url, source: 'video' }); return; } if (action === 'open-browser') { await call(window.agentApi.openTarget, button.dataset.url); notify('目标页面已打开；登录后点击启动任务'); return; } if (action === 'task-status') { await call(window.agentApi.setTaskStatus, { id: button.dataset.id, status: button.dataset.status }); return; } if (action === 'recheck-skipped') { const taskId = button.dataset.id; if (state.recheckPending.has(taskId)) return; const account = licenseIdentity(state.data?.license); state.recheckPending.add(taskId); button.disabled = true; render(); try { const result = await window.agentApi.recheckSkipped(taskId); await refresh(); if (licenseIdentity(state.data?.license) === account) notify(recheckResultText(result)); } catch (error) { if (licenseIdentity(state.data?.license) === account) { console.error('[desktop-ui]', error); notify(clientError(error), 'error'); } } finally { state.recheckPending.delete(taskId); render(); } return; } if (action === 'confirm') { await call(window.agentApi.confirmAction, button.dataset.id); return; } if (action === 'retry-draft') { await call(window.agentApi.retryDraft, button.dataset.eventKey); return; } if (action === 'load-ledger') { const response = await window.agentApi.getLedger(); state.ledger = Array.isArray(response) ? response : (response.entries || response.items || []); render(); return; } if (action === 'load-candidate') { const form = $('#selector-form'); for (const [key, value] of Object.entries(UNVERIFIED_CANDIDATE)) form.elements[key].value = value; notify('已载入未验证候选，请先探测并确认样例'); return; } if (action === 'probe') { const form = $('#selector-form'); const result = await call(window.agentApi.probeSelectors, profileFromForm(form)); if (result.transport === 'sidecar') { const entries = Object.entries(result.capability || {}).map(([key, item]) => `${key}：${item.implemented ? '已实现' : '未实现'}；自动资格 ${item.autoEligible === true ? '允许' : '未开放'}；验证来源 ${item.validation?.status || item.evidence || '未提供'}`); $('#probe-result').textContent = `外部专用 Chrome 运行组件：${result.verified ? '已实现' : '未声明'}；${entries.join(' ｜ ') || result.diagnostics || '无能力明细'}。页面送达仍须运行时平台响应确认。`; } else $('#probe-result').textContent = `当前可见匹配 评论 ${result.commentNode || 0}，输入框 ${result.replyInput || 0}，发送按钮 ${result.sendButton || 0}，样例 ${result.sample?.join(' / ') || '无'}`; return; } };
+  if (!$('#content').dataset.workflowBound) {
+    $('#content').dataset.workflowBound = '1';
+    $('#content').addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-action="resume-workflow"]');
+      if (!button) return;
+      await call(window.agentApi.resumeWorkflow, button.dataset.id);
+      notify('流程已按原检查点继续');
+    });
+  }
+  const chat = $('#agent-chat-form'); if (chat) chat.onsubmit = async (event) => { event.preventDefault(); const message = String(new FormData(chat).get('message') || '').trim(); if (!message) return; const submit = chat.querySelector('button[type="submit"]'); if (submit) submit.disabled = true; try { await call(window.agentApi.chat, { message }); notify('Agent 已选择固定流程并记录运行状态'); } finally { if (submit) submit.disabled = false; } };
   const login = $('#login-form'); if (login) login.onsubmit = async (event) => { event.preventDefault(); const value = Object.fromEntries(new FormData(login).entries()); await call(window.agentApi.login, value); notify('登录成功'); };
   const task = $('#task-form');
   if (task) task.onsubmit = async (event) => {

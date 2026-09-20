@@ -9,6 +9,7 @@
 - 独立 `server/` 和 `desktop/` 包边界；
 - Linux 授权端的账号、设备、会话、功能开关、积分台账、兑换码、幂等和 AI provider hold；
 - Electron 桌面端的 API client、任务状态机、人工确认队列、可见 DOM/CDP 专用窗口和输入校验；
+- 平台层的版本化固定 workflow、Agent 规划契约、运行实例 checkpoint/人工恢复、账号级锁和 Agent 对话入口；
 - 服务端测试，以及真实回环 HTTP + desktop `ApiClient` 的授权/积分/幂等/会话隔离验收；TaskEngine 到规则 `/evaluate` 和 AI `/draft` 的 HTTP A–E 集成均已通过，二者请求体按服务端契约分离，时间字段在授权端使用整数毫秒；
 - 旧仓库完整 Git 历史和平台能力审计，见 [`docs/reference-audit.md`](docs/reference-audit.md)。桌面端已接入受控 Python sidecar 的 JSONL 主链路；sidecar 以 PyInstaller onedir 随包分发，不能把“本地 capabilities 联通”误读为线上平台能力已验证。
 
@@ -24,6 +25,8 @@
 - Linux 生产部署和真实抖音平台结果确认。
 
 代码测试、模拟 provider、脱敏 fixture 和本地构建只能证明程序边界，不证明抖音线上能力或账号安全。模板或 AI 回复成功生成时按服务端价格扣积分；生成失败不扣积分。发送是后续独立状态，平台未知结果不得改写为成功，也不自动退款。任何候选能力都必须通过同一授权、积分、幂等和停止闸门。
+
+平台运行时契约见 [`docs/platform-runtime-contract.md`](docs/platform-runtime-contract.md)：模型只选择服务端注册的 `workflowId + version + params`，固定流程运行后不再调用模型。三个业务适配器尚未由本次平台切片实现，未验证步骤默认 fail-closed。
 
 ## 运行与验证
 

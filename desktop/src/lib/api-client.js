@@ -77,6 +77,30 @@ class ApiClient {
   evaluate(body) {
     return this.request('POST', '/v1/agent/evaluate', body, 12000);
   }
+
+  plan(body) {
+    return this.request('POST', '/v1/agent/plan', body, 30000);
+  }
+
+  workflows() {
+    return this.request('GET', '/v1/workflows');
+  }
+
+  createWorkflowRun(body) {
+    return this.request('POST', '/v1/workflow-runs', body, 12000);
+  }
+
+  workflowRun(runId) {
+    return this.request('GET', `/v1/workflow-runs/${encodeURIComponent(runId)}`);
+  }
+
+  checkpointWorkflow(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/checkpoints`, body, 12000);
+  }
+
+  recoverWorkflow(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/recover`, body, 12000);
+  }
 }
 
 module.exports = { ApiClient, ApiError };

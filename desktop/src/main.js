@@ -11,6 +11,7 @@ const { BrowserBridge, isAllowedUrl } = require('./lib/browser-bridge');
 const { ProbeBridge } = require('./lib/probe-bridge');
 const { DEFAULT_SELECTOR_PROFILE, normalizeProfile } = require('./lib/selectors');
 const { TaskEngine } = require('./lib/task-engine');
+const { WorkflowRuntime } = require('./lib/workflow-runtime');
 const { targetUrl, text, safeIdempotencyKey } = require('./lib/validation');
 
 let mainWindow;
@@ -18,6 +19,7 @@ let authStore;
 let api;
 let dataStore;
 let engine;
+let workflowRuntime;
 let browser;
 let browserState = { connected: false, collector: 'closed', matchCount: 0 };
 let lastProbe = null;
@@ -44,8 +46,16 @@ function validateEndpoint(value) {
 }
 
 function defaultData() {
-  return { tasks: [], events: [], leads: [], logs: [], pending: [], selectorProfile: DEFAULT_SELECTOR_PROFILE };
+  return { tasks: [], events: [], leads: [], logs: [], pending: [], chat: [], workflowRuns: [], selectorProfile: DEFAULT_SELECTOR_PROFILE };
 }
+
+// These are platform contracts only. The three business adapters register their
+// verified executors later; an unregistered executor must fail closed.
+const PLATFORM_WORKFLOWS = [
+  { workflowId: 'video.search', version: '1', steps: [{ stepId: 'search', retryLimit: 2 }] },
+  { workflowId: 'comment.reply_then_private', version: '1', steps: [{ stepId: 'reply_comment', retryLimit: 2 }, { stepId: 'private_message', retryLimit: 2 }] },
+  { workflowId: 'live.reply_then_private', version: '1', steps: [{ stepId: 'reply_public', retryLimit: 2 }, { stepId: 'private_message', retryLimit: 2 }] }
+];
 
 function accountDataPath(userId) {
   const key = crypto.createHash('sha256').update(`${apiEndpoint}:${userId}`).digest('hex').slice(0, 32);
@@ -79,6 +89,20 @@ function createEngineForStore(nextStore, userId = null) {
   dataStore = nextStore;
   currentAccountUserId = userId;
   engine = new TaskEngine({ store: dataStore, api, authStore, browser, selectorProfile: currentProfile(), onStateChange: emitState, ensureLicense: refreshLicense });
+  workflowRuntime = new WorkflowRuntime({
+    store: dataStore,
+    accountId: userId || 'guest',
+    workflows: PLATFORM_WORKFLOWS,
+    modelDecider: async ({ intent, context }) => {
+      if (typeof api?.plan !== 'function') throw new Error('授权中心尚未提供 Agent 规划能力');
+      const idempotencyKey = safeIdempotencyKey(`plan:${crypto.createHash('sha256').update(JSON.stringify({ intent, context })).digest('hex').slice(0, 48)}`);
+      return api.plan({ intent, context, idempotencyKey });
+    },
+    // No business adapter is implicitly trusted. Collaborators must inject a
+    // verified executor before a workflow can perform any platform action.
+    stepExecutor: null,
+    onStateChange: emitState
+  });
 }
 
 function switchAccountStore(userId, reason = 'account_switch', isCurrent = () => true) {
@@ -88,6 +112,7 @@ function switchAccountStore(userId, reason = 'account_switch', isCurrent = () =>
     browserState = { connected: false, collector: 'closed', matchCount: 0 };
     lastProbe = null;
     engine?.invalidate(reason);
+    workflowRuntime?.invalidate(reason);
     const previous = browser;
     if (previous) await previous.close?.();
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
@@ -114,7 +139,7 @@ function assertLocalSender(event) {
 }
 
 function emitState() {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState });
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: currentAccountUserId || 'guest', runs: [] } });
 }
 
 function currentProfile() { return dataStore.get().selectorProfile || DEFAULT_SELECTOR_PROFILE; }
@@ -219,7 +244,43 @@ async function handleRedeem(_event, input) {
 
 function registerIpc() {
   const wrap = (handler) => async (event, payload) => { assertLocalSender(event); return handler(event, payload); };
-  ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState })));
+  ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: currentAccountUserId || 'guest', runs: [] } })));
+  ipcMain.handle('agent:list-workflows', wrap(() => workflowRuntime.listWorkflows()));
+  ipcMain.handle('agent:chat', wrap(async (_event, input) => {
+    if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+    const message = text(input?.message, 'message', 4000);
+    const plan = await workflowRuntime.planFromIntent(message, input?.context && typeof input.context === 'object' ? input.context : {});
+    const catalogResponse = await api.workflows();
+    const catalog = Array.isArray(catalogResponse?.workflows) ? catalogResponse.workflows : [];
+    const registered = catalog.find((item) => item.workflowId === plan.workflowId && String(item.version) === String(plan.version) && item.status === 'active');
+    if (!registered) throw new Error('授权中心未开放该固定流程');
+    const contractSteps = Array.isArray(registered.contract?.steps) ? registered.contract.steps : [];
+    if (!contractSteps.length) throw new Error('授权中心返回的固定流程没有可执行步骤');
+    workflowRuntime.registerWorkflow({ workflowId: registered.workflowId, version: String(registered.version), steps: contractSteps });
+    const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}`) });
+    const remoteRunId = remote?.run?.id;
+    if (!remoteRunId) throw new Error('授权中心未返回流程实例');
+    await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: 0 });
+    const run = workflowRuntime.startPlan(plan);
+    dataStore.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
+    const result = await workflowRuntime.run(run.runId);
+    await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: 1, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+    dataStore.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: message, at: new Date().toISOString() }, { role: 'assistant', content: `已选择固定流程 ${plan.workflowId}@${plan.version}，当前状态：${result.status}`, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
+    emitState();
+    return { plan, run: result };
+  }));
+  ipcMain.handle('agent:resume-workflow', wrap(async (_event, runId) => {
+    const local = workflowRuntime.getRun(text(runId, 'run id', 160));
+    let remoteVersion = null;
+    if (local.remoteRunId) {
+      const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: 2, userConfirmed: true, reason: 'desktop_manual_resume' });
+      remoteVersion = Number.isSafeInteger(recovered?.run?.checkpointVersion) ? recovered.run.checkpointVersion : null;
+    }
+    const result = await workflowRuntime.resumeRun(local.runId);
+    if (local.remoteRunId && remoteVersion != null) await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+    emitState(); return result;
+  }));
+  ipcMain.handle('agent:pause-workflow', wrap((_event, runId) => { const result = workflowRuntime.pauseRun(text(runId, 'run id', 160)); emitState(); return result; }));
   ipcMain.handle('agent:login', wrap(handleLogin));
   ipcMain.handle('agent:logout', wrap(handleLogout));
   ipcMain.handle('agent:refresh-license', wrap(() => refreshLicense()));

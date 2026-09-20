@@ -57,6 +57,8 @@ Fastify 默认不信任 `X-Forwarded-For`，因此不会无条件把客户端提
 
 积分余额不直接作为可被覆盖的字段使用；每次变化追加 ledger，事务内维护余额快照，余额永不小于零。AI draft 的 hold 带 owner、幂等键、过期时间和状态；每次请求前回收过期 hold。进程在 provider 成功后崩溃时，hold 会在过期后释放，客户端可用同 key 重试，服务端不会再次创建并行扣款。
 
+固定流程运行实例使用 `workflow_definitions`、`workflow_runs` 和 `workflow_checkpoints` 保存版本化契约、冻结参数、知识集版本、当前步骤和恢复次数。模型规划只负责选择注册的 `workflowId/version/params`；运行中的步骤由桌面固定执行器上报，服务端拒绝未注册版本、旧 checkpoint 和跨账号知识集。`UNKNOWN`、`WAITING_HUMAN` 和 `PAUSED` 不会被服务端自动改写为成功或触发重发，恢复必须使用原运行实例并通过两次健康检查。
+
 备份优先在停服后复制数据库文件；需要在线备份时使用 Node `node:sqlite` 的一致性 backup 能力或 SQLite 官方 backup API，不能只复制仍在 WAL 写入的 `.sqlite` 文件。恢复前停止服务、替换整个数据库文件与 WAL/SHM 文件，再启动并检查 `/healthz`。
 
 ## 验证

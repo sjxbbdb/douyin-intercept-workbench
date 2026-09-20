@@ -32,6 +32,12 @@ async function providerServer(mode: 'success' | 'invalid' | 'timeout' | 'delay')
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('provider did not bind');
   return { server, baseUrl: `http://127.0.0.1:${address.port}` };
 }
+async function plannerServer() {
+  const server: Server = createServer((_request, response) => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"workflowId":"video.search","version":"1","params":{"source":"fixture"}}' } }] })); }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', () => resolve()));
+  const address = server.address(); if (!address || typeof address === 'string') throw new Error('planner did not bind');
+  return { server, baseUrl: `http://127.0.0.1:${address.port}` };
+}
 async function runCli(args: string[], env: Record<string, string>) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => { const child = spawn('node', ['--import', 'tsx', 'src/cli.ts', ...args], { cwd: process.cwd(), env: { ...process.env, ...env }, windowsHide: true }); let stdout = ''; let stderr = ''; let finished = false; const done = (code: number | null) => { if (!finished) { finished = true; clearTimeout(timer); resolve({ code, stdout, stderr }); } }; const timer = setTimeout(() => { child.kill(); stderr += 'CLI subprocess timeout'; done(null); }, 5000); child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.on('data', (chunk) => { stderr += chunk; }); child.on('error', (error) => { stderr += String(error); done(null); }); child.on('close', (code) => done(code)); });
 }
@@ -155,4 +161,42 @@ test('concurrent charges serialize and do not cross users', async () => {
     const [ra, rb] = await Promise.all(['same-key-001', 'other-key-001'].map((key, index) => f.app.inject({ method: 'POST', url: '/v1/agent/evaluate', headers: { authorization: `Bearer ${token}` }, payload: { event: event(`same-${index}`), rule, idempotencyKey: key } })));
     assert.equal([ra.statusCode, rb.statusCode].filter((code) => code === 200).length, 1); assert.equal([ra.statusCode, rb.statusCode].filter((code) => code === 409).length, 1);
   } finally { await f.close(); }
+});
+
+test('workflow registry, tenant knowledge metadata and recoverable run contract', async () => {
+  const f = await fixture(); try {
+    const first = await f.create({ username: 'workflow-a' }); const second = await f.create({ username: 'workflow-b' });
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: {
+      workflowId: 'comment.reply.v1', version: 1, name: '评论回复固定流程', contract: { steps: [{ id: 'collect', type: 'bounded_collect' }, { id: 'reply', type: 'fixed_reply' }], endCondition: 'queue_empty' }
+    } }); assert.equal(workflow.statusCode, 200, workflow.body);
+    const duplicate = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: {
+      workflowId: 'comment.reply.v1', version: 1, name: '重复版本', contract: { steps: [{ id: 'collect' }] }
+    } }); assert.equal(duplicate.statusCode, 409);
+    const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: first.username, password: first.password, deviceId: 'pc-a', deviceName: 'A' } }); const token = login.json().token;
+    const otherLogin = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: second.username, password: second.password, deviceId: 'pc-b', deviceName: 'B' } }); const otherToken = otherLogin.json().token;
+    const unknownVersion = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'plan-unknown', workflowId: 'comment.reply.v1', version: 2, params: {}, idempotencyKey: 'workflow-run-unknown-001' } }); assert.equal(unknownVersion.statusCode, 404); assert.equal(unknownVersion.json().code, 'WORKFLOW_NOT_FOUND');
+    const knowledge = await f.app.inject({ method: 'POST', url: '/v1/knowledge-sets', headers: { authorization: `Bearer ${token}` }, payload: { name: '商品资料', description: '脱敏元数据', metadata: { locale: 'zh-CN', source: 'fixture' } } }); assert.equal(knowledge.statusCode, 200, knowledge.body); assert.equal(knowledge.json().version, 1);
+    const knowledgeId = knowledge.json().id;
+    const hidden = await f.app.inject({ method: 'PATCH', url: `/v1/knowledge-sets/${knowledgeId}`, headers: { authorization: `Bearer ${otherToken}` }, payload: { description: '越权' } }); assert.equal(hidden.statusCode, 404);
+    const run = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'plan-fixture-1', workflowId: 'comment.reply.v1', version: 1, params: { batch: 'fixture-1' }, knowledgeSetId: knowledgeId, idempotencyKey: 'workflow-run-001' } }); assert.equal(run.statusCode, 200, run.body); assert.equal(run.json().run.status, 'PLANNED'); assert.equal(run.json().run.planId, 'plan-fixture-1'); assert.equal(run.json().run.knowledgeSet.version, 1);
+    const runId = run.json().run.id;
+    const replay = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'plan-fixture-1', workflowId: 'comment.reply.v1', version: 1, params: { batch: 'fixture-1' }, knowledgeSetId: knowledgeId, idempotencyKey: 'workflow-run-001' } }); assert.deepEqual(replay.json(), run.json());
+    const checkpoint = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'RUNNING', stepId: 'collect', cursor: { page: 1 }, targetState: { queue: 'open' }, expectedVersion: 0 } }); assert.equal(checkpoint.statusCode, 200, checkpoint.body); assert.equal(checkpoint.json().run.checkpointVersion, 1);
+    const human = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/human-wait`, headers: { authorization: `Bearer ${token}` }, payload: { reason: '需要人工确认登录状态', context: { redacted: true }, expectedVersion: 1 } }); assert.equal(human.statusCode, 200, human.body); assert.equal(human.json().run.status, 'WAITING_HUMAN');
+    const premature = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/recover`, headers: { authorization: `Bearer ${token}` }, payload: { checksPassed: 1 } }); assert.equal(premature.statusCode, 409); assert.equal(premature.json().code, 'RECOVERY_CHECKS_REQUIRED');
+    const recovered = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/human-wait/resolve`, headers: { authorization: `Bearer ${token}` }, payload: { checksPassed: 2, reason: '人工确认后恢复' } }); assert.equal(recovered.statusCode, 200, recovered.body); assert.equal(recovered.json().run.status, 'RUNNING'); assert.equal(recovered.json().run.recoveryAttempts, 1);
+    const stale = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'CHECKPOINT', expectedVersion: 1 } }); assert.equal(stale.statusCode, 409); assert.equal(stale.json().code, 'CHECKPOINT_CONFLICT');
+    const final = await f.app.inject({ method: 'GET', url: `/v1/workflow-runs/${runId}`, headers: { authorization: `Bearer ${token}` } }); assert.equal(final.statusCode, 200); assert.equal(final.json().checkpoints.length, 3); assert.equal(final.json().run.params.batch, 'fixture-1');
+  } finally { await f.close(); }
+});
+
+test('agent planner only returns registered fixed workflow and is idempotent', async () => {
+  const provider = await plannerServer(); const f = await fixture({ provider: { baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' } }); try {
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'video.search', version: '1', name: '查找视频', contract: { steps: ['search'] } } }); assert.equal(workflow.statusCode, 200, workflow.body);
+    const user = await f.create({ username: 'planner-user' }); const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'pc', deviceName: 'A' } }); const token = login.json().token;
+    const payload = { intent: '找一批演示视频', context: { redacted: true }, idempotencyKey: 'planner-001' };
+    const first = await f.app.inject({ method: 'POST', url: '/v1/agent/plan', headers: { authorization: `Bearer ${token}` }, payload }); assert.equal(first.statusCode, 200, first.body); assert.equal(first.json().workflowId, 'video.search'); assert.equal(first.json().version, '1');
+    const replay = await f.app.inject({ method: 'POST', url: '/v1/agent/plan', headers: { authorization: `Bearer ${token}` }, payload }); assert.deepEqual(replay.json(), first.json());
+    const disabled = await f.create({ username: 'planner-disabled', features: { workflow: false } }); const disabledLogin = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: disabled.username, password: disabled.password, deviceId: 'pc', deviceName: 'A' } }); const denied = await f.app.inject({ method: 'POST', url: '/v1/agent/plan', headers: { authorization: `Bearer ${disabledLogin.json().token}` }, payload: { ...payload, idempotencyKey: 'planner-disabled-001' } }); assert.equal(denied.statusCode, 403); assert.equal(denied.json().code, 'FEATURE_DISABLED');
+  } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
 });
