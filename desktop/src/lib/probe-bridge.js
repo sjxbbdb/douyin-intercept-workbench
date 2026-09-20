@@ -9,6 +9,10 @@ function validEvents(result, source) {
   if (!result || !Array.isArray(result.events)) throw new Error('侧车采集结果格式无效');
   return result.events.filter((event) => event && typeof event.text === 'string' && typeof event.roomId === 'string').map((event) => ({ ...event, source: event.source || source }));
 }
+function platformResponseConfirmed(item) {
+  const validation = item?.validation;
+  return validation?.delivery === 'platform_response_confirmed' || validation?.platform_response_confirmed === true;
+}
 
 class ProbeBridge {
   constructor({ accountDir, port, onStatus, onEvents, resourcesPath, cwd, env, packaged = false } = {}) {
@@ -203,10 +207,10 @@ class ProbeBridge {
     const reply = capability?.[replyKey] || {};
     const captureVerified = capture.implemented === true;
     const replyVerified = reply.implemented === true;
-    this.capability = { verified: captureVerified, source, implemented: captureVerified, autoEligible: capture.autoEligible === true, validation: capture.validation || null, evidence: capture.evidence || null, detail: captureVerified ? `侧车已声明${captureKey}能力` : `侧车未声明${captureKey}能力` };
-    this.sendCapability = { verified: replyVerified, implemented: replyVerified, autoEligible: reply.autoEligible === true, source, validation: reply.validation || null, evidence: reply.evidence || null, detail: replyVerified ? `侧车已声明${replyKey}能力，发送结果仍须运行时核实` : `侧车未声明${replyKey}能力` };
+    this.capability = { verified: captureVerified, source, implemented: captureVerified, autoEligible: capture.autoEligible === true && platformResponseConfirmed(capture), validation: capture.validation || null, evidence: capture.evidence || null, detail: captureVerified ? `侧车已声明${captureKey}能力` : `侧车未声明${captureKey}能力` };
+    this.sendCapability = { verified: replyVerified, implemented: replyVerified, autoEligible: reply.autoEligible === true && platformResponseConfirmed(reply), source, validation: reply.validation || null, evidence: reply.evidence || null, detail: replyVerified ? `侧车已声明${replyKey}能力，发送结果仍须运行时核实` : `侧车未声明${replyKey}能力` };
     const privateReply = capability?.private_reply || {};
-    this.privateCapability = { verified: privateReply.implemented === true, implemented: privateReply.implemented === true, autoEligible: privateReply.autoEligible === true, validation: privateReply.validation || null, evidence: privateReply.evidence || null, detail: privateReply.implemented === true ? '侧车已声明私信能力，发送结果仍须运行时核实' : '私信发送未声明' };
+    this.privateCapability = { verified: privateReply.implemented === true, implemented: privateReply.implemented === true, autoEligible: privateReply.autoEligible === true && platformResponseConfirmed(privateReply), validation: privateReply.validation || null, evidence: privateReply.evidence || null, detail: privateReply.implemented === true ? '侧车已声明私信能力，发送结果仍须运行时核实' : '私信发送未声明' };
   }
 
   async #probeCapability(source, isCurrent = () => true) {
@@ -285,13 +289,44 @@ class ProbeBridge {
     while (this.collectRunning) await new Promise((resolve) => setTimeout(resolve, 20));
     if (this.closed || this.lifecycleEpoch !== operationEpoch) return { status: 'unknown', sendId, reason: 'sidecar_operation_cancelled_before_send' };
     try {
-      const result = await this.client.request('send_private', { sendId, target: { authorId: eventTarget.authorId, authorName: eventTarget.authorName }, text: replyText }, { timeoutMs: sendTimeoutMs(replyText) });
+      const request = { sendId, target: { authorId: eventTarget.authorId, authorName: eventTarget.authorName }, text: replyText };
+      if (eventTarget.publicSendId) request.publicSendId = eventTarget.publicSendId;
+      const result = await this.client.request('send_private', request, { timeoutMs: sendTimeoutMs(replyText) });
       this.#resumeAfterSend(operationEpoch, resume);
       return { ...result, sendId };
     } catch (error) {
       this.#resumeAfterSend(operationEpoch, resume);
       return { status: 'unknown', sendId, reason: error.code === 'SIDECAR_TIMEOUT' || error.code === 'SIDECAR_NO_FINAL' ? 'sidecar_result_unknown' : error.message };
     }
+  }
+
+  async commentPrivateCandidates(items) {
+    const params = Array.isArray(items) ? { items } : items;
+    return this.client.request('comment_private_candidates', params, { timeoutMs: 20000 });
+  }
+
+  async liveListen(params, maxItems = 100) {
+    const request = typeof params === 'string' ? { url: params, maxItems } : params;
+    await this.#launch();
+    return this.client.request('live_listen', request, { timeoutMs: 60000 });
+  }
+
+  async livePlan(params) {
+    return this.client.request('live_plan', params, { timeoutMs: 20000 });
+  }
+
+  async liveReply(params) {
+    await this.#launch();
+    return this.client.request('live_reply', params, { timeoutMs: 60000 });
+  }
+
+  async livePrivate(params) {
+    await this.#launch();
+    return this.client.request('live_private', params, { timeoutMs: 60000 });
+  }
+
+  async liveResult(params) {
+    return this.client.request('live_result', params, { timeoutMs: 20000 });
   }
 
   #pauseForSend() {
