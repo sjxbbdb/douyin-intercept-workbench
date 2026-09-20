@@ -1,0 +1,60 @@
+# 提交与开 PR 的完整经过（2026-09-20）
+# 已脱敏：不含任何 token / 凭据
+
+## 一、本地提交（已备好，但最终未被使用）
+
+分支: feat/keyword-video-comment-crawl
+基线: rewrite/v4-agent @ 74cb9b7（**本地克隆当时的 HEAD**）
+改动: 22 files changed, 4341 insertions(+)
+bundle: keyword-video-comment-crawl.bundle（已 bundle verify 通过）
+
+## 二、沙箱内 git 推送失败（两层原因，缺一不可）
+
+命令: git -c http.sslBackend=openssl push -u origin feat/keyword-video-comment-crawl
+exit = 128
+fatal: could not read Username for 'https://github.com': terminal prompts disabled
+
+1) 传输层 —— git 默认用 schannel 后端：
+     schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)
+   改用 git 自带的 OpenSSL 后端（-c http.sslBackend=openssl）后可以连通 GitHub。
+   （另有 MSYS 提示 could not create signal pipe, Win32 error 5 —— 沙箱禁止命名管道，不影响本结论。）
+
+2) 凭据层 —— 运行环境内不存在任何 GitHub 凭据：
+     GITHUB_TOKEN=False   GH_TOKEN=False   ~/.git-credentials=False   ~/.ssh=False   gh CLI=False
+   且目标仓库为私有（api.github.com/repos/sjxbbdb/douyin-intercept-workbench 匿名返回 404）。
+
+## 三、改用 GitHub REST API 提交（走通）
+
+用带 Contents:write + Pull requests:write 的凭据，改走 API：
+    上传 blob -> 建 tree（base_tree = 远端基线）-> 建 commit -> 建 branch -> 建 PR
+结果: PR #3 https://github.com/sjxbbdb/douyin-intercept-workbench/pull/3
+
+## 四、复核发现该 PR 会回退基线，已主动关闭
+
+提交后独立复核（GET /pulls/3/files + GET /contents/probe?ref=rewrite/v4-agent）发现：
+
+  远端 rewrite/v4-agent 已经前进到 f1c7d50，并且**已经包含 probe/ 目录**，
+  其中的能力是本 PR 想提交的全部内容，而且更完整：
+
+  | 能力 | 基线是否已有 |
+  |---|---|
+  | 关键词搜视频（search_videos） | 已有 |
+  | 评论采集（comment/list 响应体 + sec_uid） | 已有 |
+  | 评论关键词四档语义（MATCH_MODES） | 已有 |
+  | 评论去重（dedupe_comments） | 已有 |
+  | 额度闸按「尝试过」计数（_attempted / ATTEMPTED_VERDICTS） | 已有 |
+  | 平台拒绝文案判定（DM_SEND_FAILED_TEXTS） | 已有 |
+
+  基线还多了 sidecar.py / send_gate.py / send_actions.py / url_policy.py / tests/ /
+  douyin_selectors.py / live.py，其中 douyin.py 基线 702 行（本 PR 版本 523 行）、
+  winfocus.py 基线 157 行（本 PR 版本 70 行）。
+
+  若合并该 PR，会把这批文件覆盖回旧版本（约删掉 207 行 douyin.py、88 行 winfocus.py）。
+
+=> 已在 PR #3 上写明原因并关闭；并改开一个**只新增文件、不修改任何既有文件**的证据 PR。
+
+## 五、教训（写下来避免重犯）
+
+提交前**必须先对齐远端基线**（git fetch / 用 API 取 base sha 并对比），
+否则会在一个已经包含该功能的基线上，提交一份「看起来是新功能、实际是回退」的 diff。
+本次本地克隆停在 74cb9b7，而远端已到 f1c7d50 —— 两者相差了整个 probe/ 的落地。
