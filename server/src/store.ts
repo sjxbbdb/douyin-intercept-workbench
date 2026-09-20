@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   lease_owner TEXT,
   lease_device_id TEXT,
   lease_expires_at INTEGER,
+  credit_action_id TEXT,
   UNIQUE(user_id, idempotency_key),
   FOREIGN KEY(workflow_id, workflow_version) REFERENCES workflow_definitions(workflow_id, version)
 );
@@ -212,6 +213,7 @@ export class Store {
     if (!columns.some((column) => column.name === 'lease_owner')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_owner TEXT");
     if (!columns.some((column) => column.name === 'lease_device_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_device_id TEXT");
     if (!columns.some((column) => column.name === 'lease_expires_at')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_expires_at INTEGER");
+    if (!columns.some((column) => column.name === 'credit_action_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN credit_action_id TEXT");
   }
   now() { return Date.now(); }
   exec(sql: string) { this.db.exec(sql); }

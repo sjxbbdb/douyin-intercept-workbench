@@ -91,6 +91,29 @@ function audit(store: Store, actorType: string, actorId: string | null, action: 
   store.run('INSERT INTO audit(id,actor_type,actor_id,action,target_user_id,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)', randomId('audit'), actorType, actorId, action, targetUserId, json(metadata), store.now());
 }
 
+function settleWorkflowCredit(store: Store, userId: string, actionId: string | null, outcome: 'commit' | 'release', runId: string) {
+  if (!actionId) return null;
+  const action = store.get<RecordValue>('SELECT * FROM credit_actions WHERE id=? AND user_id=?', actionId, userId);
+  if (!action) throw new AppError(409, 'CREDIT_ACTION_NOT_FOUND', '流程绑定的积分动作不存在');
+  const metadata = parseJson<RecordValue>(action.metadata_json, {});
+  if (metadata.runId !== runId || action.owner !== `workflow:${runId}` && !action.owner.startsWith('workflow:')) {
+    throw new AppError(409, 'CREDIT_ACTION_BINDING_INVALID', '流程积分动作绑定无效');
+  }
+  if (outcome === 'release') {
+    if (action.status === 'reserved') store.run("UPDATE credit_actions SET status='released',updated_at=? WHERE id=? AND status='reserved'", store.now(), actionId);
+    return store.get<RecordValue>('SELECT * FROM credit_actions WHERE id=?', actionId);
+  }
+  if (action.status === 'committed') return action;
+  if (action.status !== 'reserved') throw new AppError(409, 'CREDIT_ACTION_STATE', '流程积分动作已释放');
+  const before = store.get<{ balance: number }>('SELECT COALESCE(sum(delta),0) AS balance FROM ledger WHERE user_id=?', userId)?.balance ?? 0;
+  const after = before - action.amount;
+  if (after < 0) throw new AppError(409, 'INSUFFICIENT_CREDITS', '积分不足');
+  const ledgerId = randomId('ledger');
+  store.run('INSERT INTO ledger(id,user_id,delta,balance_after,kind,idempotency_key,payload_hash,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)', ledgerId, userId, -action.amount, after, `workflow:${action.owner}`, `action:${action.id}`, hashPayload({ actionId: action.id, amount: action.amount }), json({ actionId: action.id, runId }), store.now());
+  store.run("UPDATE credit_actions SET status='committed',ledger_id=?,updated_at=? WHERE id=? AND status='reserved'", ledgerId, store.now(), actionId);
+  return store.get<RecordValue>('SELECT * FROM credit_actions WHERE id=?', actionId);
+}
+
 function runResponse(row: RecordValue) {
   return {
     id: row.id,
@@ -117,6 +140,7 @@ function runResponse(row: RecordValue) {
       deviceId: row.lease_device_id,
       expiresAt: row.lease_expires_at,
     } : null,
+    creditActionId: row.credit_action_id ?? null,
   };
 }
 
@@ -234,9 +258,12 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   const { store } = deps;
   const user = (request: RequestValue) => deps.userFromRequest(request as RecordValue);
   const admin = (request: RequestValue) => deps.adminFromRequest(request as RecordValue);
-  const ensureWorkflowFeature = (actor: RecordValue) => {
+  const ensureWorkflowFeature = (actor: RecordValue, id?: string) => {
     const features = parseJson<RecordValue>(actor.features_json, {});
     if (features.workflow === false) throw forbidden('FEATURE_DISABLED', '该账号未开通固定流程功能');
+    if (!id) return;
+    const entitlement = id.startsWith('video.') ? 'videoSearch' : id.startsWith('comment.') ? 'commentReply' : id.startsWith('live.') ? 'liveInteraction' : null;
+    if (entitlement && features[entitlement] === false) throw forbidden('FEATURE_DISABLED', `该账号未开通 ${entitlement} 功能`);
   };
   const platformAccount = (actor: RecordValue, value: unknown) => {
     if (value === undefined) return undefined;
@@ -263,7 +290,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const catalog = store.all<RecordValue>("SELECT workflow_id,version,name,contract_json FROM workflow_definitions WHERE status='active' ORDER BY workflow_id,version DESC").map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, contract: parseJson(row.contract_json, {}) }));
     if (!catalog.length) throw new AppError(503, 'WORKFLOW_CATALOG_EMPTY', '暂无可用固定流程');
     const result = await deps.planner({ intent, context, catalog });
-    const id = workflowId(result.workflowId); const version = workflowVersion(result.version); const params = runParams(result.params);
+    const id = workflowId(result.workflowId); const version = workflowVersion(result.version); const params = runParams(result.params); ensureWorkflowFeature(actor, id);
     if (!store.get<RecordValue>("SELECT workflow_id FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version)) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
     const issuedAt = store.now(); const expiresAt = issuedAt + 10 * 60 * 1000;
     const response = { planId: randomId('plan'), workflowId: id, version, params, issuedAt, expiresAt };
@@ -346,22 +373,31 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   });
 
   app.post('/v1/workflow-runs', async (request) => {
-    const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body); rejectUnknown(body, ['planId', 'workflowId', 'version', 'params', 'knowledgeSetId', 'platformAccountId', 'idempotencyKey']);
-    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const plan = planId(body.planId); const params = runParams(body.params); const key = idempotencyKey(body.idempotencyKey); const account = platformAccount(actor, body.platformAccountId);
-    const payload = { planId: plan, workflowId: id, version, params, knowledgeSetId: body.knowledgeSetId ?? null, platformAccountId: account?.id ?? null, idempotencyKey: key };
+    const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body); rejectUnknown(body, ['planId', 'workflowId', 'version', 'params', 'knowledgeSetId', 'platformAccountId', 'creditActionId', 'idempotencyKey']);
+    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const plan = planId(body.planId); const params = runParams(body.params); const key = idempotencyKey(body.idempotencyKey); const account = platformAccount(actor, body.platformAccountId); const creditActionId = body.creditActionId === undefined ? null : stringValue(body.creditActionId, 'creditActionId', 160, true) as string;
+    ensureWorkflowFeature(actor, id);
+    const payload = { planId: plan, workflowId: id, version, params, knowledgeSetId: body.knowledgeSetId ?? null, platformAccountId: account?.id ?? null, creditActionId, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,status,payload_hash FROM idempotency WHERE user_id=? AND scope=\'workflow.run\' AND idem_key=?', actor.user_id, key);
     if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同请求'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     const definition = store.get<RecordValue>("SELECT * FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version); if (!definition) throw new AppError(404, 'WORKFLOW_NOT_FOUND', '流程版本不存在或未启用');
     const issuedPlan = store.get<RecordValue>('SELECT * FROM workflow_plans WHERE id=? AND user_id=?', plan, actor.user_id);
     if (!issuedPlan || issuedPlan.status !== 'issued' || issuedPlan.expires_at <= store.now()) throw new AppError(409, 'PLAN_INVALID', '流程计划不存在、已消费或已过期');
     if (issuedPlan.workflow_id !== id || issuedPlan.workflow_version !== version || issuedPlan.params_json !== json(params)) throw conflict('PLAN_MISMATCH', '流程实例与服务端签发计划不一致');
+    if (creditActionId) {
+      const action = store.get<RecordValue>('SELECT * FROM credit_actions WHERE id=? AND user_id=?', creditActionId, actor.user_id);
+      if (!action || action.status !== 'reserved' || action.owner !== `workflow:${id}`) throw conflict('CREDIT_ACTION_BINDING_INVALID', '流程积分动作必须是当前流程的 reserved 动作');
+    }
     let knowledgeSet: RecordValue | undefined;
     if (body.knowledgeSetId !== undefined) { const knowledgeSetId = stringValue(body.knowledgeSetId, 'knowledgeSetId', 100, true) as string; knowledgeSet = store.get<RecordValue>("SELECT id,version,status FROM knowledge_sets WHERE id=? AND user_id=? AND status='active'", knowledgeSetId, actor.user_id); if (!knowledgeSet) throw new AppError(404, 'KNOWLEDGE_SET_NOT_FOUND', '知识集不存在或未启用'); }
     const runId = randomId('run'); const now = store.now();
     const result = store.transaction(() => {
       store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.run', key, hashPayload(payload), 'pending', now);
       store.run('UPDATE workflow_plans SET status=\'consumed\',consumed_at=? WHERE id=? AND user_id=? AND status=\'issued\'', now, plan, actor.user_id);
-      store.run('INSERT INTO workflow_runs(id,user_id,workflow_id,workflow_version,contract_json,plan_id,platform_account_id,params_json,knowledge_set_id,knowledge_set_version,status,checkpoint_json,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?, ?,\'PLANNED\',\'{}\',?,?,?)', runId, actor.user_id, id, version, definition.contract_json, plan, account?.id ?? null, json(params), knowledgeSet?.id ?? null, knowledgeSet?.version ?? null, key, now, now);
+      store.run('INSERT INTO workflow_runs(id,user_id,workflow_id,workflow_version,contract_json,plan_id,platform_account_id,params_json,knowledge_set_id,knowledge_set_version,status,checkpoint_json,idempotency_key,created_at,updated_at,credit_action_id) VALUES(?,?,?,?,?,?,?,?,?, ?,\'PLANNED\',\'{}\',?,?,?,?)', runId, actor.user_id, id, version, definition.contract_json, plan, account?.id ?? null, json(params), knowledgeSet?.id ?? null, knowledgeSet?.version ?? null, key, now, now, creditActionId);
+      if (creditActionId) {
+        const existing = store.get<RecordValue>('SELECT metadata_json FROM credit_actions WHERE id=?', creditActionId);
+        store.run('UPDATE credit_actions SET metadata_json=?,updated_at=? WHERE id=? AND user_id=? AND status=\'reserved\'', json({ ...parseJson(existing?.metadata_json, {}), runId }), now, creditActionId, actor.user_id);
+      }
       const row = getRun(store, actor.user_id, runId); const response = { run: runResponse(row) };
       store.run("UPDATE idempotency SET status='completed',response_json=? WHERE user_id=? AND scope='workflow.run' AND idem_key=?", json(response), actor.user_id, key);
       audit(store, 'user', actor.user_id, 'workflow.run.create', actor.user_id, { runId, workflowId: id, version, knowledgeSetId: knowledgeSet?.id ?? null, paramsHash: hashPayload(params) });
@@ -455,7 +491,12 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     if (!deps.resultDecider) throw new AppError(503, 'RESULT_DECIDER_NOT_CONFIGURED', '结果决策器未配置');
     const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary }); const decision = stringValue(result.decision, 'decision', 40, true) as string; if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || Object.keys(result).some((key) => key !== 'decision')) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策无效');
     const response = { runId, workflowId: run.workflow_id, version: run.workflow_version, decision };
-    store.transaction(() => { store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.result-decision', key, hashPayload(payload), 'completed', json(response), store.now()); audit(store, 'user', actor.user_id, 'workflow.result-decision', actor.user_id, { runId, decision }); });
+    store.transaction(() => {
+      const outcome = status === 'COMPLETED' ? 'commit' : (status === 'FAILED' || status === 'STOPPED' ? 'release' : null);
+      if (outcome) settleWorkflowCredit(store, actor.user_id, run.credit_action_id ?? null, outcome, runId);
+      store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.result-decision', key, hashPayload(payload), 'completed', json(response), store.now());
+      audit(store, 'user', actor.user_id, 'workflow.result-decision', actor.user_id, { runId, decision, creditOutcome: outcome });
+    });
     return response;
   });
 }

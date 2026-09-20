@@ -12,6 +12,8 @@ const { ProbeBridge } = require('./lib/probe-bridge');
 const { DEFAULT_SELECTOR_PROFILE, normalizeProfile } = require('./lib/selectors');
 const { TaskEngine } = require('./lib/task-engine');
 const { WorkflowRuntime } = require('./lib/workflow-runtime');
+const { createWorkflowAdapter } = require('./lib/workflow-adapter');
+const { platformWorkflowDefinitions } = require('./lib/workflow-contracts');
 const { AccountRuntimeManager } = require('./lib/account-runtime-manager');
 const { platformAccountId: normalizePlatformAccountId, platformScope, accountDataPath: scopedAccountDataPath, accountDir: scopedAccountDir, browserPartition, sidecarPort: scopedSidecarPort } = require('./lib/platform-account');
 const { targetUrl, text, safeIdempotencyKey } = require('./lib/validation');
@@ -32,6 +34,7 @@ let sessionEpoch = 0;
 let currentAccountUserId = null;
 let currentPlatformAccountId = null;
 let platformAccounts = [];
+const workflowAccountRuns = new Map();
 let loginAttempt = 0;
 let accountTransition = Promise.resolve();
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -54,13 +57,9 @@ function defaultData() {
   return { tasks: [], events: [], leads: [], logs: [], pending: [], chat: [], workflowRuns: [], selectorProfile: DEFAULT_SELECTOR_PROFILE };
 }
 
-// These are platform contracts only. The three business adapters register their
-// verified executors later; an unregistered executor must fail closed.
-const PLATFORM_WORKFLOWS = [
-  { workflowId: 'video.search', version: '1', steps: [{ stepId: 'search', retryLimit: 2 }] },
-  { workflowId: 'comment.reply_then_private', version: '1', steps: [{ stepId: 'reply_comment', retryLimit: 2, sideEffect: true }, { stepId: 'private_message', retryLimit: 2, sideEffect: true }] },
-  { workflowId: 'live.reply_then_private', version: '1', steps: [{ stepId: 'reply_public', retryLimit: 2, sideEffect: true }, { stepId: 'private_message', retryLimit: 2, sideEffect: true }] }
-];
+// These fixed contracts are the platform boundary. Adapters may execute only
+// their declared steps and must return an explicitly verifiable result.
+const PLATFORM_WORKFLOWS = platformWorkflowDefinitions();
 
 function accountDataPath(userId, platformAccount = currentPlatformAccountId) {
   return scopedAccountDataPath(app.getPath('userData'), apiEndpoint, userId || 'guest', platformAccount);
@@ -78,22 +77,27 @@ function runtimeAccountId(userId, platformAccount) {
   return platformScope({ workbenchUserId: userId || 'guest', platformAccountId: platformAccount }).runtimeAccountId;
 }
 
+function createBrowserInstance(userId, platformAccount = currentPlatformAccountId, callbacks = {}) {
+  const common = { onStatus: callbacks.onStatus || (() => {}), onEvents: callbacks.onEvents || (() => {}) };
+  return process.env.DOUYIN_ELECTRON_BRIDGE === '1'
+    ? new BrowserBridge({ parentWindow: mainWindow, getPartition: () => browserPartition(apiEndpoint, userId || 'guest', platformAccount), ...common })
+    : new ProbeBridge({ accountDir: accountDir(userId, platformAccount), port: sidecarPort(userId, platformAccount), cwd: path.resolve(__dirname, '..', '..'), resourcesPath: process.resourcesPath, packaged: app.isPackaged, ...common });
+}
+
 async function createBrowser(userId, platformAccount = currentPlatformAccountId) {
   const previous = browser;
   browser = null;
   if (previous) await previous.close?.();
   const callbackEpoch = sessionEpoch;
-  const common = {
+  browser = createBrowserInstance(userId, platformAccount, {
     onStatus: (status) => { if (callbackEpoch !== sessionEpoch) return; if (status.navigating) engine?.pauseAll('browser_navigation'); if (['captcha', 'login_required', 'unsupported'].includes(status.status)) engine?.pauseAll(`sidecar_${status.status}`); browserState = { ...browserState, ...status }; emitState(); },
     onEvents: (events) => { if (callbackEpoch !== sessionEpoch) return; void engine?.ingest(events); }
-  };
-  browser = process.env.DOUYIN_ELECTRON_BRIDGE === '1'
-    ? new BrowserBridge({ parentWindow: mainWindow, getPartition: () => browserPartition(apiEndpoint, userId || 'guest', platformAccount), ...common })
-    : new ProbeBridge({ accountDir: accountDir(userId, platformAccount), port: sidecarPort(userId, platformAccount), cwd: path.resolve(__dirname, '..', '..'), resourcesPath: process.resourcesPath, packaged: app.isPackaged, ...common });
+  });
 }
 
-function createWorkflowRuntimeForStore(store, userId = null, platformAccount = null) {
+function createWorkflowRuntimeForStore(store, userId = null, platformAccount = null, browserOverride = browser) {
   const scopedRuntimeId = runtimeAccountId(userId, platformAccount);
+  const adapter = createWorkflowAdapter({ browser: browserOverride });
   return new WorkflowRuntime({
     store,
     accountId: scopedRuntimeId,
@@ -103,15 +107,18 @@ function createWorkflowRuntimeForStore(store, userId = null, platformAccount = n
       const idempotencyKey = safeIdempotencyKey(`plan:${scopedRuntimeId}:${crypto.createHash('sha256').update(JSON.stringify({ intent, context })).digest('hex').slice(0, 48)}`);
       return api.plan({ intent, context, idempotencyKey });
     },
-    // No business adapter is implicitly trusted. Collaborators must inject a
-    // verified executor before a workflow can perform any platform action.
-    stepExecutor: null,
+    // The platform owns the adapter boundary. It can call a collaborator
+    // method, but it still maps every result through the fixed workflow
+    // contract and keeps unverified sends fail-closed.
+    stepExecutor: adapter.execute,
+    reconcileAction: adapter.reconcile,
     healthCheck: async ({ run }) => {
       if (!run.remoteRunId) return { ok: true, source: 'local-checkpoint' };
+      if (run.plan?.params?.url && typeof browserOverride?.isOpenFor === 'function' && !browserOverride.isOpenFor(run.plan.params.url)) return { ok: false, reason: 'workflow_target_not_open' };
       if (typeof api?.workflowRun !== 'function') return { ok: false, reason: 'workflow_status_api_unavailable' };
       const remote = await api.workflowRun(run.remoteRunId);
       const status = remote?.run?.status;
-      return { ok: Boolean(status && status !== 'FAILED' && status !== 'COMPLETED'), status };
+      return { ok: Boolean(status && !['FAILED', 'COMPLETED', 'STOPPED'].includes(status)), status };
     },
     onStateChange: emitState
   });
@@ -134,6 +141,14 @@ function registerWorkflowAccount(userId, platformAccount) {
 function invalidateManagedWorkflows(reason, predicate = () => true) {
   if (!workflowManager) return;
   for (const account of workflowManager.snapshot().accounts) if (predicate(account.accountId)) workflowManager.invalidate(account.accountId, reason);
+}
+
+async function closeInvalidatedWorkflows() {
+  await workflowManager?.closeInvalidated?.();
+  for (const [accountId] of workflowAccountRuns) {
+    const account = (workflowManager?.snapshot?.()?.accounts || []).find((item) => item.accountId === accountId);
+    if (!account || account.status === 'invalidated' || account.status === 'closed') workflowAccountRuns.delete(accountId);
+  }
 }
 
 function switchAccountStore(userId, reason = 'account_switch', isCurrent = () => true, platformAccount = currentPlatformAccountId) {
@@ -173,7 +188,7 @@ function assertLocalSender(event) {
 }
 
 function emitState() {
-  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, platformAccounts, platformAccountId: currentPlatformAccountId });
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, workflowAccounts: [...workflowAccountRuns.values()], platformAccounts, platformAccountId: currentPlatformAccountId });
 }
 
 async function requestResultDecision(remoteRunId, result) {
@@ -185,6 +200,23 @@ async function requestResultDecision(remoteRunId, result) {
     return { ...response, requiresManualGate: result.status === 'UNKNOWN' || result.status === 'WAITING_HUMAN' };
   } catch (error) {
     return { state: 'unavailable', code: error.code || 'RESULT_DECISION_FAILED', reason: error.message, requiresManualGate: true };
+  }
+}
+
+async function solidifyRemoteWorkflow(remoteRunId, reason) {
+  if (!remoteRunId || typeof api?.workflowRun !== 'function') return;
+  try {
+    const remote = await api.workflowRun(remoteRunId);
+    if (remote?.run?.status !== 'RUNNING') return;
+    await api.checkpointWorkflow(remoteRunId, {
+      status: 'WAITING_HUMAN',
+      stepId: String(remote.run.currentStep ?? 0),
+      expectedVersion: remote.run.checkpointVersion,
+      humanWait: { reason: String(reason || '桌面端流程异常，等待人工核对'), context: { source: 'desktop_platform' } },
+      failure: { code: 'DESKTOP_WORKFLOW_INTERRUPTED', message: String(reason || '桌面端流程异常') }
+    });
+  } catch (error) {
+    console.warn('[workflow] failed to solidify remote run', remoteRunId, error.message);
   }
 }
 
@@ -305,6 +337,7 @@ async function handleLogin(_event, input) {
     const accounts = await fetchPlatformAccounts(requestApi, response.token);
     const selected = preferredPlatformAccount(safe.user.id, accounts);
     invalidateManagedWorkflows('login_account_switch');
+    await closeInvalidatedWorkflows();
     const switched = await switchAccountStore(safe.user.id, 'login_account_switch', () => attempt === loginAttempt && requestApi === api, selected);
     if (!switched || attempt !== loginAttempt || requestApi !== api) throw new Error('登录会话已切换，请重试');
     platformAccounts = accounts;
@@ -323,6 +356,7 @@ async function handleLogout() {
   const requestApi = api;
   const requestToken = authStore.getToken();
   invalidateManagedWorkflows('logout');
+  await closeInvalidatedWorkflows();
   authStore.clear();
   await switchAccountStore(null, 'logout');
   dataStore.update((data) => { for (const task of data.tasks) if (task.status === 'running') task.status = 'license_required'; return data; });
@@ -336,6 +370,7 @@ async function configureEndpoint(_event, value) {
   if (next !== apiEndpoint) {
     loginAttempt += 1;
     invalidateManagedWorkflows('endpoint_changed');
+    await closeInvalidatedWorkflows();
     authStore.clear();
     authStore.setEndpoint(next);
     apiEndpoint = next;
@@ -380,30 +415,67 @@ async function runAgentChat(input) {
     const catalog = Array.isArray(catalogResponse?.workflows) ? catalogResponse.workflows : [];
     const registered = catalog.find((item) => item.workflowId === plan.workflowId && String(item.version) === String(plan.version) && item.status === 'active');
     if (!registered) throw new Error('授权中心未开放该固定流程');
-    const contractSteps = Array.isArray(registered.contract?.steps) ? registered.contract.steps : [];
+    const canonical = PLATFORM_WORKFLOWS.find((item) => item.workflowId === registered.workflowId && String(item.version) === String(registered.version));
+    const contractSteps = canonical?.steps || (Array.isArray(registered.contract?.steps) ? registered.contract.steps : []);
     if (!contractSteps.length) throw new Error('授权中心返回的固定流程没有可执行步骤');
     runtime.registerWorkflow({ workflowId: registered.workflowId, version: String(registered.version), steps: contractSteps });
     const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: requestedPlatform, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}:${requestedPlatform}`) });
     const remoteRunId = remote?.run?.id;
     if (!remoteRunId) throw new Error('授权中心未返回流程实例');
-    await api.acquireWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${remoteRunId}:${accountId}:${deviceId}`) });
-    await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: 0 });
-    const run = runtime.startPlan(plan);
-    accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
-    const result = await runtime.run(run.runId);
-    await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-    await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: 1, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
-    const nextDecision = await requestResultDecision(remoteRunId, result);
-    await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-    accountContext.store.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: message, at: new Date().toISOString() }, { role: 'assistant', content: `已选择固定流程 ${plan.workflowId}@${plan.version}，当前状态：${result.status}`, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
-    emitState();
-    return { plan, run: result, nextDecision };
+    let leaseHeld = false;
+    let remoteVersion = Number.isSafeInteger(remote?.run?.checkpointVersion) ? remote.run.checkpointVersion : 0;
+    try {
+      await api.acquireWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${remoteRunId}:${accountId}:${deviceId}`) });
+      leaseHeld = true;
+      const running = await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: remoteVersion });
+      remoteVersion = Number.isSafeInteger(running?.run?.checkpointVersion) ? running.run.checkpointVersion : remoteVersion + 1;
+      const run = runtime.startPlan(plan);
+      workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: { ...run, status: 'RUNNING' } });
+      emitState();
+      accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
+      const result = await runtime.run(run.runId);
+      workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
+      await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
+      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {}, humanWait: result.status === 'WAITING_HUMAN' ? { reason: result.lastError?.message || '平台适配器需要人工处理', context: result.checkpoint || {} } : undefined });
+      remoteVersion = Number.isSafeInteger(finalRemote?.run?.checkpointVersion) ? finalRemote.run.checkpointVersion : remoteVersion + 1;
+      const nextDecision = await requestResultDecision(remoteRunId, result);
+      let decisionApplied = null;
+      if (nextDecision?.decision === 'wait_human' && ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status)) {
+        decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: 'server_result_decision', checkpoint: result.checkpoint || null });
+        if (result.status !== 'WAITING_HUMAN') {
+          const humanCheckpoint = await api.checkpointWorkflow(remoteRunId, { status: 'WAITING_HUMAN', stepId: String(result.currentStep), expectedVersion: remoteVersion, humanWait: { reason: 'Agent 结果决策要求人工处理', context: result.checkpoint || {} }, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+          remoteVersion = Number.isSafeInteger(humanCheckpoint?.run?.checkpointVersion) ? humanCheckpoint.run.checkpointVersion : remoteVersion + 1;
+        }
+      } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
+        decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
+      } else if (nextDecision?.decision) {
+        decisionApplied = { action: 'suggested', decision: nextDecision.decision, requiresManualGate: true };
+      }
+      const displayRun = decisionApplied?.run || result;
+      workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: displayRun });
+      const searchResult = displayRun.steps?.find((step) => step.stepId === 'search')?.result;
+      const searchHint = searchResult?.kind === 'video_search'
+        ? `；找到 ${searchResult.videos?.length || 0} 个候选视频${(searchResult.videos || []).slice(0, 3).map((video) => `\n${video.title || video.url}`).join('')}`
+        : '';
+      const humanHint = displayRun.status === 'UNKNOWN' || displayRun.status === 'WAITING_HUMAN' || decisionApplied?.requiresManualGate ? '；需要人工处理后再继续' : '';
+      const decisionHint = nextDecision?.decision ? `；结果决策：${nextDecision.decision}` : '';
+      accountContext.store.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: message, at: new Date().toISOString() }, { role: 'assistant', content: `已选择固定流程 ${plan.workflowId}@${plan.version}，当前状态：${displayRun.status}${searchHint}${humanHint}${decisionHint}`, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
+      emitState();
+      return { plan, run: displayRun, nextDecision, decisionApplied };
+    } catch (error) {
+      if (leaseHeld) await solidifyRemoteWorkflow(remoteRunId, error.message);
+      throw error;
+    } finally {
+      if (leaseHeld) {
+        try { await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${accountId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', remoteRunId, error.message); }
+      }
+    }
   }, { idempotencyKey: requestKey, metadata: { message, platformAccountId: requestedPlatform } });
 }
 
 function registerIpc() {
   const wrap = (handler) => async (event, payload) => { assertLocalSender(event); return handler(event, payload); };
-  ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, platformAccounts, platformAccountId: currentPlatformAccountId })));
+  ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, workflowAccounts: [...workflowAccountRuns.values()], platformAccounts, platformAccountId: currentPlatformAccountId })));
   ipcMain.handle('agent:list-workflows', wrap(() => workflowRuntime.listWorkflows()));
   ipcMain.handle('platform-accounts:list', wrap(() => listPlatformAccounts()));
   ipcMain.handle('platform-accounts:select', wrap((_event, platformId) => switchPlatformAccount(platformId)));
@@ -412,7 +484,7 @@ function registerIpc() {
   ipcMain.handle('agent:resume-workflow', wrap(async (_event, input) => {
     const runId = typeof input === 'string' ? input : input?.runId;
     const requestedPlatform = typeof input === 'object' && input?.platformAccountId ? normalizePlatformAccountId(input.platformAccountId) : currentPlatformAccountId;
-    if (requestedPlatform !== currentPlatformAccountId) throw new Error('请先切换到该流程所属的平台账号后再恢复，系统不会跨账号恢复流程');
+    if (!requestedPlatform || !platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('目标平台账号不属于当前工作台或已停用');
     const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
     const normalizedRunId = text(runId, 'run id', 160);
     const deviceId = authStore.getDevice().id;
@@ -425,20 +497,42 @@ function registerIpc() {
         throw new Error(`当前选中的平台账号没有该流程，已拒绝恢复：${error.message}`);
       }
       let remoteVersion = null;
-      if (local.remoteRunId) await api.acquireWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${local.remoteRunId}:${accountId}:${local.runId}:${deviceId}`) });
-      const health = await runtime.checkHealth(local.runId);
-      if (local.remoteRunId) {
-        const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: health.checksPassed, userConfirmed: true, reason: 'desktop_manual_resume' });
-        remoteVersion = Number.isSafeInteger(recovered?.run?.checkpointVersion) ? recovered.run.checkpointVersion : null;
+      let leaseHeld = false;
+      try {
+        if (local.remoteRunId) {
+          await api.acquireWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${local.remoteRunId}:${accountId}:${local.runId}:${deviceId}`) });
+          leaseHeld = true;
+        }
+        const health = await runtime.checkHealth(local.runId);
+        if (local.remoteRunId) {
+          const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: health.checksPassed, userConfirmed: true, reason: 'desktop_manual_resume' });
+          remoteVersion = Number.isSafeInteger(recovered?.run?.checkpointVersion) ? recovered.run.checkpointVersion : null;
+        }
+        const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true });
+        workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
+        if (local.remoteRunId && remoteVersion != null) {
+          await api.renewWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${local.remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
+          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {}, humanWait: result.status === 'WAITING_HUMAN' ? { reason: result.lastError?.message || '平台适配器需要人工处理', context: result.checkpoint || {} } : undefined });
+          remoteVersion = Number.isSafeInteger(checkpoint?.run?.checkpointVersion) ? checkpoint.run.checkpointVersion : remoteVersion + 1;
+        }
+        const nextDecision = await requestResultDecision(local.remoteRunId, result);
+        let decisionApplied = null;
+        if (nextDecision?.decision === 'wait_human' && ['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'PAUSED'].includes(result.status)) {
+          decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: 'server_result_decision', checkpoint: result.checkpoint || null });
+        } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
+          decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
+        } else if (nextDecision?.decision) {
+          decisionApplied = { action: 'suggested', decision: nextDecision.decision, requiresManualGate: true };
+        }
+        emitState(); return { ...(decisionApplied?.run || result), nextDecision, decisionApplied };
+      } catch (error) {
+        if (leaseHeld) await solidifyRemoteWorkflow(local.remoteRunId, error.message);
+        throw error;
+      } finally {
+        if (leaseHeld) {
+          try { await api.releaseWorkflowLease(local.remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${local.remoteRunId}:${local.runId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', local.remoteRunId, error.message); }
+        }
       }
-      const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true });
-      if (local.remoteRunId && remoteVersion != null) {
-        await api.renewWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${local.remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-        await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
-      }
-      const nextDecision = await requestResultDecision(local.remoteRunId, result);
-      if (local.remoteRunId) await api.releaseWorkflowLease(local.remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${local.remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-      emitState(); return { ...result, nextDecision };
     }, { taskId: `resume:${normalizedRunId}`, metadata: { platformAccountId: requestedPlatform } });
   }));
   ipcMain.handle('agent:pause-workflow', wrap(async (_event, runId) => {
@@ -461,7 +555,7 @@ function registerIpc() {
   ipcMain.handle('credits:redeem', wrap(handleRedeem));
   ipcMain.handle('credits:ledger', wrap(async () => { if (!authStore.getToken()) throw new Error('请先登录'); const requestEpoch = sessionEpoch; const requestApi = api; const requestToken = authStore.getToken(); const result = await requestApi.ledger(requestToken); if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，台账未应用'); return Array.isArray(result) ? result : result.entries || result.ledger || result.items || []; }));
   ipcMain.handle('browser:open', wrap(async (_event, url) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const requested = targetUrl(url); engine.pauseAll('browser_navigation'); const finalUrl = await requestBrowser.open(requested); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，页面结果已丢弃'); if (finalUrl && finalUrl !== requested) dataStore.update((data) => ({ ...data, tasks: data.tasks.map((task) => task.url === requested ? { ...task, url: finalUrl, updatedAt: new Date().toISOString() } : task) })); return browserState; }));
-  ipcMain.handle('browser:search', wrap(async (_event, input) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const result = await requestBrowser.search(text(input?.keyword, 'keyword', 200), Number(input?.maxVideos || 20), Number(input?.scrollRounds || 2)); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索结果已丢弃'); return result; }));
+  ipcMain.handle('browser:search', wrap(async (_event, input) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const result = await requestBrowser.search({ keyword: text(input?.keyword, 'keyword', 200), maxVideos: Number(input?.maxVideos || 20), scrollRounds: Number(input?.scrollRounds || 2), cursor: input?.cursor || undefined, minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索结果已丢弃'); return result; }));
   ipcMain.handle('browser:close', wrap(() => browser.close()));
   ipcMain.handle('selectors:probe', wrap(async (_event, profile) => {
     const normalized = normalizeProfile(profile || currentProfile());
@@ -520,8 +614,9 @@ async function boot() {
       const platformAccount = options?.platformAccountId;
       if (!userId || !platformAccount || accountId !== runtimeAccountId(userId, platformAccount)) throw new Error('工作流账号上下文范围无效');
       const store = new JsonStore(accountDataPath(userId, platformAccount), defaultData);
-      const runtime = createWorkflowRuntimeForStore(store, userId, platformAccount);
-      return { accountId, store, runtime };
+      const accountBrowser = createBrowserInstance(userId, platformAccount);
+      const runtime = createWorkflowRuntimeForStore(store, userId, platformAccount, accountBrowser);
+      return { accountId, store, runtime, close: () => accountBrowser.close() };
     }
   });
   // Read the encrypted token before clearing the cached display license. This

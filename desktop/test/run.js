@@ -9,6 +9,8 @@ const { targetUrl, selectorProfile } = require('../src/lib/validation');
 const { ApiClient, ApiError } = require('../src/lib/api-client');
 const { TaskEngine } = require('../src/lib/task-engine');
 const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
+const { createWorkflowAdapter } = require('../src/lib/workflow-adapter');
+const { platformWorkflowDefinitions } = require('../src/lib/workflow-contracts');
 const { AuthStore } = require('../src/lib/auth-store');
 const { platformScope, accountDataPath, browserPartition, sidecarPort } = require('../src/lib/platform-account');
 const { AccountRuntimeManager } = require('../src/lib/account-runtime-manager');
@@ -20,6 +22,37 @@ function testAsync(name, fn) { pendingTests.push((async () => { try { await fn()
 
 test('normalizes bare host and rejects credential-bearing or unsupported target URLs', () => { assert.throws(() => targetUrl('https://u:p@douyin.com/video/1')); assert.throws(() => targetUrl('https://foo.douyin.com/video/1')); assert.equal(targetUrl('https://douyin.com/video/1'), 'https://www.douyin.com/video/1'); assert.equal(targetUrl('https://www.douyin.com/video/1'), 'https://www.douyin.com/video/1'); });
 test('allows empty optional selectors and CSS combinators', () => { assert.equal(selectorProfile({ commentNode: '.row > .comment', replyButton: '' }).replyButton, ''); });
+testAsync('platform workflow adapter forwards search paging and keeps unverified sends fail-closed', async () => {
+  const calls = [];
+  const browser = {
+    search: async (params) => { calls.push({ type: 'search', params }); return { status: 'ok', videos: [{ url: 'https://www.douyin.com/video/1' }], cursor: 'next', hasMore: true }; },
+    canSend: () => false,
+    sendReply: async () => { calls.push({ type: 'send' }); return { status: 'sent_confirmed' }; }
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const search = await adapter.execute({ run: { runId: 'search-1', workflowId: 'video.search' }, plan: { params: { keyword: '暴雨末日', maxVideos: 10, cursor: 'cursor-1', minRelevance: 70 } }, step: { stepId: 'search' } });
+  assert.equal(search.status, 'completed');
+  assert.deepEqual(calls[0], { type: 'search', params: { keyword: '暴雨末日', maxVideos: 10, scrollRounds: 2, cursor: 'cursor-1', page: undefined, minRelevance: 70, strict: false } });
+  const blocked = await adapter.execute({ run: { runId: 'comment-1', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c1', roomId: 'https://www.douyin.com/video/1', authorId: 'u1', text: '多少钱' }, publicReply: '请问您想了解哪个型号？' } }, step: { stepId: 'reply_comment' } });
+  assert.equal(blocked.status, 'wait_human');
+  assert.equal(calls.filter((item) => item.type === 'send').length, 0);
+  const mismatch = await adapter.execute({ run: { runId: 'comment-mismatch', workflowId: 'comment.reply_then_private' }, plan: { params: { keywords: ['价格'], target: { id: 'c2', roomId: 'https://www.douyin.com/video/1', authorId: 'u2', text: '天气不错' }, publicReply: '不应发送' } }, step: { stepId: 'reply_comment' } });
+  assert.equal(mismatch.error.code, 'TARGET_KEYWORD_MISMATCH');
+  const publicOnly = createWorkflowAdapter({ browser: { canSend: () => true, sendReply: async () => { calls.push({ type: 'public-fallback' }); return { status: 'sent_confirmed' }; } } });
+  const privateBlocked = await publicOnly.execute({ run: { runId: 'private-missing', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c3', roomId: 'https://www.douyin.com/video/1', authorId: 'u3', text: '价格' }, keywords: ['价格'], privateReply: '不应公开发送' } }, step: { stepId: 'private_message' }, action: { actionId: 'a-private-missing', idempotencyKey: 'idem-private-missing' } });
+  assert.equal(privateBlocked.error.code, 'PRIVATE_ADAPTER_UNAVAILABLE');
+  assert.equal(calls.filter((item) => item.type === 'public-fallback').length, 0);
+});
+testAsync('platform workflow adapter exposes only explicit confirmed delivery', async () => {
+  const browser = { canSend: () => true, isOpenFor: () => true, sendReply: async () => ({ status: 'sent_confirmed', sendId: 's1' }), sendPrivate: async () => ({ status: 'sent_confirmed', sendId: 's2' }) };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'comment-2', workflowId: 'comment.reply_then_private' };
+  const plan = { params: { keywords: ['多少钱'], target: { id: 'c1', roomId: 'https://www.douyin.com/video/1', authorId: 'u1', authorName: '小王', text: '多少钱' }, publicReply: '公开回复', privateReply: '私信回复' } };
+  const publicResult = await adapter.execute({ run, plan, step: { stepId: 'reply_comment' }, action: { actionId: 'a-public', idempotencyKey: 'idem-public' } });
+  assert.deepEqual(publicResult.result, { deliveryStatus: 'sent_confirmed', reason: null, sendId: 's1' });
+  const privateResult = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { actionId: 'a-private', idempotencyKey: 'idem-private' } });
+  assert.deepEqual(privateResult.result, { deliveryStatus: 'sent_confirmed', reason: null, sendId: 's2' });
+});
 test('JsonStore commits only after atomic flush', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { events: [] }); store.set({ events: [{ id: 'one' }] }); const reopened = new JsonStore(file, { events: [] }); assert.equal(reopened.get().events[0].id, 'one'); });
 test('JsonStore refuses corrupted or inaccessible data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const broken = path.join(dir, 'broken.json'); fs.writeFileSync(broken, '{bad'); assert.throws(() => new JsonStore(broken, {}), /存储损坏/); const parentFile = path.join(dir, 'parent'); fs.writeFileSync(parentFile, 'file'); assert.throws(() => new JsonStore(path.join(parentFile, 'data.json'), { value: 1 }), /目录不可读/); });
 test('JsonStore selects the highest valid revision and requires recovery after primary corruption', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); fs.writeFileSync(file, '{broken'); for (const revision of [1, 2]) { const value = { revision }; fs.writeFileSync(`${file}.v-${revision}-fixture`, JSON.stringify({ format: 1, revision, checksum: checksum(value), value })); } const store = new JsonStore(file, {}); assert.equal(store.get().revision, 2); assert.equal(store.recoveryRequired, true); });
@@ -143,6 +176,96 @@ testAsync('workflow model decision rejects fields outside workflowId/version/par
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
   const runtime = new WorkflowRuntime({ store, accountId: 'account-a', modelDecider: async () => ({ workflowId: 'strict.fixture', version: '1', params: {}, steps: ['model-controlled'] }) });
   await assert.rejects(runtime.planFromIntent('模型不能改步骤'), /unsupported fields/);
+});
+
+test('platform workflow contracts keep public reply before private follow-up', () => {
+  const contracts = platformWorkflowDefinitions();
+  const comment = contracts.find((item) => item.workflowId === 'comment.reply_then_private');
+  const live = contracts.find((item) => item.workflowId === 'live.reply_then_private');
+  assert.deepEqual(comment.steps.map((step) => step.stepId), ['reply_comment', 'private_message']);
+  assert.deepEqual(live.steps.map((step) => step.stepId), ['reply_public', 'private_message']);
+  for (const definition of [comment, live]) {
+    assert.deepEqual(definition.steps[0].successStatuses, ['sent_confirmed']);
+    assert.deepEqual(definition.steps[1].requiresPrevious.resultStatuses, ['sent_confirmed']);
+    assert.equal(definition.steps[1].requiresPrevious.stepId, definition.steps[0].stepId);
+  }
+  // A caller cannot mutate the process-wide definitions through the returned copy.
+  comment.steps[0].stepId = 'tampered';
+  assert.equal(platformWorkflowDefinitions().find((item) => item.workflowId === comment.workflowId).steps[0].stepId, 'reply_comment');
+});
+
+testAsync('comment workflow blocks private message when public delivery is unknown', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-comment-gate-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = platformWorkflowDefinitions().find((item) => item.workflowId === 'comment.reply_then_private');
+  const calls = [];
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: {} }),
+    workflows: [definition],
+    stepExecutor: async ({ step }) => {
+      calls.push(step.stepId);
+      return { status: 'completed', result: { deliveryStatus: 'sent_unknown', evidence: { source: 'fixture' } } };
+    }
+  });
+  const run = runtime.startPlan(await runtime.planFromIntent('评论命中后先公开回复，再私信'));
+  const result = await runtime.run(run.runId);
+  assert.equal(result.status, RUN_STATES.UNKNOWN);
+  assert.deepEqual(calls, ['reply_comment']);
+  assert.equal(result.steps[0].resultStatus, 'sent_unknown');
+  assert.throws(() => runtime.applyResultDecision(run.runId, 'retry'), (error) => error.code === 'RESULT_REQUIRES_RECONCILIATION');
+  const waiting = runtime.applyResultDecision(run.runId, 'wait_human', { reason: '请核对公开回复是否已送达' });
+  assert.equal(waiting.action, 'wait_human');
+  assert.equal(waiting.run.status, RUN_STATES.WAITING_HUMAN);
+  assert.deepEqual(calls, ['reply_comment']);
+});
+
+testAsync('live workflow executes private follow-up only after confirmed public delivery', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-live-gate-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = platformWorkflowDefinitions().find((item) => item.workflowId === 'live.reply_then_private');
+  const calls = [];
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-live',
+    modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: { roomId: 'fixture-room' } }),
+    workflows: [definition],
+    stepExecutor: async ({ step }) => {
+      calls.push(step.stepId);
+      return { status: 'completed', result: { deliveryStatus: 'sent_confirmed', evidence: { source: 'fixture-only' } } };
+    }
+  });
+  const run = runtime.startPlan(await runtime.planFromIntent('直播间命中后公屏回复再私信'));
+  const result = await runtime.run(run.runId);
+  assert.equal(result.status, RUN_STATES.COMPLETED);
+  assert.deepEqual(calls, ['reply_public', 'private_message']);
+  assert.equal(result.steps[0].resultStatus, 'sent_confirmed');
+  assert.equal(result.steps[1].resultStatus, 'sent_confirmed');
+});
+
+testAsync('known failed result can be retried by decision while unknown cannot be blindly retried', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-result-transition-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = { workflowId: 'retry.fixture', version: '1', steps: [{ stepId: 'safe', retryLimit: 0 }] };
+  let attempts = 0;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    workflows: [definition],
+    stepExecutor: async () => { attempts += 1; return attempts === 1 ? { status: 'failed', error: { code: 'KNOWN_FAILURE' } } : { status: 'completed' }; }
+  });
+  const run = runtime.startPlan({ workflowId: definition.workflowId, version: definition.version, params: {} });
+  const failed = await runtime.run(run.runId);
+  assert.equal(failed.status, RUN_STATES.FAILED);
+  const retry = runtime.applyResultDecision(run.runId, 'retry');
+  assert.equal(retry.action, 'run');
+  const completed = await runtime.run(run.runId);
+  assert.equal(completed.status, RUN_STATES.COMPLETED);
+  assert.equal(attempts, 2);
+  const stopped = runtime.applyResultDecision(run.runId, 'complete');
+  assert.equal(stopped.action, 'complete');
+  assert.equal(stopped.run.status, RUN_STATES.COMPLETED);
 });
 
 testAsync('workflow short retry exhaustion becomes UNKNOWN and manual resume reuses the frozen plan', async () => {

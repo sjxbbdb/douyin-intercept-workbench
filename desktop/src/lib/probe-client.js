@@ -13,7 +13,11 @@ function integer(value, name, min, max) { if (!Number.isInteger(value) || value 
 function validateParams(method, params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new ProbeError('侧车参数必须是对象', 'SIDECAR_INVALID_PARAMS');
   if (method === 'open') return { url: requireUrl(params.url) };
-  if (method === 'search') return { keyword: requireText(params.keyword, 'keyword', 200), maxVideos: integer(params.maxVideos ?? 20, 'maxVideos', 1, 100), scrollRounds: integer(params.scrollRounds ?? 2, 'scrollRounds', 0, 30) };
+  if (method === 'search') {
+    const result = { keyword: requireText(params.keyword, 'keyword', 200), maxVideos: integer(params.maxVideos ?? 20, 'maxVideos', 1, 100), scrollRounds: integer(params.scrollRounds ?? 2, 'scrollRounds', 0, 30), minRelevance: integer(params.minRelevance ?? 0, 'minRelevance', 0, 100) };
+    if (params.cursor != null && params.cursor !== '') result.cursor = requireText(params.cursor, 'cursor', 400000);
+    return result;
+  }
   if (method === 'collect_comments') return { url: requireUrl(params.url), maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500), scrollRounds: integer(params.scrollRounds ?? 0, 'scrollRounds', 0, 40) };
   if (method === 'collect_live') return { url: requireUrl(params.url), maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500) };
   if (method === 'send_private' || method === 'send_comment') {
