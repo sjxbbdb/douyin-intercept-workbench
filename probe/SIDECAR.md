@@ -31,6 +31,17 @@ those. `dedupeAuthors` keeps one entry per commenter (highest `digg` wins);
 entries without an `authorId` are never merged with each other. This is the
 filter step of `images/11-comment-area-business`; it is covered by offline
 regression tests and needs no browser.
+`search` reads one page at a time. Call it without `cursor` to start from the
+first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
+`skippedSeen`. Pass that `cursor` back to read the next page: the tool keeps
+scrolling the same owned tab instead of reloading the first page, and any video
+already in the cursor pool is filtered out. The cursor is opaque to the host —
+the host only stores and returns it — but it is still validated on the
+boundary: a cursor issued for another keyword, an unsupported version, or a
+pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
+page yields no new video, which is the host signal to stop paging.
+`platformHasMore` / `platformCursor` mirror what the platform response body
+reported; they are read-only telemetry and are never replayed against the API.
 
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
@@ -97,4 +108,3 @@ Unverified boundaries, to be resolved before any release switch: the live
 selectors remain fixture-validated only, the platform has not been observed to
 publish an author id for every live comment, and phase-two delivery keeps the
 same `unknown` semantics as the other send paths.
-

@@ -367,7 +367,7 @@ def _absorb_search_dom(page, videos, stats):
 
 
 def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
-                  strict=False, meta=None, scroll_pause=2.0):
+                  strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
     """按关键词搜视频。返回 [{aweme_id, desc, author, url, ...}]。
 
     逐轮：吃接口响应体 -> 吃 DOM 兜底 -> 滚一屏。连续 idle_rounds 轮没新增，
@@ -376,6 +376,16 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     strict=True 时只保留 desc 命中关键词的视频（用 video_matches_keyword），
     默认 False —— 搜索本身已经是关键词匹配，再筛一遍属于可选收紧。
     meta（传 dict 时）会回填本轮的真实统计。
+
+    —— 分页（架构依据 images/10-video-search-flow：「读取一页结果 ->
+       按固定条件筛选并去重 -> 保存视频池与搜索游标 -> 申请下一轮搜索」）——
+
+    navigate=False：不自己导航，由调用方保证当前就停在该关键词的搜索页上。
+        这样重复调用会【从当前滚动位置继续往下】，一次调用就是「读取一页」。
+        （基线写死了每次都要 Page.navigate，等于每次都从第一页重来，没法翻页。）
+    seen_ids：视频池里已经有的 aweme_id，返回前全部剔掉 —— 这就是「筛选并去重」。
+        宿主把每页结果并进视频池，游标由宿主保存（数据归属见 images/19）。
+        统计里 skipped_seen 给出被去重掉的条数，方便判断是不是到头了。
     """
     info = meta if isinstance(meta, dict) else {}
     info.setdefault("api_responses", 0)
@@ -389,19 +399,23 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     cdpmod.ensure_domains(page, "Network")
     rec = cdpmod.NetworkRecorder(page, lambda u: SEARCH_API_MARK in (u or ""))
 
-    page.call("Page.navigate", {"url": SEARCH_URL % quote(keyword)}, timeout=25)
-    deadline = time.time() + 25
-    while time.time() < deadline:
-        try:
-            if page.evaluate("document.readyState") == "complete":
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
+    info["navigated"] = bool(navigate)
+    if navigate:
+        page.call("Page.navigate", {"url": SEARCH_URL % quote(keyword)}, timeout=25)
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            try:
+                if page.evaluate("document.readyState") == "complete":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
 
     info["visible"] = douyin.ensure_visible(page, log=log)
-    time.sleep(6.0)  # 结果流懒加载，给足首屏时间
+    # 续页（navigate=False）时页面已经渲染好了，不用再等首屏；重新导航才给足懒加载时间。
+    time.sleep(6.0 if navigate else 1.5)
 
+    seen = set(str(x) for x in (seen_ids or ()))
     videos, idle = {}, 0
     for i in range(scroll_rounds + 1):
         cap = douyin.captcha_probe(page)
@@ -416,8 +430,9 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
         dom_added = 0
         if not videos or info["api_responses"] == 0:
             dom_added = _absorb_search_dom(page, videos, info)
-        if len(videos) >= max_videos:
-            log("达到 max_videos=%d，停止滚动" % max_videos)
+        fresh_n = sum(1 for k in videos if k not in seen)
+        if fresh_n >= max_videos:
+            log("本页已收集到 %d 条新视频（max_videos=%d），停止滚动" % (fresh_n, max_videos))
             break
         if api_added + dom_added == 0:
             idle += 1
@@ -442,7 +457,14 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     info["segments"] = keyword_segments(keyword)
 
     kept = [v for v in all_videos if v["keyword_hit"]] if strict else all_videos
-    info["kept"] = len(kept)
+    # 「按固定条件筛选并去重」：池里已有的全部剔掉，返回的才是这一页的新结果
+    fresh = [v for v in kept if v["aweme_id"] not in seen]
+    info["skipped_seen"] = len(kept) - len(fresh)
+    info["kept"] = len(fresh)
+    # 平台响应体里的分页信号：只作为【观测】返回，不用来直调接口
+    # （直调需要伪造签名，属红线，不碰）。
+    info["platform_cursor"] = info.get("api_cursor")
+    info["platform_has_more"] = info.get("api_has_more")
 
     log("搜索关键词          : %s" % keyword)
     log("关键词分词          : %s" % (info["segments"] or "(无)"))
@@ -452,8 +474,11 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     log("DOM 兜底卡片        : %d 个" % info["dom_cards"])
     log("标题命中关键词      : %d 个" % info["keyword_hit"])
     log("滚动通道            : %s" % info["scroll_via"])
-    log("最终保留            : %d 个%s" % (len(kept), "（strict）" if strict else ""))
-    return kept
+    log("池内已去重          : %d 个" % info["skipped_seen"])
+    log("本页新视频          : %d 个%s" % (len(fresh), "（strict）" if strict else ""))
+    log("平台分页信号        : has_more=%s cursor=%s"
+        % (info.get("platform_has_more"), str(info.get("platform_cursor"))[:24]))
+    return fresh
 
 
 def _page_says_no_more(page):

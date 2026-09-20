@@ -1012,5 +1012,158 @@ class CommentFilterTests(unittest.TestCase):
 
 
 
+class SearchPagingTests(unittest.TestCase):
+    """视频搜索分页（搜索游标）的离线回归。
+
+    架构依据 images/10-video-search-flow：
+        读取一页结果 -> 按固定条件筛选并去重 -> 保存视频池与搜索游标 -> 申请下一轮搜索
+    这些用例不碰浏览器、不建临时目录。
+    """
+
+    def _instance(self, url=None):
+        import sidecar
+        page = FakeSearchPage(url)
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        return sidecar, instance, page
+
+    def test_cursor_round_trip(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1", "2"}, 3)
+        seen, page_no = sidecar._decode_cursor(token, "宝宝辅食")
+        self.assertEqual(seen, {"1", "2"})
+        self.assertEqual(page_no, 3)
+        self.assertEqual(sidecar._decode_cursor(None, "宝宝辅食"), (set(), 1))
+        self.assertEqual(sidecar._decode_cursor("", "宝宝辅食"), (set(), 1))
+
+    def test_cursor_is_rejected_when_it_does_not_match(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1"}, 2)
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(token, "别的关键词")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor("!!!not-base64!!!", "宝宝辅食")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(12345, "宝宝辅食")
+
+    def test_unsupported_cursor_version_is_rejected(self):
+        import base64
+        import json
+        import sidecar
+        raw = json.dumps({"v": 99, "k": "宝宝辅食", "n": 2, "seen": []}).encode("utf-8")
+        token = base64.urlsafe_b64encode(raw).decode("ascii")
+        with self.assertRaises(sidecar.SidecarError):
+            sidecar._decode_cursor(token, "宝宝辅食")
+
+    def test_first_page_navigates_and_second_page_reuses_the_tab(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+            second = instance.search({"keyword": "宝宝辅食", "maxVideos": 5,
+                                      "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+        first_ids = [v["id"] for v in first["videos"]]
+        second_ids = [v["id"] for v in second["videos"]]
+        self.assertEqual(first_ids, ["1", "2", "3", "4", "5"])
+        self.assertEqual(second_ids, ["6", "7", "8", "9", "10"])
+        self.assertEqual(set(first_ids) & set(second_ids), set())
+        self.assertEqual(first["page"], 1)
+        self.assertEqual(second["page"], 2)
+        self.assertEqual(first["poolSize"], 5)
+        self.assertEqual(second["poolSize"], 10)
+        self.assertTrue(first["hasMore"] and second["hasMore"])
+        self.assertTrue(calls[0]["navigate"], "第一页必须自己导航")
+        self.assertFalse(calls[1]["navigate"], "续页不能重新导航，否则又从第一页开始")
+        self.assertEqual(calls[1]["seen"], {"1", "2", "3", "4", "5"})
+        self.assertEqual(first["platformCursor"], "pc-1")
+
+    def test_continuing_renavigates_when_the_tab_left_the_search_page(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance(url="https://www.douyin.com/video/123")
+        calls = []
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search(calls)
+        try:
+            first = instance.search({"keyword": "宝宝辅食", "maxVideos": 5})
+            instance.search({"keyword": "宝宝辅食", "maxVideos": 5, "cursor": first["cursor"]})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertTrue(calls[1]["navigate"], "已经不在搜索页上时必须重新导航")
+
+    def test_empty_page_means_the_pool_is_exhausted(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = lambda *a, **k: []
+        try:
+            result = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(result["videos"], [])
+        self.assertFalse(result["hasMore"], "一页都没有新视频 -> 告诉宿主可以停了")
+
+    def test_search_rejects_cursor_from_another_keyword(self):
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        token = sidecar._encode_cursor("别的关键词", {"1"}, 2)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "cursor": token})
+
+
+class FakeSearchPage:
+    """search 只需要 location.href；续页时靠它判断"还在不在搜索页上"。"""
+
+    def __init__(self, url=None):
+        self.url = url or "https://www.douyin.com/search/x?type=general"
+
+    def evaluate(self, expression):
+        if expression == "location.href":
+            return self.url
+        return None
+
+    def close(self):
+        pass
+
+
+def make_fake_search(calls):
+    """假的 search_videos：池子固定 20 条，按 seen_ids 返回下一页的 5 条。"""
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        seen = set(str(x) for x in (seen_ids or ()))
+        calls.append({"navigate": navigate, "seen": seen})
+        pool = [{"aweme_id": str(i), "url": "https://www.douyin.com/video/%d" % i,
+                 "desc": "标题%d" % i, "author": "作者", "author_sec_uid": "SEC"}
+                for i in range(1, 21)]
+        out = [v for v in pool if v["aweme_id"] not in seen][:5]
+        if isinstance(meta, dict):
+            # 按【真实 crawl.search_videos 的 meta 契约】填：
+            # 它会把平台的 api_cursor / api_has_more 映射成 platform_cursor / platform_has_more，
+            # 并给出 skipped_seen。假函数必须照这个契约来，否则测的不是真东西。
+            meta["skipped_seen"] = 0
+            meta["api_cursor"] = "pc-1"
+            meta["api_has_more"] = 1
+            meta["platform_cursor"] = "pc-1"
+            meta["platform_has_more"] = 1
+        return out
+
+    return fake
+
+
 if __name__ == "__main__":
     unittest.main()

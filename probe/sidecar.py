@@ -5,6 +5,7 @@ handles one request, which makes parent cancellation an unambiguous stop: a
 started send remains durable and therefore is not retried automatically.
 """
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
@@ -47,6 +48,54 @@ def _err_message(value):
 
 def _iso(ts=None):
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ---------- 搜索游标（架构依据 images/10-video-search-flow）----------
+#
+# 图 10 要求：「读取一页结果 -> 按固定条件筛选并去重 -> 保存视频池与搜索游标
+# -> 尚未达到上限？ -> 申请下一轮搜索」。所以 search 必须能【续页】。
+#
+# 游标对宿主是【不透明】的：宿主只负责原样保存和回传，不解析内容。
+# 但它仍然来自外部，所以和 url / sendId 一样必须在边界上做校验。
+#
+# 🔴 为什么不直接用平台响应体里的 cursor 去直调接口：那需要伪造签名，属红线，不碰。
+#    分页靠的是「页面继续往下滚」；游标里记的是【视频池 + 页码】，
+#    去重由 crawl.search_videos(seen_ids=...) 负责。平台自己的 has_more / cursor
+#    只作为观测信号一起返回，供宿主记录，不作为翻页依据。
+
+CURSOR_VERSION = 1
+CURSOR_MAX_SEEN = 20000
+
+
+def _encode_cursor(keyword, seen, page_no):
+    payload = {"v": CURSOR_VERSION, "k": keyword, "n": int(page_no),
+               "seen": sorted(str(x) for x in seen)}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(value, keyword):
+    """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。"""
+    if value in (None, ""):
+        return set(), 1
+    if not isinstance(value, str) or len(value) > 400000:
+        raise SidecarError("invalid_input", "cursor is invalid")
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8"))
+    except Exception:
+        raise SidecarError("invalid_input", "cursor is not decodable")
+    if not isinstance(payload, dict) or payload.get("v") != CURSOR_VERSION:
+        raise SidecarError("invalid_input", "cursor version is not supported")
+    if payload.get("k") != keyword:
+        raise SidecarError("invalid_input", "cursor does not belong to this keyword")
+    seen = payload.get("seen")
+    if not isinstance(seen, list) or len(seen) > CURSOR_MAX_SEEN:
+        raise SidecarError("invalid_input", "cursor pool is invalid")
+    try:
+        page_no = int(payload.get("n") or 1)
+    except (TypeError, ValueError):
+        page_no = 1
+    return set(str(x) for x in seen), page_no
 
 
 def _fingerprint(source, room_id, author_id, text):
@@ -270,6 +319,12 @@ class Sidecar:
                                                "delivery": "queued_batch_two_phase",
                                                "scripts": "host_provided_only",
                                                "window": "expired_events_are_not_replayed"}},
+                # 图 10 的分页能力：search 支持不透明游标续页。
+                # 只读/只翻页，不涉及发送，因此不参与发送闸门。
+                "video_search_paging": {"implemented": True, "autoEligible": True,
+                                        "cursorVersion": CURSOR_VERSION,
+                                        "validation": {"status": "offline_fixture",
+                                                       "delivery": "paging_only"}},
             },
             "limits": dict(self.gate.limits),
             "accountScope": self.account_scope,
@@ -372,22 +427,48 @@ class Sidecar:
             page.close()
 
     def search(self, params):
+        """按关键词搜视频，支持【分页】（架构依据 images/10-video-search-flow）。
+
+        一次调用 = 读取一页结果：
+          · 不带 cursor        -> 从搜索页第一页开始，返回这一页 + 下一页的 cursor；
+          · 带上一次返回的 cursor -> 接着往下读一页，池里已有的会先被去重掉。
+        宿主负责保存视频池与游标（数据归属见 images/19），并据此判断是否申请下一轮。
+
+        新增字段（都是加法式，老调用方只看 videos 也不受影响）：
+          cursor / hasMore / page / poolSize / skippedSeen
+          platformHasMore / platformCursor（平台响应体的观测值，只读，不用来直调接口）
+        """
         keyword = params.get("keyword")
         if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > MAX_KEYWORD:
             raise SidecarError("invalid_input", "keyword is required")
+        keyword = keyword.strip()
         max_videos = int(params.get("maxVideos", 50))
         rounds = int(params.get("scrollRounds", 6))
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
+
+        cursor_in = params.get("cursor")
+        seen, page_no = _decode_cursor(cursor_in, keyword)
+
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
-                return {"status": "login_required", "videos": []}
+                return {"status": "login_required", "videos": [], "cursor": cursor_in,
+                        "hasMore": False, "page": page_no, "poolSize": len(seen)}
+            # 只有【第一页】或【已经不在搜索页上】才重新导航；
+            # 否则保持页面原状、继续往下滚 —— 这才是"读取下一页"。
+            first_page = cursor_in in (None, "")
+            try:
+                here = page.evaluate("location.href") or ""
+            except Exception:
+                here = ""
+            navigate = first_page or ("/search/" not in here)
             meta = {}
             with contextlib.redirect_stdout(sys.stderr):
                 videos = crawlmod.search_videos(page, keyword, scroll_rounds=rounds,
                                                 max_videos=max_videos, log=lambda *a: None,
-                                                strict=False, meta=meta)
+                                                strict=False, meta=meta,
+                                                navigate=navigate, seen_ids=seen)
             out = []
             for video in videos[:max_videos]:
                 out.append({"id": str(video.get("aweme_id") or ""),
@@ -395,8 +476,17 @@ class Sidecar:
                             "title": str(video.get("desc") or "")[:200],
                             "author": str(video.get("author") or "")[:120],
                             "authorId": str(video.get("author_sec_uid") or "")[:200]})
+            pool = set(seen) | {v["id"] for v in out if v["id"]}
+            # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
             return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
-                    "videos": out}
+                    "videos": out,
+                    "cursor": _encode_cursor(keyword, pool, page_no + 1),
+                    "hasMore": bool(out),
+                    "page": page_no,
+                    "poolSize": len(pool),
+                    "skippedSeen": int(meta.get("skipped_seen") or 0),
+                    "platformHasMore": meta.get("platform_has_more"),
+                    "platformCursor": meta.get("platform_cursor")}
         finally:
             page.close()
 
