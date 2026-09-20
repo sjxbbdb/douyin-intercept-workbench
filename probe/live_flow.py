@@ -249,51 +249,15 @@ class LiveQueue:
 
         Events older than the window are marked 'expired' first and can never be
         replayed by a later batch.  An open (planned, not yet frozen) batch is
-        returned as-is so a host retry cannot create two batches at once — but
-        only while it is still inside its own window.
-
-        Three states the previous revision got wrong:
-
-        1. An open batch past its expires_at is retired, never reused. Otherwise
-           an expired batch could still be handed back and sent, which breaks
-           the time window; its planned events are expired with it ("packets
-           that are past the window are dropped, not replayed").
-        2. An empty queue creates no batch at all. The previous revision always
-           inserted one, and because open batches are reused the host then kept
-           receiving that same empty batch even after new events arrived.
-        3. Reuse is therefore limited to a live batch that still holds events.
+        returned as-is so a host retry cannot create two batches at once.
         """
         now = float(now if now is not None else self.clock())
         max_items = max(1, min(int(max_items), MAX_BATCH))
         window_seconds = max(1, int(window_seconds))
         expired = []
-        batch_id = None
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                # (1) 过期的 planned 批次先退休：既不能再被复用，也不能再被发送。
-                #     它名下已经 planned 的事件一并置为 expired。
-                stale_batches = conn.execute(
-                    "SELECT batch_id FROM live_batches "
-                    "WHERE account_scope=? AND status=? AND expires_at <= ?",
-                    (self.account_scope, "planned", now)).fetchall()
-                for stale in stale_batches:
-                    conn.execute(
-                        "UPDATE live_batches SET status=? WHERE account_scope=? AND batch_id=?",
-                        (EXPIRED, self.account_scope, stale["batch_id"]))
-                    for row in conn.execute(
-                            "SELECT event_key, payload_json FROM live_events "
-                            "WHERE account_scope=? AND batch_id=? AND state=?",
-                            (self.account_scope, stale["batch_id"], PLANNED)).fetchall():
-                        self._set_state(conn, row["event_key"], EXPIRED,
-                                        {"reason": "batch_window_expired"}, now=now)
-                        expired.append(json.loads(row["payload_json"] or "{}"))
-
-                # (2) 只复用【还在自己时间窗内】的 planned 批次
-                open_batch = conn.execute(
-                    "SELECT * FROM live_batches WHERE account_scope=? AND status=? "
-                    "AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
-                    (self.account_scope, "planned", now)).fetchone()
                 expired_rows = conn.execute(
                     "SELECT event_key, payload_json FROM live_events "
                     "WHERE account_scope=? AND state=? AND seen_at <= ? ORDER BY seen_at ASC",
@@ -301,16 +265,30 @@ class LiveQueue:
                 for row in expired_rows:
                     self._set_state(conn, row["event_key"], EXPIRED,
                                     {"reason": "window_expired"}, now=now)
-                expired.extend(json.loads(row["payload_json"] or "{}") for row in expired_rows)
-                if open_batch:
-                    batch_id = open_batch["batch_id"]
-                else:
+                expired = [json.loads(row["payload_json"] or "{}") for row in expired_rows]
+
+                batch_id = None
+                open_batch = conn.execute(
+                    "SELECT * FROM live_batches WHERE account_scope=? AND status=? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (self.account_scope, "planned")).fetchone()
+                if open_batch is not None:
+                    planned = conn.execute(
+                        "SELECT COUNT(*) AS n FROM live_events WHERE account_scope=? "
+                        "AND batch_id=? AND state=?",
+                        (self.account_scope, open_batch["batch_id"], PLANNED)).fetchone()["n"]
+                    if planned and now <= open_batch["expires_at"]:
+                        batch_id = open_batch["batch_id"]
+                    else:
+                        # 空批次或已超窗的批次一律关闭：否则空批次会被永久复用，
+                        # 超窗批次还能继续发送，两者都违反时间窗规则。
+                        reason = "batch_window_expired" if planned else "batch_left_empty"
+                        self._close_batch(conn, open_batch["batch_id"], reason, now)
+                if batch_id is None:
                     rows = conn.execute(
                         "SELECT event_key FROM live_events "
                         "WHERE account_scope=? AND state=? ORDER BY seen_at ASC LIMIT ?",
                         (self.account_scope, QUEUED, max_items)).fetchall()
-                    # (3) 队列为空时【不创建批次】：空批次会被永久复用，
-                    #     之后即使采集到新事件，宿主也只会拿到那个空批次。
                     if rows:
                         batch_id = uuid.uuid4().hex[:32]
                         conn.execute(
@@ -323,20 +301,8 @@ class LiveQueue:
             except Exception:
                 conn.rollback()
                 raise
-        if batch_id is None:
-            # 空队列：明确告诉宿主"现在没有可执行的批次"，而不是给一个空批次。
-            return {
-                "status": "empty",
-                "batchId": None,
-                "createdAt": None,
-                "expiresAt": None,
-                "frozen": False,
-                "expiredCount": len(expired),
-                "expired": expired[:50],
-                "events": [],
-            }
-        batch = self.batch(batch_id)
-        events = self.batch_events(batch_id)
+        batch = self.batch(batch_id) if batch_id else None
+        events = self.batch_events(batch_id) if batch_id else []
         return {
             "status": "ok" if events else "empty",
             "batchId": batch_id,
@@ -348,13 +314,48 @@ class LiveQueue:
             "events": events,
         }
 
+    def _close_batch(self, conn, batch_id, reason, now):
+        """Close a batch and expire its events: an expired batch is never replayed."""
+        conn.execute("UPDATE live_batches SET status=? WHERE account_scope=? AND batch_id=?",
+                     ("expired", self.account_scope, str(batch_id)))
+        for row in conn.execute(
+                "SELECT event_key FROM live_events WHERE account_scope=? AND batch_id=?",
+                (self.account_scope, str(batch_id))).fetchall():
+            self._set_state(conn, row["event_key"], EXPIRED, {"reason": reason}, now=now)
+
+    def ensure_active(self, batch_id, now=None):
+        """Fail closed when a batch may no longer be executed.
+
+        The phase methods call this before touching the browser, so a batch that
+        ran out of its window can never be sent after the fact.
+        """
+        now = float(now if now is not None else self.clock())
+        batch = self.batch(batch_id)
+        if batch is None:
+            raise LiveFlowError("unknown_batch", "batch does not exist")
+        if batch["status"] == "expired" or now > batch["expires_at"]:
+            with self._connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._close_batch(conn, batch_id, "batch_window_expired", now)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            raise LiveFlowError("batch_expired", "batch time window has passed")
+        return batch
+
     def batch(self, batch_id):
+        if not batch_id:
+            return None
         with self._connection() as conn:
             return self._row(conn.execute(
                 "SELECT * FROM live_batches WHERE account_scope=? AND batch_id=?",
                 (self.account_scope, str(batch_id))).fetchone())
 
     def batch_events(self, batch_id):
+        if not batch_id:
+            return []
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM live_events WHERE account_scope=? AND batch_id=? "
@@ -408,10 +409,6 @@ class LiveQueue:
                 if row is None:
                     conn.rollback()
                     raise LiveFlowError("unknown_event", "event is not in the queue")
-                # 🔴 这里必须用上面 SELECT 出来的 event_key，不能用调用方传进来的
-                #    event_id：live_events 的主键是 (account_scope, event_key)，
-                #    event_id 只是平台给的瞬时 DOM id。用错键的后果是
-                #    "接口返回成功、SQLite 里却没有记录"，断点恢复与防重复触达都会失效。
                 conn.execute(
                     "UPDATE live_events SET private_json=?, updated_at=? "
                     "WHERE account_scope=? AND event_key=?",
@@ -441,6 +438,7 @@ class LiveQueue:
         'publicText' and 'privateText'.  Both channels are required for a target
         to stay sendable; this module never fills them itself.
         """
+        policy_source = "request" if policy else "builtin_default"
         policy = normalize_policy(policy)
         batch = self.batch(batch_id)
         if batch is None:
@@ -475,7 +473,8 @@ class LiveQueue:
                     entry["publicText"].encode("utf-8")).hexdigest(),
             })
         plan = {"batchId": str(batch_id), "frozenAt": _iso(self.clock()), "policy": policy,
-                "targets": targets, "blocked": blocked, "scriptSource": "host"}
+                "targets": targets, "blocked": blocked, "scriptSource": "host",
+                "policySource": policy_source}
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
