@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>.hidden{display:none}</style>
+<section id="live-chat">
+  <div data-e2e="live-chat-item" id="live-1" data-comment-id="live-1" data-author-id="live-author-1">
+    <span data-e2e="live-chat-author">Viewer A</span>
+    <span data-e2e="live-chat-content">hello live</span>
+  </div>
+  <div data-e2e="live-chat-item" class="hidden" id="live-hidden" data-comment-id="hidden" data-author-id="hidden">
+    <span data-e2e="live-chat-author">Hidden</span>
+    <span data-e2e="live-chat-content">must not collect</span>
+  </div>
+  <div data-e2e="live-chat-item" id="live-2" data-comment-id="live-2" data-author-id="live-author-2">
+    <span data-e2e="live-chat-author">Viewer B</span>
+    <span data-e2e="live-chat-content">buy question</span>
+  </div>
+</section>
+<div data-e2e="live-chat-input" contenteditable="true"></div>
+<button data-e2e="live-chat-send" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1">发送</button>

@@ -1,0 +1,26 @@
+{
+  "name": "douyin-intercept-license-server",
+  "version": "4.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "bootstrap": "tsx src/bootstrap.ts",
+    "admin": "tsx src/cli.ts",
+    "bootstrap:dist": "node dist/bootstrap.js",
+    "admin:dist": "node dist/cli.js",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "^10.2.1",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

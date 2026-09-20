@@ -1,0 +1,37 @@
+flowchart TB
+    User["客户"]
+
+    subgraph Main["主要入口"]
+        Chat["Agent 聊天"]
+        Video["找视频"]
+        Comment["评论区"]
+        Live["直播间"]
+    end
+
+    subgraph Common["公共信息与辅助入口"]
+        Accounts["账号切换与在线状态"]
+        Credits["授权期限与积分"]
+        Tasks["任务进度与异常提醒"]
+        Settings["知识库与高级设置"]
+    end
+
+    User --> Chat
+    User --> Video
+    User --> Comment
+    User --> Live
+
+    Chat --> Intent["提交自然语言目标"]
+    Video --> Direct["直接选择固定流程"]
+    Comment --> Direct
+    Live --> Direct
+
+    Intent --> Entry["统一任务入口"]
+    Direct --> Entry
+
+    Entry --> Engine["客户端主进程与执行器"]
+    Engine --> View["统一状态展示"]
+    View --> Accounts
+    View --> Credits
+    View --> Tasks
+
+    Settings --> Entry

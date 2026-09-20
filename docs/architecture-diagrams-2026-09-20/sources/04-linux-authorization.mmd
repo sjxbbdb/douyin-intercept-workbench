@@ -1,0 +1,28 @@
+flowchart TB
+    Admin["管理后台"]
+    Client["客户端请求"]
+
+    Admin --> API["统一服务接口"]
+    Client --> API
+
+    API --> Identity["工作台用户与设备认证"]
+    Identity --> Policy["授权有效期与执行策略"]
+
+    Policy --> Accounts["开户、续期、停用与设备管理"]
+    Policy --> Billing["积分、任务预算与幂等结算"]
+    Policy --> Decision["模型决策服务"]
+    Policy --> Content["话术准备服务"]
+    Policy --> Events["审计与结果查询"]
+
+    Accounts --> DB["业务关系数据库"]
+    Billing --> DB
+    Events --> DB
+
+    Content --> Knowledge["知识文档与有效版本"]
+    Content --> Vector["按客户隔离的向量索引"]
+    Decision --> Models["主模型与预设备用模型"]
+    Content --> Models
+
+    Secrets["仅服务端持有模型密钥"] --> Models
+    DB --> Backup["备份与恢复"]
+    Knowledge --> Backup

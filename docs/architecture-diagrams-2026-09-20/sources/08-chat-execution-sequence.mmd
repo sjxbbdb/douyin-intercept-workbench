@@ -1,0 +1,30 @@
+sequenceDiagram
+    participant U as 客户
+    participant UI as 聊天窗口
+    participant M as 决策与准备服务
+    participant E as 固定流程执行器
+    participant T as 自动化工具
+
+    U->>UI: 提出业务目标
+    UI->>M: 提交目标与任务上下文
+    M->>M: 识别意图，选择流程并准备参数
+    M-->>E: 返回待校验的执行计划
+    E->>E: 校验并固化本轮计划
+
+    loop 执行固定步骤，期间不调用模型
+        E->>T: 调用预定工具
+        T-->>E: 返回步骤结果
+        E->>E: 保存检查点并执行固定异常策略
+        E-->>UI: 更新进度
+    end
+
+    E-->>M: 本轮流程结果
+    M->>M: 判断继续、再执行一轮、完成或等待人工
+    M-->>UI: 说明结果与下一步
+    M-->>E: 提交下一轮计划，仍需校验
+
+    opt 客户主动停止
+        U->>UI: 停止任务
+        UI->>E: 发送明确的用户控制指令
+        E->>E: 按安全规则停止并保存现场
+    end

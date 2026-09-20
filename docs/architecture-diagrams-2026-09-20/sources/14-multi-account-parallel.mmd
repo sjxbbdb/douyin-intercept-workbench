@@ -1,0 +1,37 @@
+flowchart TB
+    Tasks["客户任务集合"]
+    Router["按绑定的抖音账号分发"]
+    Ownership["设备与账号执行归属校验"]
+
+    Tasks --> Ownership --> Router
+
+    subgraph A["抖音账号 A"]
+        QA["账号 A 流程队列"]
+        EA["独立执行器"]
+        LA["页面锁与发送调度"]
+        BA["独立浏览器环境"]
+        DA["独立检查点与动作账本"]
+
+        QA --> EA --> LA --> BA
+        EA <--> DA
+    end
+
+    subgraph B["抖音账号 B"]
+        QB["账号 B 流程队列"]
+        EB["独立执行器"]
+        LB["页面锁与发送调度"]
+        BB["独立浏览器环境"]
+        DB["独立检查点与动作账本"]
+
+        QB --> EB --> LB --> BB
+        EB <--> DB
+    end
+
+    Router --> QA
+    Router --> QB
+
+    Budget["服务端统一积分与任务预算"] --> EA
+    Budget --> EB
+
+    EA --> View["统一状态面板"]
+    EB --> View

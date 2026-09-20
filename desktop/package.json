@@ -1,0 +1,70 @@
+{
+  "name": "douyin-intercept-agent-desktop",
+  "version": "4.0.3",
+  "description": "Windows desktop agent for licensed Douyin comment lead capture and reply workflows",
+  "private": true,
+  "main": "src/main.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/run.js",
+    "test:dom": "electron test/dom-fixture.js",
+    "test:task-editor": "node test/task-editor-launcher.js",
+    "check": "node test/check-syntax.js && node test/run.js",
+    "test:probe-runtime": "node test/check-probe-runtime.js",
+    "test:probe-lifecycle": "node test/probe-bridge-lifecycle.js",
+    "build": "node test/check-probe-runtime.js && electron-builder --win --config.directories.output=release",
+    "build:portable": "node test/check-probe-runtime.js && electron-builder --win portable --config.directories.output=release",
+    "build:nsis": "node test/check-probe-runtime.js && electron-builder --win nsis --config.directories.output=release"
+  },
+  "devDependencies": {
+    "electron": "^44.4.3",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.douyinintercept.agent",
+    "productName": "截流自动回复 Agent",
+    "asar": true,
+    "compression": "maximum",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "extraResources": [
+      {
+        "from": "build/probe",
+        "to": "probe"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-${arch}-installer.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "截流自动回复 Agent"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    }
+  }
+}

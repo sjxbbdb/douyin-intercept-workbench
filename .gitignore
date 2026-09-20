@@ -1,130 +1,51 @@
-# ============================================================
-# 安全红线：以下内容绝不可提交 / 分享
-# ============================================================
+# Dependencies and build output
+node_modules/
+server/node_modules/
+desktop/node_modules/
+server/dist/
+desktop/dist/
+desktop/release/
+desktop/build/
+desktop/.builder-cache/
+release-local/
 
-# 浏览器登录态（专用 Chrome 配置目录，含 Cookie、Token、localStorage）
-dy-main/
-dy-*/
-ChromeProfile*/
-User Data/
-
-# 二维码、验证码截图
-qr*.png
-qr*.jpg
-captcha*.png
-
-# Cookie / 凭据 / 令牌
-cookies*.txt
-*cookie*.json
-*.token
+# Local runtime state and credentials
 .env
 .env.*
-secrets*.json
-credentials*.json
+!.env.example
+**/*.sqlite
+**/*.sqlite-*
+**/data/
+**/runtime/
+**/state/
+**/tokens/
+**/secrets/
+**/.token*
+**/*.token
+**/credentials.*
+**/evidence-private/
+**/test-state/
 
-# ============================================================
-# 运行数据（本机产生的业务数据，分享前必须清空）
-# ============================================================
-
-# 采集与筛选结果
-filtered_comments.json
-pipeline_raw.json
-pipeline_videos.json
-pipeline_topics.json
-videos.json
-
-# 进度 / 状态
-pipeline_progress.json
-pipeline_pause.json
-pipeline_cleaning_report.json
-scan_progress.json
-scan_request.json
-pipeline_request.json
-live_monitor_status.json
-
-# 回复队列与历史（含被回复用户信息）
-replies_queue.json
-replied_history.json
-video_comment_queue.json
-video_comment_config.json
-
-# 直播数据
-live_state.json
-live_dm_state.json
-live_config.json
-
-# 积分 / 授权运行态（含账号信息）
-license_state.json
-credit_ledger.json
-*.local.json
-
-# ============================================================
-# ⚠️ 运行目录（本项目的真实产物都在这两个目录下，绝不能提交）
-# ============================================================
-#
-# client/instances/<实例>/
-#   · 每个抖音账号一个实例目录，包含专用 Chrome 的 profile
-#     （里面有登录 Cookie！）、队列、去重历史、线索名单、审计日志。
-#   · 这是**全项目最敏感**的目录：泄露它等于泄露商家的抖音登录态。
-#
-# license-server/data/（或 DB_PATH 指向的目录）
-#   · SQLite 库 + WAL + 备份：全部商家账号、密码哈希、台账、发送明细。
-#
-client/instances/
-instances/
-license-server/data/
-data/
-*.db
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite3
-backups/
-
-# 客户端的本地控制台访问令牌（拿到即可代替商家发评论）
-ui-token.txt
-client-config.json
-browser-host.lock
-instances.json
-queue.json
-pending-sends.json
-send-outbox.json
-report-quarantine.json
-runtime-state.json
-audit-log*.jsonl
-client-log.jsonl
-
-# 统计与日志
-logs/
-*.log
-statistics*.json
-
-# ============================================================
-# 依赖与构建产物（本项目零依赖，保留规则以防后续引入）
-# ============================================================
-node_modules/
-dist/
-build/
+# Logs and local diagnostics
+**/*.log
+**/logs/
 coverage/
+*.tsbuildinfo
 
-# ============================================================
-# 编辑器 / 系统
-# ============================================================
-.vscode/
-.idea/
-*.swp
+# OS/editor files
+.DS_Store
 Thumbs.db
-desktop.ini
-# ============================================================
-# 交付包（生成物，不入库）
-# ============================================================
-#
-# ⚠️ `delivery/` 是 `node scripts/build-handover.js` 的**产物**：
-#    它的内容是"某个提交状态下整棵仓库的副本"。
-#    入库它有两个坏处：
-#      ① 每次重新生成都会产生整棵树的 diff，历史变得无法阅读，
-#         真正的手写改动会被淹没在几千行噪音里；
-#      ② 包里的文件与仓库里的文件是**两份**，改了一处忘了另一处，
-#         接手人拿到的就是一份自相矛盾的包。
-#    所以只入库脚本（scripts/build-handover.js），产物由需要的人现生成。
-delivery/
+.idea/
+.vscode/
+
+# Local package manager caches
+.npm/
+.pnpm-store/
+
+# Python probe build/runtime output (keep Python source tracked)
+probe/.venv/
+probe/.pyinstaller-venv/
+probe/build/
+probe/dist/
+probe/*.sqlite3
+probe/*.sqlite3-*

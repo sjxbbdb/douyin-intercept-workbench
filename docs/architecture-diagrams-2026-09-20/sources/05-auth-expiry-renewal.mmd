@@ -1,0 +1,27 @@
+flowchart TD
+    Create["管理员创建工作台账号"]
+    Configure["设置有效期、积分与设备额度"]
+    Distribute["向客户分发账密"]
+    Login["客户端登录"]
+
+    Create --> Configure --> Distribute --> Login
+
+    Login --> Check{"账密与设备校验通过？"}
+    Check -->|否| Error["显示具体原因"]
+    Check -->|是| Valid{"授权当前有效？"}
+
+    Valid -->|是| Session["建立授权会话"]
+    Session --> Tasks["允许执行已授权任务"]
+    Tasks --> Verify["关键操作前重新校验"]
+    Verify --> Valid
+
+    Valid -->|否| Save["保存任务现场"]
+    Save --> Wait["等待续期、解禁或设备处理"]
+    Wait --> Change["管理员完成处理"]
+    Change --> Detect["检测授权恢复"]
+
+    Detect --> Ready{"任务仍允许自动恢复？"}
+    Ready -->|是| Resume["接续原流程"]
+    Ready -->|否| Remain["保持暂停或停止状态"]
+
+    Resume --> Verify

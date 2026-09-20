@@ -1,0 +1,28 @@
+flowchart TB
+    PlatformCode["平台源代码"]
+    ToolCode["协作者工具与版本声明"]
+
+    PlatformCode --> Checks["构建、契约与隔离测试"]
+    ToolCode --> Checks
+
+    Checks --> ServerBuild["构建 Linux 服务"]
+    Checks --> ClientBuild["构建 Windows 客户端"]
+    Checks --> ToolBuild["打包自动化运行时"]
+
+    ServerBuild --> Linux["Linux 服务器部署"]
+    Linux --> Admin["运营管理后台"]
+    Linux --> API["授权、积分、模型与知识库接口"]
+    Linux --> Data["业务数据与备份"]
+
+    ToolBuild --> Bundle["客户端内置工具运行时"]
+    ClientBuild --> Bundle
+    Bundle --> Release["安装版或便携版发行包"]
+
+    Release --> Customer["客户安装并登录"]
+    Customer --> Local["本地独立账号环境与任务数据"]
+    Customer <-->|HTTPS| API
+
+    Release --> Update["版本与兼容性检查"]
+    Update --> Boundary["等待流程结束或安全暂停"]
+    Boundary --> Upgrade["保存现场并升级"]
+    Upgrade --> Recover["兼容性检查后恢复任务"]

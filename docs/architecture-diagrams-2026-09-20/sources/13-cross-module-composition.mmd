@@ -1,0 +1,23 @@
+flowchart TB
+    Goal["用户目标：找目标客户并触达"]
+    Decision["模型选择已有流程组合"]
+
+    Goal --> Decision
+
+    Decision --> Search["固定视频搜索流程"]
+    Search --> Videos["返回视频池"]
+    Videos --> Collect["固定评论采集筛选流程"]
+    Collect --> Targets["返回评论目标批次"]
+
+    Targets --> Prepare["流程边界：准备双渠道话术"]
+    Prepare --> Reply["固定评论回复后私信流程"]
+    Reply --> Result["返回该批执行结果"]
+
+    Result --> Judge{"模型判断下一步"}
+    Judge -->|处理剩余视频| Collect
+    Judge -->|扩大搜索范围| Search
+    Judge -->|执行直播任务| Live["进入直播批次流程"]
+    Judge -->|完成| Done["汇总业务结果"]
+
+    Live --> LiveResult["返回直播批次结果"]
+    LiveResult --> Judge

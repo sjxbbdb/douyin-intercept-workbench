@@ -1,0 +1,31 @@
+flowchart TB
+    Videos["搜索结果或指定视频"]
+
+    subgraph Collect["固定流程一：评论采集与筛选"]
+        Read["采集评论"]
+        Identify["关联评论标识与评论者"]
+        Match["关键词、排除词与去重"]
+        Batch["返回目标批次"]
+
+        Read --> Identify --> Match --> Batch
+    end
+
+    Videos --> Read
+    Batch --> Boundary["流程边界：模型判断与知识库话术准备"]
+    Boundary --> Freeze["固定本批目标、双渠道话术与异常策略"]
+
+    subgraph Reply["固定流程二：评论回复后私信"]
+        Public["第一阶段：逐条回复原评论"]
+        RecordPublic["保存每条公开回复状态"]
+        Barrier["公开回复阶段结束"]
+        Eligible["按固定策略确定私信清单"]
+        Private["第二阶段：向评论者逐个私信"]
+        RecordPrivate["保存私信结果"]
+        Report["返回完整批次结果"]
+
+        Public --> RecordPublic --> Barrier
+        Barrier --> Eligible --> Private --> RecordPrivate --> Report
+    end
+
+    Freeze --> Public
+    Report --> Judge["模型判断下一批、下一任务或结束"]

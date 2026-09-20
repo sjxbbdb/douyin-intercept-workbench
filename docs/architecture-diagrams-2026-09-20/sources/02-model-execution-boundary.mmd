@@ -1,0 +1,32 @@
+flowchart TD
+    Goal["用户目标"]
+    Understand["模型识别意图"]
+    Select["选择已注册的固定流程"]
+    Prepare["准备目标、参数和所需话术"]
+    Validate["程序校验流程、账号、额度与参数"]
+    Freeze["固化本轮执行计划"]
+
+    Goal --> Understand --> Select --> Prepare --> Validate
+    Validate -->|通过| Freeze
+    Validate -->|不通过| Correct["返回明确问题，有限修正"]
+    Correct --> Select
+
+    subgraph Execution["执行区域：不调用模型，不接受模型中途改动"]
+        Run["按照固定模板执行"]
+        Rules["按固定规则重试与降级"]
+        Save["持续保存检查点"]
+
+        Run --> Rules
+        Rules --> Save
+        Save --> Run
+    end
+
+    Freeze --> Run
+    Run -->|本轮结束或阻塞返回| Result["结构化流程结果"]
+    Result --> Judge["模型判断下一步"]
+
+    Judge -->|下一任务或新一轮| Select
+    Judge -->|目标完成| Done["结束任务"]
+    Judge -->|等待人工| Human["保持现场，等待处理"]
+
+    Run -.->|仅展示进度| Panel["用户操作面板"]

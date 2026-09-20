@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>.hidden{display:none}.reply-editor{display:none}</style>
+<div data-e2e="comment-list">
+  <article data-e2e="comment-item" id="comment-1" data-comment-id="comment-1">
+    <a href="https://www.douyin.com/user/author-1">Alice</a>
+    <span data-e2e="comment-content">same question</span>
+    <button data-e2e="comment-like" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1">赞</button>
+    <button data-e2e="comment-reply" onclick="this.dataset.clicks=(+this.dataset.clicks||0)+1;this.parentElement.querySelector('.reply-editor').style.display='block'">回复</button>
+    <div class="reply-editor" data-e2e="comment-reply-editor"><div data-e2e="comment-reply-input" contenteditable="true"></div><button data-e2e="comment-reply-submit">发送</button></div>
+  </article>
+  <article data-e2e="comment-item" id="comment-2" data-comment-id="comment-2">
+    <a href="https://www.douyin.com/user/author-2">Alice</a>
+    <span data-e2e="comment-content">same question</span>
+    <button data-e2e="comment-like">赞</button>
+    <button data-e2e="comment-reply">回复</button>
+    <div class="reply-editor" style="display:block" data-e2e="comment-reply-editor"><div data-e2e="comment-reply-input" contenteditable="true"></div><button data-e2e="comment-reply-submit">发送</button></div>
+  </article>
+  <article data-e2e="comment-item" id="comment-3" data-comment-id="comment-3">
+    <a href="https://www.douyin.com/user/author-3">Bob</a>
+    <span data-e2e="comment-content">different question</span>
+    <button data-e2e="comment-like">赞</button>
+    <button data-e2e="comment-reply">回复</button>
+  </article>
+  <article data-e2e="comment-item" id="comment-10" data-comment-id="comment-10">
+    <a href="https://www.douyin.com/user/author-10">Alice</a>
+    <span data-e2e="comment-content">same question</span>
+    <button data-e2e="comment-like">赞</button>
+    <button data-e2e="comment-reply">回复</button>
+  </article>
+</div>
+<div data-e2e="comment-input" contenteditable="true"></div>
+<button data-e2e="comment-submit">发送</button>

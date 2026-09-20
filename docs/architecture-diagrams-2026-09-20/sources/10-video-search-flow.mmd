@@ -1,0 +1,21 @@
+flowchart TD
+    Input["已确定的关键词、账号与搜索条件"]
+    Start["启动固定搜索流程"]
+    Search["调用视频搜索工具"]
+    Page["读取一页结果"]
+    Normalize["统一视频标识与信息"]
+    Filter["按固定条件筛选并去重"]
+    Save["保存视频池与搜索游标"]
+
+    Input --> Start --> Search --> Page --> Normalize --> Filter --> Save
+
+    Save --> Continue{"尚未达到数量、时间或预算上限？"}
+    Continue -->|是| Search
+    Continue -->|否| Result["返回本轮搜索结果"]
+
+    Result --> Judge["通知模型判断"]
+    Judge -->|需要更多视频| Next["申请下一轮搜索"]
+    Judge -->|进入评论区| Comments["选择评论采集流程"]
+    Judge -->|目标完成| Done["展示结果并结束"]
+
+    Next --> Input
