@@ -41,6 +41,47 @@ from.
 cannot overwrite phase-one state. `comment_result` never emits `charged`,
 `price`, or `balance` — credits are the server's authority alone.
 
+### Where precision belongs
+
+The pipeline has two independent keyword gates, and they measure different
+things:
+
+- **Video relevance** (search-side, `minRelevance`) filters on the video
+  title. It answers "is this video about what I sell".
+- **Comment filtering** (upstream of `comment_enqueue`) matches on the
+  comment text. It answers "is this person a customer".
+
+These are not the same axis, and the second is the one that matters:
+purchase intent lives in the comment ("求链接", "多少钱"), not in the title.
+A loosely-matching video can still contain perfectly on-target commenters.
+
+So the agreed split is: keep the video threshold **loose** — its job is only
+to avoid spending collection budget on videos where nobody could plausibly
+be a customer — and put the **precision burden on the comment filter**.
+Tightening the video threshold instead is a blunt instrument: it discards
+on-target commenters who happened to sit on an off-topic video.
+
+The cost asymmetry behind this: missing a relevant video costs almost
+nothing, while an off-target DM is irreversible, burns the recipient's
+single pre-mutual-follow message slot, and spends account quota.
+
+### Funnel (`comment_result.funnel`)
+
+`funnel` exists so that "should the comment filter be tighter" can be
+answered from data instead of vibes. It reports, for one batch:
+
+- `planned` — frozen into the plan
+- `blockedBeforeSend` — dropped before any send (missing scripts, etc.)
+- `publicEligible` / `publicOutcome` — what phase one can still reach, and
+  how the attempts actually landed; `publicOutcome` lists only targets that
+  have a result, so `planned` never appears there
+- `privateAllowed` / `privateRejected`
+- `rejectedReasons` — phase-one and phase-two reasons **aggregated together**
+
+That last point is the whole reason `funnel` exists. Phase-two rejections
+alone tell you almost nothing, because most targets never reach phase two.
+The two layers have to be read as one distribution.
+
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
 automation gate. `private_reply` records the collaborator account flow

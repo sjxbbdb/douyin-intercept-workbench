@@ -386,6 +386,21 @@ class CommentQueue:
                 "SELECT * FROM comment_batches WHERE account_scope=? AND batch_id=?",
                 (self.account_scope, str(batch_id))).fetchone())
 
+    @staticmethod
+    def _target_item(row):
+        """数据库行 -> 对外目标对象。
+
+        🔴 必须只有这一处映射。曾经 batch_targets 用映射后的形状、
+           batch_states 直接用数据库原始行（列名 target_key 而非 targetKey），
+           形状不一致让调用方静默拿到一堆 None —— 不报错，只是数据全空。
+        """
+        return {"targetId": row["target_id"], "targetKey": row["target_key"],
+                "roomId": row["room_id"], "authorId": row["author_id"],
+                "authorName": row["author_name"], "text": row["text"],
+                "state": row["state"],
+                "detail": json.loads(row["detail_json"] or "{}"),
+                "private": json.loads(row["private_json"] or "{}")}
+
     def batch_targets(self, batch_id):
         if not batch_id:
             return []
@@ -393,16 +408,31 @@ class CommentQueue:
             rows = conn.execute(
                 "SELECT * FROM comment_targets WHERE account_scope=? AND state IN (?,?)"
                 " ORDER BY seen_at ASC", (self.account_scope, PLANNED, EXPIRED)).fetchall()
-        out = []
-        for row in rows:
-            item = {"targetId": row["target_id"], "targetKey": row["target_key"],
-                    "roomId": row["room_id"], "authorId": row["author_id"],
-                    "authorName": row["author_name"], "text": row["text"],
-                    "state": row["state"],
-                    "detail": json.loads(row["detail_json"] or "{}"),
-                    "private": json.loads(row["private_json"] or "{}")}
-            out.append(item)
-        return out
+        return [self._target_item(row) for row in rows]
+
+    def batch_states(self, batch_id):
+        """批次【计划内】每个目标的当前状态。
+
+        🔴 统计绝不能建在 batch_targets 上：它的 SQL 是 state IN (planned, expired)，
+           目标一旦被标记为 sent_confirmed/unknown/failed 就会从结果里消失，
+           于是「结果统计」永远只统计到还没发过的那部分 —— 看起来永远没有进展。
+           batch_targets 服务于「取一批」和「冻结计划」，那是另一个用途，不要复用。
+        """
+        keys = [t.get("targetKey") for t in self.plan(batch_id).get("targets") or []
+                if t.get("targetKey")]
+        if not keys:
+            # 尚未冻结：没有计划可依，退回按状态取（此时目标确实都还在 planned/expired）。
+            return self.batch_targets(batch_id)
+        rows = []
+        with self._connection() as conn:
+            for start in range(0, len(keys), 400):   # 避开 SQLite 的变量数上限
+                chunk = keys[start:start + 400]
+                marks = ",".join("?" * len(chunk))
+                rows.extend(conn.execute(
+                    "SELECT * FROM comment_targets WHERE account_scope=?"
+                    " AND target_key IN (%s)" % marks,
+                    (self.account_scope, *chunk)).fetchall())
+        return [self._target_item(r) for r in rows]
 
     # ------------------------------------------------------------ 第一阶段
 
@@ -587,7 +617,8 @@ class CommentQueue:
         return None
 
     def states(self, batch_id):
-        return {item.get("targetKey"): item.get("state") for item in self.batch_targets(batch_id)}
+        return {item.get("targetKey"): item.get("state")
+                for item in self.batch_states(batch_id)}
 
     # ------------------------------------------------------------ 第二阶段
 
@@ -634,7 +665,7 @@ class CommentQueue:
         if batch is None:
             raise CommentFlowError("unknown_batch", "batch does not exist")
         plan = self.plan(batch_id)
-        items = self.batch_targets(batch_id)
+        items = self.batch_states(batch_id)
         counts = {}
         for item in items:
             state = str(item.get("state"))
@@ -646,6 +677,28 @@ class CommentQueue:
                 private_counts[status] = private_counts.get(status, 0) + 1
         public_pending = [i.get("targetKey") for i in items if str(i.get("state")) == PLANNED]
         allowed, rejected = self.private_candidates(batch_id)
+        public_items, public_rejected = self.public_candidates(batch_id)
+
+        # 🔴 漏斗：把「人是在哪一层掉的」一次算清。
+        #    只看阶段二的拒绝原因是没用的 —— 绝大多数目标根本走不到阶段二。
+        #    调评论筛选的松紧，靠的就是这两层合起来的分布；
+        #    分散在两个字段里各看一半，等于没有依据。
+        reason_counts = {}
+        for entry in list(public_rejected) + list(rejected):
+            code = str(entry.get("reason") or "")
+            if code:
+                reason_counts[code] = reason_counts.get(code, 0) + 1
+        funnel = {
+            "planned": len(plan.get("targets") or []),
+            "blockedBeforeSend": len(plan.get("blocked") or []),
+            "publicEligible": len(public_items),
+            "publicOutcome": {state: counts[state]
+                              for state in (SENT_CONFIRMED, UNKNOWN, FAILED, BLOCKED)
+                              if counts.get(state)},
+            "privateAllowed": len(allowed),
+            "privateRejected": len(rejected),
+            "rejectedReasons": reason_counts,
+        }
         return {
             "batchId": str(batch_id),
             "status": batch["status"],
@@ -654,9 +707,12 @@ class CommentQueue:
             "targets": len(plan.get("targets") or []),
             "counts": counts,
             "privateCounts": private_counts,
-            "expiredCount": len([i for i in items if str(i.get("state")) == EXPIRED]),
+            # 过期目标不进计划，所以不能从 items 里数 —— 那是两个不同的集合。
+            "expiredCount": len([i for i in self.batch_targets(batch_id)
+                                 if str(i.get("state")) == EXPIRED]),
             "privateCandidates": len(allowed),
             "privateRejected": rejected,
+            "funnel": funnel,
             "channel": "comment",
             "source": "video_comment",
             "checkpoint": {

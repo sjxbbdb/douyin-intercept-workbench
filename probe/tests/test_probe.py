@@ -938,6 +938,70 @@ class CommentFlowTests(unittest.TestCase):
                          "有状态常量没有出现在对外公布的 STATES 里")
 
 
+    def test_states_keep_targets_that_already_have_a_result(self):
+        """有结果的目标不得从统计里消失（回归）。
+
+        batch_targets 的 SQL 是 state IN (planned, expired)，所以目标一旦被标记为
+        sent_confirmed / unknown / failed 就会从它的结果里消失。统计建在它上面，
+        就会永远只统计到「还没发过」的那部分 —— 看起来永远没有进展。
+        （states 的键是 targetKey，不是 targetId。）
+        """
+        queue, batch_id = self._prep(3)
+        queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        queue.mark_public("tg-2", self.CF.UNKNOWN, batch_id)
+
+        by_id = {t["targetId"]: t["targetKey"] for t in queue.plan(batch_id)["targets"]}
+        states = queue.states(batch_id)
+        self.assertEqual(len(states), 3, "三个目标都必须还在统计里")
+        self.assertEqual(states[by_id["tg-1"]], self.CF.SENT_CONFIRMED)
+        self.assertEqual(states[by_id["tg-2"]], self.CF.UNKNOWN)
+        self.assertEqual(states[by_id["tg-3"]], self.CF.PLANNED)
+
+        counts = queue.result(batch_id)["counts"]
+        self.assertEqual(counts.get(self.CF.SENT_CONFIRMED), 1)
+        self.assertEqual(counts.get(self.CF.UNKNOWN), 1)
+        self.assertEqual(counts.get(self.CF.PLANNED), 1)
+
+    def test_result_funnel_aggregates_both_phases(self):
+        """漏斗必须把两阶段的拒绝原因【合起来】。
+
+        只看阶段二等于没有依据：绝大多数目标根本走不到阶段二。
+        调评论筛选松紧靠的就是这个合起来的分布。
+        """
+        queue, batch_id = self._prep(4)
+        queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        queue.mark_public("tg-2", self.CF.UNKNOWN, batch_id)
+        queue.mark_public("tg-3", self.CF.FAILED, batch_id)
+        # tg-4 保持 planned，没有阶段一结果
+        result = queue.result(batch_id)
+        funnel = result["funnel"]
+
+        self.assertEqual(funnel["planned"], 4)
+        # publicOutcome 只列【已经有结果】的，planned 表示还没发过，不该混进来
+        self.assertEqual(funnel["publicOutcome"],
+                         {self.CF.SENT_CONFIRMED: 1, self.CF.UNKNOWN: 1,
+                          self.CF.FAILED: 1})
+        # 还能进阶段一的只剩尚未处理的 planned ——
+        # tg-3 是 failed，而 _mark 会把 attempts 累计到 1，默认预算 maxPublicAttempts=1
+        # 表示「含首次只试一次」，所以它已经用尽，不再放行。
+        self.assertEqual(funnel["publicEligible"], 1)
+        self.assertEqual(funnel["privateAllowed"], 1)
+        self.assertEqual(funnel["privateRejected"], 3)
+
+        reasons = funnel["rejectedReasons"]
+        # 同时出现在两个阶段 -> 计数必须是 2，这才证明两阶段都被聚合了
+        self.assertEqual(reasons.get("public_unknown_no_retry"), 2)
+        # 只在阶段一出现的原因
+        self.assertEqual(reasons.get("public_sent_confirmed"), 1)
+        # 只在阶段二出现的原因
+        self.assertEqual(reasons.get("public_planned"), 1)
+        self.assertEqual(reasons.get("public_failed"), 1)
+        # 漏斗要能区分「失败但还能重试」和「失败且预算耗尽」——
+        # 这两者对操作者的含义完全不同，混成一个数字就没法调策略了。
+        self.assertEqual(reasons.get("public_attempts_exhausted"), 1)
+        # 聚合出来的一切都必须仍在声明的闭集内
+        self.assertEqual(set(reasons) - set(self.CF.REJECT_REASONS), set())
+
     def test_result_carries_no_client_side_credit_fields(self):
         """docs/api.md：服务端是积分唯一权威，客户端不得提交 charged/price/balance。"""
         queue, batch_id = self._prep(1)
