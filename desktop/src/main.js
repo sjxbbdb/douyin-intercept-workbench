@@ -385,12 +385,15 @@ async function runAgentChat(input) {
     const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: requestedPlatform, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}:${requestedPlatform}`) });
     const remoteRunId = remote?.run?.id;
     if (!remoteRunId) throw new Error('授权中心未返回流程实例');
+    await api.acquireWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${remoteRunId}:${accountId}`) });
     await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: 0 });
     const run = runtime.startPlan(plan);
     accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
     const result = await runtime.run(run.runId);
+    await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}`) });
     await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: 1, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
     const nextDecision = await requestResultDecision(remoteRunId, result);
+    await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${result.runId}:${result.status}`) });
     accountContext.store.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: message, at: new Date().toISOString() }, { role: 'assistant', content: `已选择固定流程 ${plan.workflowId}@${plan.version}，当前状态：${result.status}`, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
     emitState();
     return { plan, run: result, nextDecision };
@@ -420,14 +423,19 @@ function registerIpc() {
         throw new Error(`当前选中的平台账号没有该流程，已拒绝恢复：${error.message}`);
       }
       let remoteVersion = null;
+      if (local.remoteRunId) await api.acquireWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${local.remoteRunId}:${accountId}:${local.runId}`) });
       const health = await runtime.checkHealth(local.runId);
       if (local.remoteRunId) {
         const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: health.checksPassed, userConfirmed: true, reason: 'desktop_manual_resume' });
         remoteVersion = Number.isSafeInteger(recovered?.run?.checkpointVersion) ? recovered.run.checkpointVersion : null;
       }
       const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true });
-      if (local.remoteRunId && remoteVersion != null) await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+      if (local.remoteRunId && remoteVersion != null) {
+        await api.renewWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${local.remoteRunId}:${result.runId}:${result.status}`) });
+        await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+      }
       const nextDecision = await requestResultDecision(local.remoteRunId, result);
+      if (local.remoteRunId) await api.releaseWorkflowLease(local.remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${local.remoteRunId}:${result.runId}:${result.status}`) });
       emitState(); return { ...result, nextDecision };
     }, { taskId: `resume:${normalizedRunId}`, metadata: { platformAccountId: requestedPlatform } });
   }));

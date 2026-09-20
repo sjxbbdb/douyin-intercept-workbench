@@ -106,6 +106,18 @@ class ApiClient {
     return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/result-decision`, body, 12000);
   }
 
+  acquireWorkflowLease(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/lease/acquire`, body, 12000);
+  }
+
+  renewWorkflowLease(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/lease/renew`, body, 12000);
+  }
+
+  releaseWorkflowLease(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/lease/release`, body, 12000);
+  }
+
   platformAccounts(tokenOverride = null) {
     return this.request('GET', '/v1/platform-accounts', undefined, 12000, tokenOverride);
   }

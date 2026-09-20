@@ -250,3 +250,27 @@ test('workflow result decision is post-run only, scoped and idempotent', async (
     const hidden = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'FAILED', summary: {}, idempotencyKey: 'decision-hidden-001' } }); assert.equal(hidden.statusCode, 404);
   } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
 });
+
+test('workflow leases are device scoped, reclaimable after expiry and terminal safe', async () => {
+  const f = await fixture(); try {
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'lease.test', version: 1, name: '租约测试', contract: { steps: ['work'] } } }); assert.equal(workflow.statusCode, 200);
+    const user = await f.create({ username: 'lease-user', maxDevices: 2 });
+    const loginA = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'lease-a', deviceName: 'A' } });
+    const loginB = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'lease-b', deviceName: 'B' } });
+    const tokenA = loginA.json().token; const tokenB = loginB.json().token;
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'lease-plan-1', user.id, 'lease.test', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
+    const created = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${tokenA}` }, payload: { planId: 'lease-plan-1', workflowId: 'lease.test', version: 1, params: {}, idempotencyKey: 'lease-run-001' } }); assert.equal(created.statusCode, 200, created.body); const runId = created.json().run.id;
+    const acquired = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${tokenA}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-acquire-001' } }); assert.equal(acquired.statusCode, 200, acquired.body); assert.equal(acquired.json().lease.deviceId, 'lease-a');
+    const replay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${tokenA}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-acquire-001' } }); assert.deepEqual(replay.json(), acquired.json());
+    const blocked = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${tokenB}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-acquire-b-001' } }); assert.equal(blocked.statusCode, 409); assert.equal(blocked.json().code, 'LEASE_HELD');
+    const blockedCheckpoint = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(blockedCheckpoint.statusCode, 409); assert.equal(blockedCheckpoint.json().code, 'LEASE_OWNER_MISMATCH');
+    const renewed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/renew`, headers: { authorization: `Bearer ${tokenA}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-renew-001' } }); assert.equal(renewed.statusCode, 200, renewed.body);
+    (f.app as any).store.run('UPDATE workflow_runs SET lease_expires_at=? WHERE id=?', Date.now() - 1, runId);
+    const reacquired = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${tokenB}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-acquire-b-002' } }); assert.equal(reacquired.statusCode, 200); assert.equal(reacquired.json().lease.deviceId, 'lease-b');
+    const wrongRelease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/release`, headers: { authorization: `Bearer ${tokenA}` }, payload: { idempotencyKey: 'lease-release-a-001' } }); assert.equal(wrongRelease.statusCode, 409); assert.equal(wrongRelease.json().code, 'LEASE_OWNER_MISMATCH');
+    const started = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(started.statusCode, 200);
+    const failed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'FAILED', expectedVersion: 1 } }); assert.equal(failed.statusCode, 200);
+    const terminalRenew = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/renew`, headers: { authorization: `Bearer ${tokenB}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-renew-terminal-001' } }); assert.equal(terminalRenew.statusCode, 409); assert.equal(terminalRenew.json().code, 'LEASE_TERMINAL');
+    const released = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/release`, headers: { authorization: `Bearer ${tokenB}` }, payload: { idempotencyKey: 'lease-release-b-001' } }); assert.equal(released.statusCode, 200); assert.equal(released.json().lease, null);
+  } finally { await f.close(); }
+});

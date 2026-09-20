@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   completed_at INTEGER,
+  lease_owner TEXT,
+  lease_device_id TEXT,
+  lease_expires_at INTEGER,
   UNIQUE(user_id, idempotency_key),
   FOREIGN KEY(workflow_id, workflow_version) REFERENCES workflow_definitions(workflow_id, version)
 );
@@ -206,6 +209,9 @@ export class Store {
     const columns = this.all<{ name: string }>('PRAGMA table_info(workflow_runs)');
     if (!columns.some((column) => column.name === 'plan_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''");
     if (!columns.some((column) => column.name === 'platform_account_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN platform_account_id TEXT");
+    if (!columns.some((column) => column.name === 'lease_owner')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_owner TEXT");
+    if (!columns.some((column) => column.name === 'lease_device_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_device_id TEXT");
+    if (!columns.some((column) => column.name === 'lease_expires_at')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_expires_at INTEGER");
   }
   now() { return Date.now(); }
   exec(sql: string) { this.db.exec(sql); }

@@ -112,6 +112,55 @@ function runResponse(row: RecordValue) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at,
+    lease: row.lease_owner || row.lease_device_id || row.lease_expires_at ? {
+      owner: row.lease_owner,
+      deviceId: row.lease_device_id,
+      expiresAt: row.lease_expires_at,
+    } : null,
+  };
+}
+
+const terminalRunStatuses = new Set(['COMPLETED', 'FAILED', 'STOPPED']);
+const leaseTtl = (value: unknown) => {
+  if (value === undefined) return 120_000;
+  const ttl = integerValue(value, 'ttlMs', 5_000);
+  if (ttl > 600_000) throw badRequest('ttlMs 不能超过 600000');
+  return ttl;
+};
+
+function leaseDevice(actor: RecordValue) {
+  const device = stringValue(actor.device_id, 'deviceId', 200, true) as string;
+  return { owner: actor.user_id as string, device };
+}
+
+/**
+ * A run created by an older client may not have a lease. Such runs keep the
+ * legacy checkpoint/recovery behavior. Once a lease is present, every mutating
+ * workflow operation must come from the same live device lease.
+ */
+function assertLease(store: Store, row: RecordValue, actor: RecordValue) {
+  const hasLease = row.lease_owner !== null && row.lease_owner !== undefined
+    || row.lease_device_id !== null && row.lease_device_id !== undefined
+    || row.lease_expires_at !== null && row.lease_expires_at !== undefined;
+  if (!hasLease) return;
+  const identity = leaseDevice(actor);
+  if (row.lease_owner !== identity.owner || row.lease_device_id !== identity.device) {
+    throw conflict('LEASE_OWNER_MISMATCH', '当前设备不是流程租约持有者');
+  }
+  if (!Number.isSafeInteger(row.lease_expires_at) || row.lease_expires_at <= store.now()) {
+    throw conflict('LEASE_EXPIRED', '流程租约已过期，请重新获取');
+  }
+}
+
+function leaseResult(run: RecordValue, action: string) {
+  return {
+    action,
+    runId: run.id,
+    lease: run.lease_owner || run.lease_device_id || run.lease_expires_at ? {
+      owner: run.lease_owner,
+      deviceId: run.lease_device_id,
+      expiresAt: run.lease_expires_at,
+    } : null,
   };
 }
 
@@ -132,10 +181,11 @@ interface CheckpointInput {
   checkpointId?: string;
 }
 
-function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput) {
+function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput, actor?: RecordValue) {
   input.status = normalizeStatus(input.status);
   if (!checkpointStatuses.has(input.status)) throw badRequest('checkpoint.status 无效');
   const row = getRun(store, userId, runId);
+  if (actor) assertLease(store, row, actor);
   if (input.expectedVersion !== undefined && input.expectedVersion !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
   if (!transitions[row.status]?.has(input.status)) throw conflict('INVALID_RUN_TRANSITION', `不能从 ${row.status} 转为 ${input.status}`);
   if (input.status === 'WAITING_HUMAN' && !input.humanWait) throw badRequest('WAITING_HUMAN 必须提供 humanWait');
@@ -148,6 +198,7 @@ function applyCheckpoint(store: Store, userId: string, runId: string, input: Che
     if (store.get('SELECT 1 AS present FROM workflow_checkpoints WHERE id=?', checkpointId)) throw conflict('CHECKPOINT_EXISTS', '检查点已存在');
   return store.transaction(() => {
     const latest = getRun(store, userId, runId);
+    if (actor) assertLease(store, latest, actor);
     if (latest.checkpoint_version !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
     store.run('INSERT INTO workflow_checkpoints(id,run_id,version,status,step_id,cursor_json,target_state_json,failure_json,human_wait_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', checkpointId, runId, version, input.status, input.stepId ?? latest.current_step, json(cursor), json(targetState), input.failure ? json(input.failure) : null, input.humanWait ? json(input.humanWait) : null, now);
     const completedAt = ['COMPLETED', 'STOPPED'].includes(input.status) ? now : null;
@@ -156,8 +207,9 @@ function applyCheckpoint(store: Store, userId: string, runId: string, input: Che
   });
 }
 
-function recoverRun(store: Store, userId: string, runId: string, body: RecordValue) {
+function recoverRun(store: Store, userId: string, runId: string, body: RecordValue, actor?: RecordValue) {
   const row = getRun(store, userId, runId);
+  if (actor) assertLease(store, row, actor);
   const checksPassed = body.checksPassed === undefined ? 0 : integerValue(body.checksPassed, 'checksPassed', 0);
   const userConfirmed = body.userConfirmed === true;
   if (body.expectedVersion !== undefined && integerValue(body.expectedVersion, 'expectedVersion', 0) !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
@@ -167,6 +219,7 @@ function recoverRun(store: Store, userId: string, runId: string, body: RecordVal
   const now = store.now();
   return store.transaction(() => {
     const latest = getRun(store, userId, runId);
+    if (actor) assertLease(store, latest, actor);
     if (latest.checkpoint_version !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
     const version = latest.checkpoint_version + 1;
     const checkpoint = parseJson<RecordValue>(latest.checkpoint_json, {});
@@ -323,22 +376,81 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
 
   app.get('/v1/workflow-runs/:id', async (request) => { const actor = user(request); const row = getRun(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string); const checkpoints = store.all<RecordValue>('SELECT id,version,status,step_id AS stepId,cursor_json,target_state_json,failure_json,human_wait_json,created_at AS createdAt FROM workflow_checkpoints WHERE run_id=? ORDER BY version DESC LIMIT 100', row.id).map((x) => ({ ...x, cursor: parseJson(x.cursor_json, {}), targetState: parseJson(x.target_state_json, {}), failure: parseJson(x.failure_json, null), humanWait: parseJson(x.human_wait_json, null) })); return { run: runResponse(row), checkpoints }; });
 
+  app.post('/v1/workflow-runs/:id/lease/acquire', async (request) => {
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['ttlMs', 'idempotencyKey']);
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const identity = leaseDevice(actor); const ttl = leaseTtl(body.ttlMs); const key = idempotencyKey(body.idempotencyKey);
+    const payload = { runId, action: 'acquire', owner: identity.owner, deviceId: identity.device, ttlMs: ttl };
+    const old = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.lease.acquire' AND idem_key=?", actor.user_id, key);
+    if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同租约请求'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
+    const response = store.transaction(() => {
+      const current = getRun(store, actor.user_id, runId); const now = store.now();
+      if (terminalRunStatuses.has(current.status)) throw conflict('LEASE_TERMINAL', '终态流程不能获取租约');
+      const active = current.lease_expires_at && current.lease_expires_at > now;
+      if (active && (current.lease_owner !== identity.owner || current.lease_device_id !== identity.device)) throw conflict('LEASE_HELD', '流程租约已被其他设备持有');
+      const expiresAt = now + ttl; const action = active ? 'renewed' : 'acquired';
+      store.run('UPDATE workflow_runs SET lease_owner=?,lease_device_id=?,lease_expires_at=?,updated_at=? WHERE id=? AND user_id=?', identity.owner, identity.device, expiresAt, now, runId, actor.user_id);
+      const updated = getRun(store, actor.user_id, runId); const result = leaseResult(updated, action);
+      store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.lease.acquire', key, hashPayload(payload), 'completed', json(result), now);
+      audit(store, 'user', actor.user_id, `workflow.lease.${action}`, actor.user_id, { runId, deviceIdHash: hashPayload(identity.device), expiresAt });
+      return result;
+    });
+    return response;
+  });
+
+  app.post('/v1/workflow-runs/:id/lease/renew', async (request) => {
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['ttlMs', 'idempotencyKey']);
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const identity = leaseDevice(actor); const ttl = leaseTtl(body.ttlMs); const key = idempotencyKey(body.idempotencyKey);
+    const payload = { runId, action: 'renew', owner: identity.owner, deviceId: identity.device, ttlMs: ttl };
+    const old = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.lease.renew' AND idem_key=?", actor.user_id, key);
+    if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同租约请求'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
+    const response = store.transaction(() => {
+      const current = getRun(store, actor.user_id, runId); const now = store.now();
+      if (terminalRunStatuses.has(current.status)) throw conflict('LEASE_TERMINAL', '终态流程不能续租');
+      if (current.lease_owner !== identity.owner || current.lease_device_id !== identity.device) throw conflict('LEASE_OWNER_MISMATCH', '当前设备不是流程租约持有者');
+      if (!current.lease_expires_at || current.lease_expires_at <= now) throw conflict('LEASE_EXPIRED', '流程租约已过期，请重新获取');
+      const expiresAt = now + ttl; store.run('UPDATE workflow_runs SET lease_expires_at=?,updated_at=? WHERE id=? AND user_id=? AND lease_owner=? AND lease_device_id=? AND lease_expires_at>?', expiresAt, now, runId, actor.user_id, identity.owner, identity.device, now);
+      const updated = getRun(store, actor.user_id, runId); const result = leaseResult(updated, 'renewed');
+      store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.lease.renew', key, hashPayload(payload), 'completed', json(result), now);
+      audit(store, 'user', actor.user_id, 'workflow.lease.renewed', actor.user_id, { runId, deviceIdHash: hashPayload(identity.device), expiresAt });
+      return result;
+    });
+    return response;
+  });
+
+  app.post('/v1/workflow-runs/:id/lease/release', async (request) => {
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['idempotencyKey']);
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const identity = leaseDevice(actor); const key = idempotencyKey(body.idempotencyKey);
+    const payload = { runId, action: 'release', owner: identity.owner, deviceId: identity.device };
+    const old = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.lease.release' AND idem_key=?", actor.user_id, key);
+    if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同租约请求'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
+    const response = store.transaction(() => {
+      const current = getRun(store, actor.user_id, runId);
+      if (current.lease_owner && current.lease_device_id && (current.lease_owner !== identity.owner || current.lease_device_id !== identity.device)) throw conflict('LEASE_OWNER_MISMATCH', '当前设备不是流程租约持有者');
+      const now = store.now(); store.run('UPDATE workflow_runs SET lease_owner=NULL,lease_device_id=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?', now, runId, actor.user_id);
+      const updated = getRun(store, actor.user_id, runId); const result = leaseResult(updated, 'released');
+      store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.lease.release', key, hashPayload(payload), 'completed', json(result), now);
+      audit(store, 'user', actor.user_id, 'workflow.lease.released', actor.user_id, { runId, deviceIdHash: hashPayload(identity.device) });
+      return result;
+    });
+    return response;
+  });
+
   app.post('/v1/workflow-runs/:id/checkpoints', async (request) => {
     const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['status', 'stepId', 'cursor', 'targetState', 'failure', 'humanWait', 'expectedVersion', 'checkpointId']);
     const input: CheckpointInput = { status: stringValue(body.status, 'status', 40, true) as string, stepId: stringValue(body.stepId, 'stepId', 200), cursor: body.cursor === undefined ? undefined : objectValue(body.cursor, 'cursor', 16_000), targetState: body.targetState === undefined ? undefined : objectValue(body.targetState, 'targetState', 16_000), failure: body.failure === undefined ? undefined : objectValue(body.failure, 'failure', 8_000), humanWait: body.humanWait === undefined ? undefined : objectValue(body.humanWait, 'humanWait', 8_000), expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true) };
-    const row = applyCheckpoint(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, input); audit(store, 'user', actor.user_id, 'workflow.checkpoint', actor.user_id, { runId: row.id, version: row.checkpoint_version, status: row.status, stepId: row.current_step }); return { run: runResponse(row) };
+    const row = applyCheckpoint(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, input, actor); audit(store, 'user', actor.user_id, 'workflow.checkpoint', actor.user_id, { runId: row.id, version: row.checkpoint_version, status: row.status, stepId: row.current_step }); return { run: runResponse(row) };
   });
 
   app.post('/v1/workflow-runs/:id/human-wait', async (request) => {
-    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['reason', 'context', 'expiresAt', 'expectedVersion', 'checkpointId']); const reason = stringValue(body.reason, 'reason', 500, true) as string; const context = body.context === undefined ? {} : objectValue(body.context, 'context', 8_000); const expiresAt = body.expiresAt === undefined ? null : integerValue(body.expiresAt, 'expiresAt', store.now() + 1); const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const row = applyCheckpoint(store, actor.user_id, runId, { status: 'waiting_human', humanWait: { reason, context, expiresAt }, expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true) }); audit(store, 'user', actor.user_id, 'workflow.human_wait', actor.user_id, { runId: row.id, reasonHash: hashPayload(reason) }); return { run: runResponse(row) };
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['reason', 'context', 'expiresAt', 'expectedVersion', 'checkpointId']); const reason = stringValue(body.reason, 'reason', 500, true) as string; const context = body.context === undefined ? {} : objectValue(body.context, 'context', 8_000); const expiresAt = body.expiresAt === undefined ? null : integerValue(body.expiresAt, 'expiresAt', store.now() + 1); const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const row = applyCheckpoint(store, actor.user_id, runId, { status: 'waiting_human', humanWait: { reason, context, expiresAt }, expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true) }, actor); audit(store, 'user', actor.user_id, 'workflow.human_wait', actor.user_id, { runId: row.id, reasonHash: hashPayload(reason) }); return { run: runResponse(row) };
   });
 
-  const recoverHandler = async (request: RequestValue) => { const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['checksPassed', 'userConfirmed', 'reason', 'expectedVersion']); const row = recoverRun(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, body); audit(store, 'user', actor.user_id, 'workflow.recover', actor.user_id, { runId: row.id, recoveryAttempts: row.recovery_attempts }); return { run: runResponse(row) }; };
+  const recoverHandler = async (request: RequestValue) => { const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['checksPassed', 'userConfirmed', 'reason', 'expectedVersion']); const row = recoverRun(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, body, actor); audit(store, 'user', actor.user_id, 'workflow.recover', actor.user_id, { runId: row.id, recoveryAttempts: row.recovery_attempts }); return { run: runResponse(row) }; };
   app.post('/v1/workflow-runs/:id/recover', recoverHandler);
   app.post('/v1/workflow-runs/:id/human-wait/resolve', recoverHandler);
   app.post('/v1/workflow-runs/:id/result-decision', async (request) => {
     const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['status', 'summary', 'idempotencyKey']);
-    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); assertLease(store, run, actor); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope=\'workflow.result-decision\' AND idem_key=?', actor.user_id, key); if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同结果'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     if (!deps.resultDecider) throw new AppError(503, 'RESULT_DECIDER_NOT_CONFIGURED', '结果决策器未配置');
     const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary }); const decision = stringValue(result.decision, 'decision', 40, true) as string; if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || Object.keys(result).some((key) => key !== 'decision')) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策无效');

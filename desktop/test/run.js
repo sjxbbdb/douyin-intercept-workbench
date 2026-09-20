@@ -333,6 +333,17 @@ testAsync('ApiClient result decision preserves the original run boundary', async
   const result = await api.resultDecision('run-1', { status: 'UNKNOWN', summary: { reason: 'fixture' }, idempotencyKey: 'result-key-001' });
   assert.equal(result.decision, 'wait_human'); assert.equal(seen.url, 'https://license.example/v1/workflow-runs/run-1/result-decision'); assert.equal(seen.options.headers.Authorization, 'Bearer token');
 });
+testAsync('ApiClient workflow lease methods preserve device lease endpoints', async () => {
+  const requests = [];
+  const api = new ApiClient({ baseUrl: 'https://license.example', authStore: { getToken: () => 'token' }, fetchImpl: async (url, options) => { requests.push({ url, options }); return { ok: true, status: 200, json: async () => ({ runId: 'run-1', action: 'renewed', lease: { deviceId: 'device-a' } }) }; } });
+  await api.acquireWorkflowLease('run-1', { ttlMs: 120000, idempotencyKey: 'lease-acquire-001' });
+  await api.renewWorkflowLease('run-1', { ttlMs: 120000, idempotencyKey: 'lease-renew-001' });
+  await api.releaseWorkflowLease('run-1', { idempotencyKey: 'lease-release-001' });
+  assert.equal(requests[0].url, 'https://license.example/v1/workflow-runs/run-1/lease/acquire');
+  assert.equal(requests[1].url, 'https://license.example/v1/workflow-runs/run-1/lease/renew');
+  assert.equal(requests[2].url, 'https://license.example/v1/workflow-runs/run-1/lease/release');
+  assert.equal(requests[2].options.headers.Authorization, 'Bearer token');
+});
 
 testAsync('rule event skips unrelated text before paid evaluation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-'));
