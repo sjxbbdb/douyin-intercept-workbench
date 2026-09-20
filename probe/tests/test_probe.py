@@ -605,5 +605,125 @@ class ChromiumFixtureTests(unittest.TestCase):
 
 
 
+class VideoRelevanceTests(unittest.TestCase):
+    """找视频模块的「相关度」回归（纯离线，不碰浏览器）。
+
+    架构依据：找视频模块固定流程第 4 步要求返回
+    「视频标题、作者、链接、相关度等候选结果」，模块职责是发现与筛选视频。
+    """
+
+    def test_exact_phrase_scores_by_position(self):
+        import crawl
+        head = crawl.video_relevance("宝宝辅食怎么做 一周不重样", "宝宝辅食")
+        self.assertEqual(head["score"], 100)
+        self.assertEqual(head["reason"], "exact_phrase")
+        self.assertTrue(head["exact"])
+        self.assertEqual(head["position"], 0)
+        early = crawl.video_relevance("今天宝宝辅食吃什么", "宝宝辅食")
+        self.assertEqual((early["score"], early["position"]), (90, 2))
+        late = crawl.video_relevance("今天给大家分享一个我家一直在用的宝宝辅食做法", "宝宝辅食")
+        self.assertEqual(late["score"], 80)
+        self.assertGreater(early["score"], late["score"])
+
+    def test_every_keyword_must_appear_contiguously_for_the_top_tier(self):
+        import crawl
+        both = crawl.video_relevance("教程 宝宝辅食做法", "宝宝辅食,教程")
+        self.assertEqual((both["score"], both["reason"]), (100, "exact_phrase"))
+        self.assertEqual(sorted(both["matchedKeywords"]), ["宝宝辅食", "教程"])
+        only_one = crawl.video_relevance("宝宝辅食做法分享", "宝宝辅食,教程")
+        self.assertEqual(only_one["reason"], "partial_segments")
+        self.assertEqual(only_one["missingKeywords"], ["教程"])
+
+    def test_falls_back_to_segments_when_the_phrase_never_appears(self):
+        """抖音标题几乎不会连续包含「怎么充值codex」这种提问式关键词。"""
+        import crawl
+        rel = crawl.video_relevance("充值 codex 会员教程", "怎么充值codex")
+        self.assertFalse(rel["exact"])
+        self.assertEqual((rel["score"], rel["reason"]), (60, "all_segments"))
+        self.assertEqual(sorted(rel["matchedSegments"]), ["codex", "充值"])
+        self.assertEqual(rel["missingSegments"], [])
+
+    def test_partial_segments_score_between_full_and_none(self):
+        import crawl
+        rel = crawl.video_relevance("codex 会员教程", "怎么充值codex")
+        self.assertEqual(rel["reason"], "partial_segments")
+        self.assertEqual(rel["matchedSegments"], ["codex"])
+        self.assertEqual(rel["missingSegments"], ["充值"])
+        self.assertTrue(0 < rel["score"] < 60)
+
+    def test_no_match_and_edge_cases(self):
+        import crawl
+        none = crawl.video_relevance("完全无关的内容", "宝宝辅食")
+        self.assertEqual((none["score"], none["reason"]), (0, "no_match"))
+        self.assertFalse(none["exact"])
+        self.assertIsNone(none["position"])
+        self.assertEqual(crawl.video_relevance("", "宝宝辅食")["score"], 0)
+        self.assertEqual(crawl.video_relevance("宝宝辅食", "")["reason"], "empty_keyword")
+
+
+class SearchRelevanceTests(unittest.TestCase):
+    """search 把相关度放进候选结果，并支持按阈值筛选（模块内职责）。"""
+
+    class _Page:
+        def close(self):
+            pass
+
+    def _instance(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (self._Page(), {})
+        return sidecar, instance
+
+    @staticmethod
+    def _videos():
+        return [
+            {"aweme_id": "1", "url": "https://www.douyin.com/video/1",
+             "desc": "宝宝辅食怎么做", "author": "A", "author_sec_uid": "S1"},
+            {"aweme_id": "2", "url": "https://www.douyin.com/video/2",
+             "desc": "codex 会员教程", "author": "B", "author_sec_uid": "S2"},
+            {"aweme_id": "3", "url": "https://www.douyin.com/video/3",
+             "desc": "完全无关的内容", "author": "C", "author_sec_uid": "S3"},
+        ]
+
+    def _run(self, params):
+        sidecar, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.search_videos = lambda *a, **k: self._videos()
+        try:
+            return instance.search(params)
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    def test_every_candidate_carries_a_relevance_record(self):
+        result = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["videos"]), 3)
+        self.assertEqual(result["videos"][0]["relevance"]["score"], 100)
+        self.assertEqual(result["videos"][0]["relevance"]["reason"], "exact_phrase")
+        self.assertEqual(result["videos"][2]["relevance"]["reason"], "no_match")
+        self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
+                                            "filteredByRelevance": 0, "minRelevance": 0})
+        # 边界：只发现与筛选，不产生任何发送动作
+        for key in ("sent", "sendId", "private", "reply"):
+            self.assertNotIn(key, result)
+
+    def test_min_relevance_filters_candidates_inside_the_module(self):
+        result = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
+        self.assertEqual([v["id"] for v in result["videos"]], ["1"])
+        self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
+                                            "filteredByRelevance": 2, "minRelevance": 60})
+
+    def test_min_relevance_is_validated(self):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "minRelevance": 101})
+        with self.assertRaises(sidecar.SidecarError):
+            instance.search({"keyword": "宝宝辅食", "minRelevance": -1})
+
+
 if __name__ == "__main__":
     unittest.main()

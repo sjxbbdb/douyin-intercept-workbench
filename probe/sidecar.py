@@ -291,13 +291,30 @@ class Sidecar:
             page.close()
 
     def search(self, params):
+        """按关键词搜索视频，返回带【相关度】的候选结果。
+
+        模块边界（找视频）：只负责【发现与筛选】视频 —— 不回复评论、不私信。
+        固定流程第 4 步要求返回「标题、作者、链接、相关度等候选结果」；
+        第 5 步「用户选择，或 Agent 按规则交给评论区模块」由宿主决定，
+        所以这里只给候选和相关度，不做任何跨模块动作。
+
+        相关度由 crawl.video_relevance 计算：整串命中 > 分词全命中 > 部分命中 > 不命中，
+        规则确定、可解释、纯离线。宿主可以用 minRelevance 直接筛，也可以自己排序。
+
+        注意：相关度衡量的是【标题与关键词的字面相关】，不是视频质量；
+        热度（点赞/评论数）是另一个维度，需要时由宿主另行获取。
+        """
         keyword = params.get("keyword")
         if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > MAX_KEYWORD:
             raise SidecarError("invalid_input", "keyword is required")
+        keyword = keyword.strip()
         max_videos = int(params.get("maxVideos", 50))
         rounds = int(params.get("scrollRounds", 6))
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
+        min_relevance = int(params.get("minRelevance", 0) or 0)
+        if not 0 <= min_relevance <= 100:
+            raise SidecarError("invalid_input", "minRelevance must be between 0 and 100")
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
@@ -308,14 +325,27 @@ class Sidecar:
                                                 max_videos=max_videos, log=lambda *a: None,
                                                 strict=False, meta=meta)
             out = []
-            for video in videos[:max_videos]:
+            filtered = 0
+            for video in videos:
+                relevance = crawlmod.video_relevance(video.get("desc"), keyword)
+                if relevance["score"] < min_relevance:
+                    filtered += 1
+                    continue
+                if len(out) >= max_videos:
+                    break
                 out.append({"id": str(video.get("aweme_id") or ""),
                             "url": safe_url(video.get("url"), "video.url"),
                             "title": str(video.get("desc") or "")[:200],
                             "author": str(video.get("author") or "")[:120],
-                            "authorId": str(video.get("author_sec_uid") or "")[:200]})
+                            "authorId": str(video.get("author_sec_uid") or "")[:200],
+                            "relevance": relevance})
             return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
-                    "videos": out}
+                    "videos": out,
+                    # 被相关度阈值筛掉的条数：宿主据此决定是放宽阈值，
+                    # 还是让找视频模块换关键词再来一轮。
+                    "filter": {"collected": len(videos), "returned": len(out),
+                               "filteredByRelevance": filtered,
+                               "minRelevance": min_relevance}}
         finally:
             page.close()
 

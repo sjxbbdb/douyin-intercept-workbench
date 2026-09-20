@@ -15,6 +15,23 @@ kept only while navigating a short link; the response returns the resolved
 URL without its query string. `state-dir` and `profile-dir` must be absolute
 and outside the source directory.
 
+`search` returns one candidate per video with `id`, `url`, `title`, `author`,
+`authorId`, and a `relevance` record. Relevance is computed locally from the
+search keyword against the title and is deterministic: every keyword the user
+typed appearing contiguously in the title scores 70-100 (a hit at the head of
+the title scores highest), all keyword segments present scores 60, a partial
+segment match scores at most 39, and no match scores 0. The record carries
+`reason`, `matchedSegments` / `missingSegments`, `matchedKeywords` /
+`missingKeywords`, `exact`, and `position`, so a host can explain a ranking
+instead of trusting a bare number. `minRelevance` (0-100, default 0) filters
+candidates inside this module, and `filter` reports `collected`, `returned`, and
+`filteredByRelevance`.
+
+Relevance is the textual relatedness of the title, not video quality;
+popularity is a separate signal and is deliberately not mixed into the score.
+This method only discovers and filters candidates — it never replies to a
+comment and never sends a message.
+
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
 automation gate. `private_reply` records the collaborator account flow
