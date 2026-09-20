@@ -10,12 +10,50 @@
 """
 
 # ---------- 评论区 ----------
+#
+# 🔴 2026-09-20 真机校正（video/7686815808756020563，Chrome 153，window.__ 只读探测）
+#
+#   可见评论容器里【只存在三个】data-e2e：
+#       comment-item (x16) / video-comment-more (x16) / live-avatar (x4)
+#
+#   也就是说，下面这些曾经写进来的名字，真机上【一个都不存在】：
+#       comment-content / comment-input / comment-submit
+#       comment-reply / comment-item-reply
+#       comment-reply-input / comment-reply-submit ...
+#   它们只在自己的离线夹具里成立 —— 这正是 video_reply 一直 autoEligible=false 的原因。
+#
+#   真机上的实际形态：
+#     · 评论正文 = 【裸节点】，时间/地区/点赞/「分享」「回复」是它的兄弟节点
+#       -> 只能用「兄弟节点排除法」提取（见 douyin.body_text_js）
+#     · 「回复」按钮 = 【裸 <span>】，无 class、无 data-e2e
+#       -> 只能按文本严格匹配
+#     · 点「回复」后，同一评论项内出现【恰好 1 个】[contenteditable=true]（Draft.js）
+#     · 发送键 = 编辑器同行右侧的图标，激活时 path 填充为抖音品牌红
+#       -> 按颜色判定，比类名稳；且内容为空时它不是红色（天然的"空内容不发送"保护）
+#
+#   ⚠️ 这些是【结构锚点】而非平台承诺；平台改版会失效，所以每项都带 live_verified_at。
 COMMENT_LIST = '[data-e2e="comment-list"]'
 COMMENT_ITEM = '[data-e2e="comment-item"]'
+COMMENT_MORE = '[data-e2e="video-comment-more"]'
+# ⚠️ 已证实真机不存在，仅为兼容历史离线夹具而保留；禁止用于真机定位。
 COMMENT_CONTENT = '[data-e2e="comment-content"]'
 FEED_COMMENT_ICON = '[data-e2e="feed-comment-icon"]'
 NOTE_DETAIL = '.note-detail-container'
 CONTENTEDITABLE = '[contenteditable=true]'
+
+# 回复按钮 / 回复中状态：真机上是裸 spandiv，只能按文本定位
+COMMENT_REPLY_BUTTON_TEXT = "回复"
+COMMENT_REPLYING_TEXT = "回复中"
+# 行内回复编辑器（Draft.js），必须限定在处于「回复中」的那一项内
+COMMENT_REPLY_EDITOR_SELECTOR = CONTENTEDITABLE
+# 编辑器右侧操作区（语义类名，真机存在）
+COMMENT_INPUT_RIGHT_CT = '[class*="commentInput-right"]'
+# 发送键激活色 = 抖音品牌红
+COMMENT_SEND_ACTIVE_FILL = "rgb(254, 44, 85)"
+# 正文提取时要排除的操作文案（时间/地区/纯数字另有规则）
+COMMENT_NOISE_TEXTS = ["分享", "回复", "回复中", "作者", "置顶", "收起"]
+
+# 顶层评论输入框（发布一条新评论，不是回复某个人）
 COMMENT_EDITORS = [
     '[data-e2e="comment-input"]',
     '[data-e2e="comment-input-inner"]',
@@ -25,6 +63,8 @@ COMMENT_SEND_BUTTONS = [
     '[data-e2e="comment-submit"]',
     '[data-e2e="comment-send"]',
 ]
+# ⚠️ 以下三项保留【仅为历史离线夹具】。真机定位请用
+#    douyin.comment_reply_button / comment_reply_composer / comment_reply_send_button。
 COMMENT_REPLY_BUTTONS = [
     '[data-e2e="comment-reply"]',
     '[data-e2e="comment-item-reply"]',
@@ -163,7 +203,12 @@ DM_SEND_URL_MARK = ""          # 空 = 未确认；此时不允许宣告 sent_co
 REGISTRY = {
     "commentList":    {"value": COMMENT_LIST,   "offline_verified_at": "2026-09-18", "live_verified_at": None, "confidence": "high"},
     "commentItem":    {"value": COMMENT_ITEM,   "offline_verified_at": "2026-09-18", "live_verified_at": None, "confidence": "high"},
-    "commentContent": {"value": COMMENT_CONTENT,"offline_verified_at": "2026-09-18", "live_verified_at": None, "confidence": "high"},
+    "commentMore":    {"value": COMMENT_MORE,   "offline_verified_at": None,        "live_verified_at": "2026-09-20", "confidence": "high"},
+    "replyButton":    {"value": "text:" + COMMENT_REPLY_BUTTON_TEXT, "offline_verified_at": None, "live_verified_at": "2026-09-20", "confidence": "medium"},
+    "replyEditor":    {"value": COMMENT_REPLY_EDITOR_SELECTOR + " @ " + COMMENT_REPLYING_TEXT, "offline_verified_at": None, "live_verified_at": "2026-09-20", "confidence": "high"},
+    "replySendFill":  {"value": COMMENT_SEND_ACTIVE_FILL, "offline_verified_at": None,    "live_verified_at": "2026-09-20", "confidence": "medium"},
+    # ⚠️ commentContent 真机不存在 —— 标 None 并在 note 里写明，避免被误用
+    "commentContent": {"value": COMMENT_CONTENT,"offline_verified_at": "2026-09-18", "live_verified_at": None, "confidence": "low"},
     "dmPanelEditors": {"value": DM_PANEL_EDITORS,"offline_verified_at": None,        "live_verified_at": None, "confidence": "medium"},
     "dmEditorScope":  {"value": DM_EDITOR_SCOPES[0],"offline_verified_at": None,      "live_verified_at": "2026-09-19", "confidence": "high"},
     "searchBar":      {"value": SEARCH_BAR,      "offline_verified_at": None,        "live_verified_at": "2026-09-19", "confidence": "high"},

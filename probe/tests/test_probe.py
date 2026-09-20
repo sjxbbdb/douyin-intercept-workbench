@@ -414,7 +414,9 @@ class BoundaryTests(unittest.TestCase):
                 return "complete" if expression == "document.readyState" else None
 
             def eval_json(self, _expression):
-                return {"ok": False, "count": 2, "reason": "ambiguous_comment"}
+                # 模拟 douyin.comment_reply_button 真实会返回的歧义结果
+                # （真机上它由 douyin.py 的 _REPLY_BUTTON_JS 产生）
+                return {"found": False, "count": 2, "reason": "ambiguous_comment"}
 
             def click_at(self, *args):
                 self.clicks.append(args)
@@ -432,6 +434,8 @@ class BoundaryTests(unittest.TestCase):
         finally:
             send_actions.douyin.check_captcha, send_actions.douyin.login_state = old
         self.assertEqual(result["status"], "failed")
+        # 归因必须明确指到【回复按钮定位】这一步，而不是笼统的 not_found
+        self.assertEqual(result["reason"], "reply_ambiguous_comment")
         self.assertEqual(page.clicks, [])
 
     def test_sidecar_stdout_is_protocol_only(self):
@@ -561,28 +565,122 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.page.evaluate("document.querySelectorAll('[data-e2e=live-chat-input]')[1].remove()")
         self.assertTrue(live.find_composer(self.page)["found"])
 
-    def test_video_target_exact_id_author_text_and_reply_button(self):
-        import send_actions
-        self._load("comments.html")
-        good = self.page.eval_json(send_actions.build_comment_target_expression({
-            "id": "comment-1", "authorId": "author-1", "authorName": "Alice", "text": "same question"}))
-        self.assertTrue(good["ok"])
-        self.page.click_at(good["x"], good["y"])
-        self.assertEqual(self.page.evaluate("document.querySelector('#comment-1 [data-e2e=comment-reply]').dataset.clicks"), "1")
+    def test_video_reply_never_relies_on_invented_data_e2e(self):
+        """回归护栏：夹具里不许再出现真机不存在的那些 data-e2e。
+
+        旧夹具靠 comment-content / comment-reply / comment-reply-input /
+        comment-reply-submit 让测试全绿，而真机上一个都没有 —— 这正是
+        video_reply 长期停在 autoEligible=false 的原因。把它们钉死在这里。
+        """
+        import pathlib
+        html = (pathlib.Path(__file__).parent / "fixtures" / "comments.html").read_text(encoding="utf-8")
+        for invented in ["comment-content", "comment-reply", "comment-reply-input",
+                         "comment-reply-submit", "comment-reply-editor"]:
+            self.assertNotIn('data-e2e="%s"' % invented, html,
+                             "夹具不得再依赖真机不存在的 data-e2e：%s" % invented)
+
+    def test_video_reply_button_locates_real_structure(self):
+        """「回复」是真机上的裸 <span>，只能按文本定位。"""
         import douyin
-        comment_target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice", "text": "same question"}
-        composer = douyin.comment_reply_composer(self.page, comment_target)
-        self.assertTrue(composer["found"])
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        hit = douyin.comment_reply_button(self.page, target)
+        self.assertTrue(hit["found"], hit)
+        self.assertEqual(hit["tag"], "SPAN")
+        self.assertGreaterEqual(hit["y"], 0)
+        self.page.click_at(hit["x"], hit["y"])
+        self.assertEqual(self.page.evaluate("document.querySelector('#comment-1').dataset.replyClicks"), "1")
+
+    def test_video_reply_button_rejects_wrong_text(self):
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "not the same question"}
+        hit = douyin.comment_reply_button(self.page, target)
+        self.assertFalse(hit["found"])
+        self.assertEqual(hit["reason"], "comment_not_found")
+
+    def test_video_reply_button_requires_scroll_when_out_of_viewport(self):
+        """虚拟列表里出视口的行坐标是负的（真机实测 y=-1415）——必须先滚再读。"""
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-off", "authorId": "author-off", "authorName": "Carol",
+                  "text": "offscreen question"}
+        single = douyin.comment_reply_button(self.page, target, attempts=1, settle=0)
+        self.assertFalse(single["found"])
+        self.assertEqual(single["reason"], "scrolled_into_view")
+        # 默认会重试，最终应当拿到视口内的坐标
+        hit = douyin.comment_reply_button(self.page, target)
+        self.assertTrue(hit["found"], hit)
+        self.assertGreaterEqual(hit["y"], 0)
+
+    def test_video_reply_button_falls_back_to_author_without_id(self):
+        """没有 id 时退化为「正文 + 作者链接」；作者不符必须拒绝。"""
+        import douyin
+        self._load("comments.html")
+        ok = douyin.comment_reply_button(self.page, {
+            "authorId": "author-1", "authorName": "Alice", "text": "same question"})
+        self.assertTrue(ok["found"], ok)
+        bad = douyin.comment_reply_button(self.page, {
+            "authorId": "author-nobody", "authorName": "Nobody", "text": "same question"})
+        self.assertFalse(bad["found"])
+        self.assertEqual(bad["reason"], "comment_not_found")
+
+    def test_video_reply_composer_requires_replying_row(self):
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        self.assertEqual(douyin.comment_reply_composer(self.page, target)["reason"], "reply_not_open")
+        self.page.evaluate("openReply(document.querySelector('#comment-1'))")
+        composer = douyin.comment_reply_composer(self.page, target)
+        self.assertTrue(composer["found"], composer)
         self.assertEqual(composer["rowId"], "comment-1")
-        reply_send = douyin.comment_reply_send_button(self.page, comment_target)
-        self.assertTrue(reply_send["found"])
-        self.assertEqual(douyin.comment_composer(self.page)["found"], True)
-        wrong_author = self.page.eval_json(send_actions.build_comment_target_expression({
-            "id": "comment-1", "authorId": "author-10", "authorName": "Alice", "text": "same question"}))
-        self.assertFalse(wrong_author["ok"])
-        wrong_text = self.page.eval_json(send_actions.build_comment_target_expression({
-            "id": "comment-1", "authorId": "author-1", "authorName": "Alice", "text": "different"}))
-        self.assertFalse(wrong_text["ok"])
+
+    def test_video_reply_ambiguous_open_rows_are_rejected(self):
+        """同时有两行处于「回复中」时必须拒绝，不能猜一行。"""
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        self.page.evaluate("openReply(document.querySelector('#comment-1'));openReply(document.querySelector('#comment-3'))")
+        self.assertEqual(douyin.comment_reply_composer(self.page, target)["reason"], "ambiguous_reply_open")
+        self.assertFalse(douyin.comment_reply_send_button(self.page, target)["found"])
+        self.page.evaluate("document.querySelector('#comment-3 .replying-state').parentElement.querySelector('.comment-input-inner-container').remove();document.querySelector('#comment-3 .replying-state').remove()")
+        self.assertTrue(douyin.comment_reply_composer(self.page, target)["found"])
+
+    def test_video_reply_send_button_is_inactive_until_text_present(self):
+        """空内容时发送键不是品牌红 —— "空内容不发送"由颜色判据自动保证。"""
+        import douyin
+        self._load("comments.html")
+        target = {"id": "comment-1", "authorId": "author-1", "authorName": "Alice",
+                  "text": "same question"}
+        self.page.evaluate("openReply(document.querySelector('#comment-1'))")
+        empty = douyin.comment_reply_send_button(self.page, target)
+        self.assertFalse(empty["found"])
+        self.assertEqual(empty["reason"], "send_button_inactive")
+
+        composer = douyin.comment_reply_composer(self.page, target)
+        self.page.click_at(composer["x"], composer["y"])
+        self.page.type_text("谢谢提醒")
+        active = douyin.comment_reply_send_button(self.page, target)
+        self.assertTrue(active["found"], active)
+        self.assertTrue(active["active"])
+        self.page.click_at(active["x"], active["y"])
+        self.assertEqual(
+            self.page.evaluate("document.querySelector('#comment-1 .commentInput-right-ct .send').dataset.clicks"),
+            "1")
+
+    def test_video_reply_typing_into_wrong_row_is_never_attempted(self):
+        """目标行的编辑器没开时，绝不能把文字打进别的行。"""
+        import douyin
+        self._load("comments.html")
+        other = {"id": "comment-3", "authorId": "author-3", "authorName": "Bob",
+                 "text": "different question"}
+        self.page.evaluate("openReply(document.querySelector('#comment-1'))")
+        self.assertEqual(douyin.comment_reply_composer(self.page, other)["reason"], "reply_row_mismatch")
+
 
     def test_private_async_target_context_excludes_wrong_history(self):
         import douyin

@@ -236,7 +236,15 @@ COMMENT_TARGET_JS = """(function(target){
 
 
 def build_comment_target_expression(target):
-    """Build the scoped, exact video-comment locator expression."""
+    """⚠️ 已废弃（2026-09-20）：真机上不再可用。
+
+    它依赖 [data-e2e="comment-content"] 与 [data-e2e="comment-reply"]，
+    这两个名字在真实抖音页面上【都不存在】（真机可见评论容器里只有
+    comment-item / video-comment-more / live-avatar 三个 data-e2e）。
+    send_comment 已改用 douyin.comment_reply_button。
+
+    保留仅为兼容历史调用；新代码不要使用。
+    """
     import json
     return COMMENT_TARGET_JS.replace("ITEM_SELECTOR", json.dumps(S.COMMENT_ITEM)) \
         .replace("CONTENT_SELECTOR", json.dumps(S.COMMENT_CONTENT)) \
@@ -308,10 +316,15 @@ def send_comment(tab, gate, send_id, target, text, source):
             # person's row and does not require authorId.
             composer = live.find_composer(tab)
         else:
-            expression = build_comment_target_expression(target)
-            found = tab.eval_json(expression) or {"ok": False, "reason": "comment_not_found"}
-            if not found.get("ok"):
-                row = gate.finish(send_id, "failed", found.get("reason", "comment_not_found"))
+            # 真机校正（2026-09-20）：改用 douyin.comment_reply_button。
+            # 旧路径 build_comment_target_expression 依赖 [data-e2e="comment-content"]
+            # 与 [data-e2e="comment-reply"]，这两个名字在真机上都不存在，
+            # 于是永远停在 comment_not_found —— 这是 video_reply 长期不可自动化的原因。
+            # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
+            found = douyin.comment_reply_button(tab, target)
+            if not found.get("found"):
+                row = gate.finish(send_id, "failed",
+                                  "reply_" + str(found.get("reason") or "not_found"))
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
             time.sleep(0.6)
@@ -321,10 +334,20 @@ def send_comment(tab, gate, send_id, target, text, source):
             return gate.result(row)
         tab.click_at(composer["x"], composer["y"])
         tab.type_text(text)
-        button = live.find_send_button(tab) if source == "live" else douyin.comment_reply_send_button(tab, target)
-        if not button.get("found") or button.get("disabled"):
-            row = gate.finish(send_id, "failed", "comment_send_button_unavailable")
-            return gate.result(row)
+        if source == "live":
+            button = live.find_send_button(tab)
+            if not button.get("found") or button.get("disabled"):
+                row = gate.finish(send_id, "failed", "comment_send_button_unavailable")
+                return gate.result(row)
+        else:
+            # ⚠️ 语义变化：comment_reply_send_button 的 found 表示【处于激活态】。
+            # 真机上发送键是 <svg>，没有 disabled 属性，旧判据永远为假；
+            # 现在按颜色判定 —— 内容为空时它不是品牌红，于是"空内容不发送"自动成立。
+            button = douyin.comment_reply_send_button(tab, target)
+            if not button.get("found"):
+                row = gate.finish(send_id, "failed",
+                                  "comment_send_button_" + str(button.get("reason") or "not_found"))
+                return gate.result(row)
         after = live.find_composer(tab) if source == "live" else douyin.comment_reply_composer(tab, target)
         if (after.get("text") or "") != text:
             row = gate.finish(send_id, "failed", "text_verification_failed")
