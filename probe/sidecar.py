@@ -22,7 +22,7 @@ import douyin_selectors as S
 import live
 import live_flow
 import winfocus
-from send_actions import send_comment, send_private
+from send_actions import send_comment, send_danmaku_reply, send_private
 from send_gate import SendGate
 from url_policy import URLPolicyError, redact_url, safe_url
 
@@ -222,6 +222,20 @@ class Sidecar:
                                                "delivery": "queued_batch_two_phase",
                                                "scripts": "host_provided_only",
                                                "window": "expired_events_are_not_replayed"}},
+                # 回复弹幕（公屏 @该观众）。真机结论 2026-09-20：网页端没有「点弹幕回复」的
+                # 原生入口，所以落地形式是公屏 @昵称；发送机制（按钮 or 回车）与送达证据
+                # 都还没拿到真机确认 —— 因此 autoEligible 保持 false，并写明未验证项。
+                "live_danmaku_reply": {"implemented": True, "autoEligible": False,
+                                        "validation": {"status": "offline_unit_tests",
+                                                       "delivery": "unknown",
+                                                       "mention": "text_must_start_with_at_nickname",
+                                                       "target": "danmaku_must_be_visible_and_unique",
+                                                       "sendMechanism": "unverified_button_or_enter"}},
+                # 采集数据源：优先读页面内存里的弹幕数据模型（带 sec_uid），DOM 文本兜底。
+                "live_capture_source": {"implemented": True, "autoEligible": False,
+                                         "validation": {"status": "page_memory_verified_2026_09_19",
+                                                        "identity": "page_memory_100_percent_dom_0_percent",
+                                                        "fallback": "dom_text_nickname_only"}},
             },
             "limits": dict(self.gate.limits),
             "accountScope": self.account_scope,
@@ -459,8 +473,18 @@ class Sidecar:
             rows = live.collect_events(page, max_items=max_items)
             events = [_event("live", final_url, row) for row in rows]
             queue = self.live_queue.append(events)
+            sources = {}
+            for row in rows:
+                key = str(row.get("source") or "unknown")
+                sources[key] = sources.get(key, 0) + 1
+            identified = len([row for row in rows if str(row.get("authorId") or "").strip()])
             return {"status": "ok", "events": events, "queue": queue,
-                    "capability": {"verified": bool(events), "source": "visible_dom",
+                    "capability": {"verified": bool(events),
+                                   # 首选页面内存（带 sec_uid），不可用时才回落到 DOM 文本。
+                                   "source": ("page_memory" if sources.get("page_memory")
+                                              else "visible_dom"),
+                                   "sources": sources,
+                                   "identityCoverage": "%d/%d" % (identified, len(rows)),
                                    "detail": "queue dedupes by room/author/text; the batch window is enforced at planning"}}
         finally:
             page.close()
@@ -486,6 +510,11 @@ class Sidecar:
             # 在这个接线完成之前，边界一律拒绝调用方自带策略，改用内置的保守默认值。
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
+        reply_mode = str(params.get("replyMode") or "composer")
+        if reply_mode not in live_flow.REPLY_MODES:
+            # composer = 公屏普通评论；danmaku = 公屏 @该观众 的评论（回复弹幕）
+            raise SidecarError("invalid_input",
+                               "replyMode must be one of %s" % ", ".join(live_flow.REPLY_MODES))
         spec = live_flow.normalize_filter(params.get("keywords"),
                                           params.get("excludeKeywords"),
                                           params.get("matchMode") or "seg")
@@ -500,10 +529,11 @@ class Sidecar:
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
                     "expired": batch["expired"], "filter": batch["filter"]}
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
-                                           params.get("policy"))
+                                           params.get("policy"), reply_mode=reply_mode)
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
+                "replyMode": plan.get("replyMode"),
                 "policy": plan["policy"], "policySource": plan.get("policySource")}
 
     def live_reply(self, params):
@@ -518,6 +548,13 @@ class Sidecar:
         plan = self.live_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        mode = str(plan.get("replyMode") or "composer")
+        requested = params.get("mode")
+        if requested is not None and str(requested) != mode:
+            # 落地方式在冻结计划时定稿。中途改口会让同一批次里出现两种触达方式，
+            # 去重与审计都无法解释，所以这里一律拒绝。
+            raise SidecarError("mode_mismatch",
+                               "the frozen plan replies as %s, not %s" % (mode, requested))
         results, sendable = [], []
         for item in items:
             target = self.live_queue.target(batch_id, item["eventId"])
@@ -540,7 +577,13 @@ class Sidecar:
                     comment_target = {"id": target["eventId"], "roomId": target["roomId"],
                                       "authorId": target["authorId"],
                                       "authorName": target["authorName"], "text": target["text"]}
-                    outcome = send_comment(page, self.gate, item["sendId"], comment_target, text, "live")
+                    if mode == "danmaku":
+                        # 回复弹幕：公屏发一条 @该弹幕作者 的消息（发出前先定位那条弹幕）
+                        outcome = send_danmaku_reply(page, self.gate, item["sendId"],
+                                                     comment_target, text)
+                    else:
+                        outcome = send_comment(page, self.gate, item["sendId"], comment_target,
+                                               text, "live")
                     self.live_queue.mark(item["eventId"], str(outcome.get("status") or "unknown"),
                                          batch_id, {"sendId": item["sendId"],
                                                     "reason": outcome.get("reason")})
@@ -549,6 +592,7 @@ class Sidecar:
                 page.close()
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         return {"status": "ok" if sendable else "blocked", "phase": "public", "results": results,
+                "replyMode": mode,
                 "privateCandidates": [{"eventId": t["eventId"], "authorId": t["authorId"],
                                        "authorName": t["authorName"]} for t in allowed],
                 "privateRejected": rejected,

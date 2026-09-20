@@ -56,6 +56,8 @@ POLICY_DEFAULTS = {
 CAPACITY_DEFAULT = 500
 WINDOW_DEFAULT = 900
 MAX_BATCH = 50
+# 公屏回复的两种落地方式：普通公屏评论 / 带 @昵称 的回复弹幕（真机结论见 live.py）。
+REPLY_MODES = ("composer", "danmaku")
 
 
 class LiveFlowError(Exception):
@@ -522,7 +524,7 @@ class LiveQueue:
 
     # ------------------------------------------------------------------- plan
 
-    def freeze_plan(self, batch_id, scripts, policy=None):
+    def freeze_plan(self, batch_id, scripts, policy=None, reply_mode="composer"):
         """Freeze the two-channel plan for one batch.
 
         'scripts' maps an event id (or fingerprint) to an object carrying
@@ -531,6 +533,10 @@ class LiveQueue:
         """
         policy_source = "request" if policy else "builtin_default"
         policy = normalize_policy(policy)
+        mode = str(reply_mode or "composer")
+        if mode not in REPLY_MODES:
+            raise LiveFlowError("invalid_input",
+                                "replyMode must be one of %s" % ", ".join(REPLY_MODES))
         batch = self.batch(batch_id)
         if batch is None:
             raise LiveFlowError("unknown_batch", "batch does not exist")
@@ -547,6 +553,15 @@ class LiveQueue:
             else:
                 reason = (_script_error(entry.get("publicText"), policy, "public_text") or
                           _script_error(entry.get("privateText"), policy, "private_text"))
+            # 回复弹幕的两条【计划期】校验（都在打开浏览器之前完成）：
+            #   · 没有昵称就 @ 不到人 -> 直接 blocked，绝不用 ID 或调用方拼的名字猜；
+            #   · 话术必须自带 @昵称 前缀（话术归平台侧，本模块不代写、不改写）。
+            if not reason and mode == "danmaku":
+                name = str(event.get("authorName") or "").strip()
+                if not name:
+                    reason = "missing_author_name"
+                elif not str(entry.get("publicText") or "").lstrip().startswith("@" + name):
+                    reason = "mention_prefix_missing"
             if reason:
                 blocked.append({"eventId": event.get("id"), "reason": reason})
                 self.mark(event["id"], BLOCKED, batch_id, {"reason": reason})
@@ -565,7 +580,10 @@ class LiveQueue:
             })
         plan = {"batchId": str(batch_id), "frozenAt": _iso(self.clock()), "policy": policy,
                 "targets": targets, "blocked": blocked, "scriptSource": "host",
-                "policySource": policy_source}
+                "policySource": policy_source,
+                # 公屏回复的落地方式在【冻结时】定下来，之后不允许中途改：
+                # composer = 公屏发一条普通评论；danmaku = 公屏发一条 @该观众 的评论（回复弹幕）。
+                "replyMode": mode}
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
