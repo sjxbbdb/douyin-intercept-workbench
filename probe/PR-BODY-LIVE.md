@@ -122,15 +122,15 @@ python tests/test_probe.py LiveFlowTests BoundaryTests
 评审列出的 7 项里，本次处理 **4 项**（3 个状态机缺陷 + 策略签发边界），每项都补了回归测试；
 其余 3 项属于服务端接线与真机验收，**如实保持未完成**，不做任何"已完成"的表述。
 
-> 说明：分支上第 1/2/3 条的**实现**由协作者提交 `8767c2e` 重写过（把过期与空批次处理写进
-> `take_batch`）。下表按分支**当前实际实现与用例名**描述；本次修订在其之上补齐九步流程第 2 步
-> （关键词匹配）并修回被删掉的窗口守卫，详见第 9 节。
+> 说明：分支上曾出现一次并发写入（协作者 `8767c2e` 用另一套写法覆盖了 `live_flow.py` 与
+> `tests/test_probe.py`，随后由同一作者用 `89464b6a` revert 回本 PR 的实现，并指出本实现的一个
+> 可观测性缺口）。下表按分支**当前实际实现与用例名**描述；缺口已在本修订中修掉，经过见第 9 节。
 
 | 评审项 | 处理结果 | 回归测试 |
 |---|---|---|
-| 1 空批次会永久复用 | 队列为空时**不再创建批次**（返回 `status: "empty"`、`batchId: null`） | `test_empty_queue_never_creates_a_reusable_empty_batch` |
-| 2 过期批次仍可复用 | 取批次时把过了 `expiresAt` 的批次退休并作废其 `planned` 事件；两个阶段执行前都调用 `ensure_active`，超窗一律 `batch_expired`（守卫与"冻结批次同样过期"的取舍见第 9 节） | `test_expired_open_batch_is_retired_and_never_reused`、`test_ensure_active_retires_an_expired_batch_and_never_replays_it`、`test_sidecar_refuses_an_expired_batch_without_touching_the_browser` |
-| 3 私信结果没有持久化 | `mark_private` 按解析出的 `event_key` 更新（原实现选中了正确的行，却用调用方的 `event_id` 去写，于是接口返回成功、库里没记录） | `test_mark_private_persists_against_the_real_event_key` |
+| 1 空批次会永久复用 | 队列为空时**不再创建批次**（返回 `status: "empty"`、`batchId: null`）；已存在的空批次被关闭为 `expired` | `test_empty_batch_is_closed_instead_of_reused` |
+| 2 过期批次仍可复用 | 取批次时把过了 `expiresAt` 的批次关闭为 `expired` 并作废其 `planned` 事件；两个阶段执行前都调用 `ensure_active`，超窗一律 `batch_expired`（且先于任何浏览器动作） | `test_open_batch_is_closed_once_its_window_passed`、`test_phase_methods_refuse_an_expired_batch`、`test_sidecar_refuses_an_expired_batch_without_touching_the_browser` |
+| 3 私信结果没有持久化 | `mark_private` 按解析出的 `event_key` 更新（原实现选中了正确的行，却用调用方的 `event_id` 去写，于是接口返回成功、库里没记录） | `test_private_result_is_persisted` |
 | 4 策略由客户端参数控制 | 边界**拒绝调用方自带 policy**（`policy_not_server_issued`），改用内置保守默认值；冻结计划记录 `policySource: "builtin_default"`；库层保留 `freeze_plan(policy=...)` 作为服务端接线的缝 | `test_sidecar_live_plan_and_guards_need_no_browser` |
 | 5 积分 / 功能开关 / 服务端审计未接入 | **未做**：需要服务端协议；本 PR 不声称完成，本地 `send_gate.py` 仍是唯一本地闸 | —— |
 | 6 只有离线验证 | **未做**：真机选择器、作者标识、公屏送达、私信送达均待验收；`live_batch.autoEligible` 保持 `false` | —— |
@@ -166,52 +166,64 @@ LiveFlowTests + BoundaryTests 共 33 项：OK
 
 ### 第 2 步新增的回归测试
 
-`test_keyword_match_happens_before_a_batch_is_formed`（先匹配再成批：`maxItems=1` 时拿到的是命中
-关键词的那条，而不是队列里第一条）、`test_filtered_events_never_enter_a_later_batch`（filtered 是终态）、
-`test_exclude_keywords_win_over_a_hit`（排除词优先）、
-`test_batch_without_keywords_keeps_the_old_behaviour`（不给关键词时行为不变）、
-`test_sidecar_live_plan_applies_keywords_before_batching`（边界透传 + 非法 `matchMode` 被拒）。
+`test_plan_matches_keywords_before_forming_a_batch`（**先匹配再成批**：`maxItems=1` 时拿到的是命中
+关键词的那条，而不是队列里的第一条）、`test_plan_exclude_keywords_take_precedence`（排除词优先）、
+`test_plan_without_keywords_keeps_every_event`（不给关键词时行为不变）。
 
-### 窗口守卫新增的回归测试
+### 本次新增的窗口与台账回归测试
 
-`test_ensure_active_retires_an_expired_batch_and_never_replays_it`、
-`test_ensure_active_keeps_a_frozen_batch_and_refuses_unknown_ids`、
-`test_sidecar_refuses_an_expired_batch_without_touching_the_browser`（分支上 `ensure_active` 被删
-导致的断链回归）、`test_expiry_never_rewrites_a_recorded_send_result`。
+`test_retired_batch_events_are_counted_in_the_response`（协作者指出的对账缺口：批次退休作废的事件
+必须计入 `expiredCount` / `expired`，并带 `expiredReason`）、
+`test_expiry_never_rewrites_a_recorded_send_result`（窗口检查只能作废仍处 `planned` 的事件，
+`sent_confirmed` 等台账事实不得被改写）、
+`test_ensure_active_keeps_a_live_batch_and_refuses_unknown_ids`（窗口内的批次可用；未知批次
+fail-closed）、`test_sidecar_refuses_an_expired_batch_without_touching_the_browser`（两个阶段的拒绝
+先于任何浏览器动作）。
 
 离线回归：LiveFlowTests + BoundaryTests 共 **33 项通过**。
 
 ---
 
-## 9. 本次修订：补齐第 2 步，并修回被删掉的窗口守卫
+## 9. 本次修订：并发写入的经过与最终状态
 
-分支现有实现（协作者提交 `8767c2e`）已经用**另一套写法**重做了评审第 1/2/3 条：过期批次与空批次
-都在 `take_batch` 内部处理。本次提交**不回退那套写法**，只在它之上做三件事：
+### 分支上发生了什么（如实记录）
 
-1. **补齐九步流程第 2 步（关键词匹配）**：`take_batch` 新增 `filters`，在成批**之前**匹配；未命中或
+1. `8767c2e`（协作者）：在 `7ec3d4d3` 之上用**另一套写法**重做了第 1/2/3 条，覆盖了
+   `probe/live_flow.py` 与 `probe/tests/test_probe.py`（本 PR 的实现与其 86 行回归测试被换掉）。
+2. `89464b6a`（同一作者）：**revert** 了上一条，把这两个文件原样恢复到 `7ec3d4d3` 的内容，
+   理由是那次覆盖会丢掉已有的修复与回归测试；同时指出本实现的一个**可观测性缺口**：
+   因批次退休而作废的事件没有计入返回的 `expiredCount` / `expired`，宿主无法对账"这次丢了多少"。
+3. `2248d953`（本 PR 作者）：基于**过期的 HEAD 读取**（当时看到的是 `8767c2e`）做了一次推送，
+   又把被 revert 掉的那版内容带了回来。这是本 PR 作者的失误：推送前没有重新核对分支是否已被推进。
+4. 本提交：把 `live_flow.py` 与 `tests/test_probe.py` 恢复到 revert 之后的实现（即本 PR 的实现），
+   在其之上补齐九步流程第 2 步，并修掉协作者指出的缺口与一处台账风险。**全程没有 force push。**
+
+### 本提交做的事
+
+1. **补齐九步流程第 2 步（关键词匹配）**：`take_batch(filters=...)` 在成批**之前**匹配；未命中或
    命中排除词的事件标 `filtered`（终态），不占批次名额。`live_plan` 接受 `keywords` /
-   `excludeKeywords` / `matchMode`，响应与批次摘要都带 `filter` 计数
-   （`matched` / `missed` / `excluded`）。匹配语义直接复用评论链路的匹配器
-   （`phrase` / `seg` / `all` / `any`，排除词优先），两条链路保持一致。
-2. **修回被删掉的守卫**：`8767c2e` 删除了 `LiveQueue.ensure_active`，而 `sidecar.py` 里
-   `live_reply` / `live_private` 仍在调用它 —— 也就是说**这条分支当时是坏的**：两个阶段一旦被调用
-   就会 `AttributeError`。本次按他们的设计补回守卫，并把过期判定做成**绝对**：`expiresAt` 一过，
-   批次连同仍处 `planned` 的事件一起作废，两个阶段都以 `batch_expired` 拒绝，且拒绝发生在
-   **打开浏览器之前**。已记录结果的事件（`sent_confirmed` / `unknown` / `failed`）不被改写，
-   避免把台账事实抹掉。
-3. `find_event` 返回解析后的 `detail` / `private` / `payload`，便于宿主与测试读取状态。
+   `excludeKeywords` / `matchMode`，响应给出 `filter` 计数（`matched` / `missed` / `excluded`）。
+   匹配语义直接复用评论链路的匹配器（`phrase` / `seg` / `all` / `any`，排除词优先），
+   两条链路保持一致。
+2. **修掉协作者指出的对账缺口**：批次退休时被作废的事件现在计入同一份 `expiredCount` / `expired`
+   列表，并逐条带 `expiredReason`；`ensure_active` 的 `batch_expired` 消息里也报出数量
+   （`N event(s) were expired, not replayed`）。
+3. **修掉一处台账风险**：`_close_batch` 原先会把批次名下**所有**事件置为 `expired`，包括已经记录
+   了 `sent_confirmed` / `unknown` 的 —— 那等于把"确实发生过的触达"抹掉，之后的去重与防重复触达
+   都会失准。现在只作废仍处 `planned` 的事件，已记录的结果原样保留。
 
-### 一处需要评审确认的取舍
+### 过期语义
 
-**冻结批次过期后同样被拒绝。** 理由：`live_plan` 在取下批次的同一次调用里就冻结批次，"已冻结"
-并不代表新鲜；若对冻结批次放行，一个几小时前过期的批次仍然可以发出，这正是评审第 2 条要拦住的
-情况。代价是：公屏阶段若跨过窗口，之后的私信阶段会被拒，需要用新鲜事件重新成批。若评审认为
-"已冻结的计划应当执行到底"，把守卫里的过期分支改成只对 `planned` 生效即可（一行改动 + 对应用例）。
+过期是**绝对**的：`expiresAt` 一过，批次连同仍处 `planned` 的事件一起作废，`live_reply` /
+`live_private` 都以 `batch_expired` 拒绝，且拒绝发生在**打开浏览器之前**。冻结批次不例外 ——
+`live_plan` 在取下批次的同一次调用里就冻结，"已冻结"并不代表新鲜；若对冻结批次放行，
+一个几小时前过期的批次仍然可以发出，这正是评审第 2 条要拦住的情况。代价（公屏阶段跨过窗口后
+私信阶段会被拒，需要用新鲜事件重新成批）是显式的。
 
 ### 本机离线回归（真实输出）
 
 ```text
-Ran 33 tests in 1.165s
+Ran 33 tests in 1.231s
 
 OK
 ```

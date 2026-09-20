@@ -1,3 +1,6 @@
+（已被后续提交取代：见 COMMIT-MESSAGE-LIVE-FIXUP.txt。本提交基于过期的 HEAD 读取，
+误把 89464b6a revert 掉的内容带了回来；后续提交把 live_flow.py / tests 恢复到 revert 后的实现。）
+
 feat(probe): 直播间流程补齐第 2 步（关键词匹配），并修回被删掉的批次窗口守卫
 
 分支 8767c2e 已用另一套写法重做了评审第 1/2/3 条（过期与空批次都在 take_batch 内部处理），

@@ -97,23 +97,35 @@ same `unknown` semantics as the other send paths.
 Three state-machine defects reported in review are fixed, each with a
 regression test in `LiveFlowTests`:
 
-1. An empty queue never leaves a reusable batch behind. `live_plan` on an empty
-   queue returns `status: "empty"` with `batchId: null`; a later listening round
-   therefore gets a fresh batch instead of inheriting the empty one
-   (`test_empty_queue_never_creates_a_reusable_empty_batch`).
-2. A batch that ran past `expiresAt` is retired as `expired`, its still-planned
-   events are expired with it, and it is never handed back or sent
-   (`test_expired_open_batch_is_retired_and_never_reused`). Both phases enforce
-   the window: `live_reply` and `live_private` call `LiveQueue.ensure_active`
-   before touching the browser and fail with `batch_expired`
-   (`test_sidecar_refuses_an_expired_batch_without_touching_the_browser`).
+1. An empty queue no longer leaves a reusable batch behind. `live_plan` on an
+   empty queue returns `status: "empty"` with `batchId: null`, and an open batch
+   that holds no planned event is closed as `expired` instead of being reused
+   (`test_empty_batch_is_closed_instead_of_reused`).
+2. A batch that ran past `expiresAt` is closed as `expired`, its still-planned
+   events are expired with it, and it is never handed back or sent. `live_reply`
+   and `live_private` call `LiveQueue.ensure_active` before touching the browser
+   and fail with `batch_expired`
+   (`test_open_batch_is_closed_once_its_window_passed`,
+   `test_phase_methods_refuse_an_expired_batch`,
+   `test_sidecar_refuses_an_expired_batch_without_touching_the_browser`).
    Expiry is absolute, a frozen batch included: `live_plan` freezes in the same
-   call that takes the batch, so "frozen" is not evidence of freshness. Only
-   events still in `planned` are expired, so an already recorded result
-   (`sent_confirmed` / `unknown` / `failed`) is never rewritten
-   (`test_expiry_never_rewrites_a_recorded_send_result`).
-3. `mark_private` updates the row by the resolved `event_key`
-   (`test_mark_private_persists_against_the_real_event_key`).
+   call that takes the batch, so "frozen" is not evidence of freshness.
+3. `mark_private` now updates the row by the resolved `event_key`. It previously
+   selected the right row and then wrote with the caller-facing event id, so the
+   private result was reported as saved while the row stayed empty
+   (`test_private_result_is_persisted`).
+
+Two follow-ups reported by the reviewer and fixed here:
+
+* Retiring a batch now reports what it dropped. The events expired because the
+  batch left its window are counted in the same `expiredCount` / `expired` list
+  as the time-window expiries, each carrying `expiredReason`
+  (`test_retired_batch_events_are_counted_in_the_response`); `ensure_active`
+  also reports the number in its `batch_expired` message.
+* Retiring a batch only expires events that were still `planned`. An event that
+  already recorded a result is a ledger fact and survives the batch being closed
+  (`test_expiry_never_rewrites_a_recorded_send_result`), so a late window check
+  cannot erase a send that really happened.
 
 Policy is refused at the boundary until the authorization service signs it:
 `live_plan` rejects a caller-supplied `policy` with
