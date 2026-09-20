@@ -231,14 +231,17 @@ async function refreshLicense(tokenOverride = null) {
     if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) return { state: 'stale' };
     const safe = publicLicensePayload(me);
     if (!safe.user?.id) throw new Error('授权中心响应缺少用户身份');
-    if (currentAccountUserId !== safe.user.id || currentPlatformAccountId == null) {
-      const accounts = await fetchPlatformAccounts(requestApi, requestToken);
-      const selected = preferredPlatformAccount(safe.user.id, accounts);
+    const accounts = await fetchPlatformAccounts(requestApi, requestToken);
+    const selected = preferredPlatformAccount(safe.user.id, accounts);
+    const currentStillValid = currentPlatformAccountId && accounts.some((item) => item.id === currentPlatformAccountId);
+    const needsAccountSwitch = currentAccountUserId !== safe.user.id
+      || (!currentStillValid && selected !== currentPlatformAccountId && selected != null);
+    if (needsAccountSwitch) {
       const switched = await switchAccountStore(safe.user.id, 'account_switch_from_refresh', () => requestApi === api && authStore.getToken() === requestToken, selected);
       if (!switched) return { state: 'stale' };
-      platformAccounts = accounts;
       if (selected) authStore.setPlatformAccountId(safe.user.id, selected);
     }
+    platformAccounts = accounts;
     engine.setLicense(safe);
     return engine.publicLicense();
   } catch (error) {
