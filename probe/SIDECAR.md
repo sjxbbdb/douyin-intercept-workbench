@@ -15,6 +15,18 @@ kept only while navigating a short link; the response returns the resolved
 URL without its query string. `state-dir` and `profile-dir` must be absolute
 and outside the source directory.
 
+`search` reads one page at a time. Call it without `cursor` to start from the
+first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
+`skippedSeen`. Pass that `cursor` back to read the next page: the tool keeps
+scrolling the same owned tab instead of reloading the first page, and any video
+already in the cursor pool is filtered out. The cursor is opaque to the host —
+the host only stores and returns it — but it is still validated on the
+boundary: a cursor issued for another keyword, an unsupported version, or a
+pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
+page yields no new video, which is the host signal to stop paging.
+`platformHasMore` / `platformCursor` mirror what the platform response body
+reported; they are read-only telemetry and are never replayed against the API.
+
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
 automation gate. `private_reply` records the collaborator account flow
