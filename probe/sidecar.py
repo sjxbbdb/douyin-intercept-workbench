@@ -469,8 +469,10 @@ class Sidecar:
         """Form one batch and freeze the host-provided two-channel scripts.
 
         Events outside the window are reported as expired and never replayed.
-        A target whose scripts are missing or out of bounds is blocked here,
-        before any browser action happens.
+        Keywords - when the host supplies them - are matched before the batch is
+        formed, so a comment that does not match is marked 'filtered' and never
+        takes a batch slot.  A target whose scripts are missing or out of bounds
+        is blocked here, before any browser action happens.
         """
         try:
             max_items = int(params.get("maxItems", 20))
@@ -492,6 +494,7 @@ class Sidecar:
             filters=spec if live_flow.filter_is_active(spec) else None)
         summary = {key: batch[key] for key in
                    ("batchId", "createdAt", "expiresAt", "expiredCount", "frozen", "status")}
+        summary["filter"] = batch.get("filter") or {}
         if not batch["events"]:
             # 关键词未命中或队列为空：都不建立批次，下一次监听到达后会形成新的批次
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
