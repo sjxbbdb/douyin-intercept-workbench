@@ -775,10 +775,39 @@ class CommentFlowTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "batch_expired")
         self.assertTrue(all(t["state"] == "expired" for t in queue.batch_targets(batch_id)))
 
-    def test_queue_dedupes_and_caps_capacity(self):
+    def test_queue_dedupes_by_identity(self):
         queue = self._queue()
         first = queue.append([self._target(1), self._target(1)], now=self.T[0])
         self.assertEqual((first["added"], first["duplicates"]), (1, 1))
+        self.assertEqual(first["queued"], 1)
+        # 同一目标再次入队仍算重复，不会新增
+        again = queue.append([self._target(1)], now=self.T[0])
+        self.assertEqual((again["added"], again["duplicates"]), (0, 1))
+        self.assertEqual(again["queued"], 1)
+
+    def test_queue_caps_at_capacity_and_reports_the_drop(self):
+        """容量上限必须真的生效，且必须把丢弃数如实报出来。
+
+        语义（照 _trim 的实际行为，不是猜的）：
+          added   = 本次【插入的行数】，不是最终留存数
+          dropped = 因超容量被标为 expired 的条数 —— 是【丢弃】，不是延后
+          queued  = 最终留在队列里的条数
+        静默丢目标等于静默丢客户，所以三个数字都要断言。
+        """
+        import comment_flow
+        tiny = comment_flow.CommentQueue(os.path.join(self.tmp.name, "cap"), "account-a",
+                                         capacity=2, clock=lambda: self.T[0])
+        out = tiny.append([self._target(i) for i in (1, 2, 3)], now=self.T[0])
+        self.assertEqual(out["capacity"], 2)
+        self.assertEqual(out["added"], 3, "added 是插入行数，不是留存数")
+        self.assertEqual(out["dropped"], 1)
+        self.assertEqual(out["queued"], 2)
+        self.assertEqual(tiny.stats()["states"], {"queued": 2, "expired": 1})
+        # 被容量挤掉的是【丢弃】而非延后：expired 是终态，永不复用。
+        # 不指定是哪一条 —— 三条 seen_at 相同，排序并列时不该假定具体顺序。
+        expired = [i for i in (1, 2, 3)
+                   if tiny.find_target("tg-%d" % i)["state"] == self.CF.EXPIRED]
+        self.assertEqual(len(expired), 1)
 
     # ------------------------------------------------- 门控一：只有确认成功才私信
 
@@ -847,8 +876,16 @@ class CommentFlowTests(unittest.TestCase):
         queue, batch_id = self._prep(1)
         queue.freeze_plan(batch_id, {"tg-1": {"publicText": "x", "privateText": "y"}},
                           policy={"maxPublicAttempts": 99})
+        # 冻结时用的是内建默认；第二次传 99 必须被忽略，策略来源如实回报
+        plan = queue.plan(batch_id)
+        self.assertEqual(plan["policy"]["maxPublicAttempts"],
+                         self.CF.POLICY_DEFAULTS["maxPublicAttempts"])
+        self.assertEqual(plan["policySource"], "builtin_default")
+        # 空列表本身说明不了问题，必须断言【为什么】空
         queue.mark_public("tg-1", self.CF.FAILED, batch_id)
-        self.assertEqual(queue.public_candidates(batch_id)[0], [])
+        items, rejected = queue.public_candidates(batch_id)
+        self.assertEqual(items, [])
+        self.assertEqual([r["reason"] for r in rejected], ["public_attempts_exhausted"])
 
     # ------------------------------------------------------------- 计划与记录
 
@@ -1003,15 +1040,44 @@ class CommentFlowTests(unittest.TestCase):
         self.assertEqual(set(reasons) - set(self.CF.REJECT_REASONS), set())
 
     def test_result_carries_no_client_side_credit_fields(self):
-        """docs/api.md：服务端是积分唯一权威，客户端不得提交 charged/price/balance。"""
-        queue, batch_id = self._prep(1)
+        """docs/api.md：服务端是积分唯一权威，客户端不得提交 charged/price/balance。
+
+        🔴 两处比原来严格：
+          1) 深度遍历而不是只看顶层键 —— 嵌套结构里混进一个 charged，
+             只看 result.keys() 发现不了。
+          2) 先断言结果【确实被填充过】—— 否则一个空结果或坏掉的结果，
+             同样能让「不含积分字段」成立，用例会在什么都没验证的情况下变绿。
+             （上一轮那两个静默 bug 就是这么活下来的。）
+        """
+        queue, batch_id = self._prep(2)
         queue.mark_public("tg-1", self.CF.SENT_CONFIRMED, batch_id)
+        queue.mark_public("tg-2", self.CF.UNKNOWN, batch_id)
         result = queue.result(batch_id)
-        for forbidden in ("charged", "price", "balance"):
-            self.assertNotIn(forbidden, result)
+
+        self.assertEqual(set(_iter_keys(result)) & {"charged", "price", "balance"}, set(),
+                         "结果树的任意层级都不得出现客户端可提交的积分字段")
+
+        # 结果必须真的有内容，上面那条「不含」才有意义
+        self.assertEqual(result["counts"].get(self.CF.SENT_CONFIRMED), 1)
+        self.assertEqual(result["counts"].get(self.CF.UNKNOWN), 1)
+        self.assertEqual(result["funnel"]["planned"], 2)
+        self.assertTrue(result["funnel"]["rejectedReasons"], "漏斗不能是空的")
         self.assertEqual(result["channel"], "comment")
         self.assertEqual(result["source"], "video_comment")
         self.assertIn("phase", result["checkpoint"])
+
+
+def _iter_keys(node):
+    """递归产出嵌套结构里的所有字典键（用于「不得出现某字段」的深度断言）。"""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            for nested in _iter_keys(value):
+                yield nested
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            for nested in _iter_keys(item):
+                yield nested
 
 
 if __name__ == "__main__":
