@@ -889,6 +889,233 @@ class LiveFlowTests(unittest.TestCase):
         self.assertEqual(result["queue"]["duplicates"], 1)
         self.assertEqual(result["queue"]["queued"], 1)
 
+    def test_empty_batch_is_closed_instead_of_reused(self):
+        """回归（评审 #1）：队列为空时不得留下可被永久复用的空批次。"""
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            empty = queue.take_batch(max_items=10, window_seconds=600)
+            self.assertEqual(empty["status"], "empty")
+            self.assertIsNone(empty["batchId"])
+            now[0] += 10
+            queue.append([self._event("e1")])
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            self.assertNotEqual(batch["batchId"], empty["batchId"])
+            self.assertEqual([event["id"] for event in batch["events"]], ["e1"])
+
+    def test_open_batch_is_closed_once_its_window_passed(self):
+        """回归（评审 #2）：未冻结的批次超窗后必须关闭，不能再被取回或发送。"""
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("e1")])
+            first = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual(first["status"], "ok")
+            now[0] += 61
+            second = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertIsNone(second["batchId"])
+            self.assertEqual(second["status"], "empty")
+            self.assertEqual(queue.batch(first["batchId"])["status"], "expired")
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+
+    def test_phase_methods_refuse_an_expired_batch(self):
+        """回归（评审 #2）：超窗批次即使已被冻结，也不得再发公屏或私信。"""
+        import live_flow
+        import sidecar
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19228)
+            instance.live_queue.clock = lambda: now[0]
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 60,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            now[0] += 61
+            instance._page = lambda: (_ for _ in ()).throw(AssertionError("no browser for expired batch"))
+            for method in ("live_reply", "live_private"):
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.dispatch(method, {"batchId": batch_id,
+                                               "items": [{"eventId": "e1", "sendId": "s-1"}]})
+                self.assertEqual(raised.exception.code, "batch_expired")
+            self.assertEqual(instance.live_queue.batch(batch_id)["status"], "expired")
+
+    def test_private_result_is_persisted(self):
+        """回归（评审 #3）：私信结果必须真的落到库里，否则断点恢复与防重复都会失效。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1")])
+            batch = queue.take_batch(max_items=5, window_seconds=600)
+            queue.freeze_plan(batch["batchId"], self._scripts(["e1"]))
+            queue.mark("e1", live_flow.SENT_CONFIRMED, batch["batchId"])
+            queue.mark_private("e1", live_flow.UNKNOWN, batch["batchId"], {"sendId": "s-1"})
+            event = queue.find_event("e1")
+            self.assertIn("unknown", str(event["private_json"]))
+            self.assertEqual(event["state"], live_flow.SENT_CONFIRMED)
+            reopened = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            self.assertEqual(reopened.result(batch["batchId"])["privateCounts"], {"unknown": 1})
+
+    def test_client_supplied_policy_is_refused(self):
+        """回归（评审 #4）：策略必须由授权服务端签发，边界拒绝调用方自带策略。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19229)
+            instance.live_queue.append([self._event("e1")])
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                "scripts": self._scripts(["e1"]),
+                                                "policy": {"allowPublicStates": ["unknown"]}})
+            self.assertEqual(raised.exception.code, "policy_not_server_issued")
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            self.assertEqual(planned["policy"]["allowPublicStates"], ["sent_confirmed"])
+            self.assertEqual(planned["policySource"], "builtin_default")
+
+    def test_plan_matches_keywords_before_forming_a_batch(self):
+        """回归（流程第 2 步）：关键词匹配发生在成批之前，未命中的事件不进批次。"""
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19230)
+            instance.live_queue.append([
+                self._event("hit", text="这个蒸糕怎么做"),
+                self._event("miss", text="主播晚上好"),
+            ])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 10, "windowSeconds": 600, "matchMode": "seg",
+                "keywords": "怎么做", "scripts": self._scripts(["hit", "miss"])})
+            self.assertEqual(planned["status"], "ok")
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["hit"])
+            self.assertEqual(planned["filter"]["matched"], 1)
+            self.assertEqual(planned["filter"]["missed"], 1)
+            self.assertEqual(instance.live_queue.find_event("miss")["state"], live_flow.FILTERED)
+            self.assertEqual(instance.live_queue.find_event("miss")["detail"]["reason"], "keyword_miss")
+
+    def test_plan_exclude_keywords_take_precedence(self):
+        """回归（流程第 2 步）：命中关键词但同时命中排除词的事件被丢弃。"""
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19231)
+            instance.live_queue.append([
+                self._event("ok", text="求链接 谢谢"),
+                self._event("ad", text="求链接 加微信广告"),
+            ])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 10, "windowSeconds": 600, "matchMode": "seg",
+                "keywords": "链接", "excludeKeywords": "广告",
+                "scripts": self._scripts(["ok", "ad"])})
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["ok"])
+            self.assertEqual(planned["filter"]["excluded"], 1)
+            self.assertEqual(planned["filter"]["matched"], 1)
+            self.assertEqual(instance.live_queue.find_event("ad")["detail"]["reason"],
+                             "keyword_excluded")
+
+    def test_plan_without_keywords_keeps_every_event(self):
+        """没给关键词时行为不变：队列里的事件全部可成批。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19232)
+            instance.live_queue.append([self._event("a", text="任何一句话")])
+            planned = instance.dispatch("live_plan", {"maxItems": 10, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["a"])})
+            self.assertEqual([item["eventId"] for item in planned["targets"]], ["a"])
+            self.assertEqual(planned["filter"]["matched"], 0)
+            self.assertEqual(planned["filter"]["missed"], 0)
+
+
+    # ---- 批次退休的对账与台账保护（协作者在 89464b6a 里指出的可观测性缺口）----
+
+    def test_retired_batch_events_are_counted_in_the_response(self):
+        """回归：因批次退休而作废的事件必须计入 expiredCount / expired。
+
+        原实现只把"按时间窗过期"的事件放进返回的列表，批次退休时一并作废的那批
+        planned 事件却凭空消失：宿主看到 expiredCount=0，无法对账"这次丢了多少"。
+        """
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("e1")])
+            first = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual([event["id"] for event in first["events"]], ["e1"])
+            now[0] += 61
+            second = queue.take_batch(max_items=10, window_seconds=60)
+            self.assertEqual(second["expiredCount"], 1)
+            self.assertEqual(second["expired"][0]["id"], "e1")
+            self.assertEqual(second["expired"][0]["expiredReason"], "batch_window_expired")
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.EXPIRED)
+            self.assertEqual(queue.find_event("e1")["detail"]["reason"], "batch_window_expired")
+
+    def test_expiry_never_rewrites_a_recorded_send_result(self):
+        """回归：批次退休只能作废【还没发出去】的事件，已记录的结果不得被改写。
+
+        台账（sent_confirmed / unknown / failed / blocked）是"到底做了什么"的唯一事实，
+        如果窗口检查顺手把它改成 expired，就等于把已经发生的触达抹掉，
+        之后的对账、去重与防重复触达都会失准。
+        """
+        import live_flow
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: now[0])
+            queue.append([self._event("sent"), self._event("pending")])
+            batch_id = queue.take_batch(max_items=10, window_seconds=60)["batchId"]
+            queue.mark("sent", live_flow.SENT_CONFIRMED, batch_id)
+            now[0] += 61
+            with self.assertRaises(live_flow.LiveFlowError) as raised:
+                queue.ensure_active(batch_id)
+            self.assertEqual(raised.exception.code, "batch_expired")
+            self.assertIn("1 event(s) were expired", raised.exception.message)
+            self.assertEqual(queue.find_event("sent")["state"], live_flow.SENT_CONFIRMED)
+            self.assertEqual(queue.find_event("pending")["state"], live_flow.EXPIRED)
+
+    def test_ensure_active_keeps_a_live_batch_and_refuses_unknown_ids(self):
+        """窗口内的批次（含已冻结）继续可用；未知批次 fail-closed。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+            queue.append([self._event("e1")])
+            batch_id = queue.take_batch(max_items=10, window_seconds=600)["batchId"]
+            queue.freeze_plan(batch_id, self._scripts(["e1"]))
+            self.assertEqual(queue.ensure_active(batch_id)["batch_id"], batch_id)
+            with self.assertRaises(live_flow.LiveFlowError) as raised:
+                queue.ensure_active("does-not-exist")
+            self.assertEqual(raised.exception.code, "unknown_batch")
+
+    def test_sidecar_refuses_an_expired_batch_without_touching_the_browser(self):
+        """边界：两个阶段都以 batch_expired 拒绝过期批次，且拒绝先于任何浏览器动作。"""
+        import sidecar
+
+        def explode():
+            raise AssertionError("an expired batch must be refused before any browser work")
+
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19234)
+            instance.live_queue.clock = lambda: now[0]
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 60,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance._page = explode
+            now[0] += 61
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s1", "text": "public reply text"}]})
+            self.assertEqual(raised.exception.code, "batch_expired")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s2", "text": "private message text"}]})
+            self.assertEqual(raised.exception.code, "batch_expired")
+
 
 class CommentFilterTests(unittest.TestCase):
     """流程一「关键词、排除词与去重」的离线回归（不碰浏览器、不建临时目录）。

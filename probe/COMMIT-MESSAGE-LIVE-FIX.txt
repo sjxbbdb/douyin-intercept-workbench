@@ -1,0 +1,18 @@
+fix(probe): 修复直播间批次流程的三个状态机缺陷，并拒绝调用方自带策略
+
+按评审意见修复 PR #7 的必须修复项（每项都有回归测试）：
+
+1. 空批次会永久复用：队列为空时不再创建 planned 批次（返回 status=empty / batchId=null），
+   已存在的空批次会被关闭为 expired，新事件到达后会形成新批次。
+2. 过期批次仍可继续复用：take_batch 发现打开中的批次已过 expiresAt 就关闭它为 expired，
+   其事件一并置 expired；live_reply / live_private 执行前调用 ensure_active，
+   超窗批次直接返回 batch_expired，不再可能被发送。
+3. 私信结果没有持久化：mark_private 原本选中了正确的行却用调用方的 event_id 去写，
+   接口返回成功但 SQLite 里没有记录；改为按解析出的 event_key 更新，断点恢复与防重复重新有效。
+4. 策略不再由客户端参数控制：live_plan 拒绝调用方自带 policy（policy_not_server_issued），
+   冻结计划记录 policySource=builtin_default；库层保留 freeze_plan(policy=...) 作为服务端接线的缝。
+
+未完成项如实保留：积分 / 功能开关 / 服务端审计未接入（本地 send_gate 仍是唯一本地闸），
+真机验收（选择器、作者标识、公屏送达、私信送达）仍未进行，live_batch.autoEligible 保持 false。
+
+离线回归：LiveFlowTests + BoundaryTests 共 26 项通过。
