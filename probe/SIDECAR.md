@@ -43,6 +43,19 @@ page yields no new video, which is the host signal to stop paging.
 `platformHasMore` / `platformCursor` mirror what the platform response body
 reported; they are read-only telemetry and are never replayed against the API.
 
+The cursor pool records **every video collected on the page, including the ones
+dropped by `minRelevance`** — a filtered candidate has still been seen, and
+leaving it out of the pool would make the next page collect and process it a
+second time. `poolIds` exposes that same pool as plain data for the host's own
+dedup ledger; it is data, not a paging instruction.
+
+`status`, `hasMore`, `cursor`, and `stoppedReason` are the paging contract. A
+page that ended because of a captcha or an expired login is **terminal**: the
+response keeps the candidates already collected but reports `cursor: null`,
+`hasMore: false`, and `stoppedReason` (`captcha` / `login_required`). A host must
+not keep requesting pages on a terminal status; the challenge has to be cleared
+by a human first. Only `status: ok` with `hasMore: true` is a paging signal.
+
 `search` returns one candidate per video with `id`, `url`, `title`, `author`,
 `authorId`, and a `relevance` record. Relevance is computed locally from the
 search keyword against the title and is deterministic: every keyword the user

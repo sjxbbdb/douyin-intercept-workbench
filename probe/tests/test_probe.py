@@ -1512,5 +1512,107 @@ class SearchRelevanceTests(unittest.TestCase):
             instance.search({"keyword": "宝宝辅食", "minRelevance": -1})
 
 
+class SearchPagingRelevanceTests(unittest.TestCase):
+    """回归：分页 x 相关度筛选的组合，以及终止状态的收敛。
+
+    对应评审意见里找视频模块的两条：
+      1. 相关度筛掉的视频没有完整计入分页游标池，后续分页会重复处理；
+      2. 检测到验证码后应明确返回终止状态，不能继续给出可翻页信号。
+    """
+
+    def _instance(self, url=None):
+        import sidecar
+        page = FakeSearchPage(url)
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        return sidecar, instance
+
+    @staticmethod
+    def _videos():
+        return [
+            {"aweme_id": "1", "url": "https://www.douyin.com/video/1",
+             "desc": "宝宝辅食怎么做", "author": "A", "author_sec_uid": "S1"},
+            {"aweme_id": "2", "url": "https://www.douyin.com/video/2",
+             "desc": "codex 会员教程", "author": "B", "author_sec_uid": "S2"},
+            {"aweme_id": "3", "url": "https://www.douyin.com/video/3",
+             "desc": "完全无关的内容", "author": "C", "author_sec_uid": "S3"},
+        ]
+
+    def _run(self, params, stopped=None):
+        sidecar, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        calls = []
+
+        def fake(page, keyword, **kwargs):
+            calls.append(kwargs)
+            meta = kwargs.get("meta")
+            if isinstance(meta, dict):
+                meta["skipped_seen"] = 0
+                meta["platform_cursor"] = "pc-1"
+                meta["platform_has_more"] = 1
+                if stopped:
+                    meta["stopped_reason"] = stopped
+            return self._videos()
+
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.crawlmod.search_videos = fake
+        try:
+            return instance.search(params), calls
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    def test_pool_records_videos_dropped_by_min_relevance(self):
+        """回归 1：被相关度筛掉的视频也必须进游标池，否则下一页会重复处理。"""
+        first, _ = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
+        self.assertEqual([v["id"] for v in first["videos"]], ["1"])
+        self.assertEqual(first["filter"]["filteredByRelevance"], 2)
+        self.assertEqual(first["poolSize"], 3)
+        self.assertEqual(first["poolIds"], ["1", "2", "3"])
+
+        second, calls = self._run({"keyword": "宝宝辅食", "cursor": first["cursor"]})
+        self.assertEqual(second["page"], 2)
+        # 续页时池子里必须已经有那两条被筛掉的视频，否则它们会被重新采集一遍
+        self.assertEqual(calls[0]["seen_ids"], {"1", "2", "3"})
+
+    def test_captcha_is_terminal_and_offers_no_paging_signal(self):
+        """回归 2：验证码必须收敛成终止状态，不能继续给可翻页信号。"""
+        result, _ = self._run({"keyword": "宝宝辅食"}, stopped="captcha")
+        self.assertEqual(result["status"], "captcha")
+        self.assertIsNone(result["cursor"])
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stoppedReason"], "captcha")
+        # 熔断不丢数据：已经采到的候选照常返回
+        self.assertEqual(len(result["videos"]), 3)
+        # 游标没了，池子只能由宿主保存 —— 所以用数据字段把池子交出去
+        self.assertEqual(result["poolIds"], ["1", "2", "3"])
+
+    def test_login_required_is_also_terminal(self):
+        """同一类缺陷：登录失效也不该继续给出可翻页信号。"""
+        import sidecar
+        sidecar_mod, instance = self._instance()
+        original = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda page: "required"
+        try:
+            result = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.douyin.login_state = original
+        self.assertEqual(result["status"], "login_required")
+        self.assertIsNone(result["cursor"])
+        self.assertFalse(result["hasMore"])
+        self.assertEqual(result["stoppedReason"], "login_required")
+
+    def test_normal_page_still_offers_a_cursor(self):
+        """反向保护：别把"终止"语义误加到正常路径上。"""
+        result, calls = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNotNone(result["cursor"])
+        self.assertTrue(result["hasMore"])
+        self.assertIsNone(result["stoppedReason"])
+        self.assertEqual(result["poolSize"], 3)
+        self.assertEqual(calls[0]["navigate"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

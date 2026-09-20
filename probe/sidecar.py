@@ -468,8 +468,11 @@ class Sidecar:
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
-                return {"status": "login_required", "videos": [], "cursor": cursor_in,
-                        "hasMore": False, "page": page_no, "poolSize": len(seen)}
+                # 登录失效同样是【终止状态】：不给游标、不给可翻页信号，
+                # 否则上层会自动接着请求，等于对着一个已失效的登录态继续打平台。
+                return {"status": "login_required", "videos": [], "cursor": None,
+                        "hasMore": False, "stoppedReason": "login_required",
+                        "page": page_no, "poolSize": len(seen)}
             # 只有【第一页】或【已经不在搜索页上】才重新导航；
             # 否则保持页面原状、继续往下滚 —— 这才是"读取下一页"。
             first_page = cursor_in in (None, "")
@@ -499,20 +502,47 @@ class Sidecar:
                             "author": str(video.get("author") or "")[:120],
                             "authorId": str(video.get("author_sec_uid") or "")[:200],
                             "relevance": relevance})
-            pool = set(seen) | {v["id"] for v in out if v["id"]}
+            # 🔴 池子记【本次采集到的全部】视频，不只是通过相关度筛选的那部分：
+            #    被 minRelevance 筛掉的同样"已经见过"，不记进池子的话，
+            #    下一页会把它当新视频重新采集 —— 宿主就会重复处理同一批视频。
+            pool = set(seen) | {str(v.get("aweme_id") or "") for v in videos
+                                if v.get("aweme_id")}
+            page_filter = {"collected": len(videos), "returned": len(out),
+                           "filteredByRelevance": filtered,
+                           "minRelevance": min_relevance}
+            if meta.get("stopped_reason") == "captcha":
+                # 🔴 验证码是【终止状态】，不是"这一页到头了"。
+                #    继续返回 cursor / hasMore=true，上层就会自动接着翻页 ——
+                #    等于在没有人处理验证码的情况下继续打平台。
+                #    所以这里明确收敛：cursor=null、hasMore=false，并给出 stoppedReason。
+                #    已经采到的候选照常返回（熔断也不丢数据）。
+                #    poolIds 是【数据】不是翻页指令：宿主拿它做自己的去重账，
+                #    因为验证码之后游标不再返回，池子只能由宿主自己保存。
+                return {"status": "captcha",
+                        "videos": out,
+                        "cursor": None,
+                        "hasMore": False,
+                        "stoppedReason": "captcha",
+                        "page": page_no,
+                        "poolSize": len(pool),
+                        "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
+                        "skippedSeen": int(meta.get("skipped_seen") or 0),
+                        "platformHasMore": meta.get("platform_has_more"),
+                        "platformCursor": meta.get("platform_cursor"),
+                        "filter": page_filter}
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
-            return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
+            return {"status": "ok",
                     "videos": out,
                     "cursor": _encode_cursor(keyword, pool, page_no + 1),
                     "hasMore": bool(out),
+                    "stoppedReason": None,
                     "page": page_no,
                     "poolSize": len(pool),
+                    "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
                     "skippedSeen": int(meta.get("skipped_seen") or 0),
                     "platformHasMore": meta.get("platform_has_more"),
                     "platformCursor": meta.get("platform_cursor"),
-                    "filter": {"collected": len(videos), "returned": len(out),
-                               "filteredByRelevance": filtered,
-                               "minRelevance": min_relevance}}
+                    "filter": page_filter}
         finally:
             page.close()
 
