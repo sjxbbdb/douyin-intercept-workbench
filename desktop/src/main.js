@@ -13,6 +13,7 @@ const { DEFAULT_SELECTOR_PROFILE, normalizeProfile } = require('./lib/selectors'
 const { TaskEngine } = require('./lib/task-engine');
 const { WorkflowRuntime } = require('./lib/workflow-runtime');
 const { createWorkflowAdapter } = require('./lib/workflow-adapter');
+const workflowRequest = require('./lib/workflow-request');
 const { platformWorkflowDefinitions } = require('./lib/workflow-contracts');
 const { AccountRuntimeManager } = require('./lib/account-runtime-manager');
 const { platformAccountId: normalizePlatformAccountId, platformScope, accountDataPath: scopedAccountDataPath, accountDir: scopedAccountDir, browserPartition, sidecarPort: scopedSidecarPort } = require('./lib/platform-account');
@@ -396,21 +397,8 @@ async function handleRedeem(_event, input) {
   return result;
 }
 
-async function runAgentChat(input) {
-  if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
-  const message = text(input?.message, 'message', 4000);
-  const requestedPlatform = input?.platformAccountId == null || input.platformAccountId === ''
-    ? currentPlatformAccountId
-    : normalizePlatformAccountId(input.platformAccountId);
-  if (!currentAccountUserId || !requestedPlatform) throw new Error('请先选择已授权的平台账号');
-  if (!platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('目标平台账号不属于当前工作台或已停用');
-  const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
-  const deviceId = authStore.getDevice().id;
-  const requestKey = safeIdempotencyKey(typeof input?.idempotencyKey === 'string' && input.idempotencyKey.trim() ? input.idempotencyKey : `chat:${crypto.randomUUID()}`);
-  const context = input?.context && typeof input.context === 'object' && !Array.isArray(input.context) ? input.context : {};
-  return workflowManager.run(accountId, async ({ context: accountContext }) => {
+async function startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage = null }) {
     const runtime = accountContext.runtime;
-    const plan = await runtime.planFromIntent(message, context);
     const catalogResponse = await api.workflows();
     const catalog = Array.isArray(catalogResponse?.workflows) ? catalogResponse.workflows : [];
     const registered = catalog.find((item) => item.workflowId === plan.workflowId && String(item.version) === String(plan.version) && item.status === 'active');
@@ -459,7 +447,12 @@ async function runAgentChat(input) {
         : '';
       const humanHint = displayRun.status === 'UNKNOWN' || displayRun.status === 'WAITING_HUMAN' || decisionApplied?.requiresManualGate ? '；需要人工处理后再继续' : '';
       const decisionHint = nextDecision?.decision ? `；结果决策：${nextDecision.decision}` : '';
-      accountContext.store.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: message, at: new Date().toISOString() }, { role: 'assistant', content: `已选择固定流程 ${plan.workflowId}@${plan.version}，当前状态：${displayRun.status}${searchHint}${humanHint}${decisionHint}`, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
+      // 只有聊天触发才写聊天记录；任务面板触发时由面板自己展示检查点与统一台账，
+      // 不往聊天里塞一条假的用户消息。
+      if (chatMessage) {
+        const assistantLine = '已选择固定流程 ' + plan.workflowId + '@' + plan.version + '，当前状态：' + displayRun.status + searchHint + humanHint + decisionHint;
+        accountContext.store.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: chatMessage, at: new Date().toISOString() }, { role: 'assistant', content: assistantLine, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
+      }
       emitState();
       return { plan, run: displayRun, nextDecision, decisionApplied };
     } catch (error) {
@@ -470,7 +463,63 @@ async function runAgentChat(input) {
         try { await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${accountId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', remoteRunId, error.message); }
       }
     }
+}
+
+async function runAgentChat(input) {
+  if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+  const message = text(input?.message, 'message', 4000);
+  const requestedPlatform = input?.platformAccountId == null || input.platformAccountId === ''
+    ? currentPlatformAccountId
+    : normalizePlatformAccountId(input.platformAccountId);
+  if (!currentAccountUserId || !requestedPlatform) throw new Error('请先选择已授权的平台账号');
+  if (!platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('目标平台账号不属于当前工作台或已停用');
+  const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
+  const deviceId = authStore.getDevice().id;
+  const requestKey = safeIdempotencyKey(typeof input?.idempotencyKey === 'string' && input.idempotencyKey.trim() ? input.idempotencyKey : `chat:${crypto.randomUUID()}`);
+  const context = input?.context && typeof input.context === 'object' && !Array.isArray(input.context) ? input.context : {};
+
+  return workflowManager.run(accountId, async ({ context: accountContext }) => {
+    const plan = await accountContext.runtime.planFromIntent(message, context);
+    return startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage: message });
   }, { idempotencyKey: requestKey, metadata: { message, platformAccountId: requestedPlatform } });
+}
+
+
+// 任务面板的结构化流程启动。
+//
+// 平台契约（server/src/workflow-routes.ts:375-389）：流程实例必须绑定服务端签发的计划，
+// 客户端不能自己造 planId/params。所以这里做三件事：
+//   1) 把结构化请求翻译成一句人话 + 结构化上下文，交给平台规划器；
+//   2) 逐项核对平台返回的计划（workflowId / version / 请求里明确要求的 params）；
+//   3) 核对通过才走与聊天完全相同的启动链路（目录校验 -> 建运行 -> 租约 -> 检查点 -> 结果决策）。
+// 核对不过直接拒绝启动（fail-closed），绝不跑一个差不多的流程。
+async function runExplicitWorkflow(input) {
+  if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+  const request = workflowRequest.requestForWorkflow({
+    workflowId: input?.workflowId,
+    version: input?.version,
+    params: input?.params
+  });
+  const requestedPlatform = input?.platformAccountId == null || input.platformAccountId === ''
+    ? currentPlatformAccountId
+    : normalizePlatformAccountId(input.platformAccountId);
+  if (!currentAccountUserId || !requestedPlatform) throw new Error('请先选择已授权的平台账号');
+  if (!platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('目标平台账号不属于当前工作台或已停用');
+  const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
+  const deviceId = authStore.getDevice().id;
+  const requestKey = safeIdempotencyKey(typeof input?.idempotencyKey === 'string' && input.idempotencyKey.trim()
+    ? input.idempotencyKey
+    : 'start:' + request.workflowId + ':' + requestedPlatform + ':' + crypto.randomUUID());
+  const intent = workflowRequest.buildWorkflowIntent(request);
+  const context = workflowRequest.buildWorkflowContext(request);
+  return workflowManager.run(accountId, async ({ context: accountContext }) => {
+    const plan = await accountContext.runtime.planFromIntent(intent, context);
+    const check = workflowRequest.planMatchesRequest(plan, request);
+    if (!check.ok) {
+      throw new Error('平台返回的计划与请求不一致（' + check.reason + (check.field ? '/' + check.field : '') + '），已拒绝启动');
+    }
+    return startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId });
+  }, { idempotencyKey: requestKey, metadata: { workflowId: request.workflowId, platformAccountId: requestedPlatform } });
 }
 
 function registerIpc() {
@@ -481,6 +530,7 @@ function registerIpc() {
   ipcMain.handle('platform-accounts:select', wrap((_event, platformId) => switchPlatformAccount(platformId)));
   ipcMain.handle('platform-accounts:create', wrap((_event, input) => createPlatformAccount(input)));
   ipcMain.handle('agent:chat', wrap((_event, input) => runAgentChat(input)));
+  ipcMain.handle('agent:start-workflow', wrap((_event, input) => runExplicitWorkflow(input)));
   ipcMain.handle('agent:resume-workflow', wrap(async (_event, input) => {
     const runId = typeof input === 'string' ? input : input?.runId;
     const requestedPlatform = typeof input === 'object' && input?.platformAccountId ? normalizePlatformAccountId(input.platformAccountId) : currentPlatformAccountId;

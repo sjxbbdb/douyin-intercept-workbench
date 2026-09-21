@@ -634,4 +634,133 @@ testAsync('recheck cancels deferred authorization and evaluation contexts', asyn
   assert.equal(secondResult.stopReason, 'context_changed'); assert.equal(second.store.get().pending.length, 0);
 });
 
+testAsync('live batch workflow drives the five live_* methods and unifies the ledger', async () => {
+  const calls = [];
+  const events = [
+    { id: 'e1', authorId: 'u1', authorName: '观众甲', text: '多少钱', dmCapable: true },
+    { id: 'e2', authorId: 'u2', authorName: '观众乙', text: '价格能便宜吗', dmCapable: true }
+  ];
+  const targets = events.map((event) => ({ eventId: event.id, authorId: event.authorId, authorName: event.authorName, roomId: 'https://live.douyin.com/1', text: event.text, publicText: '谢谢支持', privateText: '你好呀' }));
+  const browser = {
+    liveListen: async (params) => { calls.push({ type: 'listen', params }); return { status: 'ok', events, queue: { added: 2, duplicates: 0 } }; },
+    livePlan: async (params) => { calls.push({ type: 'plan', params }); return { status: 'ok', batch: { batchId: 'batch-1' }, targets, blocked: [], expired: [], filter: { keywords: ['价格'], matched: 2 }, replyMode: 'danmaku', replyVia: 'native' }; },
+    liveReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'unknown', phase: 'public', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable', recordedState: 'sent_echoed', evidence: { roomEcho: true } })) }; },
+    livePrivate: async (params) => { calls.push({ type: 'private', params }); return { status: 'ok', phase: 'private', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable', evidence: { conversationEcho: true } })), skipped: [] }; },
+    liveResult: async (params) => { calls.push({ type: 'result', params }); return { batchId: params.batchId, counts: { sent_echoed: 2 }, checkpoint: { version: 3 } }; }
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'live-batch-1', workflowId: 'live.batch' };
+  // 话术由平台侧下发：没有话术时 plan 必须拒绝（fail-closed），这里给出话术才能冻结批次。
+  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['价格'], excludeKeywords: ['广告'], matchMode: 'seg', windowSeconds: 600, maxItems: 5, maxSends: 2, replyMode: 'danmaku', replyVia: 'native', publicReply: '谢谢支持', privateReply: '你好呀' } };
+
+  const listen = await adapter.execute({ run, plan, step: { stepId: 'listen' } });
+  assert.equal(listen.status, 'completed');
+  assert.equal(listen.checkpoint.count, 2);
+  assert.deepEqual(calls[0].params, { url: 'https://live.douyin.com/1', maxItems: 5 });
+
+  const planned = await adapter.execute({ run, plan, step: { stepId: 'plan' } });
+  assert.equal(planned.status, 'completed');
+  assert.equal(planned.checkpoint.batchId, 'batch-1');
+  assert.equal(planned.checkpoint.targets, 2);
+  // 关键词过滤 / 排除词 / 时间窗 / 话术都交给侧车的 live_plan（批次语义在侧车里）
+  assert.deepEqual(calls[1].params.keywords, ['价格']);
+  assert.deepEqual(calls[1].params.excludeKeywords, ['广告']);
+  assert.equal(calls[1].params.windowSeconds, 600);
+  assert.equal(calls[1].params.replyVia, 'native');
+  assert.equal(calls[1].params.scripts.e1.publicText, '谢谢支持');
+  assert.equal(calls[1].params.scripts.e2.privateText, '你好呀');
+
+  const reply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'act-1' } });
+  // 平台没有响应 -> 如实保留 unknown，绝不冒充成功
+  assert.equal(reply.status, 'unknown');
+  assert.equal(reply.result.deliveryStatus, 'unknown');
+  assert.equal(calls[2].params.mode, 'danmaku');
+  assert.deepEqual(calls[2].params.items.map((item) => item.sendId), ['act-1~public~e1', 'act-1~public~e2']);
+
+  // 公屏没有确认成功 -> 私信必须被拒绝，而不是"没人可发"就静默放行
+  const blocked = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'act-1' } });
+  assert.equal(blocked.error.code, 'PUBLIC_DELIVERY_NOT_CONFIRMED');
+  assert.equal(calls.filter((call) => call.type === 'private').length, 0);
+
+  const report = await adapter.execute({ run, plan, step: { stepId: 'report' } });
+  assert.equal(report.status, 'completed');
+  assert.deepEqual(calls[3].params, { batchId: 'batch-1' });
+  // 统一台账：公屏与私信落在同一条记录上，检查点带上平台侧的 checkpoint
+  assert.deepEqual(report.result.ledger.map((entry) => entry.eventId), ['e1', 'e2']);
+  assert.equal(report.result.ledger[0].public.status, 'unknown');
+  assert.equal(report.result.ledger[0].public.roomEcho, true);
+  assert.equal(report.result.counts.events, 2);
+  assert.equal(report.result.counts.publicUnknown, 2);
+  assert.equal(report.checkpoint.platformCheckpoint.version, 3);
+});
+
+testAsync('live batch private step binds each confirmed public send and records skips', async () => {
+  const calls = [];
+  const events = [{ id: 'e1', authorId: 'u1', authorName: '观众甲', text: '多少钱', dmCapable: true }, { id: 'e2', authorId: 'u2', authorName: '观众乙', text: '多少钱', dmCapable: true }];
+  const targets = events.map((event) => ({ eventId: event.id, authorId: event.authorId, authorName: event.authorName, roomId: 'https://live.douyin.com/1', text: event.text, publicText: '谢谢支持', privateText: '你好呀' }));
+  const browser = {
+    liveListen: async () => ({ status: 'ok', events, queue: { added: 2 } }),
+    livePlan: async () => ({ status: 'ok', batch: { batchId: 'batch-2' }, targets, blocked: [], replyMode: 'danmaku', replyVia: 'native' }),
+    liveReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
+    livePrivate: async (params) => {
+      calls.push({ type: 'private', params });
+      const [first, second] = params.items;
+      return { status: 'ok', results: [
+        { eventId: first.eventId, sendId: first.sendId, status: 'unknown', reason: 'platform_response_unavailable', evidence: { conversationEcho: true } },
+        { eventId: second.eventId, sendId: second.sendId, status: 'blocked', reason: 'dm_panel_unavailable', evidence: { skipped: true } }
+      ], skipped: [{ eventId: second.eventId, reason: 'dm_panel_unavailable' }] };
+    },
+    liveResult: async (params) => ({ batchId: params.batchId, checkpoint: { version: 7 } })
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'live-batch-2', workflowId: 'live.batch' };
+  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['多少钱'], publicReply: '谢谢支持', privateReply: '你好呀', maxSends: 2 } };
+  await adapter.execute({ run, plan, step: { stepId: 'listen' } });
+  await adapter.execute({ run, plan, step: { stepId: 'plan' } });
+
+  const reply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'act-2' } });
+  assert.equal(reply.status, 'completed');
+  assert.equal(reply.result.deliveryStatus, 'sent_confirmed');
+
+  const priv = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'act-2' } });
+  // 每条私信逐项绑定"那次已确认成功的公屏回复"
+  assert.deepEqual(calls[1].params.items.map((item) => item.publicSendId), ['act-2~public~e1', 'act-2~public~e2']);
+  assert.deepEqual(calls[1].params.items.map((item) => item.sendId), ['act-2~private~e1', 'act-2~private~e2']);
+  assert.equal(calls[1].params.items[0].text, '你好呀');
+  assert.equal(priv.status, 'wait_human');            // 有一条被平台拦下（跳过）-> 转人工，不谎报成功
+  assert.deepEqual(priv.result.skipped, [{ eventId: 'e2', reason: 'dm_panel_unavailable' }]);
+  assert.equal(priv.result.counts.privateSkipped, 1);
+  assert.equal(priv.result.counts.privateUnknown, 1);
+  assert.equal(priv.checkpoint.skipped, 1);
+});
+
+testAsync('structured workflow requests are validated and the issued plan is verified', async () => {
+  const { requestForWorkflow, buildWorkflowIntent, buildWorkflowContext, planMatchesRequest } = require('../src/lib/workflow-request');
+  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
+  const spec = requestForWorkflow(request);
+  assert.equal(spec.workflowId, 'live.batch');
+  assert.equal(spec.version, '1');
+  assert.deepEqual(spec.params.keywords, ['价格', '多少钱']);
+  // 不在登记表里的流程、缺必填参数、版本不对：都要在打开浏览器之前被拒
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.unknown', params: {} }), /unsupported workflowId/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', params: { keywords: ['价格'] } }), /missing url/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: [] } }), /missing keywords/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', version: '2', params: { url: 'https://live.douyin.com/1', keywords: ['价格'] } }), /unsupported live.batch version/);
+  const intent = buildWorkflowIntent(request);
+  assert.match(intent, /live\.douyin\.com\/1/);
+  assert.match(intent, /价格/);
+  assert.match(intent, /原生「回复 TA」/);
+  assert.equal(buildWorkflowContext(request).requestedBy, 'task_panel');
+
+  // 平台签发的计划必须与结构化请求逐项一致，否则拒绝启动
+  const good = { planId: 'plan_1', workflowId: 'live.batch', version: '1', params: { ...spec.params, policy: 'server_issued' } };
+  assert.deepEqual(planMatchesRequest(good, request), { ok: true });
+  assert.equal(planMatchesRequest({ ...good, workflowId: 'live.reply_then_private' }, request).reason, 'workflow_mismatch');
+  assert.equal(planMatchesRequest({ ...good, version: '2' }, request).reason, 'version_mismatch');
+  assert.equal(planMatchesRequest({ ...good, planId: '' }, request).reason, 'plan_id_missing');
+  assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, keywords: ['价格'] } }, request).reason, 'param_mismatch');
+  assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, url: 'https://live.douyin.com/2' } }, request).field, 'url');
+  assert.equal(planMatchesRequest(null, request).reason, 'plan_missing');
+});
+
 Promise.all(pendingTests).then(() => console.log(`\n${passed} desktop tests passed`)).catch(() => { process.exitCode = 1; });
