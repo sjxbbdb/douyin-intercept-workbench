@@ -876,8 +876,18 @@ def send_comment(tab, gate, send_id, target, text, source):
             found = douyin.comment_reply_button(tab, target)
             if not found.get("found"):
                 # 轻量尝试：滚几轮，看目标行是否只是还没进视口。
+                #
+                # 🔴 滚动本身失败【不能改写归因】：定位器返回的 reason 才是事实，
+                #    而 scroll_comment_panel 在页面不可见、面板结构变化或测试替身下
+                #    都可能直接抛错。之前没有这层保护，异常会一路冒到函数末尾的
+                #    except，把结果写成 reason='KeyError' —— 一条准确的
+                #    reply_ambiguous_comment 被替换成了毫无信息量的异常类名
+                #    （CI: BoundaryTests.test_video_comment_ambiguous_target_never_clicks）。
                 for _ in range(3):
-                    douyin.scroll_comment_panel(tab, rounds=1, pause=1.4, dy=2000)
+                    try:
+                        douyin.scroll_comment_panel(tab, rounds=1, pause=1.4, dy=2000)
+                    except Exception:
+                        break
                     found = douyin.comment_reply_button(tab, target)
                     if found.get("found"):
                         break
@@ -900,8 +910,14 @@ def send_comment(tab, gate, send_id, target, text, source):
                 #   另外加滚轮不可用时也要如实标注，否则会被当成定位器缺陷。
                 reason = str(found.get("reason") or "not_found")
                 if reason == "comment_not_found":
-                    reason = "target_not_rendered"
-                row = gate.finish(send_id, "blocked", "reply_" + reason)
+                    # 目标不在渲染层：定位器再怎么改也找不到它，这是【换目标】的事，
+                    # 不是重试代码的事 —— 归 blocked，并给一个能自查的原因。
+                    row = gate.finish(send_id, "blocked", "reply_target_not_rendered")
+                else:
+                    # 定位器自身的问题（多行歧义 / 找不到「回复」按钮）仍然是 failed：
+                    # 这是代码缺陷，基线契约（BoundaryTests）就是按 failed 断言的，
+                    # 一律改成 blocked 会把"我们没点下去"和"我们点不了"混为一谈。
+                    row = gate.finish(send_id, "failed", "reply_" + reason)
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
             # 🔴 真机（2026-09-21）：点「回复」之后编辑器不是立刻挂载的 ——
