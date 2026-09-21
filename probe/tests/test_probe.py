@@ -2451,9 +2451,15 @@ class CommentBatchFlowTests(unittest.TestCase):
             # 这里只在【私信那一步】要求 fail-closed。
             sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
             original = sidecar.send_comment
-            sidecar.send_comment = lambda *args, **kwargs: {
-                "status": "unknown", "reason": "platform_response_unavailable",
-                "sendId": args[2]}
+            def unknown_comment(*args, **kwargs):
+                send_id = args[2]
+                target = args[3]
+                text = args[4]
+                instance.gate.reserve(send_id, target["authorId"], text, kind="comment")
+                instance.gate.finish(send_id, "unknown", "platform_response_unavailable")
+                return {"status": "unknown", "reason": "platform_response_unavailable",
+                        "sendId": send_id}
+            sidecar.send_comment = unknown_comment
             try:
                 plan = instance.comment_plan(self._plan_params())
                 batch_id = plan["batch"]["batchId"]
@@ -2476,9 +2482,15 @@ class CommentBatchFlowTests(unittest.TestCase):
             sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
             original_comment = sidecar.send_comment
             original_private = sidecar.send_private
-            sidecar.send_comment = lambda *args, **kwargs: {
-                "status": "sent_confirmed", "reason": "platform_response_recorded",
-                "sendId": args[2]}
+            def confirmed_comment(*args, **kwargs):
+                send_id = args[2]
+                target = args[3]
+                text = args[4]
+                instance.gate.reserve(send_id, target["authorId"], text, kind="comment")
+                instance.gate.finish(send_id, "sent_confirmed", "platform_response_recorded")
+                return {"status": "sent_confirmed", "reason": "platform_response_recorded",
+                        "sendId": send_id}
+            sidecar.send_comment = confirmed_comment
             sidecar.send_private = lambda *args, **kwargs: {
                 "status": "unknown", "reason": "platform_response_unavailable",
                 "sendId": args[2]}
@@ -2506,9 +2518,15 @@ class CommentBatchFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
             original = sidecar.send_comment
-            sidecar.send_comment = lambda *args, **kwargs: {
-                "status": "sent_confirmed", "reason": "platform_response_recorded",
-                "sendId": args[2]}
+            def confirmed_comment(*args, **kwargs):
+                send_id = args[2]
+                target = args[3]
+                text = args[4]
+                instance.gate.reserve(send_id, target["authorId"], text, kind="comment")
+                instance.gate.finish(send_id, "sent_confirmed", "platform_response_recorded")
+                return {"status": "sent_confirmed", "reason": "platform_response_recorded",
+                        "sendId": send_id}
+            sidecar.send_comment = confirmed_comment
             try:
                 plan = instance.comment_plan(self._plan_params())
                 batch_id = plan["batch"]["batchId"]
@@ -2518,7 +2536,54 @@ class CommentBatchFlowTests(unittest.TestCase):
                     {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-OTHER"}]})
             finally:
                 sidecar.send_comment = original
-        self.assertEqual(out["results"][0]["reason"], "public_send_id_mismatch")
+        self.assertEqual(out["results"][0]["reason"], "public_not_found")
+
+    def test_private_requires_public_send_id_before_browser(self):
+        """批次私信和单发入口一样，缺绑定 ID 时不能打开浏览器。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original_comment = sidecar.send_comment
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "sent_confirmed", "reason": "platform_response_recorded",
+                "sendId": args[2]}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"}]})
+                def boom():
+                    raise AssertionError("缺 publicSendId 时不应打开浏览器")
+                instance._page = boom
+                out = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1"}]})
+            finally:
+                sidecar.send_comment = original_comment
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["results"][0]["reason"], "public_missing")
+
+    def test_private_requires_the_public_send_to_be_confirmed(self):
+        """有绑定 ID 也必须是台账中的已确认公屏回复。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original_comment = sidecar.send_comment
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "sent_confirmed", "reason": "platform_response_recorded",
+                "sendId": args[2]}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"}]})
+                instance._page = lambda: (_ for _ in ()).throw(
+                    AssertionError("未知 publicSendId 时不应打开浏览器"))
+                out = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-other"}]})
+            finally:
+                sidecar.send_comment = original_comment
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["results"][0]["reason"], "public_not_found")
 
     def test_expired_events_are_not_replayed_into_a_batch(self):
         """批次窗口：过期的候选不会重新进批次（评论区窗口远长于弹幕，但语义一致）。"""

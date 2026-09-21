@@ -1056,6 +1056,23 @@ class Sidecar:
         reasons = {row.get("eventId"): row.get("reason") for row in rejected}
         results, sendable = [], []
         for item in items:
+            # 两阶段门禁必须落在每个批次条目上，而不是只依赖
+            # private_candidates 的状态筛选：任何调用方都不能拿一个
+            # 其它公屏动作，或省略 publicSendId，来绕过本条评论的绑定。
+            public_send_id = str(item.get("publicSendId") or "").strip()
+            if not public_send_id:
+                self.comment_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                                 {"reason": "public_missing"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "public_missing"})
+                continue
+            refusal = _public_guard(self.gate, public_send_id)
+            if refusal:
+                self.comment_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                                 {"reason": refusal[0]})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": refusal[0]})
+                continue
             target = by_id.get(item["eventId"])
             if target is None:
                 results.append({"eventId": item["eventId"], "status": "blocked",
@@ -1067,7 +1084,7 @@ class Sidecar:
             # 避免"用 A 的公屏成功去给 B 发私信"这种张冠李戴。
             recorded = str(((self.comment_queue.find_event(item["eventId"]) or {})
                             .get("detail") or {}).get("sendId") or "")
-            if item["publicSendId"] and recorded and item["publicSendId"] != recorded:
+            if recorded and public_send_id != recorded:
                 results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "public_send_id_mismatch"})
                 continue
