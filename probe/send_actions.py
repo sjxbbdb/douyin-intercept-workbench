@@ -875,12 +875,32 @@ def send_comment(tab, gate, send_id, target, text, source):
             # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
             found = douyin.comment_reply_button(tab, target)
             if not found.get("found"):
+                # 🔴 真机（2026-09-21）：评论列表是【懒加载】的 —— 一个几万条评论的视频，
+                #    DOM 里只挂前 ~17 条。目标评论常常压根还没渲染，于是这里直接返回
+                #    comment_not_found，看起来像定位器坏了，其实是「没加载」。
+                #    实测：目标在第 ~43 条，页面上搜不到它的任何文本。
+                #    所以先滚动评论面板把目标行加载出来，每滚一轮重试一次定位；
+                #    仍然找不到才判失败。轮数有界，不会无限滚。
+                for _ in range(12):
+                    douyin.scroll_comment_panel(tab, rounds=2, pause=1.4, dy=2000)
+                    found = douyin.comment_reply_button(tab, target)
+                    if found.get("found"):
+                        break
+            if not found.get("found"):
                 row = gate.finish(send_id, "failed",
                                   "reply_" + str(found.get("reason") or "not_found"))
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
-            time.sleep(0.6)
-            composer = douyin.comment_reply_composer(tab, target)
+            # 🔴 真机（2026-09-21）：点「回复」之后编辑器不是立刻挂载的 ——
+            #    行要先切成「回复中」，Draft.js 编辑器才挂出来。
+            #    原来只等 0.6 秒查一次，查不到就判 comment_composer_not_found，
+            #    实测这一步就是过不去。改成有界轮询，拿到编辑器就走。
+            composer = {"found": False}
+            for _ in range(12):
+                time.sleep(0.5)
+                composer = douyin.comment_reply_composer(tab, target)
+                if composer.get("found"):
+                    break
         if not composer.get("found"):
             row = gate.finish(send_id, "failed", "comment_composer_not_found")
             return gate.result(row)
