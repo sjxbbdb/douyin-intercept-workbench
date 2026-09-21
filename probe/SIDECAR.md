@@ -83,6 +83,61 @@ For an onedir Windows bundle, run `build_sidecar.cmd` from this directory.
 It creates an isolated `.pyinstaller-venv` and writes
 `dist\probe-agent\probe-agent.exe`; PyInstaller is a build-only dependency.
 
+## Comment batch flow (images/11-comment-area-business)
+
+The video comment area had a **single-target** send path only: `collect_comments`
+returned candidates and the host called `send_comment` / `send_private` once per
+target. That is not enough to hold the fixed workflow
+「关键词匹配评论 -> 公开回复 -> **只有 sent_confirmed 才允许私信**」, because the
+two-phase rule cannot be enforced by host discipline. Four methods now mirror the
+live batch flow on the comment side:
+
+| method | phase | needs a browser |
+|---|---|---|
+| `comment_plan` | collect one video, filter comments, form and freeze one batch | yes (collection only) |
+| `comment_reply` | phase one: public reply per accepted item | only when something is sendable |
+| `comment_private` | phase two: private message, bound to the recorded public send | only when something is sendable |
+| `comment_result` | batch report, counts and resume checkpoint | no |
+
+Differences from the live flow, all deliberate:
+
+* the input is a **video URL plus filter parameters** (`commentKeywords`,
+  `excludeKeywords`, `matchMode`, `minDigg`, `dedupeAuthors`) - the comment area
+  has no continuous listening, so one collection is one batch;
+* the host supplies **one** script pair (`publicText` / `privateText`) and
+  `comment_flow.build_scripts()` expands it over every target, while the live flow
+  takes per-target scripts;
+* a collection that yields no matching comment returns `status: "empty"` and
+  **creates no batch**, so the host changes video or keywords instead of holding an
+  empty plan;
+* `captcha` / `login_required` / `unsupported` are passed through as terminal
+  statuses: no batch is created against a page that cannot be worked with.
+
+`comment_plan` is fail-closed before any browser action: a missing
+`publicText` / `privateText`, an out-of-range `maxItems` / `windowSeconds`, and a
+caller-supplied `policy` are all refused (`invalid_input` /
+`policy_not_server_issued`). Batch state lives in `comment_flow.sqlite3` - a
+separate database from `live_flow.sqlite3`, so live-room and comment-area state
+never mix and per-account scoping stays unambiguous.
+
+Phase two keeps the same derived-candidate rule as `live_private`: only targets
+whose recorded phase-one state is in `policy.allowPublicStates`
+(default `["sent_confirmed"]`) are sendable; `unknown` / `failed` / `blocked`
+are refused with `public_unknown` / `public_failed` / `public_blocked`, a missing
+commenter id with `missing_author_id`. In addition the private item may carry the
+`publicSendId` it believes succeeded: it is compared with the send id recorded on
+that event, and a mismatch is refused with `public_send_id_mismatch` instead of
+sending - so a confirmed reply to one person can never be spent on another.
+
+The response of `comment_plan` reports two different filters, and they are not
+interchangeable: `filter` is the **collection-side** comment statistics
+(keywords / exclusions / like threshold / author dedupe) and `batchFilter` is the
+event-level statistics of the batch window.
+
+Unverified boundary, unchanged from the live batch: the mechanism is offline
+tested, but it drives `video_reply` and `private_reply`, both of which still lack
+platform delivery evidence - so `comment_batch.autoEligible` is `false`.
+
 ## Live batch flow (images/12-live-room-business)
 
 Five further methods implement the collaborator half of the live flow, between
