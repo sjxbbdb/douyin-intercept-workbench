@@ -3293,5 +3293,96 @@ class LivePrivateBindingTests(unittest.TestCase):
             self.assertIn("comment_private_candidates", caps["methods"])
 
 
+class LivePrivateLedgerGatingTests(unittest.TestCase):
+    """真实台账上的【逐条】门禁：同一批次里只有公屏确认成功的那条才允许私信。
+
+    与 LivePrivateBindingTests 的分工：那边每条绕过路径单独验一个事件；这里把
+    【同一批次里的两条弹幕】放进一次真实调用，证明门禁是逐条的、不是整批放行：
+
+      * 两条事件的批次状态都是 sent_confirmed（候选清单允许两条）——
+        所以本用例单独钉的是"逐项台账绑定"，而不是候选清单；
+      * 真实台账里只有一条公屏回复是 sent_confirmed，另一条停在 unknown（真机常态）；
+      * 结果：确认的那条进入浏览器阶段，unknown 的那条在【打开浏览器之前】被拒绝。
+
+    另外钉住一条容易搞错的细节：契约判定读的是 SendGate.lookup() 的【原始状态】，
+    而不是 result() 映射后的对外状态 —— 后者会把 sent_confirmed 映射成 unknown，
+    照它判定就永远进不了私信。
+    """
+
+    class _Page:
+        def close(self):
+            pass
+
+    @staticmethod
+    def _public_reply(gate, send_id, status):
+        gate.reserve(send_id, "live-danmaku-native:%s" % send_id, "谢谢支持", kind="danmaku_reply")
+        if status in ("unknown", "sent_confirmed"):
+            gate.mark_started(send_id)
+        gate.finish(send_id, status, "platform_response_unavailable")
+        return send_id
+
+    def test_only_the_confirmed_item_reaches_the_private_phase(self):
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19233)
+
+            # 注意：混合批次里"有一条可发"就会打开浏览器 —— 那是正确的。
+            # 这里要钉的是【逐条】：未确认的那条绝不能进到发送路径里。
+            instance._page = lambda: (self._Page(), {"pid": 1})
+            instance.live_queue.append([
+                sidecar._event("live", "room-1", {"id": "e-ok", "authorId": "A" * 40,
+                                                  "authorName": "观众甲", "text": "多少钱"}),
+                sidecar._event("live", "room-1", {"id": "e-unknown", "authorId": "B" * 40,
+                                                  "authorName": "观众乙", "text": "多少钱"}),
+            ])
+            scripts = {"e-ok": {"publicText": "谢谢支持", "privateText": "私信话术"},
+                       "e-unknown": {"publicText": "谢谢支持", "privateText": "私信话术"}}
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "replyMode": "danmaku", "scripts": scripts})
+            batch_id = planned["batch"]["batchId"]
+            self.assertEqual(sorted(item["eventId"] for item in planned["targets"]),
+                             ["e-ok", "e-unknown"])
+
+            self._public_reply(instance.gate, "pub-ok", "sent_confirmed")
+            self._public_reply(instance.gate, "pub-unknown", "unknown")
+            for event_id, send_id in (("e-ok", "pub-ok"), ("e-unknown", "pub-unknown")):
+                instance.live_queue.mark(event_id, live_flow.SENT_CONFIRMED, batch_id,
+                                         {"sendId": send_id})
+            candidates, _rejected = instance.live_queue.private_candidates(batch_id)
+            self.assertEqual(len(candidates), 2, "本用例验的是逐项台账门禁，不是候选清单")
+
+            raw = instance.gate.lookup("pub-ok")
+            self.assertEqual(raw["status"], "sent_confirmed")
+            self.assertEqual(instance.gate.result(raw)["status"], "unknown",
+                             "对外 result() 会把 sent_confirmed 映射成 unknown")
+
+            sent = []
+            original = sidecar.send_private
+            sidecar.send_private = lambda _page, _gate, send_id, target, text: (
+                sent.append((send_id, target["authorId"], text)) or
+                {"status": "unknown", "reason": "platform_response_unavailable",
+                 "evidence": {"conversationEcho": True}})
+            try:
+                result = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e-ok", "sendId": "d-ok", "publicSendId": "pub-ok"},
+                    {"eventId": "e-unknown", "sendId": "d-unknown",
+                     "publicSendId": "pub-unknown"}]})
+            finally:
+                sidecar.send_private = original
+
+            by_event = {item["eventId"]: item for item in result["results"]}
+            self.assertEqual(by_event["e-unknown"]["status"], "blocked")
+            self.assertEqual(by_event["e-unknown"]["reason"], "public_unknown")
+            self.assertEqual(by_event["e-ok"]["status"], "unknown")
+            self.assertEqual([item[1] for item in sent], ["A" * 40], "只有确认过的那条进入浏览器阶段")
+            self.assertEqual(sent[0][0], "d-ok")
+            # 拒绝要留痕：台账里能查到原因，不是静默跳过
+            self.assertEqual(instance.live_queue.find_event("e-unknown")["private"]["reason"],
+                             "public_unknown")
+            self.assertEqual(instance.live_queue.find_event("e-ok")["private"]["status"], "unknown")
+            self.assertEqual(result["skipped"], [], "被门禁拒绝不等于对方不可私信，不能计成跳过")
+
+
 if __name__ == "__main__":
     unittest.main()
