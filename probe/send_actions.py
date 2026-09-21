@@ -851,9 +851,15 @@ def send_comment(tab, gate, send_id, target, text, source):
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
-        login = douyin.login_state(tab)
+        # 🔴 必须走 _await_login，不能用裸的 login_state（真机 2026-09-21）：
+        #    抖音是 SPA，账号元素异步挂载；导航后立刻查会得到 unknown，
+        #    于是"明明登录着"却被判未登录、且记成 failed —— 这条目标再也进不了私信。
+        #    私信 / 直播公屏 / 直播私信三条路径早就用了 _await_login，唯独评论回复漏了，
+        #    后果就是评论公开回复在真机上从未走通过（video_reply 至今没有送达证据）。
+        login = _await_login(tab)
         if login != "verified":
-            row = gate.finish(send_id, "failed", "login_required" if login == "required" else "login_state_unknown")
+            row = gate.finish(send_id, "failed",
+                              "login_required" if login == "required" else "login_state_unknown")
             return gate.result(row)
 
         if source == "live":
@@ -868,12 +874,42 @@ def send_comment(tab, gate, send_id, target, text, source):
             # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
             found = douyin.comment_reply_button(tab, target)
             if not found.get("found"):
-                row = gate.finish(send_id, "failed",
-                                  "reply_" + str(found.get("reason") or "not_found"))
+                # 轻量尝试：滚几轮，看目标行是不是只是还没进视口。
+                # 🔴 滚动本身失败【不能改写归因】：定位器返回的 reason 才是事实，
+                #    而 scroll_comment_panel 在页面不可见 / 面板结构变化 / 测试替身下
+                #    都可能直接抛错；异常冒到函数末尾会把结果写成 reason='KeyError'，
+                #    一条准确的 reply_ambiguous_comment 被换成毫无信息量的异常类名。
+                for _ in range(3):
+                    try:
+                        douyin.scroll_comment_panel(tab, rounds=1, pause=1.4, dy=2000)
+                    except Exception:
+                        break
+                    found = douyin.comment_reply_button(tab, target)
+                    if found.get("found"):
+                        break
+            if not found.get("found"):
+                # 「找不到」有两种含义，混起来会误导排查方向：
+                #   absent    -> 目标不在渲染层（采集走接口、回复走 DOM，两个集合不重合），
+                #                这是【换目标】的事，记 blocked + 明确原因；
+                #   ambiguous / no_button -> 定位器自身的问题，记 failed。
+                reason = str(found.get("reason") or "not_found")
+                state = str(found.get("state") or "")
+                if state == "absent":
+                    row = gate.finish(send_id, "blocked", "reply_target_not_rendered")
+                else:
+                    row = gate.finish(send_id, "failed", "reply_" + reason)
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
-            time.sleep(0.6)
-            composer = douyin.comment_reply_composer(tab, target)
+            # 🔴 真机（2026-09-21）：点「回复」之后编辑器不是立刻挂载的 ——
+            #    行要先切成「回复中」，Draft.js 编辑器才挂出来。
+            #    原来只等 0.6 秒查一次，查不到就判 comment_composer_not_found。
+            #    改成有界轮询，拿到编辑器就走。
+            composer = {"found": False}
+            for _ in range(12):
+                time.sleep(0.5)
+                composer = douyin.comment_reply_composer(tab, target)
+                if composer.get("found"):
+                    break
         if not composer.get("found"):
             row = gate.finish(send_id, "failed", "comment_composer_not_found")
             return gate.result(row)

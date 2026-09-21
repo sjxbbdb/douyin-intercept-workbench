@@ -889,6 +889,23 @@ class Sidecar:
                 item["matchedKeyword"] = str(row.get("matched_keyword") or "")
                 item["digg"] = int(row.get("digg") or 0)
                 targets.append(item)
+            # 只读探测，不滚动不点击：给每个目标标一个"此刻够不够得到"。
+            # 🔴 判据与回复路径【完全同一份】（douyin.comment_row_present ->
+            #    comment_row_state）：歧义的行在两边都算"够不到"。
+            #    两套判据曾经让同一条评论先被判"在页面上"、再被判"歧义失败"，
+            #    采集阶段还会把够不到的目标排进批次。
+            # 探测本身失败记为 None —— "没探到"与"看不见"是两件事。
+            for item in targets:
+                try:
+                    probe = douyin.comment_row_present(page, item)
+                    item["visible"] = bool(probe.get("present"))
+                    # reachable：这一行能被唯一识别（按钮可能要先滚进视口）
+                    item["reachable"] = bool(probe.get("reachable"))
+                    item["rowState"] = probe.get("state")
+                except Exception:
+                    item["visible"] = None
+                    item["reachable"] = None
+                    item["rowState"] = None
             filtered = {
                 "collected": len(rows),
                 "matched": int(fstats.get("matched") or 0),
@@ -897,6 +914,8 @@ class Sidecar:
                 "noAuthor": int(fstats.get("no_sec_uid") or 0),
                 "dedupedAuthors": int(deduped),
                 "targetCount": len(targets),
+                "visible": sum(1 for it in targets if it.get("visible")),
+                "reachable": sum(1 for it in targets if it.get("reachable")),
                 "matchMode": match_mode,
                 "keywords": list(fstats.get("keywords") or []),
                 "excludeKeywords": list(fstats.get("exclude_keywords") or []),

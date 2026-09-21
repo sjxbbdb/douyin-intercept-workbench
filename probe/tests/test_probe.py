@@ -414,9 +414,11 @@ class BoundaryTests(unittest.TestCase):
                 return "complete" if expression == "document.readyState" else None
 
             def eval_json(self, _expression):
-                # 模拟 douyin.comment_reply_button 真实会返回的歧义结果
-                # （真机上它由 douyin.py 的 _REPLY_BUTTON_JS 产生）
-                return {"found": False, "count": 2, "reason": "ambiguous_comment"}
+                # 模拟 douyin.comment_row_state 真实会返回的歧义状态
+                # （真机上它由 douyin.py 的 _ROW_STATE_JS 产生）。
+                # 形状是 {state: ...} —— 判据统一之后行状态只有这一份来源，
+                # 旧的 {found, reason} 形状已经不存在。
+                return {"state": "ambiguous", "count": 2, "total": 9}
 
             def click_at(self, *args):
                 self.clicks.append(args)
@@ -469,6 +471,96 @@ class BoundaryTests(unittest.TestCase):
             lines = [json.loads(line.decode("utf-8")) for line in proc.stdout.splitlines() if line.strip()]
             self.assertEqual(proc.returncode, 0)
             self.assertEqual([line["id"] for line in lines], [request_id, request_id])
+
+class CommentRowStateTests(unittest.TestCase):
+    """目标行判据必须【唯一】：comment_row_present 与 comment_reply_button 不得各说各话。
+
+    真机 2026-09-21：两者曾经是两套判据 ——
+      · 采集侧 comment_row_present：找到第一行就算 present；
+      · 回复侧 comment_reply_button：必须唯一命中，多命中即 ambiguous_comment。
+    于是同一条评论可以先被判「已经在页面上」、紧接着回复时又报歧义失败，
+    采集阶段还会据此把"够不到的目标"排进批次。
+    现在两者共用 douyin.comment_row_state，这里把结论一致性钉住。
+    """
+
+    TARGET = {"id": "c-1", "authorId": "author-1", "authorName": "甲", "text": "求带"}
+
+    class _Page:
+        def __init__(self, state):
+            self.state = state
+
+        def eval_json(self, expression, timeout=None):
+            return self.state
+
+    def test_ambiguous_row_is_not_present_and_the_button_says_so_too(self):
+        """两行都匹配 -> 两边都必须判"够不到"，而且原因一致。"""
+        import douyin
+        page = self._Page({"state": "ambiguous", "count": 2, "total": 9})
+        present = douyin.comment_row_present(page, self.TARGET)
+        button = douyin.comment_reply_button(page, self.TARGET, attempts=1)
+        self.assertFalse(present["present"], "歧义的行不算 present（旧判据会在这里说 True）")
+        self.assertFalse(present["reachable"])
+        self.assertEqual(present["state"], "ambiguous")
+        self.assertEqual(present["reason"], "ambiguous_comment")
+        self.assertFalse(button["found"])
+        self.assertEqual(button["reason"], douyin.ROW_STATE_REASONS["ambiguous"])
+
+    def test_absent_row_is_unreachable_on_both_sides(self):
+        import douyin
+        page = self._Page({"state": "absent", "count": 0, "total": 4})
+        present = douyin.comment_row_present(page, self.TARGET)
+        button = douyin.comment_reply_button(page, self.TARGET, attempts=1)
+        self.assertFalse(present["present"])
+        self.assertFalse(present["reachable"])
+        self.assertEqual(present["state"], "absent")
+        self.assertEqual(button["reason"], "comment_not_found")
+
+    def test_unique_row_is_present_and_gives_coordinates(self):
+        import douyin
+        page = self._Page({"state": "present", "count": 1, "total": 4, "index": 2,
+                           "x": 640, "y": 300, "tag": "SPAN"})
+        present = douyin.comment_row_present(page, self.TARGET)
+        button = douyin.comment_reply_button(page, self.TARGET, attempts=1)
+        self.assertTrue(present["present"])
+        self.assertTrue(present["reachable"])
+        self.assertFalse(present["needsScroll"])
+        self.assertTrue(button["found"])
+        self.assertEqual((button["x"], button["y"]), (640, 300))
+
+    def test_row_that_only_needs_a_scroll_is_still_reachable(self):
+        """按钮出视口：行唯一、够得到，只是要先滚 —— present=False 但 reachable=True。"""
+        import douyin
+        page = self._Page({"state": "needs_scroll", "count": 1, "total": 4})
+        present = douyin.comment_row_present(page, self.TARGET)
+        self.assertFalse(present["present"])
+        self.assertTrue(present["reachable"])
+        self.assertTrue(present["needsScroll"])
+        button = douyin.comment_reply_button(page, self.TARGET, attempts=2, settle=0)
+        self.assertFalse(button["found"])
+        self.assertEqual(button["reason"], "scrolled_into_view",
+                         "一直滚不进视口要如实说「还在滚」，不能报成找不到")
+
+    def test_missing_reply_button_has_its_own_reason(self):
+        import douyin
+        page = self._Page({"state": "no_button", "count": 1, "total": 4})
+        present = douyin.comment_row_present(page, self.TARGET)
+        self.assertFalse(present["present"])
+        self.assertTrue(present["reachable"], "行在、只是没有回复按钮 -> 定位器问题，不是够不到")
+        self.assertEqual(present["reason"], "reply_button_not_found")
+
+    def test_eval_failure_is_never_reported_as_absent(self):
+        """"没探到"与"看不见"是两件事：探测失败必须留痕，不能算成目标不存在。"""
+        import douyin
+
+        class Boom:
+            def eval_json(self, expression, timeout=None):
+                return None
+
+        present = douyin.comment_row_present(Boom(), self.TARGET)
+        self.assertFalse(present["present"])
+        self.assertEqual(present["state"], "eval_failed")
+        self.assertIsNone(present["reason"])
+
 
 @unittest.skipUnless(__import__("sidecar")._find_browser(), "Chrome/Edge not installed")
 class ChromiumFixtureTests(unittest.TestCase):

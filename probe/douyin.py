@@ -802,21 +802,30 @@ def _row_helpers_js():
         "if(r.width>0&&r.height>0)return ls[i];}return null;}"
         "function rows(){var root=visibleRoot();if(!root)return [];"
         "return Array.from(root.querySelectorAll(" + json.dumps(S.COMMENT_ITEM) + ")).filter(vis);}"
-        # 正文提取：排除作者链接内、时间/地区、纯数字、固定操作文案，取最长候选
+        # 正文提取：排除作者链接内、时间/地区、固定操作文案，取最长候选。
+        # 🔴 真机（2026-09-21）：原来把【纯数字】一律当噪声跳过（本意是滤掉点赞数），
+        #    结果正文就是「111」的评论提不出正文，rowMatches 必然失败，表现为
+        #    reply_comment_not_found —— 而「111 / 求带」这类短评论恰恰是截流最常见的命中目标。
+        #    现在：非数字候选优先，一个都没有时才退用纯数字候选。
         "function bodyText(row){var noise=" + json.dumps(S.COMMENT_NOISE_TEXTS) + ";"
-        "var link=row.querySelector('a[href*=\"/user/\"]');var best='';"
+        "var link=row.querySelector('a[href*=\"/user/\"]');var best='',numBest='';"
         "var all=row.querySelectorAll('span,div');"
         "for(var i=0;i<all.length;i++){var e=all[i];"
         "if(e.children&&e.children.length>0)continue;"
         "if(link&&link.contains(e))continue;"
         "var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();"
         "if(!t)continue;"
-        "if(/^\\d+$/.test(t))continue;"
+        "if(/^\\d+$/.test(t)){if(t.length>numBest.length)numBest=t;continue;}"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
         "if(t.indexOf('·')>=0&&/\\d/.test(t))continue;"
+        # 🔴 真机（2026-09-21）：行处于「回复中」时会多出一个「回复@某人」元素，
+        #    它比评论正文长，会被"取最长候选"选中 -> bodyText 变成「回复@xxx」
+        #    -> rowMatches 正文比对失败 -> 报 reply_row_mismatch，
+        #    看起来像"编辑器认不出属于哪一行"，实际是正文提取被污染。
+        "if(/^回复@/.test(t))continue;"
         "if(noise.indexOf(t)>=0)continue;"
         "if(t.length>best.length)best=t;}"
-        "return best;}"
+        "return best||numBest;}"
         # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
         "function rowMatches(row,t){"
         "if(t.text&&bodyText(row)!==t.text)return false;"
@@ -844,14 +853,28 @@ def _target_json(target):
     })
 
 
-# --- 1) 「回复」按钮：先滚入视口，再读坐标 ---
-_REPLY_BUTTON_JS = (
+# --- 1) 目标行的【唯一判据】 ---
+#
+# 🔴 真机教训（2026-09-21）：同一份目标行曾经有【两套判据】——
+#    · 采集侧的 comment_row_present 用「找到第一行就算 present」；
+#    · 回复侧这里用「必须唯一命中，多命中即 ambiguous_comment」。
+#    于是同一条评论可以先被判「已经在页面上」、紧接着回复时又报歧义失败：
+#    宿主拿到的是自相矛盾的两个结论，采集阶段还会据此把"够不到的目标"排进批次。
+#
+#    现在两个函数共用同一个 _ROW_STATE_JS，行状态只有这一个来源：
+#      absent       没有行匹配            -> 目标不在渲染层（换目标，不是修代码）
+#      ambiguous    多于一行匹配          -> 判据不足（文案/昵称重复），不得猜着点
+#      no_button    行在但没有「回复」按钮 -> 定位器问题
+#      needs_scroll 按钮在但出视口        -> 本轮滚进视口，下一轮重读坐标
+#      present      恰好一行且按钮可见    -> 给出坐标
+_ROW_STATE_JS = (
     "(function(t){" + _row_helpers_js() +
     "var rs=rows();"
     "var hits=rs.filter(function(r){return rowMatches(r,t);});"
-    "if(hits.length!==1)return {found:false,count:hits.length,"
-    "reason:hits.length?'ambiguous_comment':'comment_not_found'};"
+    "if(hits.length===0)return {state:'absent',count:0,total:rs.length};"
+    "if(hits.length>1)return {state:'ambiguous',count:hits.length,total:rs.length};"
     "var row=hits[0];"
+    "var index=rs.indexOf(row);"
     "var all=row.querySelectorAll('span,div,button,[role=button]');"
     "var btn=null;"
     "for(var i=0;i<all.length;i++){var e=all[i];"
@@ -859,12 +882,56 @@ _REPLY_BUTTON_JS = (
     "var s=(e.innerText||e.textContent||'').replace(/\\s+/g,'').trim();"
     "if(s!==" + json.dumps(S.COMMENT_REPLY_BUTTON_TEXT) + ")continue;"
     "if(!vis(e))continue;btn=e;break;}"
-    "if(!btn)return {found:false,count:1,reason:'reply_button_not_found'};"
+    "if(!btn)return {state:'no_button',count:1,index:index,total:rs.length};"
     "if(!inView(btn)){row.scrollIntoView({block:'center'});"
-    "return {found:false,count:1,reason:'scrolled_into_view'};}"
+    "return {state:'needs_scroll',count:1,index:index,total:rs.length};}"
     "var r=btn.getBoundingClientRect();"
-    "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),tag:btn.tagName};})(TARGET)"
+    "return {state:'present',count:1,index:index,total:rs.length,"
+    "x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),tag:btn.tagName};})(TARGET)"
 )
+
+# 状态 -> 对外原因（宿主、日志与测试都看这一份）
+ROW_STATE_REASONS = {
+    "absent": "comment_not_found",
+    "ambiguous": "ambiguous_comment",
+    "no_button": "reply_button_not_found",
+}
+
+
+def comment_row_state(cdp, target):
+    """目标行此刻的状态（唯一判据）。返回 {state, count, index, total, x?, y?}。"""
+    expression = _ROW_STATE_JS.replace("TARGET", _target_json(target))
+    state = cdp.eval_json(expression)
+    if not isinstance(state, dict):
+        return {"state": "eval_failed", "count": 0}
+    return state
+
+
+def comment_row_present(cdp, target):
+    """目标行此刻是否已经在渲染层（只读，不滚动、不点击）。
+
+    与 comment_reply_button 共用同一判据：**ambiguous 不算 present**，
+    否则采集阶段说"在页面上"、回复阶段说"歧义"，两个结论互相打架，
+    真正"够不到"的目标也会被当成可用目标排进批次。
+
+    采集走接口能拿 100~200 条，回复走 DOM 只渲染几十条，两个集合不重合 ——
+    所以采集时就要标出哪些【此刻够得到】，而不是先排进批次再反复重试。
+    只读、不滚动、不点击，可以安全地对多条候选调用。
+    """
+    state = comment_row_state(cdp, target)
+    kind = str(state.get("state") or "eval_failed")
+    return {"present": kind == "present",
+            "state": kind,
+            "count": state.get("count"),
+            "index": state.get("index"),
+            "total": state.get("total"),
+            # reachable = 这一行能被【唯一识别】（够不够得到是宿主的事）：
+            #   · needs_scroll：行在，只是按钮要先滚进视口；
+            #   · no_button   ：行在，是【定位器】找不到按钮 —— 这是代码要修，
+            #                   不能因此把目标判成"够不到"而丢掉。
+            "reachable": kind in ("present", "needs_scroll", "no_button"),
+            "needsScroll": kind == "needs_scroll",
+            "reason": ROW_STATE_REASONS.get(kind)}
 
 
 def comment_reply_button(cdp, target, attempts=4, settle=1.2):
@@ -874,15 +941,19 @@ def comment_reply_button(cdp, target, attempts=4, settle=1.2):
     （真机实测某行「回复」按钮 y=-1415）。直接按坐标点会点到别处。
     legacy reply_worker.js 的既有做法就是 scrollIntoView -> 等重渲染 -> 再读一次。
     """
-    expression = _REPLY_BUTTON_JS.replace("TARGET", _target_json(target))
     result = {"found": False, "reason": "not_attempted"}
     for _ in range(max(1, attempts)):
-        result = cdp.eval_json(expression) or {"found": False, "reason": "eval_failed"}
-        if result.get("found"):
-            return result
-        if result.get("reason") != "scrolled_into_view":
+        state = comment_row_state(cdp, target)
+        kind = str(state.get("state") or "eval_failed")
+        result = {"found": False, "count": state.get("count"), "state": kind}
+        if kind == "present":
+            return {"found": True, "state": kind, "count": state.get("count"),
+                    "x": state.get("x"), "y": state.get("y"), "tag": state.get("tag")}
+        if kind != "needs_scroll":
+            result["reason"] = ROW_STATE_REASONS.get(kind, kind)
             return result
         time.sleep(settle)
+    result["reason"] = "scrolled_into_view"
     return result
 
 
