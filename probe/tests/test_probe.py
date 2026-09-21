@@ -2018,6 +2018,190 @@ class SearchPagingTests(unittest.TestCase):
             instance.search({"keyword": "宝宝辅食", "cursor": token})
 
 
+class EndToEndChainTests(unittest.TestCase):
+    """关键词搜视频 -> 抓评论 -> 公开回复 -> 私信：四段串成一条链跑一遍。
+
+    【离线链路测试】。平台 I/O 打桩，但 SendGate 与两阶段门禁是【真实的】——
+    打桩点只有四个，且每个桩都严格照真实网关协议写（reserve -> mark_started -> finish）。
+    桩写错的话，测的就是桩而不是接线。
+
+    ⚠️ 它【不能】替代真机验证：本机沙箱起不了 Chrome（命名管道被拒），
+       浏览器层零覆盖，也没有任何真实送达证据。
+    """
+
+    KEYWORD = "宝宝辅食"
+    VIDEO_URL = "https://www.douyin.com/video/7686815808756020563"
+
+    class _Page(object):
+        def evaluate(self, expression):
+            if expression == "location.href":
+                return EndToEndChainTests.VIDEO_URL
+            if expression == "document.readyState":
+                return "complete"      # _navigate 会等它，否则报 page did not finish navigation
+            return None
+
+        def close(self):
+            pass
+
+        def call(self, *args, **kwargs):
+            return {}
+
+    # ----------------------------------------------------- 四个平台边界桩
+
+    def _fake_search(self, page, keyword, scroll_rounds=12, max_videos=200, log=print,
+                     strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        if isinstance(meta, dict):
+            meta["skipped_seen"] = 0
+            meta["platform_cursor"] = "pc-1"
+            meta["platform_has_more"] = 1
+        return [{"aweme_id": "7686815808756020563", "url": self.VIDEO_URL,
+                 "desc": "%s 六个月食谱" % keyword, "author": "作者",
+                 "author_sec_uid": "SEC-VIDEO"}]
+
+    def _fake_comments(self, page, video, log=None, scroll_rounds=6, navigate=False):
+        rows = [{"cid": "c-1", "text": "求链接", "authorId": "author-1",
+                 "authorName": "小明", "digg": 5, "sec_uid": "SEC-1"},
+                {"cid": "c-2", "text": "多少钱", "authorId": "author-2",
+                 "authorName": "小红", "digg": 9, "sec_uid": "SEC-2"}]
+        return rows, {"stopped_reason": None}
+
+    def _fake_filter(self, rows, keywords, mode=None, min_digg=0, exclude_keywords=None):
+        kept = [dict(row) for row in rows]
+        for row in kept:
+            row["matched_keyword"] = (list(keywords or [""]) or [""])[0]
+        stats = {"matched": len(kept), "excluded": 0, "low_digg": 0, "no_sec_uid": 0,
+                 "keywords": list(keywords or []),
+                 "exclude_keywords": list(exclude_keywords or []),
+                 "modes": {str(mode or "seg"): len(kept)}}
+        return kept, stats
+
+    def _fake_send_comment(self, page, gate, send_id, target, text, source):
+        """照真实 send_comment：走 HTTP 接口，平台响应可观测，因此能给出确定结论。"""
+        self.sends.append(("comment", send_id))
+        gate.reserve(send_id, "comment:%s" % str((target or {}).get("id") or ""),
+                     text, kind="comment")
+        gate.mark_started(send_id)
+        return gate.result(gate.finish(send_id, self.public_status, "platform_response",
+                                       {"platformStatusCodes": [0]}))
+
+    def _fake_send_private(self, page, gate, send_id, target, text):
+        """照真实 send_private：走 frontier WebSocket，响应【不可观测】，
+        所以它永远停在 unknown —— 这正是两阶段契约要挡住的东西。"""
+        self.sends.append(("private", send_id))
+        gate.reserve(send_id, str((target or {}).get("authorId") or ""),
+                     text, kind="private")
+        gate.mark_started(send_id)
+        return gate.result(gate.finish(send_id, "unknown",
+                                       "platform_response_unavailable", {}))
+
+    # ------------------------------------------------------------ 装配
+
+    def setUp(self):
+        import sidecar
+        self.sidecar = sidecar
+        self.public_status = "sent_confirmed"
+        self.sends = []
+        self.saved = (sidecar.crawlmod.search_videos,
+                      sidecar.crawlmod.crawl_video_comments,
+                      sidecar.crawlmod.filter_comments,
+                      sidecar.douyin.login_state,
+                      sidecar.douyin.captcha_probe,
+                      sidecar.send_comment,
+                      sidecar.send_private)
+        sidecar.crawlmod.search_videos = self._fake_search
+        sidecar.crawlmod.crawl_video_comments = self._fake_comments
+        sidecar.crawlmod.filter_comments = self._fake_filter
+        sidecar.douyin.login_state = lambda page: "ok"
+        sidecar.douyin.captcha_probe = lambda page: {"hit": False}
+        sidecar.send_comment = self._fake_send_comment
+        sidecar.send_private = self._fake_send_private
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        self.instance._page = lambda: (self._Page(), {})
+        self.instance.account_scope = "account-a"
+        self.instance.gate = SendGate(self.tmp.name, "account-a")
+
+    def tearDown(self):
+        import sidecar
+        (sidecar.crawlmod.search_videos, sidecar.crawlmod.crawl_video_comments,
+         sidecar.crawlmod.filter_comments, sidecar.douyin.login_state,
+         sidecar.douyin.captcha_probe, sidecar.send_comment,
+         sidecar.send_private) = self.saved
+        self.tmp.cleanup()
+
+    # -------------------------------------------------------------- 链路
+
+    def _search_and_collect(self):
+        found = self.instance.search({"keyword": self.KEYWORD, "maxVideos": 5})
+        self.assertEqual(found["status"], "ok")
+        self.assertEqual([v["id"] for v in found["videos"]], ["7686815808756020563"])
+
+        collected = self.instance.collect_comments({
+            "url": self.VIDEO_URL, "commentKeywords": "求链接,多少钱",
+            "matchMode": "seg", "minDigg": 0, "dedupeAuthors": True})
+        self.assertEqual(collected["status"], "ok")
+        targets = collected["targets"]
+        self.assertEqual(len(targets), 2, "两条评论都应成为候选目标")
+        self.assertEqual([t["authorId"] for t in targets], ["author-1", "author-2"])
+        self.assertTrue(all(t["roomId"] == self.VIDEO_URL for t in targets),
+                        "每个目标都必须带着它所属的视频地址")
+        return found, collected, targets
+
+    def test_full_chain_search_collect_reply_then_private(self):
+        """四段串起来：搜视频 -> 抓评论 -> 公开回复 -> 私信。"""
+        found, collected, targets = self._search_and_collect()
+        target = targets[0]
+
+        reply = self.instance.send_comment({
+            "sendId": "pub-1", "target": target, "text": "看到你说求链接", "source": "video"})
+        # 🔴 两层要分开看：
+        #   · 落库的【原始状态】才是契约判据 —— send_gate 的对外 result() 会把
+        #     sent_confirmed 遮蔽成 unknown（避免过度宣称），只看返回值会误判成"没成功"。
+        #   · 对外的 unknown 是【有意的】：平台响应可观测不等于可以对外宣布送达。
+        self.assertEqual(self.instance.gate.lookup("pub-1")["status"], "sent_confirmed",
+                         "评论公开回复走 HTTP 接口，响应可观测，落库应是确定结论")
+        self.assertEqual(reply["status"], "unknown",
+                         "对外仍遮蔽成 unknown —— 这是有意的，不是 bug")
+
+        dm = self.instance.send_private({
+            "sendId": "priv-1", "publicSendId": "pub-1", "target": target,
+            "text": "细节在我主页"})
+        self.assertEqual(dm["status"], "unknown",
+                         "私信走 WebSocket，响应不可观测，因此只能停在 unknown")
+        self.assertEqual([s[0] for s in self.sends], ["comment", "private"],
+                         "顺序必须是先公开回复、后私信")
+
+    def test_private_is_refused_before_the_public_reply_is_confirmed(self):
+        """链路的核心断言：公屏没确认成功之前，私信一步都不许走。"""
+        _, _, targets = self._search_and_collect()
+        target = targets[0]
+        with self.assertRaises(self.sidecar.SidecarError) as raised:
+            self.instance.send_private({"sendId": "priv-1", "publicSendId": "pub-1",
+                                        "target": target, "text": "你好"})
+        self.assertEqual(raised.exception.code, "public_not_found")
+        self.assertEqual(self.sends, [], "被拒时不得发生任何发送")
+
+    # 注：「省略 publicSendId 必须被拒」的链路断言【不在本 PR】。
+    #     那个行为由 fix/private-requires-confirmed-public 修复，
+    #     其单测在那一支上；在这里断言会让本分支出现红灯。
+
+    def test_unconfirmed_public_reply_cannot_unlock_the_private_message(self):
+        """公开回复只到 unknown（平台响应未捕获）时，链路必须停在第三段。"""
+        self.public_status = "unknown"
+        _, _, targets = self._search_and_collect()
+        target = targets[0]
+        reply = self.instance.send_comment({
+            "sendId": "pub-1", "target": target, "text": "看到你说求链接", "source": "video"})
+        self.assertEqual(reply["status"], "unknown")
+        with self.assertRaises(self.sidecar.SidecarError) as raised:
+            self.instance.send_private({"sendId": "priv-1", "publicSendId": "pub-1",
+                                        "target": target, "text": "细节在我主页"})
+        self.assertEqual(raised.exception.code, "public_unknown")
+        self.assertEqual([s[0] for s in self.sends], ["comment"],
+                         "只应发生公开回复，私信必须被挡住")
+
+
 class FakeSearchPage:
     """search 只需要 location.href；续页时靠它判断"还在不在搜索页上"。"""
 
