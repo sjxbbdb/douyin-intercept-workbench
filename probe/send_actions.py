@@ -225,8 +225,10 @@ def send_private(tab, gate, send_id, target, text):
             return gate.result(row)
         if douyin.profile_error_page(tab):
             # 身份不可见时的占位 id（真机实测 111111）会打开错误页；错误页上没有账号元素，
-            # 旧代码会把它误报成 login_state_unknown。先如实报告主页不存在。
-            row = gate.finish(send_id, "failed", "profile_not_found")
+            # 旧代码会把它误报成 login_state_unknown。主页不存在 = 这个目标不可触达 ->
+            # 跳过并换下一个（同样不消费任何发送动作）。
+            row = gate.finish(send_id, "blocked", "profile_not_found",
+                              {"skipped": True, "blockedBy": "profile_missing"})
             return gate.result(row)
         # 🔴 真机教训（工作日志第 7 条）：页面 visibilityState=hidden 时点击不送达渲染进程，
         #    表现就是"私信按钮点上去、面板死活不开"（人工点却正常）。先拉活页面。
@@ -243,10 +245,15 @@ def send_private(tab, gate, send_id, target, text):
 
         entry = douyin.dm_entry(tab)
         if entry.get("blocked"):
-            row = gate.finish(send_id, "blocked", "target_dm_not_available")
+            # 平台明确表示"这个人不能私信"（未互关 / 私密账号 / 已关闭私信）。
+            # 这是【跳过】而不是失败：我们一条消息都没发，失败状态会误导成通道故障。
+            row = gate.finish(send_id, "blocked", "dm_not_available",
+                              {"skipped": True, "platform": entry.get("reason"),
+                               "blockedBy": "platform_dm_restriction"})
             return gate.result(row)
         if not entry.get("found"):
-            row = gate.finish(send_id, "failed", "target_session_not_found")
+            row = gate.finish(send_id, "blocked", "dm_entry_not_found",
+                              {"skipped": True, "blockedBy": "no_dm_entry"})
             return gate.result(row)
         author_name = str(target.get("authorName") or "").strip()
         context = douyin.recipient_context(tab, author_id, author_name)
@@ -289,7 +296,13 @@ def send_private(tab, gate, send_id, target, text):
             #    真机可用的收件人信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
             panel = douyin.dm_panel_state(tab, author_name)
             if not (panel.get("found") and panel.get("headerMatch")):
-                row = gate.finish(send_id, "failed", "composer_not_found")
+                # 🔴 真机与用户反馈（2026-09-21）：有的目标私信入口点得动、面板却始终不开
+                #    （对方未互关 / 私密账号 / 关闭了陌生人私信）。这时我们一条消息都没发，
+                #    应当【跳过并换下一个目标】，而不是把它记成"发送失败"。
+                #    注意：这里只影响"能否触达"的判定，不影响任何发送门槛。
+                row = gate.finish(send_id, "blocked", "dm_panel_unavailable",
+                                  {"skipped": True, "blockedBy": "panel_not_opened",
+                                   "entryClicks": 3})
                 return gate.result(row)
             context_mode = "live_panel_header"
             composer = {"found": True, "x": panel["x"], "y": panel["y"],

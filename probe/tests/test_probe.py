@@ -2550,9 +2550,129 @@ class IdentityVisibilityTests(unittest.TestCase):
                                                    "gone-profile", {"authorId": "111111"}, "你好")
         finally:
             send_actions.time.sleep = old_sleep
-        self.assertEqual(result["status"], "failed")
+        # 主页不存在 = 这个目标不可触达 -> 跳过（blocked + skipped），不是"发送失败"：
+        # 我们一条消息都没发出去，失败状态会误导成通道故障（用户 2026-09-21 要求）。
+        self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reason"], "profile_not_found")
+        self.assertTrue(result["evidence"]["skipped"])
         self.assertEqual(page.clicks, [], "主页不存在时一个点击都不许发出去")
+
+
+class PrivateSkipTests(unittest.TestCase):
+    """私密账号 / 不接受陌生人私信的目标：跳过，不记成发送失败（用户 2026-09-21 要求）。
+
+    判据来自真机：有的目标「私信」入口点得动、面板却始终不开（对方未互关 / 私密账号）。
+    这时我们一条消息都没发出去 —— 失败状态会误导成"通道坏了"，而且会挡住后面的目标。
+    """
+
+    class Page:
+        def __init__(self):
+            self.clicks = []
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return "https://www.douyin.com/user/" + ("A" * 40)
+            return None
+
+        def click_at(self, *args):
+            self.clicks.append(args)
+
+        def close(self):
+            pass
+
+    def _patched(self, entry, panel=None, clicks_expected=0):
+        import douyin
+        import send_actions
+        page = self.Page()
+        saved = (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
+                 send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+                 send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+                 send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
+                 send_actions.douyin.make_network_recorder, send_actions.time.sleep)
+        send_actions.douyin.login_state = lambda _cdp: "verified"
+        send_actions.douyin.check_captcha = lambda _cdp: False
+        send_actions.douyin.visibility_state = lambda _cdp: "visible"
+        send_actions.douyin.dm_entry = lambda _cdp: dict(entry)
+        send_actions.douyin.dm_panel_state = lambda _cdp, _name: dict(panel or {"found": False})
+        send_actions.douyin.dm_composer_for_recipient = lambda *_a, **_k: {"found": False}
+        send_actions.douyin.recipient_context = lambda *_a, **_k: {"verified": True}
+        send_actions.douyin.profile_error_page = lambda _cdp: False
+        send_actions.time.sleep = lambda _seconds: None
+        return page, saved
+
+    def _restore(self, saved):
+        import send_actions
+        (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
+         send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+         send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+         send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
+         send_actions.douyin.make_network_recorder, send_actions.time.sleep) = saved
+
+    def test_a_blocked_dm_entry_is_skipped_without_any_click(self):
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": False, "blocked": True,
+                                     "reason": "stranger_dm_disabled"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "skip-1",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "dm_not_available")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(page.clicks, [], "对方不可私信时一个点击都不许发出去")
+
+    def test_a_panel_that_never_opens_is_skipped_not_failed(self):
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "skip-2",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "dm_panel_unavailable")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(len(page.clicks), 3, "面板打不开时按入口重试次数上报，且不发消息")
+
+    def test_sidecar_returns_the_skipped_list_separately(self):
+        import live_flow
+        import send_actions
+        import sidecar
+        author = "A" * 40
+        page, saved = self._patched({"found": False, "blocked": True,
+                                     "reason": "stranger_dm_disabled"})
+        original_send = sidecar.send_private
+        sidecar.send_private = send_actions.send_private
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                           os.path.join(td, "profile"), 19227)
+                instance._page = lambda: (page, {"pid": 1})
+                instance.live_queue.append([sidecar._event("live", "room-1", {
+                    "id": "e1", "authorId": author, "authorName": "小明", "text": "问一下"})])
+                planned = instance.dispatch("live_plan", {
+                    "maxItems": 5, "windowSeconds": 600,
+                    "scripts": {"e1": {"publicText": "公开话术", "privateText": "私信话术"}}})
+                batch_id = planned["batch"]["batchId"]
+                instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id)
+                result = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "skip-3"}]})
+                self.assertEqual(result["skipped"], [{"eventId": "e1", "reason": "dm_not_available"}])
+                self.assertEqual(result["results"][0]["status"], "blocked")
+        finally:
+            sidecar.send_private = original_send
+            self._restore(saved)
 
 
 if __name__ == "__main__":

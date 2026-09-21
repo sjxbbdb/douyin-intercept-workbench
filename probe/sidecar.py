@@ -1005,6 +1005,7 @@ class Sidecar:
                                 "reason": "script_mismatch"})
                 continue
             sendable.append((item, target, text))
+        skipped = []
         if sendable:
             page, _ = self._page()
             try:
@@ -1017,9 +1018,15 @@ class Sidecar:
                                                  {"sendId": item["sendId"],
                                                   "reason": outcome.get("reason")})
                     results.append(dict(outcome, eventId=item["eventId"]))
+                    # 「跳过」= 对方不可私信（未互关 / 私密账号 / 面板打不开），
+                    # 我们一条消息都没发出去。单独列出来，别让宿主把它统计成"发送失败"。
+                    if (outcome.get("evidence") or {}).get("skipped"):
+                        skipped.append({"eventId": item["eventId"],
+                                        "reason": outcome.get("reason")})
             finally:
                 page.close()
         return {"status": "ok" if sendable else "blocked", "phase": "private", "results": results,
+                "skipped": skipped,
                 "checkpoint": self.live_queue.result(batch_id)["checkpoint"]}
 
     def live_result(self, params):
