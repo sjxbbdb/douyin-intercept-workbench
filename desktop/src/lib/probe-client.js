@@ -17,8 +17,9 @@ function batchItems(value, name = 'items') {
   if (!Array.isArray(value) || value.length > 500) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS');
   return value.map((item, index) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw new ProbeError(`${name}[${index}] 参数无效`, 'SIDECAR_INVALID_PARAMS');
-    allowedKeys(item, ['eventId', 'sendId', 'text'], `${name}[${index}]`);
+    allowedKeys(item, ['eventId', 'sendId', 'publicSendId', 'text'], `${name}[${index}]`);
     const result = { eventId: identifier(item.eventId, `${name}[${index}].eventId`), sendId: identifier(item.sendId, `${name}[${index}].sendId`, 160) };
+    if (item.publicSendId != null && item.publicSendId !== '') result.publicSendId = identifier(item.publicSendId, `${name}[${index}].publicSendId`, 160);
     if (item.text != null && item.text !== '') result.text = requireText(item.text, `${name}[${index}].text`, 1000);
     return result;
   });
@@ -63,10 +64,11 @@ function validateParams(method, params) {
     return { url, maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500) };
   }
   if (method === 'live_plan') {
-    allowedKeys(params, ['maxItems', 'windowSeconds', 'scripts', 'keywords', 'excludeKeywords', 'matchMode', 'replyMode', 'policy']);
+    allowedKeys(params, ['maxItems', 'windowSeconds', 'scripts', 'keywords', 'excludeKeywords', 'matchMode', 'replyMode', 'replyVia', 'policy']);
     if (params.policy !== undefined) throw new ProbeError('策略必须由授权服务端签发', 'SIDECAR_POLICY_NOT_SERVER_ISSUED');
     const result = { maxItems: integer(params.maxItems ?? 20, 'maxItems', 1, 50), windowSeconds: integer(params.windowSeconds ?? 900, 'windowSeconds', 1, 86400) };
     if (params.replyMode !== undefined) { if (!['composer', 'danmaku'].includes(params.replyMode)) throw new ProbeError('replyMode 参数无效', 'SIDECAR_INVALID_PARAMS'); result.replyMode = params.replyMode; }
+    if (params.replyVia !== undefined) { if (!['native', 'mention_text'].includes(params.replyVia)) throw new ProbeError('replyVia 参数无效', 'SIDECAR_INVALID_PARAMS'); result.replyVia = params.replyVia; }
     if (params.scripts !== undefined) {
       if (!params.scripts || typeof params.scripts !== 'object' || Array.isArray(params.scripts) || Object.keys(params.scripts).length > 500) throw new ProbeError('scripts 参数无效', 'SIDECAR_INVALID_PARAMS');
       result.scripts = {};

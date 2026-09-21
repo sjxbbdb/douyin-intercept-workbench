@@ -9,10 +9,13 @@ const { ProbeBridge } = require('../src/lib/probe-bridge');
 
 const livePlan = validateParams('live_plan', {
   maxItems: 2, windowSeconds: 60, replyMode: 'danmaku', keywords: ['价格'],
+  replyVia: 'native',
   scripts: { 'event-1': { publicText: '回复', privateText: '联系' } },
 });
 assert.equal(livePlan.replyMode, 'danmaku');
+assert.equal(livePlan.replyVia, 'native');
 assert.deepEqual(validateParams('live_reply', { batchId: 'batch-1', mode: 'danmaku', items: [{ eventId: 'event-1', sendId: 'send-1', text: '@用户 回复' }] }).items.length, 1);
+assert.equal(validateParams('live_private', { batchId: 'batch-1', items: [{ eventId: 'event-1', sendId: 'send-2', publicSendId: 'public-1' }] }).items[0].publicSendId, 'public-1');
 assert.equal(validateParams('send_private', { sendId: 'send-2', publicSendId: 'public-1', target: { authorId: 'author-1' }, text: '你好' }).publicSendId, 'public-1');
 assert.throws(() => validateParams('live_plan', { policy: { allowPublicStates: ['unknown'] } }), (error) => error instanceof ProbeError && error.code === 'SIDECAR_POLICY_NOT_SERVER_ISSUED');
 assert.throws(() => validateParams('live_reply', { batchId: 'batch-1', items: [{ eventId: 'event-1', sendId: 'send-1', dangerous: 'x' }] }), /不受支持/);
@@ -32,8 +35,11 @@ assert.throws(() => validateParams('comment_private_candidates', { items: [{ eve
   const calls = [];
   bridge.client.request = async (method, params) => { calls.push({ method, params }); return { status: 'ok' }; };
   await bridge.commentPrivateCandidates([{ eventId: 'event-1', authorId: 'author-1', publicSendId: 'public-1' }]);
-  await bridge.livePlan({ maxItems: 1 });
+  await bridge.livePlan({ maxItems: 1, replyVia: 'native' });
+  await bridge.livePrivate({ batchId: 'batch-1', items: [{ eventId: 'event-1', sendId: 'send-2', publicSendId: 'public-1' }] });
   await bridge.liveResult({ batchId: 'batch-1' });
-  assert.deepEqual(calls.map((call) => call.method), ['comment_private_candidates', 'live_plan', 'live_result']);
+  assert.deepEqual(calls.map((call) => call.method), ['comment_private_candidates', 'live_plan', 'launch', 'live_private', 'live_result']);
+  assert.equal(calls[1].params.replyVia, 'native');
+  assert.equal(calls[3].params.items[0].publicSendId, 'public-1');
   console.log('Probe protocol PASS (PR#12 validation and capability gate)');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
