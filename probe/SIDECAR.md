@@ -37,11 +37,28 @@ first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
 scrolling the same owned tab instead of reloading the first page, and any video
 already in the cursor pool is filtered out. The cursor is opaque to the host —
 the host only stores and returns it — but it is still validated on the
-boundary: a cursor issued for another keyword, an unsupported version, or a
-pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
+boundary: a cursor issued for **another account**, for another keyword, an
+unsupported version, or a pool beyond the cap is rejected with `invalid_input`.
+`hasMore` is false when a
 page yields no new video, which is the host signal to stop paging.
 `platformHasMore` / `platformCursor` mirror what the platform response body
 reported; they are read-only telemetry and are never replayed against the API.
+
+### Cursor version 2: bound to an account
+
+Version 1 cursors carried only `{keyword, page, seen}`. Nothing tied them to
+an account, so account A could hand account B's cursor back and the pool
+would silently cross over: B would treat videos A had already seen as new,
+which both re-processes them and hides genuinely new ones. That is a silent
+data mix-up rather than a missing feature, so it is not the kind of thing a
+user would notice.
+
+Version 2 adds `a` (the account scope) to the payload and rejects a mismatch
+with `cursor belongs to another account`. Version 1 cursors are now rejected
+outright — fail-closed, at the cost of one restarted paging run.
+
+The account scope is derived from the profile directory, which the host
+already receives, so the cursor discloses nothing new.
 
 `search` returns one candidate per video with `id`, `url`, `title`, `author`,
 `authorId`, and a `relevance` record. Relevance is computed locally from the

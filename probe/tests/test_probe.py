@@ -1537,40 +1537,72 @@ class SearchPagingTests(unittest.TestCase):
     这些用例不碰浏览器、不建临时目录。
     """
 
+    SCOPE = "account-a"
+
     def _instance(self, url=None):
         import sidecar
         page = FakeSearchPage(url)
         instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
         instance._page = lambda: (page, {})
+        # 游标现在绑定账号，所以假实例也必须带上 account_scope
+        instance.account_scope = self.SCOPE
         return sidecar, instance, page
 
     def test_cursor_round_trip(self):
         import sidecar
-        token = sidecar._encode_cursor("宝宝辅食", {"1", "2"}, 3)
-        seen, page_no = sidecar._decode_cursor(token, "宝宝辅食")
+        token = sidecar._encode_cursor("宝宝辅食", self.SCOPE, {"1", "2"}, 3)
+        seen, page_no = sidecar._decode_cursor(token, "宝宝辅食", self.SCOPE)
         self.assertEqual(seen, {"1", "2"})
         self.assertEqual(page_no, 3)
-        self.assertEqual(sidecar._decode_cursor(None, "宝宝辅食"), (set(), 1))
-        self.assertEqual(sidecar._decode_cursor("", "宝宝辅食"), (set(), 1))
+        self.assertEqual(sidecar._decode_cursor(None, "宝宝辅食", self.SCOPE), (set(), 1))
+        self.assertEqual(sidecar._decode_cursor("", "宝宝辅食", self.SCOPE), (set(), 1))
 
     def test_cursor_is_rejected_when_it_does_not_match(self):
         import sidecar
-        token = sidecar._encode_cursor("宝宝辅食", {"1"}, 2)
+        token = sidecar._encode_cursor("宝宝辅食", self.SCOPE, {"1"}, 2)
         with self.assertRaises(sidecar.SidecarError):
-            sidecar._decode_cursor(token, "别的关键词")
+            sidecar._decode_cursor(token, "别的关键词", self.SCOPE)
         with self.assertRaises(sidecar.SidecarError):
-            sidecar._decode_cursor("!!!not-base64!!!", "宝宝辅食")
+            sidecar._decode_cursor("!!!not-base64!!!", "宝宝辅食", self.SCOPE)
         with self.assertRaises(sidecar.SidecarError):
-            sidecar._decode_cursor(12345, "宝宝辅食")
+            sidecar._decode_cursor(12345, "宝宝辅食", self.SCOPE)
 
     def test_unsupported_cursor_version_is_rejected(self):
         import base64
         import json
         import sidecar
-        raw = json.dumps({"v": 99, "k": "宝宝辅食", "n": 2, "seen": []}).encode("utf-8")
+        raw = json.dumps({"v": 99, "a": self.SCOPE, "k": "宝宝辅食", "n": 2,
+                          "seen": []}).encode("utf-8")
         token = base64.urlsafe_b64encode(raw).decode("ascii")
         with self.assertRaises(sidecar.SidecarError):
-            sidecar._decode_cursor(token, "宝宝辅食")
+            sidecar._decode_cursor(token, "宝宝辅食", self.SCOPE)
+
+    def test_cursor_is_bound_to_the_account(self):
+        """游标必须绑定账号 —— 否则多账号会互相污染视频池。
+
+        这是静默的数据串号：账号 B 拿到账号 A 的游标后，
+        会把 A 已经见过的视频当成新视频，既重复处理又漏掉真正的新视频。
+        """
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", "account-a", {"1", "2"}, 3)
+        # 本账号可用
+        seen, page_no = sidecar._decode_cursor(token, "宝宝辅食", "account-a")
+        self.assertEqual((seen, page_no), ({"1", "2"}, 3))
+        # 换个账号必须被拒绝
+        with self.assertRaises(sidecar.SidecarError) as ctx:
+            sidecar._decode_cursor(token, "宝宝辅食", "account-b")
+        self.assertIn("account", str(ctx.exception))
+
+    def test_cursor_carries_the_account_it_was_issued_for(self):
+        """载荷里必须真有账号，而不是靠调用方自觉。"""
+        import base64
+        import json
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", "account-a", {"1"}, 2)
+        payload = json.loads(base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8"))
+        self.assertEqual(payload.get("a"), "account-a")
+        self.assertEqual(payload.get("v"), sidecar.CURSOR_VERSION)
+        self.assertEqual(sidecar.CURSOR_VERSION, 2, "改载荷必须同时提版本，否则老游标会被误用")
 
     def test_first_page_navigates_and_second_page_reuses_the_tab(self):
         import sidecar
@@ -1637,9 +1669,61 @@ class SearchPagingTests(unittest.TestCase):
     def test_search_rejects_cursor_from_another_keyword(self):
         import sidecar
         sidecar_mod, instance, page = self._instance()
-        token = sidecar._encode_cursor("别的关键词", {"1"}, 2)
+        token = sidecar._encode_cursor("别的关键词", self.SCOPE, {"1"}, 2)
         with self.assertRaises(sidecar.SidecarError):
             instance.search({"keyword": "宝宝辅食", "cursor": token})
+
+    def test_search_rejects_cursor_from_another_account(self):
+        """端到端：换账号的游标必须在 search 这一层就被拒，不能悄悄串池。"""
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        token = sidecar._encode_cursor("宝宝辅食", "account-b", {"1", "2"}, 2)
+        with self.assertRaises(sidecar.SidecarError) as ctx:
+            instance.search({"keyword": "宝宝辅食", "cursor": token})
+        self.assertIn("account", str(ctx.exception))
+
+    def test_search_issues_a_cursor_bound_to_its_own_account(self):
+        """自己签发的游标必须带上自己的账号，且能被自己解回来。"""
+        import base64
+        import json
+        import sidecar
+        sidecar_mod, instance, page = self._instance()
+        original_login = sidecar.douyin.login_state
+        original_search = sidecar.crawlmod.search_videos
+        sidecar.douyin.login_state = lambda p: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search_listing([_vid(1)], {})
+        try:
+            result = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        payload = json.loads(
+            base64.urlsafe_b64decode(result["cursor"].encode("ascii")).decode("utf-8"))
+        self.assertEqual(payload.get("a"), self.SCOPE)
+        # 自己的游标自己必须能解回来，否则分页直接断掉。
+        # page_no=2 是对的：第一页返回的是【下一页】的游标。
+        seen, page_no = sidecar._decode_cursor(result["cursor"], "宝宝辅食", self.SCOPE)
+        self.assertEqual((seen, page_no), ({"1"}, 2))
+
+
+def _vid(i):
+    return {"aweme_id": str(i), "url": "https://www.douyin.com/video/%d" % i,
+            "desc": "标题%d" % i, "author": "作者", "author_sec_uid": "SEC"}
+
+
+def make_fake_search_listing(videos, meta_extra=None):
+    """假的 search_videos：返回固定列表，并按【真实 meta 契约】填分页观测字段。"""
+
+    def fake(page, keyword, scroll_rounds=12, max_videos=200, log=print,
+             strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
+        if isinstance(meta, dict):
+            meta["skipped_seen"] = 0
+            meta["platform_cursor"] = "pc-1"
+            meta["platform_has_more"] = 1
+            meta.update(meta_extra or {})
+        return list(videos)
+
+    return fake
 
 
 class FakeSearchPage:
@@ -1749,6 +1833,7 @@ class SearchRelevanceTests(unittest.TestCase):
         import sidecar
         instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
         instance._page = lambda: (self._Page(), {})
+        instance.account_scope = "account-a"   # 游标绑定账号后，假实例也需要它
         return sidecar, instance
 
     @staticmethod

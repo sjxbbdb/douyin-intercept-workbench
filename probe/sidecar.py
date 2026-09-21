@@ -65,19 +65,27 @@ def _iso(ts=None):
 #    去重由 crawl.search_videos(seen_ids=...) 负责。平台自己的 has_more / cursor
 #    只作为观测信号一起返回，供宿主记录，不作为翻页依据。
 
-CURSOR_VERSION = 1
+# 🔴 v2：游标绑定账号。v1 的载荷只有 {关键词, 页码, 已见池}，没有账号字段，
+#    于是账号 A 的游标可以在账号 B 下直接使用 —— 池子会串，
+#    B 会把 A 已经见过的视频当成新视频。这是静默的数据串号，不是功能缺失。
+#    v1 游标现在会被明确拒绝（fail-closed），宿主重开一次分页即可。
+CURSOR_VERSION = 2
 CURSOR_MAX_SEEN = 20000
 
 
-def _encode_cursor(keyword, seen, page_no):
-    payload = {"v": CURSOR_VERSION, "k": keyword, "n": int(page_no),
-               "seen": sorted(str(x) for x in seen)}
+def _encode_cursor(keyword, account_scope, seen, page_no):
+    payload = {"v": CURSOR_VERSION, "a": str(account_scope), "k": keyword,
+               "n": int(page_no), "seen": sorted(str(x) for x in seen)}
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _decode_cursor(value, keyword):
-    """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。"""
+def _decode_cursor(value, keyword, account_scope):
+    """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。
+
+    账号不匹配一律拒绝：游标是宿主保存的不透明串，如果它没绑账号，
+    多账号场景下就会互相污染视频池。
+    """
     if value in (None, ""):
         return set(), 1
     if not isinstance(value, str) or len(value) > 400000:
@@ -88,6 +96,8 @@ def _decode_cursor(value, keyword):
         raise SidecarError("invalid_input", "cursor is not decodable")
     if not isinstance(payload, dict) or payload.get("v") != CURSOR_VERSION:
         raise SidecarError("invalid_input", "cursor version is not supported")
+    if str(payload.get("a") or "") != str(account_scope):
+        raise SidecarError("invalid_input", "cursor belongs to another account")
     if payload.get("k") != keyword:
         raise SidecarError("invalid_input", "cursor does not belong to this keyword")
     seen = payload.get("seen")
@@ -564,12 +574,13 @@ class Sidecar:
         rounds = int(params.get("scrollRounds", 6))
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
-        cursor_in = params.get("cursor")
-        seen, page_no = _decode_cursor(cursor_in, keyword)
-
+        # 纯参数校验放在最前：它不该依赖 self 的任何状态，
+        # 否则一个坏参数会以别的错误形式（例如账号缺省）冒出来。
         min_relevance = int(params.get("minRelevance", 0) or 0)
         if not 0 <= min_relevance <= 100:
             raise SidecarError("invalid_input", "minRelevance must be between 0 and 100")
+        cursor_in = params.get("cursor")
+        seen, page_no = _decode_cursor(cursor_in, keyword, self.account_scope)
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
@@ -638,7 +649,7 @@ class Sidecar:
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
             return {"status": "ok",
                     "videos": out,
-                    "cursor": _encode_cursor(keyword, pool, page_no + 1),
+                    "cursor": _encode_cursor(keyword, self.account_scope, pool, page_no + 1),
                     "hasMore": bool(out),
                     "stoppedReason": None,
                     "page": page_no,
