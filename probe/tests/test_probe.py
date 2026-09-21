@@ -1962,6 +1962,43 @@ class CommentFlowContractTests(unittest.TestCase):
                                        "target": {"authorId": "author-1"}, "text": "你好"})
             return raised.exception.code
 
+    def test_missing_public_send_id_is_refused(self):
+        """缺 publicSendId 必须拒绝 —— 它曾经是「可选」的，那等于没有守卫。
+
+        「可选参数」在这个位置的真实含义是：任何调用方只要省略它，
+        就绕过了「公开回复确认成功后才允许私信」这条契约，
+        而偏偏执行发送的就是这条单发路径。批量清单一直强制这一条，
+        两个入口口径不一致时，实际生效的是最弱的那条。
+        （_instance(explode=True) 让 _page 抛异常，顺带证明门禁在开浏览器之前生效。）
+        """
+        import sidecar
+        base = {"sendId": "priv-1", "target": {"authorId": "author-1"}, "text": "你好"}
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = SendGate(td, "account-a")
+            for extra in ({},                                  # 完全没有这个键
+                          {"publicSendId": None},              # 显式 null
+                          {"publicSendId": ""},                # 空串
+                          {"publicSendId": "   "}):            # 只有空白
+                params = dict(base)
+                params.update(extra)
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.send_private(params)
+                self.assertEqual(raised.exception.code, "public_missing",
+                                 "缺 publicSendId 必须按 public_missing 拒绝：%r" % (extra,))
+
+    def test_confirmed_public_reply_is_the_only_way_through(self):
+        """正例：公屏确认成功时放行（否则上面那条就变成了"永远发不出去"）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            public_id = self._public_reply(gate, "pub-ok", "sent_confirmed")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            instance._page = lambda: (self._Page(), {"pid": 1})
+            # 走到真实发送分支即可；这里只断言门禁没有拦住它
+            self.assertIsNone(sidecar._public_guard(gate, public_id))
+
     def test_unresolved_public_reply_blocks_the_private_message(self):
         """unknown（本通道常态）不得转成私信 —— 这是红线 2/3 的直接体现。"""
         self.assertEqual(self._refuse("unknown"), "public_unknown")
