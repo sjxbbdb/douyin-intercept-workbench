@@ -9,7 +9,7 @@
 - 独立 `server/` 和 `desktop/` 包边界；
 - Linux 授权端的账号、设备、会话、功能开关、积分台账、兑换码、幂等和 AI provider hold；
 - Electron 桌面端的 API client、任务状态机、人工确认队列、可见 DOM/CDP 专用窗口和输入校验；
-- 平台层的版本化固定 workflow、Agent 规划契约、运行实例 checkpoint/人工恢复、账号级锁和 Agent 对话入口；
+- 平台层的版本化固定 workflow、Agent 规划契约、运行实例 checkpoint/人工恢复、账号级锁和 Agent 对话入口；桌面端已把协作者 sidecar 挂到平台适配层，评论/直播固定为“公屏回复确认后再私信”；
 - 服务端测试，以及真实回环 HTTP + desktop `ApiClient` 的授权/积分/幂等/会话隔离验收；TaskEngine 到规则 `/evaluate` 和 AI `/draft` 的 HTTP A–E 集成均已通过，二者请求体按服务端契约分离，时间字段在授权端使用整数毫秒；
 - 旧仓库完整 Git 历史和平台能力审计，见 [`docs/reference-audit.md`](docs/reference-audit.md)。桌面端已接入受控 Python sidecar 的 JSONL 主链路；sidecar 以 PyInstaller onedir 随包分发，不能把“本地 capabilities 联通”误读为线上平台能力已验证。
 
@@ -17,7 +17,7 @@
 
 尚未宣称完成的内容：
 
-- 当前抖音版本的各能力接入仍按能力矩阵逐项验收；合作方独立 `probe/` 有视频搜索、评论采集/筛选和私信的实机探索记录。sidecar 的五项 capability 已实现并随包联通，但视频/直播发送仍只有 fixture 证据；私信自动资格依据已接受的 PR1 协作者账号流程证据，仍需按发行环境复核；
+- 当前抖音版本的各能力接入仍按能力矩阵逐项验收；合作方独立 `probe/` 有视频搜索、评论采集/筛选和私信的实机探索记录。sidecar 的 capability 已实现并随包联通，但评论/直播发送仍因缺少 `sent_confirmed` 的真实平台响应证据而 fail-closed；
 - 官方开放平台资质申请、正式 API 生产接入和平台审核；
 - 真实账号上的评论/直播/私信发送与平台响应确认；
 - 真实支付、充值渠道和商业套餐结算；
@@ -26,7 +26,7 @@
 
 代码测试、模拟 provider、脱敏 fixture 和本地构建只能证明程序边界，不证明抖音线上能力或账号安全。模板或 AI 回复成功生成时按服务端价格扣积分；生成失败不扣积分。发送是后续独立状态，平台未知结果不得改写为成功，也不自动退款。任何候选能力都必须通过同一授权、积分、幂等和停止闸门。
 
-平台运行时契约见 [`docs/platform-runtime-contract.md`](docs/platform-runtime-contract.md)：模型只选择服务端注册的 `workflowId + version + params`，固定流程运行后不再调用模型。三个业务适配器尚未由本次平台切片实现，未验证步骤默认 fail-closed。
+平台运行时契约见 [`docs/platform-runtime-contract.md`](docs/platform-runtime-contract.md)：模型只选择服务端注册的 `workflowId + version + params`，固定流程运行后不再调用模型。三个业务流程已由平台适配层接入 sidecar；未获得 `sent_confirmed` 证据的步骤默认进入 `UNKNOWN` 或人工等待。
 
 ## 运行与验证
 

@@ -69,6 +69,8 @@ INTERROGATIVE_PREFIXES = ["怎么", "如何", "怎样", "咋样", "咋", "哪里
                           "有没有", "求", "教我", "请问", "想问", "麻烦"]
 FUNCTION_WORDS = {"的", "了", "吗", "呢", "吧", "啊", "呀", "和", "与", "或", "在", "是",
                   "我", "你", "他", "它", "要", "想", "会", "能", "可以", "这个", "那个", "一下"}
+# 轻动词：中文里「做/搞/弄/赚… + 名词」的组合，中心语是后面那个名词（做副业 -> 副业）。
+LIGHT_VERBS = ("做", "搞", "弄", "干", "赚", "学", "玩", "用", "整", "撸")
 
 _SPLIT_RE = re.compile(r"[\s,，。.!！?？、;；:：/|]+")
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fa5]+|[A-Za-z0-9]+")
@@ -126,6 +128,40 @@ def keyword_segments(keyword):
     return uniq
 
 
+def keyword_core_segments(keyword):
+    """视频关键词的「中心语」（内容词根）：剥掉疑问词与轻动词后剩下的部分。
+
+    为什么需要（2026-09-21 真机）：
+      关键词「怎么做副业」经 keyword_segments 只剩一个分词「做副业」，
+      而抖音标题写的是「副业」——「做副业」整串几乎不会出现在标题里，
+      结果 80 条真实候选里 79 条相关度是 0，"相关度" 这一列等于没有。
+      中文复合词的中心语在后（做+副业 / 学+剪辑），把轻动词剥掉就能对上中心语。
+
+    只剥【开头或结尾的一个】轻动词，且剥完至少留 2 个字；
+    剥不动就返回空（表示这个关键词没有更宽的中心语可退化）。
+    """
+    out = []
+    for seg in keyword_segments(keyword):
+        core = seg
+        for prefix in INTERROGATIVE_PREFIXES:
+            core = core.replace(prefix, "")
+        core = core.strip()
+        for verb in LIGHT_VERBS:
+            if core.startswith(verb) and len(core) - len(verb) >= 2:
+                core = core[len(verb):]
+            elif core.endswith(verb) and len(core) - len(verb) >= 2:
+                core = core[:-len(verb)]
+        core = core.strip()
+        if len(core) >= 2 and core != seg:
+            out.append(core)
+    seen, uniq = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
 def comment_segments(keyword):
     """评论关键词的「词」。
 
@@ -139,6 +175,7 @@ def comment_segments(keyword):
 
 
 def video_matches_keyword(video_text, keyword):
+    """视频标题是否匹配关键词（bool）。保留给老调用方；新代码用 video_relevance。"""
     src = normalize_search_text(video_text)
     target = normalize_search_text(keyword)
     if not target:
@@ -149,6 +186,120 @@ def video_matches_keyword(video_text, keyword):
     if not segs:
         return False
     return all(s in src for s in segs)
+
+
+# ===================== 视频相关度（找视频模块的「相关度」） =====================
+#
+# 架构依据：找视频模块固定流程第 4 步要求返回
+#     「视频标题、作者、链接、【相关度】等候选结果」，
+# 并且模块的职责就是「发现和筛选视频」。
+#
+# 基线只有 video_matches_keyword 的一个 bool —— 宿主既没法排序候选，
+# 也没法按阈值筛选（要么全要、要么按 bool 一刀切）。
+#
+# 打分只用【我们自己就能观察到的信号】（搜索关键词 vs 视频标题），
+# 不引入任何平台接口之外的推断；规则确定、可解释、纯离线可测。
+#
+#   1. 用户写的【每个关键词都整串连续】出现在标题里：基础 70，再按首次出现位置加分
+#        （开头 +30 / 前 10 字 +20 / 其它 +10），最高 100；
+#   2. 否则退化为分词命中：全部分词都出现（顺序无关）给 60；
+#   2.5 分词一个都没对上，但关键词的【中心语】全对上（做副业 -> 副业）：给 50；
+#   3. 只命中部分分词：按命中比例给分（40 × 比例，四舍五入，上限 39）；
+#   4. 一个都没命中：0。
+#
+# 为什么退化那一层必须存在：抖音标题几乎不会连续包含「怎么充值codex」这种提问式关键词，
+# 只认整串会把结果清成 0（这条来自 pipeline.js 的真机结论）。
+#
+# ⚠️ 相关度衡量的是【标题与关键词的字面相关】，不是视频质量。
+#    热度（点赞/评论数）是另一个维度，已经在候选结果里单独给出，不混进这个分数。
+RELEVANCE_EXACT_BASE = 70
+RELEVANCE_EXACT_BONUS_HEAD = 30
+RELEVANCE_EXACT_BONUS_EARLY = 20
+RELEVANCE_EXACT_BONUS_LATE = 10
+RELEVANCE_ALL_SEGMENTS = 60
+RELEVANCE_CORE_SEGMENTS = 50
+RELEVANCE_PARTIAL_BASE = 40
+RELEVANCE_EARLY_CHARS = 10
+
+
+def video_relevance(video_text, keyword):
+    """视频与关键词的相关度（0-100）。返回 dict，字段见下面的注释。
+
+    返回：
+      score            0-100 的整数
+      reason           exact_phrase / all_segments / core_segments / partial_segments /
+                       no_match / empty_keyword
+      matchedSegments  命中的分词
+      missingSegments  未命中的分词
+      exact            是否整串连续命中
+      position         整串首次出现的字符位置（未整串命中时为 None）
+    """
+    parts = split_keywords(keyword)          # 用户实际写下的每个关键词
+    segs = keyword_segments(keyword)         # 分词（中文↔英文边界 + 剥疑问前缀）
+    out = {"score": 0, "reason": "no_match", "matchedSegments": [],
+           "missingSegments": list(segs), "matchedCores": [], "missingCores": [],
+           "exact": False, "position": None,
+           "matchedKeywords": [], "missingKeywords": list(parts)}
+    if not normalize_search_text(keyword):
+        out["reason"] = "empty_keyword"
+        return out
+    src = normalize_search_text(video_text)
+    if not src:
+        return out
+
+    # 第 1 档：用户写的每个关键词都【整串连续】出现在标题里
+    hits, miss = [], []
+    for part in parts:
+        (hits if normalize_search_text(part) in src else miss).append(part)
+    if parts and not miss:
+        position = min(src.find(normalize_search_text(part)) for part in hits)
+        if position == 0:
+            bonus = RELEVANCE_EXACT_BONUS_HEAD
+        elif position <= RELEVANCE_EARLY_CHARS:
+            bonus = RELEVANCE_EXACT_BONUS_EARLY
+        else:
+            bonus = RELEVANCE_EXACT_BONUS_LATE
+        out.update({"score": min(100, RELEVANCE_EXACT_BASE + bonus),
+                    "reason": "exact_phrase", "exact": True, "position": position,
+                    "matchedSegments": list(segs), "missingSegments": [],
+                    "matchedKeywords": hits, "missingKeywords": []})
+        return out
+
+    # 第 2/3 档：退化为分词命中（顺序无关）——视频标题几乎不会连续包含长提问式关键词
+    if not segs:
+        out.update({"matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    seg_hit = [s for s in segs if s in src]
+    seg_miss = [s for s in segs if s not in src]
+    if not seg_miss:
+        out.update({"score": RELEVANCE_ALL_SEGMENTS, "reason": "all_segments",
+                    "matchedSegments": seg_hit, "missingSegments": [],
+                    "matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    # 第 2.5 档：分词没对上，但关键词的【中心语】全对上了（做副业 -> 副业）。
+    # 真机：关键词「怎么做副业」的 80 条候选里 79 条只有「副业」没有「做副业」，
+    # 没有这一档，提问式关键词的相关度就整列是 0。
+    cores = keyword_core_segments(keyword)
+    core_hit = [c for c in cores if c in src]
+    core_miss = [c for c in cores if c not in src]
+    if cores and not core_miss:
+        out.update({"score": RELEVANCE_CORE_SEGMENTS, "reason": "core_segments",
+                    "matchedSegments": seg_hit, "missingSegments": seg_miss,
+                    "matchedCores": core_hit, "missingCores": [],
+                    "matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    if seg_hit or core_hit:
+        ratio = (len(seg_hit) + 0.5 * len(core_hit)) / float(len(segs))
+        score = int(round(RELEVANCE_PARTIAL_BASE * ratio))
+        out.update({"score": min(score, RELEVANCE_PARTIAL_BASE - 1),
+                    "reason": "partial_segments",
+                    "matchedSegments": seg_hit, "missingSegments": seg_miss,
+                    "matchedCores": core_hit, "missingCores": core_miss,
+                    "matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    out.update({"matchedKeywords": hits, "missingKeywords": miss,
+                "matchedCores": core_hit, "missingCores": core_miss})
+    return out
 
 
 def split_keywords(raw):
@@ -216,13 +367,25 @@ def comment_matches(text, keywords, mode="seg"):
     return None
 
 
-def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0):
+def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0,
+                    exclude_keywords=""):
     """按评论关键词筛评论。返回 (命中列表, 统计)。
 
     统计里 modes 字段会给出【全部 4 个档位】的命中数，方便一眼看出该松还是该紧，
     不必来回试参数。
+
+    排除词（exclude_keywords）——架构依据 images/11-comment-area-business 流程一
+    「关键词、排除词与去重」：
+
+      · 语义：一条评论【先按关键词命中】，再看是否命中任一排除词；命中排除词就【丢弃】。
+        排除词优先级高于关键词，且与关键词共用同一个档位（mode）。
+      · 统计里的 excluded 只数【本来命中关键词、却被排除词挡掉】的条数 ——
+        这才是可调参的数字；不命中关键词的评论本来就不会进来，数进去只会误导。
+      · 为什么要排除词：关键词为了召回必然放宽（实测「可以」在 313 条里命中 44 条），
+        但公开回复与私信必须避开同行、广告、无关人群 —— 那些由排除词兜底。
     """
     keywords = split_keywords(comment_keywords)
+    exclude = split_keywords(exclude_keywords)
     if mode not in MATCH_MODES:
         raise ValueError("未知 match mode: %s（可选 %s）" % (mode, "/".join(MATCH_MODES)))
 
@@ -232,8 +395,10 @@ def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0):
         "empty_text": 0,
         "low_digg": 0,
         "no_sec_uid": 0,
+        "excluded": 0,
         "mode": mode,
         "keywords": keywords,
+        "exclude_keywords": exclude,
         "modes": {},
     }
     for m in MATCH_MODES:
@@ -246,6 +411,9 @@ def filter_comments(comments, comment_keywords="", mode="seg", min_digg=0):
             continue
         hit = comment_matches(c.get("text"), keywords, mode)
         if hit is None:
+            continue
+        if exclude and comment_matches(c.get("text"), exclude, mode) is not None:
+            stats["excluded"] += 1
             continue
         if (c.get("digg") or 0) < min_digg:
             stats["low_digg"] += 1
@@ -350,7 +518,7 @@ def _absorb_search_dom(page, videos, stats):
 
 
 def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
-                  strict=False, meta=None, scroll_pause=2.0):
+                  strict=False, meta=None, scroll_pause=2.0, navigate=True, seen_ids=None):
     """按关键词搜视频。返回 [{aweme_id, desc, author, url, ...}]。
 
     逐轮：吃接口响应体 -> 吃 DOM 兜底 -> 滚一屏。连续 idle_rounds 轮没新增，
@@ -359,6 +527,16 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     strict=True 时只保留 desc 命中关键词的视频（用 video_matches_keyword），
     默认 False —— 搜索本身已经是关键词匹配，再筛一遍属于可选收紧。
     meta（传 dict 时）会回填本轮的真实统计。
+
+    —— 分页（架构依据 images/10-video-search-flow：「读取一页结果 ->
+       按固定条件筛选并去重 -> 保存视频池与搜索游标 -> 申请下一轮搜索」）——
+
+    navigate=False：不自己导航，由调用方保证当前就停在该关键词的搜索页上。
+        这样重复调用会【从当前滚动位置继续往下】，一次调用就是「读取一页」。
+        （基线写死了每次都要 Page.navigate，等于每次都从第一页重来，没法翻页。）
+    seen_ids：视频池里已经有的 aweme_id，返回前全部剔掉 —— 这就是「筛选并去重」。
+        宿主把每页结果并进视频池，游标由宿主保存（数据归属见 images/19）。
+        统计里 skipped_seen 给出被去重掉的条数，方便判断是不是到头了。
     """
     info = meta if isinstance(meta, dict) else {}
     info.setdefault("api_responses", 0)
@@ -372,19 +550,23 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     cdpmod.ensure_domains(page, "Network")
     rec = cdpmod.NetworkRecorder(page, lambda u: SEARCH_API_MARK in (u or ""))
 
-    page.call("Page.navigate", {"url": SEARCH_URL % quote(keyword)}, timeout=25)
-    deadline = time.time() + 25
-    while time.time() < deadline:
-        try:
-            if page.evaluate("document.readyState") == "complete":
-                break
-        except Exception:
-            pass
-        time.sleep(0.5)
+    info["navigated"] = bool(navigate)
+    if navigate:
+        page.call("Page.navigate", {"url": SEARCH_URL % quote(keyword)}, timeout=25)
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            try:
+                if page.evaluate("document.readyState") == "complete":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
 
     info["visible"] = douyin.ensure_visible(page, log=log)
-    time.sleep(6.0)  # 结果流懒加载，给足首屏时间
+    # 续页（navigate=False）时页面已经渲染好了，不用再等首屏；重新导航才给足懒加载时间。
+    time.sleep(6.0 if navigate else 1.5)
 
+    seen = set(str(x) for x in (seen_ids or ()))
     videos, idle = {}, 0
     for i in range(scroll_rounds + 1):
         cap = douyin.captcha_probe(page)
@@ -399,8 +581,9 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
         dom_added = 0
         if not videos or info["api_responses"] == 0:
             dom_added = _absorb_search_dom(page, videos, info)
-        if len(videos) >= max_videos:
-            log("达到 max_videos=%d，停止滚动" % max_videos)
+        fresh_n = sum(1 for k in videos if k not in seen)
+        if fresh_n >= max_videos:
+            log("本页已收集到 %d 条新视频（max_videos=%d），停止滚动" % (fresh_n, max_videos))
             break
         if api_added + dom_added == 0:
             idle += 1
@@ -425,7 +608,14 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     info["segments"] = keyword_segments(keyword)
 
     kept = [v for v in all_videos if v["keyword_hit"]] if strict else all_videos
-    info["kept"] = len(kept)
+    # 「按固定条件筛选并去重」：池里已有的全部剔掉，返回的才是这一页的新结果
+    fresh = [v for v in kept if v["aweme_id"] not in seen]
+    info["skipped_seen"] = len(kept) - len(fresh)
+    info["kept"] = len(fresh)
+    # 平台响应体里的分页信号：只作为【观测】返回，不用来直调接口
+    # （直调需要伪造签名，属红线，不碰）。
+    info["platform_cursor"] = info.get("api_cursor")
+    info["platform_has_more"] = info.get("api_has_more")
 
     log("搜索关键词          : %s" % keyword)
     log("关键词分词          : %s" % (info["segments"] or "(无)"))
@@ -435,8 +625,11 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     log("DOM 兜底卡片        : %d 个" % info["dom_cards"])
     log("标题命中关键词      : %d 个" % info["keyword_hit"])
     log("滚动通道            : %s" % info["scroll_via"])
-    log("最终保留            : %d 个%s" % (len(kept), "（strict）" if strict else ""))
-    return kept
+    log("池内已去重          : %d 个" % info["skipped_seen"])
+    log("本页新视频          : %d 个%s" % (len(fresh), "（strict）" if strict else ""))
+    log("平台分页信号        : has_more=%s cursor=%s"
+        % (info.get("platform_has_more"), str(info.get("platform_cursor"))[:24]))
+    return fresh
 
 
 def _page_says_no_more(page):
@@ -689,9 +882,14 @@ def crawl_video_comments(page, video, log=print, scroll_rounds=7, settle=3.0, wa
 
 # ===================== 组装：关键词筛评论 -> 私信队列 =====================
 
-def build_queue(comments, comment_keywords, min_digg=0, mode="seg"):
-    """按评论关键词筛人，产出私信队列（按 sec_uid 去重）。"""
-    matched, stats = filter_comments(comments, comment_keywords, mode=mode, min_digg=min_digg)
+def build_queue(comments, comment_keywords, min_digg=0, mode="seg", exclude_keywords=""):
+    """按评论关键词筛人，产出私信队列（按 sec_uid 去重）。
+
+    exclude_keywords 语义见 filter_comments：命中排除词的评论在出队列前就被丢掉 ——
+    这是避免给同行/广告人群发私信的最后一道闸。
+    """
+    matched, stats = filter_comments(comments, comment_keywords, mode=mode, min_digg=min_digg,
+                                     exclude_keywords=exclude_keywords)
     queue, seen = [], set()
     for c in matched:
         uid = c.get("sec_uid")

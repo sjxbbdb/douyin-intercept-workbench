@@ -147,6 +147,14 @@ class AccountRuntimeManager {
     return true;
   }
 
+  /** Close contexts for invalidated accounts while keeping the manager usable. */
+  async closeInvalidated() {
+    await Promise.all([...this.accounts.values()]
+      .filter((account) => account.status === 'invalidated')
+      .map((account) => this.#closeContext(account)));
+    return this.snapshot();
+  }
+
   snapshot() {
     return {
       closed: this.closed,
@@ -231,6 +239,13 @@ class AccountRuntimeManager {
   }
 
   #reactivate(account, options) {
+    if (account.context || account.contextPromise) {
+      const previous = account.context;
+      account.context = null;
+      account.contextPromise = null;
+      account.contextClosed = true;
+      Promise.resolve(previous?.close?.()).catch(() => {});
+    }
     account.status = 'active';
     account.generation += 1;
     account.options = clone({ ...account.options, ...options });

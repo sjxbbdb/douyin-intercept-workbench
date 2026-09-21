@@ -9,6 +9,8 @@ const { targetUrl, selectorProfile } = require('../src/lib/validation');
 const { ApiClient, ApiError } = require('../src/lib/api-client');
 const { TaskEngine } = require('../src/lib/task-engine');
 const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
+const { createWorkflowAdapter } = require('../src/lib/workflow-adapter');
+const { platformWorkflowDefinitions } = require('../src/lib/workflow-contracts');
 const { AuthStore } = require('../src/lib/auth-store');
 const { platformScope, accountDataPath, browserPartition, sidecarPort } = require('../src/lib/platform-account');
 const { AccountRuntimeManager } = require('../src/lib/account-runtime-manager');
@@ -20,6 +22,86 @@ function testAsync(name, fn) { pendingTests.push((async () => { try { await fn()
 
 test('normalizes bare host and rejects credential-bearing or unsupported target URLs', () => { assert.throws(() => targetUrl('https://u:p@douyin.com/video/1')); assert.throws(() => targetUrl('https://foo.douyin.com/video/1')); assert.equal(targetUrl('https://douyin.com/video/1'), 'https://www.douyin.com/video/1'); assert.equal(targetUrl('https://www.douyin.com/video/1'), 'https://www.douyin.com/video/1'); });
 test('allows empty optional selectors and CSS combinators', () => { assert.equal(selectorProfile({ commentNode: '.row > .comment', replyButton: '' }).replyButton, ''); });
+testAsync('platform workflow adapter forwards search paging and keeps unverified sends fail-closed', async () => {
+  const calls = [];
+  const browser = {
+    search: async (params) => { calls.push({ type: 'search', params }); return { status: 'ok', videos: [{ url: 'https://www.douyin.com/video/1' }], cursor: 'next', hasMore: true }; },
+    canSend: () => false,
+    sendReply: async () => { calls.push({ type: 'send' }); return { status: 'sent_confirmed' }; }
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const search = await adapter.execute({ run: { runId: 'search-1', workflowId: 'video.search' }, plan: { params: { keyword: '暴雨末日', maxVideos: 10, cursor: 'cursor-1', minRelevance: 70 } }, step: { stepId: 'search' } });
+  assert.equal(search.status, 'completed');
+  assert.deepEqual(search.result.poolIds, undefined);
+  assert.deepEqual(search.checkpoint, { phase: 'search', status: 'ok', count: 1, cursor: 'next', hasMore: true });
+  assert.deepEqual(calls[0], { type: 'search', params: { keyword: '暴雨末日', maxVideos: 10, scrollRounds: 2, cursor: 'cursor-1', page: undefined, minRelevance: 70, strict: false } });
+  const blocked = await adapter.execute({ run: { runId: 'comment-1', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c1', roomId: 'https://www.douyin.com/video/1', authorId: 'u1', text: '多少钱' }, publicReply: '请问您想了解哪个型号？' } }, step: { stepId: 'reply_comment' } });
+  assert.equal(blocked.status, 'wait_human');
+  assert.equal(calls.filter((item) => item.type === 'send').length, 0);
+  const mismatch = await adapter.execute({ run: { runId: 'comment-mismatch', workflowId: 'comment.reply_then_private' }, plan: { params: { keywords: ['价格'], target: { id: 'c2', roomId: 'https://www.douyin.com/video/1', authorId: 'u2', text: '天气不错' }, publicReply: '不应发送' } }, step: { stepId: 'reply_comment' } });
+  assert.equal(mismatch.error.code, 'TARGET_KEYWORD_MISMATCH');
+  const publicOnly = createWorkflowAdapter({ browser: { canSend: () => true, sendReply: async () => { calls.push({ type: 'public-fallback' }); return { status: 'sent_confirmed' }; } } });
+  const privateBlocked = await publicOnly.execute({ run: { runId: 'private-missing', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c3', roomId: 'https://www.douyin.com/video/1', authorId: 'u3', text: '价格' }, keywords: ['价格'], privateReply: '不应公开发送' } }, step: { stepId: 'private_message' }, action: { actionId: 'a-private-missing', idempotencyKey: 'idem-private-missing' } });
+  assert.equal(privateBlocked.error.code, 'PUBLIC_DELIVERY_ID_MISSING');
+  assert.equal(calls.filter((item) => item.type === 'public-fallback').length, 0);
+});
+testAsync('platform workflow adapter preserves terminal search evidence for human recovery', async () => {
+  const browser = {
+    search: async () => ({
+      status: 'captcha',
+      videos: [{ id: 'v1', url: 'https://www.douyin.com/video/1', title: '候选', author: '作者', relevance: { score: 80 } }],
+      cursor: null,
+      hasMore: false,
+      stoppedReason: 'captcha',
+      poolIds: ['v1', 'v2', 'v1'],
+      poolSize: 2,
+      page: 3,
+      skippedSeen: 1,
+      platformHasMore: true,
+      platformCursor: 'telemetry-only',
+      filter: { collected: 2, returned: 1, filteredByRelevance: 1, minRelevance: 70 }
+    })
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const result = await adapter.execute({ run: { runId: 'search-captcha', workflowId: 'video.search' }, plan: { params: { keyword: '暴雨末日' } }, step: { stepId: 'search' } });
+  assert.equal(result.status, 'wait_human');
+  assert.deepEqual(result.result, {
+    kind: 'video_search',
+    videos: [{ id: 'v1', url: 'https://www.douyin.com/video/1', title: '候选', author: '作者', relevance: 80 }],
+    cursor: null,
+    hasMore: false,
+    poolIds: ['v1', 'v2'],
+    poolSize: 2,
+    page: 3,
+    skippedSeen: 1,
+    stoppedReason: 'captcha',
+    platformHasMore: true,
+    platformCursor: 'telemetry-only',
+    filter: { collected: 2, returned: 1, filteredByRelevance: 1, minRelevance: 70 }
+  });
+  assert.deepEqual(result.checkpoint, {
+    phase: 'search', status: 'captcha', count: 1, cursor: null, hasMore: false,
+    stoppedReason: 'captcha', poolIds: ['v1', 'v2'], poolSize: 2, page: 3,
+    skippedSeen: 1, platformHasMore: true, platformCursor: 'telemetry-only',
+    filter: { collected: 2, returned: 1, filteredByRelevance: 1, minRelevance: 70 }
+  });
+});
+testAsync('platform workflow adapter exposes only explicit confirmed delivery', async () => {
+  const browser = { canSend: () => true, isOpenFor: () => true, sendReply: async () => ({ status: 'sent_confirmed', sendId: 's1' }), sendPrivate: async () => ({ status: 'sent_confirmed', sendId: 's2' }) };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'comment-2', workflowId: 'comment.reply_then_private' };
+  const plan = { params: { keywords: ['多少钱'], target: { id: 'c1', roomId: 'https://www.douyin.com/video/1', authorId: 'u1', authorName: '小王', text: '多少钱' }, publicReply: '公开回复', privateReply: '私信回复' } };
+  const publicResult = await adapter.execute({ run, plan, step: { stepId: 'reply_comment' }, action: { actionId: 'a-public', idempotencyKey: 'idem-public' } });
+  assert.deepEqual(publicResult.result, { deliveryStatus: 'sent_confirmed', reason: null, sendId: 's1' });
+  const privateResult = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { actionId: 'a-private', idempotencyKey: 'idem-private' } });
+  assert.deepEqual(privateResult.result, { deliveryStatus: 'sent_confirmed', reason: null, sendId: 's2' });
+  const unknownAdapter = createWorkflowAdapter({ browser: { canSend: () => true, sendReply: async () => ({ status: 'unknown', sendId: 's-unknown' }), sendPrivate: async () => { throw new Error('private send must be gated'); } } });
+  const unknownRun = { runId: 'comment-unknown-public', workflowId: 'comment.reply_then_private' };
+  const unknownPublic = await unknownAdapter.execute({ run: unknownRun, plan, step: { stepId: 'reply_comment' }, action: { actionId: 'a-public-unknown', idempotencyKey: 'idem-public-unknown' } });
+  assert.equal(unknownPublic.status, 'unknown');
+  const unknownPrivate = await unknownAdapter.execute({ run: unknownRun, plan, step: { stepId: 'private_message' }, action: { actionId: 'a-private-unknown', idempotencyKey: 'idem-private-unknown' } });
+  assert.equal(unknownPrivate.error.code, 'PUBLIC_DELIVERY_NOT_CONFIRMED');
+});
 test('JsonStore commits only after atomic flush', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { events: [] }); store.set({ events: [{ id: 'one' }] }); const reopened = new JsonStore(file, { events: [] }); assert.equal(reopened.get().events[0].id, 'one'); });
 test('JsonStore refuses corrupted or inaccessible data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const broken = path.join(dir, 'broken.json'); fs.writeFileSync(broken, '{bad'); assert.throws(() => new JsonStore(broken, {}), /存储损坏/); const parentFile = path.join(dir, 'parent'); fs.writeFileSync(parentFile, 'file'); assert.throws(() => new JsonStore(path.join(parentFile, 'data.json'), { value: 1 }), /目录不可读/); });
 test('JsonStore selects the highest valid revision and requires recovery after primary corruption', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); fs.writeFileSync(file, '{broken'); for (const revision of [1, 2]) { const value = { revision }; fs.writeFileSync(`${file}.v-${revision}-fixture`, JSON.stringify({ format: 1, revision, checksum: checksum(value), value })); } const store = new JsonStore(file, {}); assert.equal(store.get().revision, 2); assert.equal(store.recoveryRequired, true); });
@@ -143,6 +225,96 @@ testAsync('workflow model decision rejects fields outside workflowId/version/par
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
   const runtime = new WorkflowRuntime({ store, accountId: 'account-a', modelDecider: async () => ({ workflowId: 'strict.fixture', version: '1', params: {}, steps: ['model-controlled'] }) });
   await assert.rejects(runtime.planFromIntent('模型不能改步骤'), /unsupported fields/);
+});
+
+test('platform workflow contracts keep public reply before private follow-up', () => {
+  const contracts = platformWorkflowDefinitions();
+  const comment = contracts.find((item) => item.workflowId === 'comment.reply_then_private');
+  const live = contracts.find((item) => item.workflowId === 'live.reply_then_private');
+  assert.deepEqual(comment.steps.map((step) => step.stepId), ['reply_comment', 'private_message']);
+  assert.deepEqual(live.steps.map((step) => step.stepId), ['reply_public', 'private_message']);
+  for (const definition of [comment, live]) {
+    assert.deepEqual(definition.steps[0].successStatuses, ['sent_confirmed']);
+    assert.deepEqual(definition.steps[1].requiresPrevious.resultStatuses, ['sent_confirmed']);
+    assert.equal(definition.steps[1].requiresPrevious.stepId, definition.steps[0].stepId);
+  }
+  // A caller cannot mutate the process-wide definitions through the returned copy.
+  comment.steps[0].stepId = 'tampered';
+  assert.equal(platformWorkflowDefinitions().find((item) => item.workflowId === comment.workflowId).steps[0].stepId, 'reply_comment');
+});
+
+testAsync('comment workflow blocks private message when public delivery is unknown', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-comment-gate-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = platformWorkflowDefinitions().find((item) => item.workflowId === 'comment.reply_then_private');
+  const calls = [];
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: {} }),
+    workflows: [definition],
+    stepExecutor: async ({ step }) => {
+      calls.push(step.stepId);
+      return { status: 'completed', result: { deliveryStatus: 'sent_unknown', evidence: { source: 'fixture' } } };
+    }
+  });
+  const run = runtime.startPlan(await runtime.planFromIntent('评论命中后先公开回复，再私信'));
+  const result = await runtime.run(run.runId);
+  assert.equal(result.status, RUN_STATES.UNKNOWN);
+  assert.deepEqual(calls, ['reply_comment']);
+  assert.equal(result.steps[0].resultStatus, 'sent_unknown');
+  assert.throws(() => runtime.applyResultDecision(run.runId, 'retry'), (error) => error.code === 'RESULT_REQUIRES_RECONCILIATION');
+  const waiting = runtime.applyResultDecision(run.runId, 'wait_human', { reason: '请核对公开回复是否已送达' });
+  assert.equal(waiting.action, 'wait_human');
+  assert.equal(waiting.run.status, RUN_STATES.WAITING_HUMAN);
+  assert.deepEqual(calls, ['reply_comment']);
+});
+
+testAsync('live workflow executes private follow-up only after confirmed public delivery', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-live-gate-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = platformWorkflowDefinitions().find((item) => item.workflowId === 'live.reply_then_private');
+  const calls = [];
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-live',
+    modelDecider: async () => ({ workflowId: definition.workflowId, version: definition.version, params: { roomId: 'fixture-room' } }),
+    workflows: [definition],
+    stepExecutor: async ({ step }) => {
+      calls.push(step.stepId);
+      return { status: 'completed', result: { deliveryStatus: 'sent_confirmed', evidence: { source: 'fixture-only' } } };
+    }
+  });
+  const run = runtime.startPlan(await runtime.planFromIntent('直播间命中后公屏回复再私信'));
+  const result = await runtime.run(run.runId);
+  assert.equal(result.status, RUN_STATES.COMPLETED);
+  assert.deepEqual(calls, ['reply_public', 'private_message']);
+  assert.equal(result.steps[0].resultStatus, 'sent_confirmed');
+  assert.equal(result.steps[1].resultStatus, 'sent_confirmed');
+});
+
+testAsync('known failed result can be retried by decision while unknown cannot be blindly retried', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-result-transition-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  const definition = { workflowId: 'retry.fixture', version: '1', steps: [{ stepId: 'safe', retryLimit: 0 }] };
+  let attempts = 0;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-a',
+    workflows: [definition],
+    stepExecutor: async () => { attempts += 1; return attempts === 1 ? { status: 'failed', error: { code: 'KNOWN_FAILURE' } } : { status: 'completed' }; }
+  });
+  const run = runtime.startPlan({ workflowId: definition.workflowId, version: definition.version, params: {} });
+  const failed = await runtime.run(run.runId);
+  assert.equal(failed.status, RUN_STATES.FAILED);
+  const retry = runtime.applyResultDecision(run.runId, 'retry');
+  assert.equal(retry.action, 'run');
+  const completed = await runtime.run(run.runId);
+  assert.equal(completed.status, RUN_STATES.COMPLETED);
+  assert.equal(attempts, 2);
+  const stopped = runtime.applyResultDecision(run.runId, 'complete');
+  assert.equal(stopped.action, 'complete');
+  assert.equal(stopped.run.status, RUN_STATES.COMPLETED);
 });
 
 testAsync('workflow short retry exhaustion becomes UNKNOWN and manual resume reuses the frozen plan', async () => {
@@ -460,6 +632,135 @@ testAsync('recheck cancels deferred authorization and evaluation contexts', asyn
   const second = make(async () => {}, async () => { evaluateStarted = true; return new Promise((resolve) => { releaseEvaluate = resolve; }); });
   const secondRun = second.engine.recheckSkipped(second.task.id); while (!evaluateStarted) await Promise.resolve(); second.engine.invalidate('account_switch'); releaseEvaluate({ matched: true, reply: '不应入队' }); const secondResult = await secondRun;
   assert.equal(secondResult.stopReason, 'context_changed'); assert.equal(second.store.get().pending.length, 0);
+});
+
+testAsync('live batch workflow drives the five live_* methods and unifies the ledger', async () => {
+  const calls = [];
+  const events = [
+    { id: 'e1', authorId: 'u1', authorName: '观众甲', text: '多少钱', dmCapable: true },
+    { id: 'e2', authorId: 'u2', authorName: '观众乙', text: '价格能便宜吗', dmCapable: true }
+  ];
+  const targets = events.map((event) => ({ eventId: event.id, authorId: event.authorId, authorName: event.authorName, roomId: 'https://live.douyin.com/1', text: event.text, publicText: '谢谢支持', privateText: '你好呀' }));
+  const browser = {
+    liveListen: async (params) => { calls.push({ type: 'listen', params }); return { status: 'ok', events, queue: { added: 2, duplicates: 0 } }; },
+    livePlan: async (params) => { calls.push({ type: 'plan', params }); return { status: 'ok', batch: { batchId: 'batch-1' }, targets, blocked: [], expired: [], filter: { keywords: ['价格'], matched: 2 }, replyMode: 'danmaku', replyVia: 'native' }; },
+    liveReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'unknown', phase: 'public', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable', recordedState: 'sent_echoed', evidence: { roomEcho: true } })) }; },
+    livePrivate: async (params) => { calls.push({ type: 'private', params }); return { status: 'ok', phase: 'private', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable', evidence: { conversationEcho: true } })), skipped: [] }; },
+    liveResult: async (params) => { calls.push({ type: 'result', params }); return { batchId: params.batchId, counts: { sent_echoed: 2 }, checkpoint: { version: 3 } }; }
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'live-batch-1', workflowId: 'live.batch' };
+  // 话术由平台侧下发：没有话术时 plan 必须拒绝（fail-closed），这里给出话术才能冻结批次。
+  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['价格'], excludeKeywords: ['广告'], matchMode: 'seg', windowSeconds: 600, maxItems: 5, maxSends: 2, replyMode: 'danmaku', replyVia: 'native', publicReply: '谢谢支持', privateReply: '你好呀' } };
+
+  const listen = await adapter.execute({ run, plan, step: { stepId: 'listen' } });
+  assert.equal(listen.status, 'completed');
+  assert.equal(listen.checkpoint.count, 2);
+  assert.deepEqual(calls[0].params, { url: 'https://live.douyin.com/1', maxItems: 5 });
+
+  const planned = await adapter.execute({ run, plan, step: { stepId: 'plan' } });
+  assert.equal(planned.status, 'completed');
+  assert.equal(planned.checkpoint.batchId, 'batch-1');
+  assert.equal(planned.checkpoint.targets, 2);
+  // 关键词过滤 / 排除词 / 时间窗 / 话术都交给侧车的 live_plan（批次语义在侧车里）
+  assert.deepEqual(calls[1].params.keywords, ['价格']);
+  assert.deepEqual(calls[1].params.excludeKeywords, ['广告']);
+  assert.equal(calls[1].params.windowSeconds, 600);
+  assert.equal(calls[1].params.replyVia, 'native');
+  assert.equal(calls[1].params.scripts.e1.publicText, '谢谢支持');
+  assert.equal(calls[1].params.scripts.e2.privateText, '你好呀');
+
+  const reply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'act-1' } });
+  // 平台没有响应 -> 如实保留 unknown，绝不冒充成功
+  assert.equal(reply.status, 'unknown');
+  assert.equal(reply.result.deliveryStatus, 'unknown');
+  assert.equal(calls[2].params.mode, 'danmaku');
+  assert.deepEqual(calls[2].params.items.map((item) => item.sendId), ['act-1~public~e1', 'act-1~public~e2']);
+
+  // 公屏没有确认成功 -> 私信必须被拒绝，而不是"没人可发"就静默放行
+  const blocked = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'act-1' } });
+  assert.equal(blocked.error.code, 'PUBLIC_DELIVERY_NOT_CONFIRMED');
+  assert.equal(calls.filter((call) => call.type === 'private').length, 0);
+
+  const report = await adapter.execute({ run, plan, step: { stepId: 'report' } });
+  assert.equal(report.status, 'completed');
+  assert.deepEqual(calls[3].params, { batchId: 'batch-1' });
+  // 统一台账：公屏与私信落在同一条记录上，检查点带上平台侧的 checkpoint
+  assert.deepEqual(report.result.ledger.map((entry) => entry.eventId), ['e1', 'e2']);
+  assert.equal(report.result.ledger[0].public.status, 'unknown');
+  assert.equal(report.result.ledger[0].public.roomEcho, true);
+  assert.equal(report.result.counts.events, 2);
+  assert.equal(report.result.counts.publicUnknown, 2);
+  assert.equal(report.checkpoint.platformCheckpoint.version, 3);
+});
+
+testAsync('live batch private step binds each confirmed public send and records skips', async () => {
+  const calls = [];
+  const events = [{ id: 'e1', authorId: 'u1', authorName: '观众甲', text: '多少钱', dmCapable: true }, { id: 'e2', authorId: 'u2', authorName: '观众乙', text: '多少钱', dmCapable: true }];
+  const targets = events.map((event) => ({ eventId: event.id, authorId: event.authorId, authorName: event.authorName, roomId: 'https://live.douyin.com/1', text: event.text, publicText: '谢谢支持', privateText: '你好呀' }));
+  const browser = {
+    liveListen: async () => ({ status: 'ok', events, queue: { added: 2 } }),
+    livePlan: async () => ({ status: 'ok', batch: { batchId: 'batch-2' }, targets, blocked: [], replyMode: 'danmaku', replyVia: 'native' }),
+    liveReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
+    livePrivate: async (params) => {
+      calls.push({ type: 'private', params });
+      const [first, second] = params.items;
+      return { status: 'ok', results: [
+        { eventId: first.eventId, sendId: first.sendId, status: 'unknown', reason: 'platform_response_unavailable', evidence: { conversationEcho: true } },
+        { eventId: second.eventId, sendId: second.sendId, status: 'blocked', reason: 'dm_panel_unavailable', evidence: { skipped: true } }
+      ], skipped: [{ eventId: second.eventId, reason: 'dm_panel_unavailable' }] };
+    },
+    liveResult: async (params) => ({ batchId: params.batchId, checkpoint: { version: 7 } })
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'live-batch-2', workflowId: 'live.batch' };
+  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['多少钱'], publicReply: '谢谢支持', privateReply: '你好呀', maxSends: 2 } };
+  await adapter.execute({ run, plan, step: { stepId: 'listen' } });
+  await adapter.execute({ run, plan, step: { stepId: 'plan' } });
+
+  const reply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'act-2' } });
+  assert.equal(reply.status, 'completed');
+  assert.equal(reply.result.deliveryStatus, 'sent_confirmed');
+
+  const priv = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'act-2' } });
+  // 每条私信逐项绑定"那次已确认成功的公屏回复"
+  assert.deepEqual(calls[1].params.items.map((item) => item.publicSendId), ['act-2~public~e1', 'act-2~public~e2']);
+  assert.deepEqual(calls[1].params.items.map((item) => item.sendId), ['act-2~private~e1', 'act-2~private~e2']);
+  assert.equal(calls[1].params.items[0].text, '你好呀');
+  assert.equal(priv.status, 'wait_human');            // 有一条被平台拦下（跳过）-> 转人工，不谎报成功
+  assert.deepEqual(priv.result.skipped, [{ eventId: 'e2', reason: 'dm_panel_unavailable' }]);
+  assert.equal(priv.result.counts.privateSkipped, 1);
+  assert.equal(priv.result.counts.privateUnknown, 1);
+  assert.equal(priv.checkpoint.skipped, 1);
+});
+
+testAsync('structured workflow requests are validated and the issued plan is verified', async () => {
+  const { requestForWorkflow, buildWorkflowIntent, buildWorkflowContext, planMatchesRequest } = require('../src/lib/workflow-request');
+  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
+  const spec = requestForWorkflow(request);
+  assert.equal(spec.workflowId, 'live.batch');
+  assert.equal(spec.version, '1');
+  assert.deepEqual(spec.params.keywords, ['价格', '多少钱']);
+  // 不在登记表里的流程、缺必填参数、版本不对：都要在打开浏览器之前被拒
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.unknown', params: {} }), /unsupported workflowId/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', params: { keywords: ['价格'] } }), /missing url/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: [] } }), /missing keywords/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', version: '2', params: { url: 'https://live.douyin.com/1', keywords: ['价格'] } }), /unsupported live.batch version/);
+  const intent = buildWorkflowIntent(request);
+  assert.match(intent, /live\.douyin\.com\/1/);
+  assert.match(intent, /价格/);
+  assert.match(intent, /原生「回复 TA」/);
+  assert.equal(buildWorkflowContext(request).requestedBy, 'task_panel');
+
+  // 平台签发的计划必须与结构化请求逐项一致，否则拒绝启动
+  const good = { planId: 'plan_1', workflowId: 'live.batch', version: '1', params: { ...spec.params, policy: 'server_issued' } };
+  assert.deepEqual(planMatchesRequest(good, request), { ok: true });
+  assert.equal(planMatchesRequest({ ...good, workflowId: 'live.reply_then_private' }, request).reason, 'workflow_mismatch');
+  assert.equal(planMatchesRequest({ ...good, version: '2' }, request).reason, 'version_mismatch');
+  assert.equal(planMatchesRequest({ ...good, planId: '' }, request).reason, 'plan_id_missing');
+  assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, keywords: ['价格'] } }, request).reason, 'param_mismatch');
+  assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, url: 'https://live.douyin.com/2' } }, request).field, 'url');
+  assert.equal(planMatchesRequest(null, request).reason, 'plan_missing');
 });
 
 Promise.all(pendingTests).then(() => console.log(`\n${passed} desktop tests passed`)).catch(() => { process.exitCode = 1; });

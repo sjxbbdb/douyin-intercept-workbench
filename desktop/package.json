@@ -10,10 +10,10 @@
   },
   "scripts": {
     "start": "electron .",
-    "test": "node test/run.js",
+    "test": "node test/run.js && node test/probe-protocol.js",
     "test:dom": "electron test/dom-fixture.js",
     "test:task-editor": "node test/task-editor-launcher.js",
-    "check": "node test/check-syntax.js && node test/run.js",
+    "check": "node test/check-syntax.js && node test/run.js && node test/probe-protocol.js",
     "test:probe-runtime": "node test/check-probe-runtime.js",
     "test:probe-lifecycle": "node test/probe-bridge-lifecycle.js",
     "build": "node test/check-probe-runtime.js && electron-builder --win --config.directories.output=release",
