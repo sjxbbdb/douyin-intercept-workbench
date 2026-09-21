@@ -128,10 +128,15 @@ comment and never sends a message.
 
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
-automation gate. `private_reply` records the collaborator account flow
-evidence from PR #1 but still reports delivery as `unknown` unless a response
-is bound to that click. Video and live replies are fixture validated and
-remain `autoEligible: false` until platform validation.
+automation gate. Every channel whose real delivery is still unproven reports
+`autoEligible: false` — the live and DM channels only have page-side echo
+(`roomEcho` / `conversationEcho`), and the IM channel rides a long-lived
+connection that yields no HTTP response at all. That now includes
+`private_reply`, which previously carried `autoEligible: true` from the PR #1
+collaborator run; per `AGENTS.md` red line 6 an unverified capability must
+fail closed, so it stays `false` until a platform response (or an explicit
+server policy) is bound to the click. `comment_private_candidates` is listed
+as well (read-only gate helper, not a send channel).
 
 `comment_batch` covers the two-phase closure above. It reports
 `validation.status: offline_fixture` and `autoEligible: false`, and must stay
@@ -172,7 +177,7 @@ the platform boundary of images/18 and the script boundary of images/09:
 | `live_listen` | collect one listening round and enqueue it | yes |
 | `live_plan` | take a batch, check the window, freeze host scripts | no |
 | `live_reply` | phase one: public reply per accepted item | only when something is sendable |
-| `live_private` | phase two: private message per derived candidate | only when something is sendable |
+| `live_private` | phase two: private message, each item bound to its own confirmed public send | only when something is sendable |
 | `live_result` | batch report, counts and resume checkpoint | no |
 
 `live_plan` also takes the flow-step-2 filter: `keywords`, `excludeKeywords` and `matchMode`
@@ -219,6 +224,57 @@ Unverified boundaries, to be resolved before any release switch: the live
 selectors remain fixture-validated only, the platform has not been observed to
 publish an author id for every live comment, and phase-two delivery keeps the
 same `unknown` semantics as the other send paths.
+
+## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
+
+* **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
+  以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
+  续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
+  响应 `filter` 新增 `kept`（实际返回条数）与 `poolAdded`（本页新增进池的条数）便于对账。
+  回归：`test_relevance_filtered_videos_stay_in_the_cursor_pool`。
+* **验证码是终止状态**：命中验证码时返回 `status: "captcha"`、`hasMore: false`、`cursor: null`
+  与 `stoppedReason: "captcha_requires_manual_action"` —— 不再给可翻页信号，
+  避免上层据此自动继续请求、在风控点上越撞越深。
+  回归：`test_captcha_is_terminal_and_offers_no_next_page`。
+* **评论区两阶段契约**：`comment_private_candidates` 把一个批次按「公屏是否确认成功」分成
+  `allowed` / `rejected`；`send_private` 也接受 `publicSendId`，给出时**必须**是
+  `sent_confirmed`，否则在**打开浏览器之前**以稳定原因拒绝：
+  `public_missing` / `public_not_found` / `public_not_a_reply` / `public_pending` /
+  `public_unknown` / `public_failed` / `public_blocked` / `missing_author_id`。
+  ⚠️ `send_gate.result()` 会把 `sent_confirmed` 映射成 `unknown`（避免过度宣称），
+  所以契约判定读的是 **`SendGate.lookup()` 返回的原始状态**。
+  回归：`CommentFlowContractTests`（5 项，含"不通过就不许打开浏览器"）。
+* **直播私信逐项绑定公屏成功（审核意见 2026-09-21）**：`live_private` 的每个 item 必须带
+  `publicSendId`，且该 sendId 必须满足两条：①在台账里是"已确认成功的公屏回复"；
+  ②就是这个事件自己那次回复（事件详情里记录的 `sendId`）。任一不满足就地 `blocked`，
+  **在打开浏览器之前**拒绝：`public_missing` / `public_not_found` / `public_not_a_reply` /
+  `public_pending` / `public_unknown` / `public_failed` / `public_blocked` /
+  `public_send_mismatch`。
+  只按批次候选清单放行会留下绕过路径（调用方不带 `publicSendId` 直接要私信），
+  所以绑定检查必须落在**每个 item** 上；`_live_batch_items` 也不再丢弃该字段。
+  回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
+
+### 采集数据源与「回复弹幕」（2026-09-20 真机）
+
+* **采集优先读页面内存**：弹幕虚拟列表组件的 React fiber props 里有 originalList（消息数组），
+  每条 WebcastChatMessage 的 payload.user 带 `sec_uid` / nickname —— 真机实测 42/42 带标识。
+  DOM 文本采集保留为兜底，但**行内没有用户标识**（真机 0%），此时 `authorId` 一律留空，
+  绝不拿昵称冒充标识。`live_listen` 的响应如实回报 `source` 与 `identityCoverage`。
+* **回复弹幕**：真机确认网页端没有「点某条弹幕 → 回复」的原生入口（全页 hover 扫描恒为 0；
+  点击弹幕不进入回复态；输入框 `@` 也没有提及联想）。因此「回复弹幕」= 公屏发一条以
+  `@昵称` 开头的消息，边界规则：
+  1. `live_plan` 新增 `replyMode`（`composer` 默认 / `danmaku`），在**冻结计划时定稿**；
+     之后 `live_reply` 传别的 mode 会被 `mode_mismatch` 拒绝 —— 同一批次里不允许两种触达方式；
+  2. `danmaku` 模式下，**计划期**就要求每个目标有昵称（否则 `missing_author_name`）且话术自带
+     `@昵称` 前缀（否则 `mention_prefix_missing`）：话术仍归平台侧，本模块不代写、不改写；
+  3. 发出前必须先在屏上**定位到那条弹幕**（唯一命中 + 未被面板遮挡），否则以
+     `danmaku_not_found` / `danmaku_ambiguous` / `danmaku_covered` 拒绝，且不产生任何输入；
+  4. 输入框内容与话术完全一致后才发送；用的是按钮还是回车记录在结果的 `mechanism` 里。
+* **拟人输入**：`type_text` 默认逐字真人节奏（每字 **0.1–0.9 秒**随机，标点后略长），
+  不再使用固定 60ms 节拍；显式传 `per_char_delay` 时保留固定节拍（离线回归与兼容旧调用）。
+  输入仍走 `Input.dispatchKeyEvent(type=char)`（真机验证过：`insertText` 对受控富文本编辑器无效）。
+* 未验证边界（fail-closed）：`@昵称` 的送达证据（对方是否收到提醒）、发送机制是按钮还是回车、
+  以及弹幕定位在虚拟列表滚动中的稳定性，都需要真机确认；`autoEligible` 保持 `false`。
 
 ## Review fixes (PR #7 revision)
 

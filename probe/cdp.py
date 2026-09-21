@@ -6,10 +6,15 @@
   · 全部 IO 走 127.0.0.1，不对外暴露（交接包 §2.13 的反面教材就是绑 0.0.0.0）。
 """
 import json
+import random
 import time
 import urllib.request
 
 from dsh_ws import RawWebSocket
+
+# 真人打字节奏（秒/字）：每个字符重新取一次随机值，而不是固定节拍。
+TYPING_DELAY_RANGE = (0.1, 0.9)
+TYPING_PAUSE_CHARS = "，。！？；,.!?;"
 
 
 class CDPError(Exception):
@@ -104,8 +109,8 @@ class CDP:
     def insert_text(self, text):
         self.call("Input.insertText", {"text": text}, timeout=10)
 
-    def type_text(self, text, per_char_delay=0.06):
-        """用真实按键事件逐字输入。
+    def type_text(self, text, per_char_delay=None, delay_range=None):
+        """用真实按键事件逐字输入，默认按真人节奏（0.1-0.9 秒/字）。
 
         为什么要多这一个方法（2026-09-19 真机观察）：
           面板正常打开、dm_composer 读到的 text 已是「你好」、发送按钮也点到了，
@@ -114,14 +119,31 @@ class CDP:
               的内部状态可能没更新，于是"点发送"时被判为空内容而无动作。
         Input.dispatchKeyEvent(type=char) 会产生 beforeinput/input 事件，
         更接近真人输入，React 能收到。
+
+        节奏：每个字符之间【重新取一次】0.1-0.9 秒的随机停顿，标点后再多停一点。
+        固定节拍（例如每字 60ms）本身就是机器人特征，所以默认不再使用固定值；
+        显式传 per_char_delay 时退化为固定节拍（离线回归与兼容旧调用用）。
         """
+        lo, hi = delay_range or TYPING_DELAY_RANGE
         for ch in text:
             self.call("Input.dispatchKeyEvent",
                       {"type": "char", "text": ch, "unmodifiedText": ch, "key": ch}, timeout=10)
-            time.sleep(per_char_delay)
+            if per_char_delay is None:
+                pause = random.uniform(lo, hi)
+                if ch in TYPING_PAUSE_CHARS:
+                    pause = min(hi, pause + random.uniform(0.0, 0.3))
+            else:
+                pause = float(per_char_delay)
+            time.sleep(pause)
 
-    def press_key(self, key, code=None, key_code=None):
-        base = {"key": key, "code": code or key, "windowsVirtualKeyCode": key_code or 0, "nativeVirtualKeyCode": key_code or 0}
+    def press_key(self, key, code=None, key_code=None, modifiers=0):
+        """真实按键。modifiers 用 CDP 位掩码：1=Alt 2=Ctrl 4=Meta 8=Shift。
+
+        为什么需要修饰键（真机 2026-09-20）：清空公屏输入框里残留的 @提及/草稿
+        要用 Ctrl+A 全选再删 —— 没有修饰键就只能一个字一个字退格，既慢又容易漏。
+        """
+        base = {"key": key, "code": code or key, "windowsVirtualKeyCode": key_code or 0,
+                "nativeVirtualKeyCode": key_code or 0, "modifiers": int(modifiers or 0)}
         self.call("Input.dispatchKeyEvent", dict(base, type="keyDown"), timeout=10)
         self.call("Input.dispatchKeyEvent", dict(base, type="keyUp"), timeout=10)
 

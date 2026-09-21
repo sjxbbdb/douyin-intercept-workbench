@@ -21,10 +21,12 @@ import comment_flow
 import crawl as crawlmod
 import douyin
 import douyin_selectors as S
+import click_guard
 import live
 import live_flow
 import winfocus
-from send_actions import send_comment, send_private
+from send_actions import (send_comment, send_danmaku_reply,
+                            send_danmaku_reply_native, send_private)
 from send_gate import SendGate
 from url_policy import URLPolicyError, redact_url, safe_url
 
@@ -167,6 +169,44 @@ def _dedupe_by_author(rows):
     return [best[k] for k in order], dropped
 
 
+# 两阶段契约（评论区固定流程）：公屏回复确认成功之前，不允许进入私信阶段。
+PUBLIC_CONFIRMED = "sent_confirmed"
+PUBLIC_REPLY_KINDS = ("comment", "danmaku_reply")
+
+
+def _public_guard(gate, public_send_id):
+    """只有「公屏回复确认成功」才允许私信；返回 None 表示放行。
+
+    为什么看原始状态：send_gate 的对外 result() 会把 sent_confirmed 映射成 unknown
+    （避免过度宣称），但两阶段契约必须按【落库的原始状态】判断，否则永远进不了私信。
+
+    稳定拒绝原因（宿主可直接据此决定重试或放弃）：
+      public_missing    宿主没给 publicSendId（批量清单里属于必修项）
+      public_not_found  这个 sendId 在本地台账里不存在
+      public_not_a_reply 这个 sendId 不是公屏回复（比如私信记录）
+      public_pending    公屏回复尚未有结论（reserved / started）
+      public_unknown    公屏结果未知（红线：未知不得自动重试，更不得转私信）
+      public_failed     公屏发送失败
+      public_blocked    公屏被平台/校验拦下
+    """
+    send_id = str(public_send_id or "").strip()
+    if not send_id:
+        return None
+    row = gate.lookup(send_id)
+    if row is None:
+        return ("public_not_found", "the public reply sendId is unknown; private is refused")
+    if str(row.get("kind") or "") not in PUBLIC_REPLY_KINDS:
+        return ("public_not_a_reply", "that sendId is not a public reply")
+    status = str(row.get("status") or "")
+    if status in ("reserved", "started"):
+        status = "pending"
+    if status != PUBLIC_CONFIRMED:
+        return ("public_" + status,
+                "public reply is %s; only %s allows a private message"
+                % (status, PUBLIC_CONFIRMED))
+    return None
+
+
 def _live_batch_items(params):
     """Validate the per-item send plan of one live batch phase.
 
@@ -187,7 +227,10 @@ def _live_batch_items(params):
         send_id = str(raw.get("sendId") or "").strip()
         if not event_id or not send_id:
             raise SidecarError("invalid_input", "each item needs eventId and sendId")
-        out.append({"eventId": event_id, "sendId": send_id, "text": raw.get("text")})
+        # 🔴 审核意见（2026-09-21）：这里原来只保留 eventId/sendId/text，把 publicSendId 静默丢掉了 ——
+        #    于是第二阶段（私信）永远看不到"公屏那次成功"的绑定，绕过门禁的路径就藏在这个归一化里。
+        out.append({"eventId": event_id, "sendId": send_id, "text": raw.get("text"),
+                    "publicSendId": str(raw.get("publicSendId") or "").strip()})
     return batch_id, out
 
 
@@ -239,6 +282,8 @@ class Sidecar:
         self.account_scope = hashlib.sha256(self.profile_dir.encode("utf-8")).hexdigest()[:32]
         self.gate = SendGate(self.state_dir, self.account_scope)
         self.comment_queue = comment_flow.CommentQueue(self.state_dir, self.account_scope)
+        # 点击审计：每次（含被拒绝的）点击都写一行，便于事后复核落点
+        click_guard.set_audit_path(os.path.join(self.state_dir, "click_audit.jsonl"))
         self.live_queue = live_flow.LiveQueue(self.state_dir, self.account_scope)
         self.marker_path = os.path.join(self.state_dir, "browser-owner.json")
 
@@ -296,6 +341,7 @@ class Sidecar:
             "methods": ["capabilities", "launch", "doctor", "open", "search",
                          "collect_comments", "collect_live", "send_private", "send_comment",
                          "comment_enqueue", "comment_plan", "comment_reply",
+                         "comment_private_candidates",
                          "live_listen", "live_plan", "live_reply", "live_private", "live_result",
                          "close"],
             "sendStatuses": ["unknown", "failed", "blocked"],
@@ -308,9 +354,15 @@ class Sidecar:
                 "comment_filter": {"implemented": True, "autoEligible": True,
                                     "validation": {"status": "offline_fixture",
                                                    "delivery": "filter_only"}},
-                "private_reply": {"implemented": True, "autoEligible": True,
+                # 🔴 审核意见（2026-09-21）：私信的真实送达仍是【未知】——
+                #    IM 走长连接，页面侧只能拿到会话回声（conversationEcho），拿不到平台响应。
+                #    按 AGENTS.md 红线 6「未验证能力必须 fail-closed」，这里必须 autoEligible=false，
+                #    不能因为"协作者账号上跑通过一次"就允许自动发送。
+                "private_reply": {"implemented": True, "autoEligible": False,
                                    "validation": {"status": "pr1_real_account_flow", "scope": "collaborator_account",
-                                                   "delivery": "unknown_without_bound_platform_response"}},
+                                                   "delivery": "unknown_without_bound_platform_response",
+                                                   "evidenceLevel": "conversation_echo_only",
+                                                   "releaseCondition": "platform_response_or_explicit_server_policy"}},
                 "video_reply": {"implemented": True, "autoEligible": False,
                                  "validation": {"status": "real_device_selectors_2026-09-20",
                                                 "delivery": "platform_response_when_captured_else_unknown"}},
@@ -333,6 +385,59 @@ class Sidecar:
                                                "delivery": "queued_batch_two_phase",
                                                "scripts": "host_provided_only",
                                                "window": "expired_events_are_not_replayed"}},
+                # 回复弹幕（公屏 @该观众）。真机结论 2026-09-20：网页端没有「点弹幕回复」的
+                # 原生入口，落地形式是公屏 @昵称；发送键经实测是【回车】。
+                # 已有房间消息流回声作证据，但没有平台响应 -> delivery 仍不是 confirmed。
+                "live_danmaku_reply": {"implemented": True, "autoEligible": False,
+                                        "validation": {"status": "offline_unit_tests+real_run_2026_09_20",
+                                                       "delivery": "room_echo_only_platform_response_unavailable",
+                                                       "mention": "text_must_start_with_at_nickname",
+                                                       "target": "danmaku_must_be_visible_and_unique",
+                                                       "sendMechanism": "enter_verified_2026_09_20",
+                                                       "realRuns": "9 sends, roomEcho true each time"}},
+                # 私信（两阶段里的第二阶段）。真机 2026-09-20 首次跑通一条：
+                # 收件人校验用会话头部标题，发送键回车，发送后会话里出现该条。
+                # 仍然 autoEligible=false：没有平台响应，且"面板能否打开"是平台侧差异。
+                "live_private_reply": {"implemented": True, "autoEligible": False,
+                                        "validation": {"status": "offline_unit_tests+real_run_2026_09_20",
+                                                       "delivery": "conversation_echo_only_platform_response_unavailable",
+                                                       "recipientVerification": "live_panel_header",
+                                                       "sendMechanism": "enter_verified_2026_09_20",
+                                                       "panelMayNotOpen": "platform_side_difference"}},
+                # 评论区固定流程：关键词匹配评论 -> 公开回复 -> 只有 sent_confirmed 才允许私信。
+                # 拒绝原因是稳定枚举（见模块级 _public_guard），宿主可直接据此决策。
+                "comment_flow": {"implemented": True, "autoEligible": False,
+                                  "validation": {"status": "offline_unit_tests",
+                                                 "delivery": "unknown",
+                                                 "privateGate": "sent_confirmed_only",
+                                                 "rejectReasons": ["public_missing",
+                                                                   "public_not_found",
+                                                                   "public_not_a_reply",
+                                                                   "public_pending",
+                                                                   "public_unknown",
+                                                                   "public_failed",
+                                                                   "public_blocked",
+                                                                   "missing_author_id"]}},
+                # 批量私信候选清单（只读，不碰浏览器）：替宿主守住"公屏确认成功才允许私信"这条契约。
+                # 它不是发送动作，所以不参与 autoEligible 发送闸门；但仍然标 autoEligible=false，
+                # 避免任何调用方把它误当成"可以自动发私信"的开关。
+                "comment_private_candidates": {"implemented": True, "autoEligible": False,
+                                                "validation": {"status": "offline_unit_tests",
+                                                               "delivery": "gate_only",
+                                                               "privateGate": "sent_confirmed_only",
+                                                               "rejectReasons": ["public_missing",
+                                                                                 "public_not_found",
+                                                                                 "public_not_a_reply",
+                                                                                 "public_pending",
+                                                                                 "public_unknown",
+                                                                                 "public_failed",
+                                                                                 "public_blocked",
+                                                                                 "missing_author_id"]}},
+                # 采集数据源：优先读页面内存里的弹幕数据模型（带 sec_uid），DOM 文本兜底。
+                "live_capture_source": {"implemented": True, "autoEligible": False,
+                                         "validation": {"status": "page_memory_verified_2026_09_19",
+                                                        "identity": "page_memory_100_percent_dom_0_percent",
+                                                        "fallback": "dom_text_nickname_only"}},
                 # 图 10 的分页能力：search 支持不透明游标续页。
                 # 只读/只翻页，不涉及发送，因此不参与发送闸门。
                 "video_search_paging": {"implemented": True, "autoEligible": True,
@@ -482,8 +587,11 @@ class Sidecar:
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
-                return {"status": "login_required", "videos": [], "cursor": cursor_in,
-                        "hasMore": False, "page": page_no, "poolSize": len(seen)}
+                # 登录失效同样是【终止状态】：不给游标、不给可翻页信号，
+                # 否则上层会自动接着请求，等于对着一个已失效的登录态继续打平台。
+                return {"status": "login_required", "videos": [], "cursor": None,
+                        "hasMore": False, "stoppedReason": "login_required",
+                        "page": page_no, "poolSize": len(seen)}
             # 只有【第一页】或【已经不在搜索页上】才重新导航；
             # 否则保持页面原状、继续往下滚 —— 这才是"读取下一页"。
             first_page = cursor_in in (None, "")
@@ -513,20 +621,47 @@ class Sidecar:
                             "author": str(video.get("author") or "")[:120],
                             "authorId": str(video.get("author_sec_uid") or "")[:200],
                             "relevance": relevance})
-            pool = set(seen) | {v["id"] for v in out if v["id"]}
+            # 🔴 池子记【本次采集到的全部】视频，不只是通过相关度筛选的那部分：
+            #    被 minRelevance 筛掉的同样"已经见过"，不记进池子的话，
+            #    下一页会把它当新视频重新采集 —— 宿主就会重复处理同一批视频。
+            pool = set(seen) | {str(v.get("aweme_id") or "") for v in videos
+                                if v.get("aweme_id")}
+            page_filter = {"collected": len(videos), "returned": len(out),
+                           "filteredByRelevance": filtered,
+                           "minRelevance": min_relevance}
+            if meta.get("stopped_reason") == "captcha":
+                # 🔴 验证码是【终止状态】，不是"这一页到头了"。
+                #    继续返回 cursor / hasMore=true，上层就会自动接着翻页 ——
+                #    等于在没有人处理验证码的情况下继续打平台。
+                #    所以这里明确收敛：cursor=null、hasMore=false，并给出 stoppedReason。
+                #    已经采到的候选照常返回（熔断也不丢数据）。
+                #    poolIds 是【数据】不是翻页指令：宿主拿它做自己的去重账，
+                #    因为验证码之后游标不再返回，池子只能由宿主自己保存。
+                return {"status": "captcha",
+                        "videos": out,
+                        "cursor": None,
+                        "hasMore": False,
+                        "stoppedReason": "captcha",
+                        "page": page_no,
+                        "poolSize": len(pool),
+                        "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
+                        "skippedSeen": int(meta.get("skipped_seen") or 0),
+                        "platformHasMore": meta.get("platform_has_more"),
+                        "platformCursor": meta.get("platform_cursor"),
+                        "filter": page_filter}
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
-            return {"status": "captcha" if meta.get("stopped_reason") == "captcha" else "ok",
+            return {"status": "ok",
                     "videos": out,
                     "cursor": _encode_cursor(keyword, pool, page_no + 1),
                     "hasMore": bool(out),
+                    "stoppedReason": None,
                     "page": page_no,
                     "poolSize": len(pool),
+                    "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
                     "skippedSeen": int(meta.get("skipped_seen") or 0),
                     "platformHasMore": meta.get("platform_has_more"),
                     "platformCursor": meta.get("platform_cursor"),
-                    "filter": {"collected": len(videos), "returned": len(out),
-                               "filteredByRelevance": filtered,
-                               "minRelevance": min_relevance}}
+                    "filter": page_filter}
         finally:
             page.close()
 
@@ -646,14 +781,57 @@ class Sidecar:
             page.close()
 
     def send_private(self, params):
+        """私信。可选 publicSendId：给出时必须已确认成功，否则在打开浏览器之前就拒绝。"""
         send_id = str(params.get("sendId") or "")
         target = params.get("target")
         text = params.get("text")
+        # 🔴 两阶段契约在【打开浏览器之前】判定（fail-closed）：
+        #    不该发的连页面都不开，既省一次风控暴露，也不会留下"点了一半"的现场。
+        refusal = _public_guard(self.gate, params.get("publicSendId"))
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         page, _ = self._page()
         try:
             return send_private(page, self.gate, send_id, target, text)
         finally:
             page.close()
+
+    def comment_private_candidates(self, params):
+        """把一个批次按「公屏是否确认成功」分成 allowed / rejected（只读，不碰浏览器）。
+
+        架构依据：评论区固定流程 —— 关键词匹配评论 -> 公开回复 -> **只有 sent_confirmed
+        才允许私信**；unknown / failed / blocked 一律禁止进入私信。
+        每条拒绝都给稳定的原因，宿主据它决定重试、人工处理还是放弃。
+
+        items[i] 需要 {eventId, authorId, authorName, publicSendId}；缺 publicSendId 的按
+        public_missing 拒绝 —— 批量清单的存在意义就是替宿主守住这条流程契约。
+        （单发 send_private 仍可不带 publicSendId：那是宿主自己已经确认过时的低层入口。）
+        """
+        items = params.get("items")
+        if not isinstance(items, list) or not items:
+            raise SidecarError("invalid_input", "items must be a non-empty list")
+        allowed, rejected = [], []
+        for item in items:
+            if not isinstance(item, dict):
+                raise SidecarError("invalid_input", "each item must be an object")
+            event_id = str(item.get("eventId") or "").strip()
+            author_id = str(item.get("authorId") or "").strip()
+            public_send_id = str(item.get("publicSendId") or "").strip()
+            if not public_send_id:
+                rejected.append({"eventId": event_id, "reason": "public_missing"})
+                continue
+            refusal = _public_guard(self.gate, public_send_id)
+            if refusal:
+                rejected.append({"eventId": event_id, "reason": refusal[0]})
+                continue
+            if not author_id:
+                rejected.append({"eventId": event_id, "reason": "missing_author_id"})
+                continue
+            allowed.append({"eventId": event_id, "authorId": author_id,
+                            "authorName": str(item.get("authorName") or "")[:120],
+                            "publicSendId": public_send_id})
+        return {"status": "ok", "allowed": allowed, "rejected": rejected,
+                "policy": {"allowPublicStates": [PUBLIC_CONFIRMED]}}
 
     def send_comment(self, params):
         send_id = str(params.get("sendId") or "")
@@ -828,8 +1006,18 @@ class Sidecar:
             rows = live.collect_events(page, max_items=max_items)
             events = [_event("live", final_url, row) for row in rows]
             queue = self.live_queue.append(events)
+            sources = {}
+            for row in rows:
+                key = str(row.get("source") or "unknown")
+                sources[key] = sources.get(key, 0) + 1
+            identified = len([row for row in rows if str(row.get("authorId") or "").strip()])
             return {"status": "ok", "events": events, "queue": queue,
-                    "capability": {"verified": bool(events), "source": "visible_dom",
+                    "capability": {"verified": bool(events),
+                                   # 首选页面内存（带 sec_uid），不可用时才回落到 DOM 文本。
+                                   "source": ("page_memory" if sources.get("page_memory")
+                                              else "visible_dom"),
+                                   "sources": sources,
+                                   "identityCoverage": "%d/%d" % (identified, len(rows)),
                                    "detail": "queue dedupes by room/author/text; the batch window is enforced at planning"}}
         finally:
             page.close()
@@ -855,6 +1043,15 @@ class Sidecar:
             # 在这个接线完成之前，边界一律拒绝调用方自带策略，改用内置的保守默认值。
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
+        reply_via = str(params.get("replyVia") or "native")
+        if reply_via not in live_flow.REPLY_VIAS:
+            raise SidecarError("invalid_input",
+                               "replyVia must be one of %s" % ", ".join(live_flow.REPLY_VIAS))
+        reply_mode = str(params.get("replyMode") or "composer")
+        if reply_mode not in live_flow.REPLY_MODES:
+            # composer = 公屏普通评论；danmaku = 公屏 @该观众 的评论（回复弹幕）
+            raise SidecarError("invalid_input",
+                               "replyMode must be one of %s" % ", ".join(live_flow.REPLY_MODES))
         spec = live_flow.normalize_filter(params.get("keywords"),
                                           params.get("excludeKeywords"),
                                           params.get("matchMode") or "seg")
@@ -869,10 +1066,12 @@ class Sidecar:
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
                     "expired": batch["expired"], "filter": batch["filter"]}
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
-                                           params.get("policy"))
+                                           params.get("policy"), reply_mode=reply_mode,
+                                           reply_via=reply_via)
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
+                "replyMode": plan.get("replyMode"), "replyVia": plan.get("replyVia"),
                 "policy": plan["policy"], "policySource": plan.get("policySource")}
 
     def live_reply(self, params):
@@ -887,6 +1086,14 @@ class Sidecar:
         plan = self.live_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        mode = str(plan.get("replyMode") or "composer")
+        reply_via = str(plan.get("replyVia") or "native")
+        requested = params.get("mode")
+        if requested is not None and str(requested) != mode:
+            # 落地方式在冻结计划时定稿。中途改口会让同一批次里出现两种触达方式，
+            # 去重与审计都无法解释，所以这里一律拒绝。
+            raise SidecarError("mode_mismatch",
+                               "the frozen plan replies as %s, not %s" % (mode, requested))
         results, sendable = [], []
         for item in items:
             target = self.live_queue.target(batch_id, item["eventId"])
@@ -909,15 +1116,36 @@ class Sidecar:
                     comment_target = {"id": target["eventId"], "roomId": target["roomId"],
                                       "authorId": target["authorId"],
                                       "authorName": target["authorName"], "text": target["text"]}
-                    outcome = send_comment(page, self.gate, item["sendId"], comment_target, text, "live")
-                    self.live_queue.mark(item["eventId"], str(outcome.get("status") or "unknown"),
-                                         batch_id, {"sendId": item["sendId"],
-                                                    "reason": outcome.get("reason")})
-                    results.append(dict(outcome, eventId=item["eventId"]))
+                    if mode == "danmaku" and reply_via == "native":
+                        # 原生「回复 TA」：点弹幕 -> 菜单 -> 回复 TA -> 平台插入 @昵称 -> 打字 -> 回车
+                        outcome = send_danmaku_reply_native(page, self.gate, item["sendId"],
+                                                            comment_target, text)
+                    elif mode == "danmaku":
+                        # 回落：公屏发一条 @该弹幕作者 的纯文本消息
+                        outcome = send_danmaku_reply(page, self.gate, item["sendId"],
+                                                     comment_target, text)
+                    else:
+                        outcome = send_comment(page, self.gate, item["sendId"], comment_target,
+                                               text, "live")
+                    status = str(outcome.get("status") or "unknown")
+                    evidence = outcome.get("evidence") or {}
+                    if mode == "danmaku" and evidence.get("roomEcho"):
+                        # 房间消息流里出现了自己刚发的那条：本通道目前能拿到的最强证据（真机实测）。
+                        # 它仍然不是平台响应，所以单独记一个状态，绝不冒充 sent_confirmed ——
+                        # 默认策略 allowPublicStates 只放行 sent_confirmed，因此不会自动私信，
+                        # 要不要按 sent_echoed 继续由平台侧的 policy 决定。
+                        status = live_flow.SENT_ECHOED
+                    self.live_queue.mark(item["eventId"], status, batch_id,
+                                         {"sendId": item["sendId"],
+                                          "reason": outcome.get("reason"),
+                                          "mechanism": evidence.get("mechanism"),
+                                          "roomEcho": evidence.get("roomEcho")})
+                    results.append(dict(outcome, eventId=item["eventId"], recordedState=status))
             finally:
                 page.close()
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         return {"status": "ok" if sendable else "blocked", "phase": "public", "results": results,
+                "replyMode": mode,
                 "privateCandidates": [{"eventId": t["eventId"], "authorId": t["authorId"],
                                        "authorName": t["authorName"]} for t in allowed],
                 "privateRejected": rejected,
@@ -936,10 +1164,41 @@ class Sidecar:
         by_id = {item["eventId"]: item for item in allowed}
         results, sendable = [], []
         for item in items:
+            # 🔴 审核意见（2026-09-21）：直播私信必须【逐项绑定】那一次已确认成功的公屏回复。
+            #    只靠批次候选清单（按事件状态放行）会留下一条绕过路径：
+            #    调用方可以不带 publicSendId 直接要私信，公屏成功门禁就形同虚设。
+            #    三道检查，任一不过就地 blocked，绝不打开浏览器：
+            #      ① public_missing      没给 publicSendId
+            #      ② public_*            台账里该 sendId 不是"已确认成功的公屏回复"（复用 _public_guard）
+            #      ③ public_send_mismatch 给的 sendId 不是这个事件自己那次公屏回复
+            public_send_id = str(item.get("publicSendId") or "").strip()
+            if not public_send_id:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": "public_missing"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "public_missing"})
+                continue
+            refusal = _public_guard(self.gate, public_send_id)
+            if refusal:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": refusal[0]})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": refusal[0]})
+                continue
+            event = self.live_queue.find_event(item["eventId"]) or {}
+            recorded = str((event.get("detail") or {}).get("sendId") or "")
+            if recorded and recorded != public_send_id:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": "public_send_mismatch"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "public_send_mismatch"})
+                continue
             target = by_id.get(item["eventId"])
             if target is None:
                 reason = next((r["reason"] for r in rejected
                                if r["eventId"] == item["eventId"]), "not_a_private_candidate")
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": reason})
                 results.append({"eventId": item["eventId"], "status": "blocked", "reason": reason})
                 continue
             text = item.get("text") or target["privateText"]
@@ -950,6 +1209,7 @@ class Sidecar:
                                 "reason": "script_mismatch"})
                 continue
             sendable.append((item, target, text))
+        skipped = []
         if sendable:
             page, _ = self._page()
             try:
@@ -962,9 +1222,15 @@ class Sidecar:
                                                  {"sendId": item["sendId"],
                                                   "reason": outcome.get("reason")})
                     results.append(dict(outcome, eventId=item["eventId"]))
+                    # 「跳过」= 对方不可私信（未互关 / 私密账号 / 面板打不开），
+                    # 我们一条消息都没发出去。单独列出来，别让宿主把它统计成"发送失败"。
+                    if (outcome.get("evidence") or {}).get("skipped"):
+                        skipped.append({"eventId": item["eventId"],
+                                        "reason": outcome.get("reason")})
             finally:
                 page.close()
         return {"status": "ok" if sendable else "blocked", "phase": "private", "results": results,
+                "skipped": skipped,
                 "checkpoint": self.live_queue.result(batch_id)["checkpoint"]}
 
     def live_result(self, params):
@@ -981,6 +1247,7 @@ class Sidecar:
         allowed = {"capabilities", "launch", "doctor", "open", "search",
                    "collect_comments", "collect_live", "send_private", "send_comment",
                    "comment_enqueue", "comment_plan", "comment_reply",
+                   "comment_private_candidates",
                    "live_listen", "live_plan", "live_reply", "live_private", "live_result",
                    "close"}
         if method not in allowed:

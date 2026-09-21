@@ -1,0 +1,71 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<title>直播间截流 · 真机证据看板</title>
+<style>
+ body{background:#0d1117;color:#e6edf3;font:13px/1.55 "Segoe UI","Microsoft YaHei",monospace;margin:0;padding:22px 26px}
+ h1{font-size:20px;margin:0 0 4px;color:#58a6ff}
+ h2{font-size:15px;margin:22px 0 8px;color:#7ee787;border-bottom:1px solid #30363d;padding-bottom:5px}
+ table{border-collapse:collapse;width:100%;margin:6px 0 4px}
+ th,td{border:1px solid #30363d;padding:4px 7px;text-align:left;font-size:12px}
+ th{background:#161b22;color:#8b949e}
+ td.ok{color:#7ee787} td.no{color:#ff7b72} td.skip{color:#d29922}
+ .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:9px 11px}
+ .k{color:#8b949e} .v{color:#e6edf3} .small{color:#8b949e;font-size:11px}
+ pre{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:9px 11px;white-space:pre-wrap;font-size:12px;color:#c9d1d9}
+ .step{color:#79c0ff}
+</style></head><body>
+<h1>抖音直播间截流 · 真机证据看板</h1>
+<div class="small">生成时间 2026-09-21 10:23:52 ｜ 目标昵称/正文均已脱敏 ｜ 本页由程序从真实运行产物生成，不是示意图</div>
+
+<h2>1. 当前环境</h2>
+<div class="grid">
+  <div class="card"><div class="k">浏览器</div><div class="v">Chrome/153.0.8010.50</div><div class="small">Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36</div></div>
+  <div class="card"><div class="k">接入方式</div><div class="v">CDP（--remote-debugging-port=9222）</div><div class="small">协议 1.3 ｜ 调试页面数 1</div></div>
+  <div class="card"><div class="k">运行形态</div><div class="v">Windows + Python 3.13 sidecar（纯标准库）</div><div class="small">专用调试 profile，商家手动登录</div></div>
+</div>
+
+<h2>2. 原子链路（每一步的真实落点，全部 fail-closed）</h2>
+<pre><span class="step">① 监听</span>     live.collect_feed（页面内存，带 sec_uid）→ 兜底 collect_dom
+<span class="step">② 匹配</span>     live.match_danmaku（复用评论链路同一套匹配器：seg/phrase/all/any + 排除词）
+<span class="step">③ 去重成批</span> live_flow.LiveQueue（指纹去重 + 批次窗口 + 容量上限）
+<span class="step">④ 话术</span>     freeze_plan（平台侧下发；缺任一通道即 blocked，本模块不代写话术）
+<span class="step">⑤ 公屏回复</span> send_danmaku_reply_native：点弹幕正文 → 菜单「回复 TA」→ 平台插入 @提及
+             → 校验提及对象 → 真实按键输入正文 → 校验输入 → 回车 → roomEcho 取证
+<span class="step">⑥ 才进私信</span> 默认策略只放行 sent_confirmed；unknown / sent_echoed 不自动升级
+<span class="step">⑦ 私信话术</span> plan.privateText（同样由平台侧下发）
+<span class="step">⑧ 私信</span>     send_private：主页 →「私信」入口（3 轮重取坐标）→ 面板头部校验收件人
+             → 真实按键输入 → 回车 → conversationEcho 取证；对方不可私信则【跳过】
+<span class="step">⑨ 检查点</span>   live_flow 批次状态 + send_gate 台账（每个动作一个幂等键）</pre>
+
+<h2>3. 点击审计（每次尝试一行；被守卫拒绝的也记录）</h2>
+<div class="small">来源 v2-20260921-100548/click_audit.jsonl ｜ 共 6 条尝试，被拒绝 0 条</div>
+<table><tr><th>动作</th><th>x</th><th>y</th><th>结果</th><th>命中元素</th></tr><tr><td>open_reply_menu</td><td>1536</td><td>807</td><td class='ok'>已点击</td><td>webcast-chatroom___content-with-em</td></tr>
+<tr><td>choose_reply_menu_item</td><td>1537</td><td>870</td><td class='ok'>已点击</td><td>W7b1OYaI semi-dropdown-item</td></tr>
+<tr><td>composer_focus</td><td>1526</td><td>892</td><td class='ok'>已点击</td><td>ace-line</td></tr>
+<tr><td>open_reply_menu</td><td>1533</td><td>445</td><td class='ok'>已点击</td><td>webcast-chatroom___content-with-em</td></tr>
+<tr><td>choose_reply_menu_item</td><td>1534</td><td>496</td><td class='ok'>已点击</td><td>W7b1OYaI semi-dropdown-item</td></tr>
+<tr><td>composer_focus</td><td>1526</td><td>892</td><td class='ok'>已点击</td><td>ace-line</td></tr></table>
+
+<h2>4. 发送台账（幂等键 + 证据分级）</h2>
+<table><tr><th>sendId</th><th>类型</th><th>状态</th><th>原因</th><th>提及</th><th>房间回声</th><th>会话回声</th></tr><tr><td>v2-1789956348-r1</td><td>danmaku_reply</td><td class='ok'>unknown</td><td>platform_response_unavailable</td><td>True</td><td>True</td><td>None</td></tr>
+<tr><td>v2-1789956348-r2</td><td>danmaku_reply</td><td class='ok'>unknown</td><td>platform_response_unavailable</td><td>True</td><td>True</td><td>None</td></tr>
+<tr><td>v2-1789956348-dm0</td><td>private</td><td class='ok'>unknown</td><td>platform_response_unavailable</td><td>None</td><td>None</td><td>True</td></tr>
+<tr><td>v2-1789956348-dm1</td><td>private</td><td class='skip'>blocked</td><td>dm_panel_unavailable</td><td>None</td><td>None</td><td>None</td></tr></table>
+
+<h2>5. 离线回归</h2>
+<pre>~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: headless Chrome did not expose CDP
+----------------------------------------------------------------------
+Ran 127 tests in 192.071s
+FAILED (failures=12, errors=1)</pre>
+
+<h2>6. 本轮真机解决的问题</h2>
+<pre>· 广场式房间地址：房间号在 ?live_web_rid= 里 → 按房间号归一（原报 target.roomId path is required / URLPolicyError）
+· 隐藏浮层假阳性：Semi 浮层隐藏时位于 (-9947,-9941) 却仍有尺寸 → 菜单判定必须"在视口内且命中自己"
+· 平台确认框「单次只支持艾特一个人」是全屏遮罩 → 回复前清空输入框残留 + 插入提及后"边等边看"
+· 虚拟列表：页面内存 200 条、DOM 只渲染十几行 → 候选只取"此刻渲染在列表内"的可见行
+· 长弹幕被平台截断 → 定位改为"完全相同或前缀匹配（≥6 字）"
+· 观众身份不一定可见（占位 uid=111111）→ 错误页如实报 profile_not_found；身份不可见不私信
+· 私密账号 / 不接受陌生人私信 → 跳过（blocked + skipped），换下一个目标，不记成失败
+· 输入必须真实按键（逐字 char 事件，0.1~0.9 秒/字），不能用 insertText</pre>
+</body></html>
