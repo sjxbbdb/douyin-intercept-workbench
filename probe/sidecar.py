@@ -874,6 +874,26 @@ class Sidecar:
                 item["matchedKeyword"] = str(row.get("matched_keyword") or "")
                 item["digg"] = int(row.get("digg") or 0)
                 targets.append(item)
+            # 只读探测，不滚动不点击：给每个目标标出【此刻能不能回】。
+            #
+            # 🔴 口径必须与发送阶段一致（2026-09-21 评审）：这里用的是与
+            #    douyin.comment_reply_button 同一份判定（共用 replyButtonIn + 同一套 reason），
+            #    所以 visible=true 蕴含"发送阶段能直接点到回复按钮"，
+            #    不会出现"标注说能回、点下去却必被拒"的不一致。
+            #    探测本身失败记为 None —— 不能把"没探到"当成"不可见"，那是两件事。
+            for item in targets:
+                try:
+                    state = douyin.comment_row_present(page, item)
+                    item["rowPresent"] = bool(state.get("present"))
+                    item["rowMatches"] = int(state.get("matches") or 0)
+                    # visible 是【强语义】：唯一命中 + 回复按钮存在可见且在视口内
+                    item["visible"] = bool(state.get("replyReady"))
+                    item["visibilityReason"] = str(state.get("reason") or "")
+                except Exception:
+                    item["visible"] = None
+                    item["rowPresent"] = None
+                    item["visibilityReason"] = None
+            visible_count = sum(1 for it in targets if it.get("visible"))
             filtered = {
                 "collected": len(rows),
                 "matched": int(fstats.get("matched") or 0),
@@ -886,6 +906,12 @@ class Sidecar:
                 "keywords": list(fstats.get("keywords") or []),
                 "excludeKeywords": list(fstats.get("exclude_keywords") or []),
                 "modeCounts": dict(fstats.get("modes") or {}),
+                # 🔴 可见性是回复能否成功的前提（真机 2026-09-21）：
+                #    采集走接口能拿 100~200 条，回复走 DOM 只渲染几十条，两个集合不重合。
+                #    这里如实告诉宿主哪些目标【此刻在页面上】，让它只挑可见的；
+                #    否则宿主会选到一个够不到的目标，反复重试后才发现是白费。
+                "visibleCount": visible_count,
+                "invisibleCount": len(targets) - visible_count,
             }
             return {"status": status, "events": events, "targets": targets, "filter": filtered,
                     "capability": {"verified": bool(events), "source": "api_or_dom",
