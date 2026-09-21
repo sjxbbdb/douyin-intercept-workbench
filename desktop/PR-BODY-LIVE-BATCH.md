@@ -66,6 +66,26 @@ npm test
    统一台账与平台检查点都出现在结果里；
 2. 公屏确认成功后私信逐项绑定 `publicSendId`；被跳过的那条单独进 `skipped` 与计数。
 
+
+## 附：为什么 Agent 聊天还起不了直播批次（以及怎么打开）
+
+桌面端契约已经就位，但 `main.js -> runAgentChat` 只允许启动**授权中心 catalog 里 status=active**
+的流程，catalog 来自服务端 `workflow_definitions` 表 —— 该表**只有 admin API 能写入**
+（`server/src/workflow-routes.ts`: `POST /v1/admin/workflows`），代码里没有播种。
+
+本 PR 附带一个幂等的注册脚本（契约直接取自 `desktop/src/lib/workflow-contracts.js`，避免两边漂移）：
+
+```
+node scripts/register-live-batch-workflow.mjs --dry-run            # 只打印 payload
+node scripts/register-live-batch-workflow.mjs --endpoint https://api.example.com \
+     --username admin --password '***'                             # 登录换 token 并注册
+node scripts/register-live-batch-workflow.mjs --endpoint ... --token '***'
+```
+
+* 幂等：已注册同 `workflowId+version` 就跳过，不覆盖；
+* 服务端已经支持把 `live.*` 映射到 `liveInteraction` 功能开关
+  （`workflow-routes.ts` 的 `ensureWorkflowFeature`），所以注册后还要给账号开这个开关。
+
 ## 仍未接线（下一步）
 
 * **Agent 聊天与任务面板**：还没有入口启动/监视 `live.batch` 运行（当前 UI 驱动的是评论流程）。
