@@ -69,6 +69,8 @@ INTERROGATIVE_PREFIXES = ["怎么", "如何", "怎样", "咋样", "咋", "哪里
                           "有没有", "求", "教我", "请问", "想问", "麻烦"]
 FUNCTION_WORDS = {"的", "了", "吗", "呢", "吧", "啊", "呀", "和", "与", "或", "在", "是",
                   "我", "你", "他", "它", "要", "想", "会", "能", "可以", "这个", "那个", "一下"}
+# 轻动词：中文里「做/搞/弄/赚… + 名词」的组合，中心语是后面那个名词（做副业 -> 副业）。
+LIGHT_VERBS = ("做", "搞", "弄", "干", "赚", "学", "玩", "用", "整", "撸")
 
 _SPLIT_RE = re.compile(r"[\s,，。.!！?？、;；:：/|]+")
 _TOKEN_RE = re.compile(r"[\u4e00-\u9fa5]+|[A-Za-z0-9]+")
@@ -126,6 +128,40 @@ def keyword_segments(keyword):
     return uniq
 
 
+def keyword_core_segments(keyword):
+    """视频关键词的「中心语」（内容词根）：剥掉疑问词与轻动词后剩下的部分。
+
+    为什么需要（2026-09-21 真机）：
+      关键词「怎么做副业」经 keyword_segments 只剩一个分词「做副业」，
+      而抖音标题写的是「副业」——「做副业」整串几乎不会出现在标题里，
+      结果 80 条真实候选里 79 条相关度是 0，"相关度" 这一列等于没有。
+      中文复合词的中心语在后（做+副业 / 学+剪辑），把轻动词剥掉就能对上中心语。
+
+    只剥【开头或结尾的一个】轻动词，且剥完至少留 2 个字；
+    剥不动就返回空（表示这个关键词没有更宽的中心语可退化）。
+    """
+    out = []
+    for seg in keyword_segments(keyword):
+        core = seg
+        for prefix in INTERROGATIVE_PREFIXES:
+            core = core.replace(prefix, "")
+        core = core.strip()
+        for verb in LIGHT_VERBS:
+            if core.startswith(verb) and len(core) - len(verb) >= 2:
+                core = core[len(verb):]
+            elif core.endswith(verb) and len(core) - len(verb) >= 2:
+                core = core[:-len(verb)]
+        core = core.strip()
+        if len(core) >= 2 and core != seg:
+            out.append(core)
+    seen, uniq = set(), []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
 def comment_segments(keyword):
     """评论关键词的「词」。
 
@@ -167,6 +203,7 @@ def video_matches_keyword(video_text, keyword):
 #   1. 用户写的【每个关键词都整串连续】出现在标题里：基础 70，再按首次出现位置加分
 #        （开头 +30 / 前 10 字 +20 / 其它 +10），最高 100；
 #   2. 否则退化为分词命中：全部分词都出现（顺序无关）给 60；
+#   2.5 分词一个都没对上，但关键词的【中心语】全对上（做副业 -> 副业）：给 50；
 #   3. 只命中部分分词：按命中比例给分（40 × 比例，四舍五入，上限 39）；
 #   4. 一个都没命中：0。
 #
@@ -180,6 +217,7 @@ RELEVANCE_EXACT_BONUS_HEAD = 30
 RELEVANCE_EXACT_BONUS_EARLY = 20
 RELEVANCE_EXACT_BONUS_LATE = 10
 RELEVANCE_ALL_SEGMENTS = 60
+RELEVANCE_CORE_SEGMENTS = 50
 RELEVANCE_PARTIAL_BASE = 40
 RELEVANCE_EARLY_CHARS = 10
 
@@ -189,7 +227,8 @@ def video_relevance(video_text, keyword):
 
     返回：
       score            0-100 的整数
-      reason           exact_phrase / all_segments / partial_segments / no_match / empty_keyword
+      reason           exact_phrase / all_segments / core_segments / partial_segments /
+                       no_match / empty_keyword
       matchedSegments  命中的分词
       missingSegments  未命中的分词
       exact            是否整串连续命中
@@ -198,7 +237,8 @@ def video_relevance(video_text, keyword):
     parts = split_keywords(keyword)          # 用户实际写下的每个关键词
     segs = keyword_segments(keyword)         # 分词（中文↔英文边界 + 剥疑问前缀）
     out = {"score": 0, "reason": "no_match", "matchedSegments": [],
-           "missingSegments": list(segs), "exact": False, "position": None,
+           "missingSegments": list(segs), "matchedCores": [], "missingCores": [],
+           "exact": False, "position": None,
            "matchedKeywords": [], "missingKeywords": list(parts)}
     if not normalize_search_text(keyword):
         out["reason"] = "empty_keyword"
@@ -236,15 +276,29 @@ def video_relevance(video_text, keyword):
                     "matchedSegments": seg_hit, "missingSegments": [],
                     "matchedKeywords": hits, "missingKeywords": miss})
         return out
-    if seg_hit:
-        ratio = len(seg_hit) / float(len(segs))
+    # 第 2.5 档：分词没对上，但关键词的【中心语】全对上了（做副业 -> 副业）。
+    # 真机：关键词「怎么做副业」的 80 条候选里 79 条只有「副业」没有「做副业」，
+    # 没有这一档，提问式关键词的相关度就整列是 0。
+    cores = keyword_core_segments(keyword)
+    core_hit = [c for c in cores if c in src]
+    core_miss = [c for c in cores if c not in src]
+    if cores and not core_miss:
+        out.update({"score": RELEVANCE_CORE_SEGMENTS, "reason": "core_segments",
+                    "matchedSegments": seg_hit, "missingSegments": seg_miss,
+                    "matchedCores": core_hit, "missingCores": [],
+                    "matchedKeywords": hits, "missingKeywords": miss})
+        return out
+    if seg_hit or core_hit:
+        ratio = (len(seg_hit) + 0.5 * len(core_hit)) / float(len(segs))
         score = int(round(RELEVANCE_PARTIAL_BASE * ratio))
         out.update({"score": min(score, RELEVANCE_PARTIAL_BASE - 1),
                     "reason": "partial_segments",
                     "matchedSegments": seg_hit, "missingSegments": seg_miss,
+                    "matchedCores": core_hit, "missingCores": core_miss,
                     "matchedKeywords": hits, "missingKeywords": miss})
         return out
-    out.update({"matchedKeywords": hits, "missingKeywords": miss})
+    out.update({"matchedKeywords": hits, "missingKeywords": miss,
+                "matchedCores": core_hit, "missingCores": core_miss})
     return out
 
 

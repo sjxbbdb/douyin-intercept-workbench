@@ -1738,6 +1738,62 @@ class VideoRelevanceTests(unittest.TestCase):
         self.assertEqual(crawl.video_relevance("宝宝辅食", "")["reason"], "empty_keyword")
 
 
+    def test_question_style_keyword_falls_back_to_content_core(self):
+        """真机 2026-09-21：关键词「怎么做副业」搜出 80 条真实候选，79 条相关度 0。
+
+        原因：分词只剩「做副业」，而抖音标题里写的是「副业」。
+        中心语退一档之后这类标题拿到确定的分；完全无关的仍然是 0。
+        """
+        import crawl
+        rel = crawl.video_relevance("今天分享三类无门槛副业！看到就是赚到！", "怎么做副业")
+        self.assertEqual((rel["score"], rel["reason"]), (50, "core_segments"))
+        self.assertEqual(rel["matchedCores"], ["副业"])
+        self.assertEqual(rel["missingSegments"], ["做副业"])
+        self.assertFalse(rel["exact"])
+        none = crawl.video_relevance("完全无关的内容", "怎么做副业")
+        self.assertEqual((none["score"], none["reason"]), (0, "no_match"))
+
+    def test_content_core_is_order_insensitive(self):
+        import crawl
+        tail = crawl.video_relevance("在家搞副业，一个月多赚三千", "副业怎么做")
+        self.assertEqual((tail["score"], tail["reason"]), (50, "core_segments"))
+        learn = crawl.video_relevance("新手剪辑入门第一课", "怎么学剪辑")
+        self.assertEqual((learn["score"], learn["reason"]), (50, "core_segments"))
+        # 中心语也不在标题里 -> 仍然 0
+        self.assertEqual(crawl.video_relevance("视频软件推荐", "怎么学剪辑")["score"], 0)
+
+    def test_core_tier_never_outranks_a_real_segment_hit(self):
+        import crawl
+        core = crawl.video_relevance("今天分享三类无门槛副业", "怎么做副业")
+        allseg = crawl.video_relevance("副业怎么做，顺带说说做副业的方法", "怎么做副业")
+        self.assertEqual((allseg["score"], allseg["reason"]), (60, "all_segments"))
+        self.assertLess(core["score"], allseg["score"])
+
+    def test_plain_keyword_has_no_core_to_fall_back_to(self):
+        import crawl
+        rel = crawl.video_relevance("今天分享三类无门槛副业", "副业")
+        self.assertEqual((rel["score"], rel["reason"]), (90, "exact_phrase"))
+        none = crawl.video_relevance("完全无关的内容", "副业")
+        self.assertEqual((none["score"], none["reason"]), (0, "no_match"))
+
+    def test_real_titles_from_the_field_run(self):
+        """真机回归：下面 6 条是 2026-09-21 用「怎么做副业」真实搜到的标题。"""
+        import crawl
+        titles = [
+            "普通人怎么做副业赚的小钱#知识分享 #副业",
+            "今天分享三类无门槛副业！看到就是赚到！#聚星超媒 #副业",
+            "一天赚两个月工资的副业小方法，手把手教学#副业",
+            "【建议收藏】三个副业，六个软件，做好生活费完全不是问题 #兼职 #副业",
+            "适合普通人的0成本副业，代价就是吃苦熬夜，做好了闷声发大财#干货分享",
+            "利润很吓人的4个副业。#干货分享 #副业",
+        ]
+        scores = [crawl.video_relevance(t, "怎么做副业")["score"] for t in titles]
+        self.assertTrue(all(s > 0 for s in scores), scores)
+        self.assertEqual(crawl.video_relevance(titles[0], "怎么做副业")["reason"], "exact_phrase")
+        unrelated = crawl.video_relevance("我们输在学业上 可未必输在事业上#电商", "怎么做副业")
+        self.assertEqual(unrelated["score"], 0)
+
+
 class SearchRelevanceTests(unittest.TestCase):
     """search 把相关度放进候选结果，并支持按阈值筛选（模块内职责）。"""
 
