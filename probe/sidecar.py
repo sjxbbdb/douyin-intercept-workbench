@@ -180,7 +180,7 @@ def _public_guard(gate, public_send_id):
     （避免过度宣称），但两阶段契约必须按【落库的原始状态】判断，否则永远进不了私信。
 
     稳定拒绝原因（宿主可直接据此决定重试或放弃）：
-      public_missing    宿主没给 publicSendId（批量清单里属于必修项）
+      public_missing    宿主没给 publicSendId —— 【所有】入口都必须拒绝，不是可选项
       public_not_found  这个 sendId 在本地台账里不存在
       public_not_a_reply 这个 sendId 不是公屏回复（比如私信记录）
       public_pending    公屏回复尚未有结论（reserved / started）
@@ -190,7 +190,13 @@ def _public_guard(gate, public_send_id):
     """
     send_id = str(public_send_id or "").strip()
     if not send_id:
-        return None
+        # 🔴 缺 ID 必须拒绝，不能放行。
+        #    「可选参数」在这个位置等于没有守卫：任何调用方只要省略 publicSendId
+        #    就绕过了整个两阶段契约，而偏偏执行发送的就是这条单发路径。
+        #    批量清单一直强制这一条，两条路径的口径必须一致 —— 否则
+        #    最弱的那条路径就是实际生效的那条。
+        return ("public_missing",
+                "publicSendId is required; only a confirmed public reply allows a private message")
     row = gate.lookup(send_id)
     if row is None:
         return ("public_not_found", "the public reply sendId is unknown; private is refused")
@@ -767,7 +773,13 @@ class Sidecar:
             page.close()
 
     def send_private(self, params):
-        """私信。可选 publicSendId：给出时必须已确认成功，否则在打开浏览器之前就拒绝。"""
+        """私信。**必须**给出 publicSendId，且该公屏回复已确认成功。
+
+        两阶段契约在【打开浏览器之前】判定（fail-closed）：不该发的连页面都不开，
+        既省一次风控暴露，也不会留下「点了一半」的现场。
+        缺 publicSendId 一律 public_missing 拒绝 —— 它曾经是「可选」的，
+        那等于给整条契约留了一个省略参数就能走的后门。
+        """
         send_id = str(params.get("sendId") or "")
         target = params.get("target")
         text = params.get("text")
@@ -790,8 +802,8 @@ class Sidecar:
         每条拒绝都给稳定的原因，宿主据它决定重试、人工处理还是放弃。
 
         items[i] 需要 {eventId, authorId, authorName, publicSendId}；缺 publicSendId 的按
-        public_missing 拒绝 —— 批量清单的存在意义就是替宿主守住这条流程契约。
-        （单发 send_private 仍可不带 publicSendId：那是宿主自己已经确认过时的低层入口。）
+        public_missing 拒绝。单发 send_private 现在同样强制这一条，
+        两个入口的口径一致 —— 否则最弱的那条就是实际生效的那条。
         """
         items = params.get("items")
         if not isinstance(items, list) or not items:

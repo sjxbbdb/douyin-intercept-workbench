@@ -153,13 +153,20 @@ same `unknown` semantics as the other send paths.
   避免上层据此自动继续请求、在风控点上越撞越深。
   回归：`test_captcha_is_terminal_and_offers_no_next_page`。
 * **评论区两阶段契约**：`comment_private_candidates` 把一个批次按「公屏是否确认成功」分成
-  `allowed` / `rejected`；`send_private` 也接受 `publicSendId`，给出时**必须**是
+  `allowed` / `rejected`；`send_private` **必须**带 `publicSendId` 且该公屏回复是
   `sent_confirmed`，否则在**打开浏览器之前**以稳定原因拒绝：
   `public_missing` / `public_not_found` / `public_not_a_reply` / `public_pending` /
   `public_unknown` / `public_failed` / `public_blocked` / `missing_author_id`。
   ⚠️ `send_gate.result()` 会把 `sent_confirmed` 映射成 `unknown`（避免过度宣称），
   所以契约判定读的是 **`SendGate.lookup()` 返回的原始状态**。
-  回归：`CommentFlowContractTests`（5 项，含"不通过就不许打开浏览器"）。
+  🔴 **`publicSendId` 是必填，不是可选**。它曾经写成「可选：给出时校验」，
+  那等于没有守卫 —— 任何调用方省略这个参数就绕过了整条契约，
+  而偏偏执行发送的就是这条单发路径。批量入口一直强制 `public_missing`，
+  两个入口口径不一致时，实际生效的是最弱的那条。现在两者一致。
+  ⚠️ **对宿主是破坏性变更**：`desktop/src/lib/probe-client.js` 的 `send_private`
+  目前不透传 `publicSendId`，不同步修改的话该调用会开始以 `public_missing` 失败。
+  这是有意的 —— 那条路径本来就应该先拿到公屏回复的 `sendId`。
+  回归：`CommentFlowContractTests`（含改前会失败的 `test_missing_public_send_id_is_refused`）。
 * **直播私信逐项绑定公屏成功（审核意见 2026-09-21）**：`live_private` 的每个 item 必须带
   `publicSendId`，且该 sendId 必须满足两条：①在台账里是"已确认成功的公屏回复"；
   ②就是这个事件自己那次回复（事件详情里记录的 `sendId`）。任一不满足就地 `blocked`，
