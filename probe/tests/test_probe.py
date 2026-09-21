@@ -819,10 +819,17 @@ class LiveFlowTests(unittest.TestCase):
             self.assertEqual(reply["status"], "blocked")
             self.assertEqual(reply["results"][0]["reason"], "script_mismatch")
             self.assertEqual(instance.live_queue.find_event("e1")["state"], "blocked")
+            # 审核意见（2026-09-21）之后契约更严：私信必须【逐项绑定】那次确认成功的公屏回复。
+            # 所以缺 publicSendId 时在打开浏览器之前就按 public_missing 拒绝（原来是按队列状态
+            # public_planned 拒绝 —— 那条路径正是"可以绕过公屏门禁"的来源）。
             private = instance.dispatch("live_private", {"batchId": batch_id, "items": [
                 {"eventId": "e2", "sendId": "s2"}]})
             self.assertEqual(private["status"], "blocked")
-            self.assertEqual(private["results"][0]["reason"], "public_planned")
+            self.assertEqual(private["results"][0]["reason"], "public_missing")
+            # 给了一个台账里不存在的 publicSendId -> 同样在打开浏览器之前拒绝
+            private = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e2", "sendId": "s3", "publicSendId": "no-such-send"}]})
+            self.assertEqual(private["results"][0]["reason"], "public_not_found")
             with self.assertRaises(sidecar.SidecarError) as raised:
                 instance.dispatch("live_result", {"batchId": "does-not-exist"})
             self.assertEqual(raised.exception.code, "unknown_batch")
@@ -1115,6 +1122,289 @@ class LiveFlowTests(unittest.TestCase):
                 instance.dispatch("live_private", {"batchId": batch_id, "items": [
                     {"eventId": "e1", "sendId": "s2", "text": "private message text"}]})
             self.assertEqual(raised.exception.code, "batch_expired")
+
+
+    # ---- 回复弹幕（公屏 @该观众）：真机结论 + 离线回归 ----
+
+    def test_plan_freezes_the_reply_mode_and_rejects_unknown_modes(self):
+        """落地方式在【冻结计划】时定稿；未知模式直接拒绝。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19240)
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "@LIVE-E1 这个我会，稍后私信你",
+                                   "privateText": "private message text"}}})
+            self.assertEqual(planned["replyMode"], "danmaku")
+            self.assertEqual(
+                instance.live_queue.plan(planned["batch"]["batchId"])["replyMode"], "danmaku")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                "replyMode": "shout", "scripts": {}})
+            self.assertEqual(raised.exception.code, "invalid_input")
+
+    def test_danmaku_mode_blocks_a_target_without_a_nickname(self):
+        """没有昵称就 @ 不到人：计划期直接 blocked，绝不用 ID 猜一个人名。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19241)
+            instance.live_queue.append([self._event("e1", author_id="", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "scripts": {"e1": {"publicText": "@someone 稍后私信你",
+                                   "privateText": "private message text"}}})
+            self.assertEqual(planned["status"], "blocked")
+            self.assertEqual(planned["blocked"][0]["reason"], "missing_author_name")
+
+    def test_danmaku_mode_requires_the_mention_prefix_from_the_host_script(self):
+        """话术归平台侧：没有 @昵称 前缀就 blocked —— 本模块不代写、不改写话术。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19242)
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "replyVia": "mention_text",
+                "scripts": {"e1": {"publicText": "这个我会，稍后私信你",
+                                   "privateText": "private message text"}}})
+            self.assertEqual(planned["status"], "blocked")
+            self.assertEqual(planned["blocked"][0]["reason"], "mention_prefix_missing")
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "blocked")
+
+    def test_reply_mode_cannot_change_after_the_plan_is_frozen(self):
+        """同一批次里不允许两种触达方式：改口在打开浏览器之前就被拒绝。"""
+        import sidecar
+
+        def explode():
+            raise AssertionError("a mode mismatch must be refused before any browser work")
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19243)
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance._page = explode
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.dispatch("live_reply", {"batchId": batch_id, "mode": "danmaku",
+                                                 "items": [{"eventId": "e1", "sendId": "s1"}]})
+            self.assertEqual(raised.exception.code, "mode_mismatch")
+
+    def test_danmaku_reply_refuses_before_typing_when_the_row_is_gone(self):
+        """屏上没有那条弹幕就不发：绝不把 @ 认错人，也不产生任何输入与点击。"""
+        import live
+        import send_actions
+
+        class Page:
+            def __init__(self):
+                self.clicks, self.typed = [], []
+
+            def call(self, *_args, **_kwargs):
+                return {}
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://live.douyin.com/123"
+                return None
+
+            def click_at(self, *args):
+                self.clicks.append(args)
+
+            def type_text(self, *args, **_kwargs):
+                self.typed.append(args)
+
+        old = (live.find_danmaku, send_actions.douyin.check_captcha,
+               send_actions.douyin.login_state, send_actions.time.sleep)
+        live.find_danmaku = lambda _tab, _target: {"ok": False, "reason": "danmaku_not_found"}
+        send_actions.douyin.check_captcha = lambda _tab: False
+        send_actions.douyin.login_state = lambda _tab: "verified"
+        send_actions.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                page = Page()
+                gate = SendGate(td, "account-a")
+                result = send_actions.send_danmaku_reply(page, gate, "s-live-1", {
+                    "id": "evt-1", "roomId": "https://live.douyin.com/123",
+                    "authorName": "LIVE-E1", "text": "怎么做"}, "@LIVE-E1 稍后私信你")
+        finally:
+            (live.find_danmaku, send_actions.douyin.check_captcha,
+             send_actions.douyin.login_state, send_actions.time.sleep) = old
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "danmaku_not_found")
+        self.assertEqual(page.typed, [])
+        self.assertEqual(page.clicks, [])
+
+    def test_danmaku_reply_input_guards_run_before_anything_else(self):
+        """缺昵称 / 话术没带 @昵称：连浏览器都不碰就拒绝。"""
+        import send_actions
+        missing_nick = send_actions.send_danmaku_reply(object(), None, "s-live-2", {
+            "id": "evt-2", "roomId": "https://live.douyin.com/123",
+            "authorName": "", "text": "怎么做"}, "@谁 稍后私信你")
+        self.assertEqual(missing_nick["status"], "failed")
+        self.assertIn("authorName", missing_nick["reason"])
+        no_prefix = send_actions.send_danmaku_reply(object(), None, "s-live-3", {
+            "id": "evt-3", "roomId": "https://live.douyin.com/123",
+            "authorName": "LIVE-E1", "text": "怎么做"}, "稍后私信你")
+        self.assertEqual(no_prefix["status"], "failed")
+        self.assertIn("@authorName", no_prefix["reason"])
+
+    def test_human_typing_paces_every_character_between_0_1_and_0_9_seconds(self):
+        """拟人节奏：每字 0.1-0.9 秒随机停顿，而不是固定节拍（真机要求）。"""
+        import cdp
+        sleeps, methods = [], []
+        old_sleep, old_uniform = cdp.time.sleep, cdp.random.uniform
+        cdp.time.sleep = lambda seconds: sleeps.append(round(float(seconds), 4))
+        cdp.random.uniform = lambda lo, hi: (lo + hi) / 2.0
+
+        class Tab(cdp.CDP):
+            def __init__(self):
+                pass
+
+            def call(self, method, params=None, timeout=None):
+                methods.append(method)
+                return {}
+
+        try:
+            Tab().type_text("你好呀")                    # 3 个字，无标点
+            self.assertEqual(len(sleeps), 3)
+            for value in sleeps:
+                self.assertGreaterEqual(value, 0.1)
+                self.assertLessEqual(value, 0.9)
+            self.assertEqual(methods, ["Input.dispatchKeyEvent"] * 3)
+            sleeps[:] = []
+            Tab().type_text("好的，明白了")               # 含标点：停顿仍在上限内
+            for value in sleeps:
+                self.assertGreaterEqual(value, 0.1)
+                self.assertLessEqual(value, 0.9)
+            sleeps[:] = []
+            Tab().type_text("ab", per_char_delay=0.06)   # 显式固定节拍仍然可用
+            self.assertEqual(sleeps, [0.06, 0.06])
+        finally:
+            cdp.time.sleep, cdp.random.uniform = old_sleep, old_uniform
+
+    def test_live_capture_prefers_page_memory_and_falls_back_to_dom(self):
+        """采集优先页面内存（带 sec_uid），不可用时才回落到 DOM 文本（无标识）。"""
+        import live
+
+        class Cdp:
+            def __init__(self, feed, dom):
+                self.feed, self.dom = feed, dom
+
+            def eval_json(self, expression):
+                if expression == live.FEED_JS:
+                    return self.feed
+                if expression == live.COLLECT_JS:
+                    return self.dom
+                return None
+
+        memory = {"ok": True, "rows": [{"id": "m1", "sec_uid": "FAKE-SEC-UID", "uid": "9",
+                                        "authorName": "N", "text": "怎么做", "atMs": 1,
+                                        "roomId": "room", "userFlags": {}}]}
+        rows = live.collect_events(Cdp(memory, {"rows": []}), max_items=5)
+        self.assertEqual(rows[0]["authorId"], "FAKE-SEC-UID")
+        self.assertEqual(rows[0]["source"], "page_memory")
+        dom = {"rows": [{"id": "d1", "authorName": "N", "text": "怎么做", "onTop": True,
+                         "source": "dom"}]}
+        rows = live.collect_events(Cdp({"ok": False, "reason": "no_originalList"}, dom), max_items=5)
+        self.assertEqual(rows[0]["authorName"], "N")
+        self.assertEqual(rows[0]["authorId"], "")
+        self.assertEqual(rows[0]["source"], "dom")
+
+    def test_danmaku_locator_reports_the_reason_instead_of_guessing(self):
+        """定位器把「没找到 / 多条命中 / 被遮挡」如实回报，绝不返回一个近似坐标。"""
+        import live
+
+        class Cdp:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def eval_json(self, _expression):
+                return self.payload
+
+        self.assertFalse(live.find_danmaku(Cdp({"ok": False, "count": 0,
+                                                "reason": "danmaku_not_found"}),
+                                          {"authorName": "N", "text": "怎么做"})["ok"])
+        ambiguous = live.find_danmaku(Cdp({"ok": False, "count": 2,
+                                           "reason": "danmaku_ambiguous"}),
+                                     {"authorName": "N", "text": "怎么做"})
+        self.assertEqual(ambiguous["reason"], "danmaku_ambiguous")
+        self.assertNotIn("x", ambiguous)
+        self.assertEqual(live.find_danmaku(Cdp(None), {"authorName": "N", "text": "x"})["reason"],
+                         "danmaku_lookup_failed")
+
+
+    def test_room_echo_is_recorded_as_sent_echoed_and_never_auto_privates(self):
+        """真机证据分级：房间回声记为 sent_echoed，但默认策略不会因此自动私信。"""
+        import sidecar
+
+        class Page:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19250)
+            instance._page = lambda: (Page(), {"pid": 1})
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "replyVia": "mention_text",
+                "scripts": {"e1": {"publicText": "@LIVE-E1 你好",
+                                   "privateText": "private message text"}}})
+            batch_id = planned["batch"]["batchId"]
+            original = sidecar.send_danmaku_reply
+            sidecar.send_danmaku_reply = lambda *_args, **_kwargs: {
+                "status": "unknown", "reason": "platform_response_unavailable",
+                "evidence": {"mechanism": "enter", "roomEcho": True}}
+            try:
+                reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s-echo"}]})
+            finally:
+                sidecar.send_danmaku_reply = original
+            self.assertEqual(reply["replyMode"], "danmaku")
+            self.assertEqual(reply["results"][0]["recordedState"], "sent_echoed")
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "sent_echoed")
+            # 默认策略只放行 sent_confirmed：回声不自动升级成私信
+            self.assertEqual(reply["privateCandidates"], [])
+            self.assertEqual(reply["privateRejected"][0]["reason"], "public_sent_echoed")
+
+    def test_echo_requires_the_text_to_actually_appear(self):
+        """没有回声时保持 unknown（不因为"点了发送"就当成成功）。"""
+        import sidecar
+
+        class Page:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19251)
+            instance._page = lambda: (Page(), {"pid": 1})
+            instance.live_queue.append([self._event("e1", text="怎么做")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                "replyVia": "mention_text",
+                "scripts": {"e1": {"publicText": "@LIVE-E1 你好",
+                                   "privateText": "private message text"}}})
+            batch_id = planned["batch"]["batchId"]
+            original = sidecar.send_danmaku_reply
+            sidecar.send_danmaku_reply = lambda *_args, **_kwargs: {
+                "status": "unknown", "reason": "platform_response_unavailable",
+                "evidence": {"mechanism": "enter", "roomEcho": False}}
+            try:
+                reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s-noecho"}]})
+            finally:
+                sidecar.send_danmaku_reply = original
+            self.assertEqual(instance.live_queue.find_event("e1")["state"], "unknown")
+            self.assertEqual(reply["results"][0]["recordedState"], "unknown")
 
 
 class CommentFilterTests(unittest.TestCase):
@@ -1510,6 +1800,872 @@ class SearchRelevanceTests(unittest.TestCase):
             instance.search({"keyword": "宝宝辅食", "minRelevance": 101})
         with self.assertRaises(sidecar.SidecarError):
             instance.search({"keyword": "宝宝辅食", "minRelevance": -1})
+
+
+class CommentFlowContractTests(unittest.TestCase):
+    """评论区两阶段契约（第 3 项）：公开回复确认成功之前，一律不许私信。
+
+    架构依据：评论区固定流程 —— 关键词匹配评论 -> 公开回复 -> 只有 sent_confirmed
+    才允许私信；unknown / failed / blocked 明确禁止进入私信，且拒绝必须发生在
+    打开浏览器之前（fail-closed）。
+    """
+
+    class _Page:
+        def __init__(self, url="https://www.douyin.com/user/other"):
+            self.url = url
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return self.url
+            return None
+
+        def close(self):
+            pass
+
+    def _instance(self, explode=False):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        if explode:
+            def boom():
+                raise AssertionError("契约不通过时不得打开浏览器")
+            instance._page = boom
+        else:
+            instance._page = lambda: (self._Page(), {"pid": 1})
+        return sidecar, instance
+
+    @staticmethod
+    def _public_reply(gate, send_id, status):
+        gate.reserve(send_id, "comment:%s:author-1" % send_id, "public text", kind="comment")
+        if status in ("unknown", "sent_confirmed"):
+            # 这两类是"点下去之后"才可能有的结果；failed / blocked 属于开始之前就被拦下，
+            # 不能先 mark_started —— send_gate 会把 started+failed 升级成 unknown（正确行为）。
+            gate.mark_started(send_id)
+        gate.finish(send_id, status, "platform_response_unavailable")
+        return send_id
+
+    def _refuse(self, status):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            public_id = self._public_reply(gate, "pub-%s" % status, status)
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-1", "publicSendId": public_id,
+                                       "target": {"authorId": "author-1"}, "text": "你好"})
+            return raised.exception.code
+
+    def test_unresolved_public_reply_blocks_the_private_message(self):
+        """unknown（本通道常态）不得转成私信 —— 这是红线 2/3 的直接体现。"""
+        self.assertEqual(self._refuse("unknown"), "public_unknown")
+
+    def test_failed_and_blocked_public_replies_block_the_private_message(self):
+        self.assertEqual(self._refuse("failed"), "public_failed")
+        self.assertEqual(self._refuse("blocked"), "public_blocked")
+
+    def test_unknown_send_id_and_wrong_kind_are_refused(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-2", "publicSendId": "does-not-exist",
+                                       "target": {"authorId": "author-1"}, "text": "你好"})
+            self.assertEqual(raised.exception.code, "public_not_found")
+            # 把"私信记录"当成公屏回复来用 -> 也必须拒绝
+            gate.reserve("dm-1", "author-1", "你好", kind="private")
+            gate.mark_started("dm-1")
+            gate.finish("dm-1", "sent_confirmed", "platform_response_recorded")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-3", "publicSendId": "dm-1",
+                                       "target": {"authorId": "author-1"}, "text": "你好"})
+            self.assertEqual(raised.exception.code, "public_not_a_reply")
+
+    def test_confirmed_public_reply_lets_the_private_stage_start(self):
+        """sent_confirmed 才放行：放行后确实进入了浏览器阶段（用假页面走到画像校验）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            public_id = self._public_reply(gate, "pub-ok", "sent_confirmed")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            result = instance.send_private({"sendId": "priv-ok", "publicSendId": public_id,
+                                            "target": {"authorId": "author-1"}, "text": "你好"})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "target_profile_mismatch",
+                         "放行后应当继续走到成像校验（证明守卫已通过）")
+
+    def test_batch_listing_gives_stable_reasons(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            ok = self._public_reply(gate, "pub-batch-ok", "sent_confirmed")
+            unknown = self._public_reply(gate, "pub-batch-unknown", "unknown")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            listing = instance.dispatch("comment_private_candidates", {"items": [
+                {"eventId": "e1", "authorId": "author-1", "authorName": "A", "publicSendId": ok},
+                {"eventId": "e2", "authorId": "author-2", "publicSendId": unknown},
+                {"eventId": "e3", "authorId": "author-3"},
+                {"eventId": "e4", "authorId": "", "publicSendId": ok}]})
+        self.assertEqual([item["eventId"] for item in listing["allowed"]], ["e1"])
+        self.assertEqual([(item["eventId"], item["reason"]) for item in listing["rejected"]],
+                         [("e2", "public_unknown"), ("e3", "public_missing"),
+                          ("e4", "missing_author_id")])
+        self.assertEqual(listing["policy"]["allowPublicStates"], ["sent_confirmed"])
+
+
+    # ---- 用户卡片（学自用户真机演示的入口）：失败关闭语义 ----
+
+    def test_user_card_is_not_guessed_when_the_nickname_is_missing(self):
+        """昵称找不到时不许猜坐标：直接 nickname_not_found。"""
+        import live
+
+        class Cdp:
+            def eval_json(self, _expression):
+                return {"ok": False, "reason": "nickname_not_found"}
+
+        result = live.open_user_card(Cdp(), {"authorName": "N", "text": "怎么做"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "nickname_not_found")
+
+    def test_user_card_reports_when_it_never_opens(self):
+        """卡片始终不出现 -> card_not_opened，且确实做过悬停动作。"""
+        import live
+
+        class Cdp:
+            def __init__(self):
+                self.moves = 0
+
+            def eval_json(self, expression):
+                if "userMenuPanel" in expression:
+                    return []                      # 一直没有可见卡片
+                return {"ok": True, "x": 100, "y": 200}
+
+            def call(self, *_args, **_kwargs):
+                self.moves += 1
+                return {}
+
+        cdp = Cdp()
+        result = live.open_user_card(cdp, {"authorName": "N", "text": "怎么做"},
+                                     wait_seconds=0.2, interval=0.05)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "card_not_opened")
+        self.assertGreater(cdp.moves, 0, "应当真的把鼠标移到昵称上悬停")
+
+    def test_user_card_action_requires_an_exact_label(self):
+        """卡片条目按文案精确匹配；找不到就返回 card_action_not_found。"""
+        import live
+        card = {"items": [{"text": "关注", "x": 1, "y": 2},
+                          {"text": "回复", "x": 3, "y": 4}]}
+        hit = live.user_card_action(card, "回复")
+        self.assertTrue(hit["ok"])
+        self.assertEqual((hit["x"], hit["y"]), (3, 4))
+        missing = live.user_card_action(card, "私信")
+        self.assertFalse(missing["ok"])
+        self.assertEqual(missing["reason"], "card_action_not_found")
+        self.assertFalse(live.user_card_action(card, "")["ok"])
+
+
+class ClickGuardTests(unittest.TestCase):
+    """受约束点击的回归（2026-09-20 事故：点击落到了浏览器地址栏 / 页面头像）。"""
+
+    class _Cdp:
+        def __init__(self, probe):
+            self.probe = probe
+            self.clicks = []
+
+        def eval_json(self, _expression):
+            return self.probe
+
+        def click_at(self, x, y):
+            self.clicks.append((x, y))
+
+    def test_refuses_when_the_point_is_not_the_expected_element(self):
+        import click_guard
+        cdp = self._Cdp({"ok": True, "expectHit": False, "textHit": None, "containerOk": None,
+                         "hit": {"tag": "span", "cls": "semi-avatar", "textLen": 0}, "chain": []})
+        result = click_guard.click_checked(cdp, 10, 10,
+                                           expect_selectors=['[class*="content-with-emoji-text"]'],
+                                           label="unit")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "click_target_mismatch")
+        self.assertEqual(cdp.clicks, [], "被拒绝时绝不能真的点下去")
+
+    def test_refuses_when_the_point_is_outside_the_container(self):
+        import click_guard
+        cdp = self._Cdp({"ok": True, "expectHit": True, "textHit": None, "containerOk": False,
+                         "hit": {"tag": "div", "cls": "x", "textLen": 1}, "chain": []})
+        result = click_guard.click_checked(cdp, 10, 10, container_box=[100, 200, 320, 500],
+                                           label="unit")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "click_outside_container")
+        self.assertEqual(cdp.clicks, [])
+
+    def test_refuses_when_the_expected_text_is_missing(self):
+        import click_guard
+        cdp = self._Cdp({"ok": True, "expectHit": True, "textHit": False, "containerOk": True,
+                         "hit": {"tag": "div", "cls": "y", "textLen": 3}, "chain": []})
+        result = click_guard.click_checked(cdp, 10, 10, expect_text="私信", label="unit")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "click_text_mismatch")
+        self.assertEqual(cdp.clicks, [])
+
+    def test_nothing_at_point_is_refused(self):
+        import click_guard
+        cdp = self._Cdp({"ok": False, "reason": "nothing_at_point"})
+        result = click_guard.click_checked(cdp, 10, 10, label="unit")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "nothing_at_point")
+        self.assertEqual(cdp.clicks, [])
+
+    def test_clicks_only_when_every_check_passes_and_records_an_audit_line(self):
+        import json
+        import click_guard
+        with tempfile.TemporaryDirectory() as td:
+            audit = os.path.join(td, "click_audit.jsonl")
+            click_guard.set_audit_path(audit)
+            try:
+                cdp = self._Cdp({"ok": True, "expectHit": True, "textHit": True, "containerOk": True,
+                                 "hit": {"tag": "li", "cls": "semi-dropdown-item", "textLen": 8},
+                                 "chain": ["li.semi-dropdown-item"]})
+                result = click_guard.click_checked(cdp, 1537, 360, expect_selectors=["li"],
+                                                   expect_text="回复", label="choose_reply")
+                self.assertTrue(result["ok"])
+                self.assertEqual(cdp.clicks, [(1537, 360)])
+                with open(audit, "r", encoding="utf-8") as fh:
+                    lines = [json.loads(line) for line in fh if line.strip()]
+            finally:
+                click_guard.set_audit_path(None)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0]["clicked"])
+        self.assertEqual(lines[0]["label"], "choose_reply")
+        self.assertEqual(lines[0]["probe"]["hit"]["cls"], "semi-dropdown-item")
+
+    def test_refused_click_is_also_audited(self):
+        import json
+        import click_guard
+        with tempfile.TemporaryDirectory() as td:
+            audit = os.path.join(td, "click_audit.jsonl")
+            click_guard.set_audit_path(audit)
+            try:
+                cdp = self._Cdp({"ok": True, "expectHit": False, "textHit": None, "containerOk": None,
+                                 "hit": {"tag": "div", "cls": "omnibox", "textLen": 0}, "chain": []})
+                click_guard.click_checked(cdp, 1, 2, expect_selectors=["li"], label="refused")
+                with open(audit, "r", encoding="utf-8") as fh:
+                    lines = [json.loads(line) for line in fh if line.strip()]
+            finally:
+                click_guard.set_audit_path(None)
+        self.assertFalse(lines[0]["clicked"])
+        self.assertEqual(lines[0]["reason"], "click_target_mismatch")
+
+
+class ChatScrollTests(unittest.TestCase):
+    """聊天列表滚动的回归（直播间列表一直自动滚动，是点击打偏的根因）。"""
+
+    def test_scroll_refuses_without_the_main_chat_list(self):
+        import live
+
+        class Cdp:
+            def eval_json(self, _expression):
+                return {"found": False, "reason": "main_chat_list_not_found"}
+
+            def call(self, *_args, **_kwargs):
+                raise AssertionError("没有主列表时不得发滚轮事件")
+
+        result = live.scroll_chat_list(Cdp(), "up")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "main_chat_list_not_found")
+
+    def test_scroll_up_sends_a_negative_wheel_delta_at_the_list_center(self):
+        import live
+        calls = []
+
+        class Cdp:
+            def eval_json(self, _expression):
+                return {"found": True, "box": [1000, 300, 320, 500]}
+
+            def call(self, method, params=None, timeout=None):
+                calls.append((method, params))
+                return {}
+
+        result = live.scroll_chat_list(Cdp(), "up", amount=420, times=2)
+        self.assertTrue(result["ok"])
+        wheels = [item for item in calls if item[0] == "Input.dispatchMouseEvent"]
+        self.assertEqual(len(wheels), 2)
+        self.assertTrue(all(item[1]["deltaY"] == -420 for item in wheels), "上滚必须是负 deltaY")
+        self.assertEqual((wheels[0][1]["x"], wheels[0][1]["y"]), (1160, 550))
+
+    def test_pause_autoscroll_reports_whether_the_list_settled(self):
+        import live
+        original = (live.main_chat_list, live.chat_list_tail, live.scroll_chat_list)
+        # 第一次调用：前后一致（停住了）；第二次调用：前后不一致（还在自动滚动）
+        scripted = [{"ok": True, "key": "a"}, {"ok": True, "key": "a"},
+                    {"ok": True, "key": "b"}, {"ok": True, "key": "c"}]
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        live.chat_list_tail = lambda _cdp, box=None: scripted.pop(0)
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": True}
+        try:
+            settled = live.pause_autoscroll(object(), settle=0.01)
+            self.assertTrue(settled["ok"])
+            self.assertTrue(settled["paused"])
+            moving = live.pause_autoscroll(object(), settle=0.01)
+        finally:
+            live.main_chat_list, live.chat_list_tail, live.scroll_chat_list = original
+        self.assertFalse(moving["paused"], "列表仍在动时必须如实报告，不能假装停住了")
+
+
+class RoomUrlTests(unittest.TestCase):
+    """真机回归（2026-09-20）：抖音直播广场点进来的房间，房间号在【查询串】里。
+
+    症状：地址是 https://live.douyin.com/?anchor_id=...&live_web_rid=423909340168，路径为空。
+    旧代码 split("?")[0] 只得到 https://live.douyin.com/（没有房间号），
+    于是 target.roomId 校验失败（path is required），一条回复都发不出去；
+    就算 roomId 拼对了，"校验当前页面"那一步还会抛 URLPolicyError。
+    """
+
+    SQUARE = ("https://live.douyin.com/?anchor_id=257730616498059&category_name=all"
+              "&is_vs=0&live_web_rid=423909340168&page_type=main_category")
+    PATH = "https://live.douyin.com/423909340168"
+
+    def test_room_id_is_read_from_the_query_of_a_square_url(self):
+        import live
+        self.assertEqual(live.room_id_from_url(self.SQUARE), "423909340168")
+        self.assertEqual(live.room_id_from_url(self.PATH), "423909340168")
+        self.assertEqual(live.room_id_from_url(self.PATH + "?foo=1"), "423909340168")
+        self.assertEqual(live.room_id_from_url("https://live.douyin.com/?web_rid=8888"), "8888")
+
+    def test_room_id_refuses_addresses_without_a_room(self):
+        import live
+        for value in ("https://live.douyin.com/", "https://live.douyin.com/?anchor_id=1",
+                      "https://www.douyin.com/user/abc", "https://live.douyin.com/rooms",
+                      "https://live.douyin.com/?live_web_rid=abc", "", None):
+            self.assertEqual(live.room_id_from_url(value), "", repr(value))
+
+    def test_current_room_url_normalizes_the_open_tab(self):
+        import live
+
+        class Cdp:
+            def __init__(self, href):
+                self.href = href
+
+            def evaluate(self, _expression):
+                return self.href
+
+        self.assertEqual(live.current_room_url(Cdp(self.SQUARE)), self.PATH)
+        self.assertEqual(live.current_room_url(Cdp("https://www.douyin.com/user/abc")), "")
+
+    def test_canonical_room_treats_both_address_forms_as_one_room(self):
+        import send_actions
+        square = send_actions._canonical_room(self.SQUARE)
+        self.assertEqual(square, send_actions._canonical_room(self.PATH))
+        self.assertEqual(square, ("live.douyin.com", "/423909340168"))
+        self.assertIsNone(send_actions._canonical_room("https://live.douyin.com/"),
+                          "没有房间号的地址不是合法房间，必须判不合法，而不是当成空路径的房间")
+        self.assertEqual(send_actions._canonical_room("https://www.douyin.com/video/7"),
+                         ("www.douyin.com", "/video/7"))
+
+    def test_resolved_room_url_rebuilds_the_square_address_instead_of_raising(self):
+        import send_actions
+        self.assertEqual(send_actions._resolved_room_url(self.SQUARE), self.PATH)
+        self.assertEqual(send_actions._resolved_room_url(self.PATH), self.PATH)
+        self.assertEqual(send_actions._resolved_room_url("https://www.douyin.com/user/abc"),
+                         "https://www.douyin.com/user/abc")
+        with self.assertRaises(URLPolicyError):
+            send_actions._resolved_room_url("https://live.douyin.com/")
+
+
+class RoomEchoTests(unittest.TestCase):
+    """roomEcho 的匹配语义：它只是【证据】，不能变成送达判据（红线 2）。"""
+
+    @staticmethod
+    def _echo(rows, text, composer_text=""):
+        import live
+        original = (live.collect_feed, live.find_composer)
+        live.collect_feed = lambda _cdp: {"rows": rows}
+        live.find_composer = lambda _cdp: {"found": True, "text": composer_text}
+        try:
+            return live.wait_room_echo(object(), text, seconds=0.01, interval=0.01)
+        finally:
+            live.collect_feed, live.find_composer = original
+
+    def test_identical_text_is_reported_as_a_full_match(self):
+        result = self._echo([{"text": "公共回复文案", "authorName": "me"}], "公共回复文案")
+        self.assertTrue(result["row"])
+        self.assertEqual(result["matchedBy"], "full")
+
+    def test_platform_rendered_mention_still_matches_on_the_body(self):
+        # 平台会把提及渲染成 [@某人] 这类 token，整条比不出来，正文必须能兜住。
+        result = self._echo([{"text": "[@某人]你好呀", "authorName": "me"}], "@某人 你好呀")
+        self.assertTrue(result["row"])
+        self.assertEqual(result["matchedBy"], "body")
+
+    def test_missing_echo_reports_no_row(self):
+        result = self._echo([{"text": "别人的弹幕"}], "我们没发过这条", composer_text="")
+        self.assertIsNone(result["row"])
+
+    def test_a_one_character_body_is_not_enough_to_claim_an_echo(self):
+        # 只发一个字时"正文包含"会误报（房间里到处都是这个字），必须拒绝。
+        result = self._echo([{"text": "好", "authorName": "other"}], "@某人 好")
+        self.assertIsNone(result["row"])
+
+    def test_composer_state_is_reported_even_without_an_echo(self):
+        result = self._echo([], "发出去的文案", composer_text="")
+        self.assertTrue(result["composerCleared"])
+
+
+class ReplyViaTests(unittest.TestCase):
+    """公屏回复的两条通道（native / mention_text）在【冻结计划时】定稿。"""
+
+    @staticmethod
+    def _queue(td, author_name="小***"):
+        import live_flow
+        queue = live_flow.LiveQueue(td, "account-a", clock=lambda: 1000.0)
+        queue.append([{"kind": "live", "roomId": "room-1", "id": "e1", "authorId": "u1",
+                       "authorName": author_name, "text": "问一下"}])
+        return queue
+
+    def _plan(self, td, public, via="native", name="小***"):
+        queue = self._queue(td, author_name=name)
+        batch = queue.take_batch(max_items=10, window_seconds=600)
+        return queue, queue.freeze_plan(batch["batchId"],
+                                        {"e1": {"publicText": public, "privateText": "私信话术"}},
+                                        reply_mode="danmaku", reply_via=via)
+
+    def test_native_reply_rejects_a_script_that_starts_with_at(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue, plan = self._plan(td, "@小*** 你好")
+            self.assertEqual(plan["targets"], [])
+            self.assertEqual(plan["blocked"], [{"eventId": "e1",
+                                                "reason": "body_must_not_start_with_at"}])
+            self.assertEqual(plan["replyVia"], "native")
+            self.assertEqual(queue.find_event("e1")["state"], live_flow.BLOCKED)
+
+    def test_native_reply_allows_a_masked_nickname(self):
+        # 原生通道里提及由平台插入，昵称读不全（小***）照样能 @ 到人。
+        with tempfile.TemporaryDirectory() as td:
+            _queue, plan = self._plan(td, "你好呀")
+            self.assertEqual([item["eventId"] for item in plan["targets"]], ["e1"])
+            self.assertEqual(plan["replyVia"], "native")
+
+    def test_mention_text_reply_requires_the_at_prefix_and_rejects_masked_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            _queue, plan = self._plan(td, "你好呀", via="mention_text", name="小明")
+            self.assertEqual(plan["blocked"][0]["reason"], "mention_prefix_missing")
+        with tempfile.TemporaryDirectory() as td:
+            _queue, plan = self._plan(td, "@小*** 你好呀", via="mention_text")
+            self.assertEqual(plan["blocked"][0]["reason"], "nickname_masked")
+        with tempfile.TemporaryDirectory() as td:
+            _queue, plan = self._plan(td, "@小明 你好呀", via="mention_text", name="小明")
+            self.assertEqual([item["eventId"] for item in plan["targets"]], ["e1"])
+            self.assertEqual(plan["replyVia"], "mention_text")
+
+    def test_reply_via_is_rejected_for_other_modes_and_unknown_values(self):
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            queue = self._queue(td)
+            batch = queue.take_batch(max_items=10, window_seconds=600)
+            with self.assertRaises(live_flow.LiveFlowError):
+                queue.freeze_plan(batch["batchId"], {"e1": {"publicText": "x", "privateText": "y"}},
+                                  reply_mode="composer", reply_via="mention_text")
+            with self.assertRaises(live_flow.LiveFlowError):
+                queue.freeze_plan(batch["batchId"], {"e1": {"publicText": "x", "privateText": "y"}},
+                                  reply_mode="danmaku", reply_via="guessed")
+
+
+class SidecarReplyViaDispatchTests(unittest.TestCase):
+    """sidecar 必须按冻结计划里的 replyVia 分派到对应发送通道（不是按调用方参数）。"""
+
+    EVENT = {"id": "e1", "authorId": "u1", "authorName": "小***", "text": "问一下"}
+
+    class Page:
+        def close(self):
+            pass
+
+    def _instance(self, td):
+        import sidecar
+        instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19226)
+        instance._page = lambda: (self.Page(), {"pid": 1})
+        return instance
+
+    def _run(self, via, public="你好呀", author_name="小***"):
+        import live_flow
+        import sidecar
+        calls = []
+        originals = (sidecar.send_danmaku_reply_native, sidecar.send_danmaku_reply,
+                     sidecar.send_comment)
+        sidecar.send_danmaku_reply_native = lambda *a, **k: (
+            calls.append("native") or {"status": "unknown", "evidence": {"roomEcho": True}})
+        sidecar.send_danmaku_reply = lambda *a, **k: (
+            calls.append("mention_text") or {"status": "unknown", "evidence": {"roomEcho": True}})
+        sidecar.send_comment = lambda *a, **k: (
+            calls.append("comment") or {"status": "unknown"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                instance = self._instance(td)
+                event = dict(self.EVENT, authorName=author_name)
+                instance.live_queue.append([sidecar._event("live", "room-1", event)])
+                planned = instance.dispatch("live_plan", {
+                    "maxItems": 10, "windowSeconds": 600, "replyMode": "danmaku",
+                    "replyVia": via, "scripts": {"e1": {"publicText": public,
+                                                        "privateText": "私信话术"}}})
+                self.assertEqual(planned["status"], "ok", planned)
+                self.assertEqual(planned["replyVia"], via)
+                batch_id = planned["batch"]["batchId"]
+                reply = instance.dispatch("live_reply", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "s-%s" % via}]})
+                self.assertEqual(reply["status"], "ok", reply)
+                self.assertEqual(instance.live_queue.find_event("e1")["state"],
+                                 live_flow.SENT_ECHOED)
+        finally:
+            (sidecar.send_danmaku_reply_native, sidecar.send_danmaku_reply,
+             sidecar.send_comment) = originals
+        return calls
+
+    def test_native_plan_dispatches_to_the_native_sender(self):
+        self.assertEqual(self._run("native"), ["native"])
+
+    def test_mention_text_plan_dispatches_to_the_text_sender(self):
+        self.assertEqual(self._run("mention_text", public="@小明 你好呀", author_name="小明"),
+                         ["mention_text"])
+
+    def test_unknown_via_is_rejected_before_any_browser_work(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = self._instance(td)
+            with self.assertRaises(sidecar.SidecarError):
+                instance.dispatch("live_plan", {"maxItems": 10, "windowSeconds": 600,
+                                                "replyMode": "danmaku", "replyVia": "guessed",
+                                                "scripts": {}})
+
+
+class IdentityVisibilityTests(unittest.TestCase):
+    """真机事实（2026-09-20，两个房间对比）：观众身份不一定可见，不可见时必须 fail-closed。
+
+    房间 689015985670：16/16 条弹幕带真实 sec_uid，可打开主页私信。
+    房间 423909340168：观众行 sec_uid 为空、uid 是占位值 111111、昵称已脱敏，
+    只有主播自己的消息带 sec_uid；拿 111111 拼出来的主页是错误页。
+    """
+
+    SEC = "MS4wLjABAAAAbp6Jd7TQ3H0LiKYb8wBlRCQHY5dBGQlFEA1__xMq5VBmNHWPHlJUNBP5xt3fZdyS"
+
+    def test_sec_uid_is_dm_capable_and_a_placeholder_uid_is_not(self):
+        import live
+        self.assertTrue(live.dm_capable(self.SEC, "452620235059355"))
+        for bad in ("", None, "111111", "abc", "MS4wLj"):
+            self.assertFalse(live.dm_capable(bad, "111111"), repr(bad))
+            self.assertFalse(live.dm_capable("", bad), repr(bad))
+
+    def test_collected_rows_carry_identity_visibility(self):
+        import live
+        original = live.collect_feed
+        live.collect_feed = lambda _cdp: {"ok": True, "rows": [
+            {"id": "m1", "sec_uid": self.SEC, "uid": "42", "authorName": "A", "text": "hi"},
+            {"id": "m2", "sec_uid": "", "uid": "111111", "authorName": "B***", "text": "hi"}]}
+        try:
+            rows = live.collect_events(object(), max_items=10)
+        finally:
+            live.collect_feed = original
+        self.assertTrue(rows[0]["dmCapable"])
+        self.assertFalse(rows[1]["dmCapable"], "占位 uid 不能当成可私信身份")
+        self.assertEqual(rows[1]["uid"], "111111")
+
+    def test_profile_error_page_is_reported_instead_of_login_unknown(self):
+        import douyin
+
+        class Cdp:
+            def __init__(self, value):
+                self.value = value
+
+            def eval_json(self, _expression):
+                return self.value
+
+        self.assertTrue(douyin.profile_error_page(Cdp(True)))
+        self.assertFalse(douyin.profile_error_page(Cdp(False)))
+
+    def test_profile_error_page_lookup_never_raises(self):
+        import douyin
+
+        class Boom:
+            def eval_json(self, _expression):
+                raise RuntimeError("boom")
+
+        class NoEval:
+            pass
+
+        self.assertFalse(douyin.profile_error_page(Boom()))
+        self.assertFalse(douyin.profile_error_page(NoEval()))
+
+    def test_private_send_reports_a_missing_profile_before_any_click(self):
+        import send_actions
+
+        class Page:
+            def __init__(self):
+                self.clicks = []
+
+            def call(self, *_args, **_kwargs):
+                return {}
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://www.douyin.com/user/111111"
+                return None
+
+            def eval_json(self, expression):
+                # 只回答"是不是错误页"这一个问题，其余保持沉默。
+                return True if "error-page" in expression else None
+
+            def click_at(self, *args):
+                self.clicks.append(args)
+
+        old_sleep = send_actions.time.sleep
+        send_actions.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                page = Page()
+                result = send_actions.send_private(page, SendGate(td, "account-a"),
+                                                   "gone-profile", {"authorId": "111111"}, "你好")
+        finally:
+            send_actions.time.sleep = old_sleep
+        # 主页不存在 = 这个目标不可触达 -> 跳过（blocked + skipped），不是"发送失败"：
+        # 我们一条消息都没发出去，失败状态会误导成通道故障（用户 2026-09-21 要求）。
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "profile_not_found")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(page.clicks, [], "主页不存在时一个点击都不许发出去")
+
+
+class PrivateSkipTests(unittest.TestCase):
+    """私密账号 / 不接受陌生人私信的目标：跳过，不记成发送失败（用户 2026-09-21 要求）。
+
+    判据来自真机：有的目标「私信」入口点得动、面板却始终不开（对方未互关 / 私密账号）。
+    这时我们一条消息都没发出去 —— 失败状态会误导成"通道坏了"，而且会挡住后面的目标。
+    """
+
+    class Page:
+        def __init__(self):
+            self.clicks = []
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return "https://www.douyin.com/user/" + ("A" * 40)
+            return None
+
+        def click_at(self, *args):
+            self.clicks.append(args)
+
+        def close(self):
+            pass
+
+    def _patched(self, entry, panel=None, clicks_expected=0):
+        import douyin
+        import send_actions
+        page = self.Page()
+        saved = (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
+                 send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+                 send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+                 send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
+                 send_actions.douyin.make_network_recorder, send_actions.time.sleep)
+        send_actions.douyin.login_state = lambda _cdp: "verified"
+        send_actions.douyin.check_captcha = lambda _cdp: False
+        send_actions.douyin.visibility_state = lambda _cdp: "visible"
+        send_actions.douyin.dm_entry = lambda _cdp: dict(entry)
+        send_actions.douyin.dm_panel_state = lambda _cdp, _name: dict(panel or {"found": False})
+        send_actions.douyin.dm_composer_for_recipient = lambda *_a, **_k: {"found": False}
+        send_actions.douyin.recipient_context = lambda *_a, **_k: {"verified": True}
+        send_actions.douyin.profile_error_page = lambda _cdp: False
+        send_actions.time.sleep = lambda _seconds: None
+        return page, saved
+
+    def _restore(self, saved):
+        import send_actions
+        (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
+         send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+         send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+         send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
+         send_actions.douyin.make_network_recorder, send_actions.time.sleep) = saved
+
+    def test_a_blocked_dm_entry_is_skipped_without_any_click(self):
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": False, "blocked": True,
+                                     "reason": "stranger_dm_disabled"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "skip-1",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "dm_not_available")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(page.clicks, [], "对方不可私信时一个点击都不许发出去")
+
+    def test_a_panel_that_never_opens_is_skipped_not_failed(self):
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "skip-2",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "dm_panel_unavailable")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(len(page.clicks), 3, "面板打不开时按入口重试次数上报，且不发消息")
+
+    def test_sidecar_returns_the_skipped_list_separately(self):
+        import live_flow
+        import send_actions
+        import sidecar
+        author = "A" * 40
+        page, saved = self._patched({"found": False, "blocked": True,
+                                     "reason": "stranger_dm_disabled"})
+        original_send = sidecar.send_private
+        sidecar.send_private = send_actions.send_private
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                           os.path.join(td, "profile"), 19227)
+                instance._page = lambda: (page, {"pid": 1})
+                instance.live_queue.append([sidecar._event("live", "room-1", {
+                    "id": "e1", "authorId": author, "authorName": "小明", "text": "问一下"})])
+                planned = instance.dispatch("live_plan", {
+                    "maxItems": 5, "windowSeconds": 600,
+                    "scripts": {"e1": {"publicText": "公开话术", "privateText": "私信话术"}}})
+                batch_id = planned["batch"]["batchId"]
+                instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id,
+                                         {"sendId": "pub-skip"})
+                instance.gate.reserve("pub-skip", "live-danmaku-native:e1:小明", "公开话术",
+                                      kind="danmaku_reply")
+                instance.gate.mark_started("pub-skip")
+                instance.gate.finish("pub-skip", "sent_confirmed", "platform_response_recorded")
+                result = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "skip-3", "publicSendId": "pub-skip"}]})
+                self.assertEqual(result["skipped"], [{"eventId": "e1", "reason": "dm_not_available"}])
+                self.assertEqual(result["results"][0]["status"], "blocked")
+        finally:
+            sidecar.send_private = original_send
+            self._restore(saved)
+
+
+class LivePrivateBindingTests(unittest.TestCase):
+    """审核意见（2026-09-21）：直播私信必须逐项绑定"那一次已确认成功的公屏回复"。
+
+    只靠批次候选清单（按事件状态放行）会留下一条绕过路径：调用方不带 publicSendId
+    直接要私信，公屏成功门禁就形同虚设。下面把三条绕过路径都钉住。
+    """
+
+    class _Page:
+        def close(self):
+            pass
+
+    def _setup(self, td, recorded_send_id="pub-1"):
+        import live_flow
+        import sidecar
+        instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19231)
+
+        def explode():
+            raise AssertionError("契约不通过时不得打开浏览器")
+
+        instance._page = explode
+        instance.live_queue.append([sidecar._event("live", "room-1", {
+            "id": "e1", "authorId": "A" * 40, "authorName": "小明", "text": "问一下"})])
+        planned = instance.dispatch("live_plan", {
+            "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+            "scripts": {"e1": {"publicText": "谢谢支持", "privateText": "私信话术"}}})
+        batch_id = planned["batch"]["batchId"]
+        # 公屏这一phase确实确认成功（并记录那次的 sendId）
+        instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id,
+                                 {"sendId": recorded_send_id})
+        return sidecar, instance, batch_id
+
+    @staticmethod
+    def _confirmed_public(gate, send_id):
+        gate.reserve(send_id, "live-danmaku-native:e1:小明", "谢谢支持", kind="danmaku_reply")
+        gate.mark_started(send_id)
+        gate.finish(send_id, "sent_confirmed", "platform_response_recorded")
+        return send_id
+
+    def test_missing_public_send_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td)
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-1"}]})
+            self.assertEqual(reply["results"][0]["reason"], "public_missing")
+            self.assertEqual(reply["results"][0]["status"], "blocked")
+
+    def test_unconfirmed_public_send_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td)
+            instance.gate.reserve("pub-unconfirmed", "live-danmaku-native:e1:小明", "谢谢支持",
+                                  kind="danmaku_reply")
+            instance.gate.mark_started("pub-unconfirmed")
+            instance.gate.finish("pub-unconfirmed", "unknown", "platform_response_unavailable")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-2", "publicSendId": "pub-unconfirmed"}]})
+            self.assertEqual(reply["results"][0]["reason"], "public_unknown")
+
+    def test_a_public_send_from_another_event_is_refused(self):
+        """拿别人那次的公屏成功来给这个事件开私信 -> public_send_mismatch。"""
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="pub-own")
+            self._confirmed_public(instance.gate, "pub-other")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-3", "publicSendId": "pub-other"}]})
+            self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
+
+    def test_the_bound_public_send_lets_the_private_phase_reach_the_page(self):
+        """绑定正确时确实进入浏览器阶段（用假页面验证走通了门禁，而不是被别的规则拦下）。"""
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="pub-ok")
+            self._confirmed_public(instance.gate, "pub-ok")
+            instance._page = lambda: (self._Page(), {"pid": 1})
+            calls = []
+            original = sidecar.send_private
+            sidecar.send_private = lambda *_a, **_k: (calls.append(1) or
+                                                      {"status": "unknown",
+                                                       "evidence": {"conversationEcho": True}})
+            try:
+                reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "p-4", "publicSendId": "pub-ok"}]})
+            finally:
+                sidecar.send_private = original
+            self.assertEqual(calls, [1])
+            self.assertEqual(reply["results"][0]["status"], "unknown")
+
+    def test_capabilities_keep_unverified_channels_fail_closed(self):
+        """未验证的能力必须 fail-closed；只读的门禁辅助方法也要出现在能力清单里。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19232)
+            caps = instance.dispatch("capabilities", {})
+            capability = caps["capability"]
+            for name in ("private_reply", "video_reply", "live_reply", "live_batch",
+                         "live_danmaku_reply", "live_private_reply", "comment_flow",
+                         "comment_private_candidates"):
+                self.assertIn(name, capability, name)
+                self.assertFalse(capability[name]["autoEligible"],
+                                 "%s 未验证却标记为可自动发送" % name)
+            self.assertIn("comment_private_candidates", caps["methods"])
 
 
 if __name__ == "__main__":
