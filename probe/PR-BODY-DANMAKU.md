@@ -22,6 +22,8 @@
 |---|---|
 | ![直播间整体](probe/docs/evidence-2026-09-21/01-live-room-overview.png) | 直播间整体：右侧公屏弹幕列表 + 底部输入框（**可见行**才可点，见 3.3） |
 | ![原生回复菜单](probe/docs/evidence-2026-09-21/02-native-reply-menu.png) | 点击弹幕正文后弹出的原生菜单（「资料卡」/「回复 TA」）——**这就是用户要求的原生回复路径** |
+| ![输入框提及](probe/docs/evidence-2026-09-21/03-composer-mention.png) | **点「回复 TA」之后**：平台把 @提及**插进了输入框**（`startsAt=true, mention=true, mentionCount=1`）——提及是平台实体，不是我们拼的文本 |
+| ![回复已上屏](probe/docs/evidence-2026-09-21/06-reply-on-screen.png) | **发送之后**：这条回复出现在公屏消息流里（`roomEcho=true`）。图中他人昵称/正文已脱敏，只保留我们发出的那条 |
 | ![私信会话](probe/docs/evidence-2026-09-21/04-dm-conversations.png) | 平台自己的私信会话入口（会话列表已脱敏），私信通道就落在这里 |
 
 ---
@@ -98,6 +100,8 @@
 | 关键词命中（屏上可见弹幕） | ✅ 自动派生关键词命中 2~9 行/轮 |
 | 原生「回复 TA」公屏回复 | ✅ 多轮成功：`mentionInserted=true` + `roomEcho=true` |
 | 私信 | ✅ 成功：`conversationEcho=true`、`composerCleared=true`、收件人 `live_panel_header` 校验通过 |
+| 输入框提及（截图 03） | ✅ `startsAt=true` / `mention=true` / `mentionCount=1`：提及由平台插入 |
+| 回复上屏（截图 06） | ✅ `roomEcho=true`：回复确实出现在公屏消息流 |
 | 私信跳过 | ✅ 对方不可私信时按跳过处理并**换下一个目标**（不发送、不重试） |
 | 点击审计 | ✅ 每次尝试一行；被拒绝的落点含输入框（`ace-line`）、未读分隔条、平台遮罩（`semi-modal-wrap`） |
 
