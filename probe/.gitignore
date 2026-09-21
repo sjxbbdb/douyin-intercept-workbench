@@ -18,4 +18,8 @@ build/
 dist/
 .tmp-*
 _*.py
+# 受限沙箱下的测试运行器工作目录（临时状态，不入库）
+tbox/
+../tbox/
+
 _fetch.js
