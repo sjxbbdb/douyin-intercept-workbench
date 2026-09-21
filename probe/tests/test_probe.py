@@ -2168,6 +2168,371 @@ class CommentFlowContractTests(unittest.TestCase):
         self.assertFalse(live.user_card_action(card, "")["ok"])
 
 
+class SearchPoolTests(unittest.TestCase):
+    """找视频模块的三条缺口：搜索结果保存、videoId 交接、多账号池/游标隔离。
+
+    此前 search 只把候选放在响应里 —— 宿主重启就只剩自己内存里那份池子，
+    而且「选中某个候选交给评论区」没有正式链路，只能自己拼 URL。
+    """
+
+    KEYWORD = "怎么做副业"
+
+    class _Page:
+        def __init__(self, url=""):
+            self.url = url
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return self.url
+            return None
+
+        def eval_json(self, expression, timeout=None):
+            # 登录态/验证码探针都走 eval_json：返回 None 表示"没看到弹窗、也没看到账号"
+            # -> login_state 判 unknown（只有 required 才会中止搜索）。
+            return None
+
+        def close(self):
+            pass
+
+    @staticmethod
+    def _videos():
+        from crawl import video_relevance
+        # 标题与相关度：整串命中 100 / 分词全命中 60 / 不命中 0。
+        # （注：提问式关键词的「中心语档」修复属于另一个 PR，这里不依赖它。）
+        rows = [("111", "怎么做副业赚的小钱", "甲", 100),
+                ("222", "副业怎么做，顺带说说做副业的方法", "乙", 60),
+                ("333", "完全无关的内容", "丙", 0)]
+        out = []
+        for video_id, title, author, _score in rows:
+            video = {"aweme_id": video_id, "desc": title, "author": author,
+                     "author_sec_uid": "sec-%s" % video_id,
+                     "url": "https://www.douyin.com/video/%s" % video_id}
+            video["_relevance"] = video_relevance(title, SearchPoolTests.KEYWORD)
+            out.append(video)
+        return out
+
+    def _instance(self, state_dir, scope="account-a"):
+        import search_pool
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance.state_dir = state_dir
+        instance.account_scope = scope
+        instance.gate = SendGate(state_dir, scope)
+        instance.video_pool = search_pool.SearchPool(state_dir, scope)
+        instance._page = lambda: (self._Page(), {"pid": 1})
+        return sidecar, instance
+
+    def _search(self, instance, sidecar_mod, **params):
+        original = sidecar_mod.crawlmod.search_videos
+        sidecar_mod.crawlmod.search_videos = lambda *args, **kwargs: self._videos()
+        try:
+            return instance.search(dict({"keyword": self.KEYWORD}, **params))
+        finally:
+            sidecar_mod.crawlmod.search_videos = original
+
+    def test_search_saves_every_collected_candidate_not_only_the_returned_ones(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td)
+            result = self._search(instance, sidecar_mod, minRelevance=40)
+            stats = instance.video_pool.stats()
+        self.assertEqual([video["id"] for video in result["videos"]], ["111", "222"],
+                         "低于 minRelevance 的候选不返回")
+        self.assertEqual(result["poolSaved"]["inserted"], 3,
+                         "池子必须记下【本次采集到的全部】视频，否则下一页会重复采集")
+        self.assertEqual(result["poolSaved"]["total"], 3)
+        self.assertEqual(stats["total"], 3)
+
+    def test_repeat_search_upserts_instead_of_duplicating(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td)
+            self._search(instance, sidecar_mod)
+            second = self._search(instance, sidecar_mod)
+            stats = instance.video_pool.stats()
+        self.assertEqual(second["poolSaved"]["inserted"], 0)
+        self.assertEqual(second["poolSaved"]["updated"], 3)
+        self.assertEqual(stats["total"], 3)
+
+    def test_saved_candidates_are_listed_by_the_pool_method(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td)
+            self._search(instance, sidecar_mod)
+            listing = instance.dispatch("search_pool", {"minRelevance": 40})
+        self.assertEqual(listing["status"], "ok")
+        self.assertEqual([video["videoId"] for video in listing["videos"]], ["111", "222"])
+        self.assertEqual(listing["videos"][0]["relevance"]["score"], 100)
+        self.assertEqual(listing["stats"]["keywords"], 1)
+
+    def test_pool_is_isolated_per_account_scope(self):
+        """同一个库文件，两个账号互不可见（多账号并行时这是数据正确性问题）。"""
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, account_a = self._instance(td, scope="account-a")
+            self._search(account_a, sidecar_mod)
+            _, account_b = self._instance(td, scope="account-b")
+            listing_b = account_b.dispatch("search_pool", {})
+            listing_a = account_a.dispatch("search_pool", {})
+        self.assertEqual(len(listing_a["videos"]), 3)
+        self.assertEqual(listing_b["videos"], [])
+        self.assertEqual(listing_b["stats"]["total"], 0)
+
+    def test_cursor_from_another_account_is_refused(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, account_a = self._instance(td, scope="account-a")
+            result = self._search(account_a, sidecar_mod)
+            _, account_b = self._instance(td, scope="account-b")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                account_b.search({"keyword": self.KEYWORD, "cursor": result["cursor"]})
+        self.assertEqual(raised.exception.code, "cursor_account_mismatch")
+
+    def test_video_id_is_the_formal_handoff_into_the_comment_area(self):
+        """videoId 取自池子 —— 宿主不必自己拼 URL，来源关键词与相关度也不丢。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td)
+            self._search(instance, sidecar_mod)
+            resolved = sidecar._resolve_video_url(instance, {"videoId": "111"})
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                sidecar._resolve_video_url(instance, {"videoId": "999"})
+        self.assertEqual(resolved, "https://www.douyin.com/video/111")
+        self.assertEqual(raised.exception.code, "unknown_video_id")
+
+
+class CommentBatchFlowTests(unittest.TestCase):
+    """评论批次契约：评论批次 -> 逐条公开回复 -> 确认后私信。
+
+    这是协作者侧缺口清单里的第 2 条：此前评论区只有【单条】发送路径，
+    「评论批次 → 逐条公开回复 → 确认后私信」这条固定流程接不起来 ——
+    单条发送可以靠宿主自觉，两阶段契约（只有 sent_confirmed 才允许私信）不行。
+
+    全部离线：采集被替换成固定结果，发送函数被替换成假实现，
+    所有边界校验必须在打开浏览器【之前】完成（用 explode 的 _page 证明）。
+    """
+
+    VIDEO = "https://www.douyin.com/video/7501633234145447202"
+    PUBLIC = "需要的话看我主页，我整理了一份"
+    PRIVATE = "你好，看到你在评论区留言了"
+
+    class _Page:
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            return "complete" if expression == "document.readyState" else None
+
+        def close(self):
+            pass
+
+    @staticmethod
+    def _targets(count=2):
+        return [{"id": "e%d" % index, "source": "video",
+                 "roomId": CommentBatchFlowTests.VIDEO,
+                 "authorId": "author-%d" % index, "authorName": "用户%d" % index,
+                 "text": "求带搞钱，在线等！", "observedAt": "2026-09-21T05:00:00Z",
+                 "fingerprint": "fp%d" % index, "matchedKeyword": "求带", "digg": 3}
+                for index in range(1, count + 1)]
+
+    @staticmethod
+    def _collected(targets):
+        return {"status": "ok", "events": targets, "targets": targets,
+                "filter": {"collected": 40, "matched": len(targets),
+                           "targetCount": len(targets), "matchMode": "phrase",
+                           "keywords": ["求带"], "modeCounts": {"phrase": len(targets)}}}
+
+    def _instance(self, state_dir, collected, explode=False):
+        import comment_flow
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance.state_dir = state_dir
+        instance.account_scope = "account-a"
+        instance.gate = SendGate(state_dir, "account-a")
+        instance.comment_queue = comment_flow.CommentQueue(state_dir, "account-a")
+        instance.collect_comments = lambda params: collected
+        if explode:
+            def boom():
+                raise AssertionError("这一阶段不该打开浏览器")
+            instance._page = boom
+        else:
+            instance._page = lambda: (self._Page(), {"pid": 1})
+        return sidecar, instance
+
+    def _plan_params(self, **overrides):
+        params = {"url": self.VIDEO, "publicText": self.PUBLIC, "privateText": self.PRIVATE,
+                  "commentKeywords": "求带", "matchMode": "phrase"}
+        params.update(overrides)
+        return params
+
+    def test_plan_refuses_missing_scripts_before_any_browser_action(self):
+        """话术不完整就不建批次 —— fail-closed，连浏览器都不开。"""
+        import sidecar
+        for missing in ("publicText", "privateText"):
+            with tempfile.TemporaryDirectory() as td:
+                sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                       explode=True)
+                params = self._plan_params()
+                params.pop(missing)
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.comment_plan(params)
+                self.assertEqual(raised.exception.code, "invalid_input")
+                label = "public_text" if missing == "publicText" else "private_text"
+                self.assertIn(label, str(raised.exception.message))
+
+    def test_caller_supplied_policy_is_refused(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.comment_plan(self._plan_params(policy={"maxPrivate": 50}))
+            self.assertEqual(raised.exception.code, "policy_not_server_issued")
+
+    def test_plan_freezes_one_host_script_for_every_target(self):
+        """宿主给【一套】话术，套用到批次内每个目标上，并冻结成计划。"""
+        import hashlib
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(3)))
+            result = instance.comment_plan(self._plan_params())
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(len(result["targets"]), 3)
+        self.assertEqual({target["publicText"] for target in result["targets"]}, {self.PUBLIC})
+        self.assertEqual({target["privateText"] for target in result["targets"]}, {self.PRIVATE})
+        self.assertEqual(result["scriptSource"], "host")
+        self.assertTrue(result["batch"]["frozen"])
+        self.assertEqual(result["filter"]["matched"], 3)
+        self.assertEqual(result["publicTextSha256"],
+                         hashlib.sha256(self.PUBLIC.encode("utf-8")).hexdigest())
+
+    def test_plan_is_empty_without_a_single_matching_comment(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected([]))
+            result = instance.comment_plan(self._plan_params())
+        self.assertEqual(result["status"], "empty")
+        self.assertIsNone(result["batch"])
+        self.assertEqual(result["targets"], [])
+
+    def test_terminal_collect_status_is_passed_through(self):
+        """验证码/未登录/不支持的图文帖都是【终止态】：不建批次。"""
+        for status in ("captcha", "login_required", "unsupported"):
+            with tempfile.TemporaryDirectory() as td:
+                collected = {"status": status, "events": [], "targets": [], "filter": {}}
+                sidecar_mod, instance = self._instance(td, collected)
+                result = instance.comment_plan(self._plan_params())
+            self.assertEqual(result["status"], status)
+            self.assertIsNone(result["batch"])
+
+    def test_reply_blocks_a_rewritten_script_and_sends_nothing(self):
+        """话术必须与冻结的那份逐字一致：改写就 blocked，且不打开浏览器。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            original = sidecar.send_comment
+            calls = []
+            sidecar.send_comment = lambda *args, **kwargs: calls.append(args) or {"status": "unknown"}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                out = instance.comment_reply({"batchId": plan["batch"]["batchId"], "items": [
+                    {"eventId": "e1", "sendId": "pub-e1", "text": "我自己改写的话术"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(calls, [], "改写话术时不得调用发送")
+        self.assertEqual(out["status"], "blocked")
+        self.assertEqual(out["results"][0]["reason"], "script_mismatch")
+
+    def test_unknown_public_reply_never_becomes_a_private_message(self):
+        """本通道常态是 unknown：必须挡在私信之外，且不打开浏览器。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            # 公屏那一步是【确实会打开浏览器】的（它就是发送动作），
+            # 这里只在【私信那一步】要求 fail-closed。
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original = sidecar.send_comment
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "unknown", "reason": "platform_response_unavailable",
+                "sendId": args[2]}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                reply = instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"}]})
+                private = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(reply["results"][0]["status"], "unknown")
+        self.assertEqual(reply["privateCandidates"], [])
+        self.assertEqual(reply["privateRejected"][0]["reason"], "public_unknown")
+        self.assertEqual(private["status"], "blocked")
+        self.assertEqual(private["results"][0]["reason"], "public_unknown")
+
+    def test_confirmed_public_reply_opens_the_private_phase(self):
+        """只有 sent_confirmed 放行私信；放行后私信阶段的 sendId 绑定要留痕。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original_comment = sidecar.send_comment
+            original_private = sidecar.send_private
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "sent_confirmed", "reason": "platform_response_recorded",
+                "sendId": args[2]}
+            sidecar.send_private = lambda *args, **kwargs: {
+                "status": "unknown", "reason": "platform_response_unavailable",
+                "sendId": args[2]}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                reply = instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"}]})
+                private = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-e1"}]})
+                report = instance.comment_result({"batchId": batch_id})
+            finally:
+                sidecar.send_comment = original_comment
+                sidecar.send_private = original_private
+        self.assertEqual(reply["privateCandidates"][0]["eventId"], "e1")
+        self.assertEqual(reply["privateCandidates"][0]["publicSendId"], "pub-e1")
+        self.assertEqual(private["status"], "ok")
+        self.assertEqual(private["results"][0]["status"], "unknown")
+        self.assertEqual(report["counts"].get("sent_confirmed"), 1)
+        self.assertEqual(report["privateCounts"].get("unknown"), 1)
+        self.assertEqual(report["checkpoint"]["phase"], "private")
+
+    def test_private_refuses_a_public_send_id_that_belongs_elsewhere(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original = sidecar.send_comment
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "sent_confirmed", "reason": "platform_response_recorded",
+                "sendId": args[2]}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"}]})
+                out = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-OTHER"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(out["results"][0]["reason"], "public_send_id_mismatch")
+
+    def test_expired_events_are_not_replayed_into_a_batch(self):
+        """批次窗口：过期的候选不会重新进批次（评论区窗口远长于弹幕，但语义一致）。"""
+        import comment_flow
+        clock = {"now": 1000.0}
+        with tempfile.TemporaryDirectory() as td:
+            queue = comment_flow.CommentQueue(td, "account-a", clock=lambda: clock["now"])
+            queue.append(self._targets(1))
+            clock["now"] += comment_flow.WINDOW_DEFAULT + 1
+            batch = queue.take_batch(max_items=5)
+        self.assertEqual(batch["events"], [])
+        self.assertEqual(batch["expiredCount"], 1)
+
+
 class ClickGuardTests(unittest.TestCase):
     """受约束点击的回归（2026-09-20 事故：点击落到了浏览器地址栏 / 页面头像）。"""
 

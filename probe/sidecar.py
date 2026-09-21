@@ -17,12 +17,14 @@ import time
 from datetime import datetime, timezone
 
 import cdp as cdpmod
+import comment_flow
 import crawl as crawlmod
 import douyin
 import douyin_selectors as S
 import click_guard
 import live
 import live_flow
+import search_pool
 import winfocus
 from send_actions import (send_comment, send_danmaku_reply,
                             send_danmaku_reply_native, send_private)
@@ -69,15 +71,27 @@ CURSOR_VERSION = 1
 CURSOR_MAX_SEEN = 20000
 
 
-def _encode_cursor(keyword, seen, page_no):
+def _encode_cursor(keyword, seen, page_no, account_scope=None):
+    """游标 = 不透明字符串。带 account_scope 之后，跨账号复用会被拒绝。
+
+    为什么必须带：游标里的 seen 是"已经见过哪些视频"的池子。
+    A 账号的池子被 B 账号拿去当已见集合，等于 B 凭空跳过了 A 采过的视频
+    （多账号并行时这是静默的数据错误，不是权限问题）。
+    """
     payload = {"v": CURSOR_VERSION, "k": keyword, "n": int(page_no),
                "seen": sorted(str(x) for x in seen)}
+    if account_scope:
+        payload["a"] = str(account_scope)
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _decode_cursor(value, keyword):
-    """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。"""
+def _decode_cursor(value, keyword, account_scope=None):
+    """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。
+
+    account_scope 给定时，游标里带账号的必须与它一致（老游标不带账号字段，
+    仍然接受 —— 否则宿主手里尚未过期的那一个会被突然判死）。
+    """
     if value in (None, ""):
         return set(), 1
     if not isinstance(value, str) or len(value) > 400000:
@@ -90,6 +104,9 @@ def _decode_cursor(value, keyword):
         raise SidecarError("invalid_input", "cursor version is not supported")
     if payload.get("k") != keyword:
         raise SidecarError("invalid_input", "cursor does not belong to this keyword")
+    if account_scope and payload.get("a") and str(payload["a"]) != str(account_scope):
+        raise SidecarError("cursor_account_mismatch",
+                           "cursor belongs to another account scope")
     seen = payload.get("seen")
     if not isinstance(seen, list) or len(seen) > CURSOR_MAX_SEEN:
         raise SidecarError("invalid_input", "cursor pool is invalid")
@@ -212,6 +229,49 @@ def _public_guard(gate, public_send_id):
     return None
 
 
+def _resolve_video_url(instance, params):
+    """把 url / videoId 解析成视频地址；videoId 走【搜索池】这条正式交接链路。
+
+    为什么要有 videoId：宿主从「找视频」模块选中的候选本来就来自池子，
+    让它自己拼 URL 等于把交接信息（来源关键词、相关度）丢掉，
+    复制粘贴出错时还会把评论任务挂到别的视频上。
+    """
+    video_id = str(params.get("videoId") or "").strip()
+    if video_id:
+        store = instance._pool()
+        row = store.get(video_id) if store is not None else None
+        if row is None:
+            raise SidecarError("unknown_video_id",
+                               "videoId is not in the saved search pool; run search first")
+        return safe_url(row["url"], "pool video url", keep_query=True)
+    return safe_url(params.get("url"), "url", keep_query=True)
+
+
+def _comment_batch_items(params):
+    """校验评论批次某个阶段的逐条发送计划（形状与直播间一致）。
+
+    每条都带宿主给的幂等键 sendId，重试只能重放同一个动作。
+    publicSendId 同样【不能在这里被吞掉】：私信阶段的公屏绑定就是从它来的。
+    """
+    batch_id = str(params.get("batchId") or "").strip()
+    if not batch_id:
+        raise SidecarError("invalid_input", "batchId is required")
+    items = params.get("items")
+    if not isinstance(items, list) or not items:
+        raise SidecarError("invalid_input", "items must be a non-empty array")
+    out = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise SidecarError("invalid_input", "each item must be an object")
+        event_id = str(raw.get("eventId") or "").strip()
+        send_id = str(raw.get("sendId") or "").strip()
+        if not event_id or not send_id:
+            raise SidecarError("invalid_input", "each item needs eventId and sendId")
+        out.append({"eventId": event_id, "sendId": send_id, "text": raw.get("text"),
+                    "publicSendId": str(raw.get("publicSendId") or "").strip()})
+    return batch_id, out
+
+
 def _live_batch_items(params):
     """Validate the per-item send plan of one live batch phase.
 
@@ -289,6 +349,11 @@ class Sidecar:
         # 点击审计：每次（含被拒绝的）点击都写一行，便于事后复核落点
         click_guard.set_audit_path(os.path.join(self.state_dir, "click_audit.jsonl"))
         self.live_queue = live_flow.LiveQueue(self.state_dir, self.account_scope)
+        # 评论批次用【独立的库】—— 直播间与评论区的事件、批次、私信候选不能互相污染，
+        # 多账号下更是靠 account_scope + 独立库双重隔离（见 comment_flow）。
+        self.comment_queue = comment_flow.CommentQueue(self.state_dir, self.account_scope)
+        # 搜索结果池：按【账号 + 关键词】落库，候选可以被 videoId 正式引用（交接给评论区）。
+        self.video_pool = search_pool.SearchPool(self.state_dir, self.account_scope)
         self.marker_path = os.path.join(self.state_dir, "browser-owner.json")
 
     @staticmethod
@@ -339,12 +404,32 @@ class Sidecar:
             raise SidecarError("browser_not_visible", "owned browser window must be visible")
         return page, marker
 
+    def _pool(self):
+        """搜索池的取用口。
+
+        正常路径由 __init__ 建好；测试替身（Sidecar.__new__ 构造、没有 state_dir）
+        取不到池子时返回 None，让搜索本身照常工作 —— 落库是【加法能力】，
+        不能因为它而让既有的搜索契约整体失败。
+        """
+        pool = getattr(self, "video_pool", None)
+        if pool is not None:
+            return pool
+        state_dir = getattr(self, "state_dir", None)
+        if not state_dir:
+            return None
+        scope = getattr(self, "account_scope", None)
+        if not scope:
+            return None
+        self.video_pool = search_pool.SearchPool(state_dir, scope)
+        return self.video_pool
+
     def capabilities(self, _params):
         return {
             "protocolVersion": 1,
             "methods": ["capabilities", "launch", "doctor", "open", "search",
                          "collect_comments", "collect_live", "send_private", "send_comment",
-                         "comment_private_candidates",
+                         "comment_private_candidates", "search_pool",
+                         "comment_plan", "comment_reply", "comment_private", "comment_result",
                          "live_listen", "live_plan", "live_reply", "live_private", "live_result",
                          "close"],
             "sendStatuses": ["unknown", "failed", "blocked"],
@@ -366,6 +451,22 @@ class Sidecar:
                                                    "delivery": "unknown_without_bound_platform_response",
                                                    "evidenceLevel": "conversation_echo_only",
                                                    "releaseCondition": "platform_response_or_explicit_server_policy"}},
+                # 搜索池：候选视频落库（账号+关键词），并让 videoId 成为
+                # 「找视频 -> 评论区」的正式交接标识。只读/只落库，不发送。
+                "video_pool": {"implemented": True, "autoEligible": True,
+                                "validation": {"status": "offline_unit_tests",
+                                               "delivery": "durable_candidate_pool",
+                                               "isolation": "account_scope on rows and cursor",
+                                               "handoff": "collect_comments/comment_plan accept videoId"}},
+                # 评论批次：把「评论批次 -> 逐条公开回复 -> 确认后私信」接成一条有状态的流程。
+                # autoEligible=false —— 批次机制本身离线可测，但它驱动的两个发送动作
+                # （video_reply / private_reply）都还没有平台送达证据，按红线 6 一律 fail-closed。
+                "comment_batch": {"implemented": True, "autoEligible": False,
+                                   "validation": {"status": "offline_unit_tests",
+                                                  "delivery": "queued_batch_two_phase",
+                                                  "scripts": "host_provided_only",
+                                                  "publicGate": "only sent_confirmed allows private",
+                                                  "window": "expired_events_are_not_replayed"}},
                 "video_reply": {"implemented": True, "autoEligible": False,
                                  "validation": {"status": "offline_dom_fixture", "delivery": "unknown"}},
                 "live_capture": {"implemented": True, "autoEligible": True,
@@ -571,7 +672,10 @@ class Sidecar:
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
         cursor_in = params.get("cursor")
-        seen, page_no = _decode_cursor(cursor_in, keyword)
+        # account_scope 用 getattr 取：测试替身（__new__ 构造）没有这个属性，
+        # 而游标绑定属于【加法能力】，不该让既有的搜索契约整体失败。
+        scope = getattr(self, "account_scope", None)
+        seen, page_no = _decode_cursor(cursor_in, keyword, scope)
 
         min_relevance = int(params.get("minRelevance", 0) or 0)
         if not 0 <= min_relevance <= 100:
@@ -598,21 +702,33 @@ class Sidecar:
                                                 max_videos=max_videos, log=lambda *a: None,
                                                 strict=False, meta=meta,
                                                 navigate=navigate, seen_ids=seen)
-            out = []
-            filtered = 0
+            # 先给【本次采集到的每一条】算相关度，再按 minRelevance 决定返回哪些。
+            # 分成 rows（全部，进池子）与 out（返回给宿主）两拨：
+            # 池子必须完整，否则被筛掉的那些会在下一页被当成新视频重复采集。
+            rows = []
             for video in videos:
-                relevance = crawlmod.video_relevance(video.get("desc"), keyword)
-                if relevance["score"] < min_relevance:
-                    filtered += 1
+                video_id = str(video.get("aweme_id") or "")
+                if not video_id:
                     continue
-                if len(out) >= max_videos:
-                    break
-                out.append({"id": str(video.get("aweme_id") or ""),
-                            "url": safe_url(video.get("url"), "video.url"),
-                            "title": str(video.get("desc") or "")[:200],
-                            "author": str(video.get("author") or "")[:120],
-                            "authorId": str(video.get("author_sec_uid") or "")[:200],
-                            "relevance": relevance})
+                rows.append({"id": video_id,
+                             "url": safe_url(video.get("url"), "video.url"),
+                             "title": str(video.get("desc") or "")[:200],
+                             "author": str(video.get("author") or "")[:120],
+                             "authorId": str(video.get("author_sec_uid") or "")[:200],
+                             "relevance": crawlmod.video_relevance(video.get("desc"), keyword)})
+            out = [row for row in rows if row["relevance"]["score"] >= min_relevance][:max_videos]
+            filtered = len(rows) - len([row for row in rows
+                                        if row["relevance"]["score"] >= min_relevance])
+            # 搜索结果保存：候选落库（按 账号 + 关键词），videoId 从此可以被正式引用。
+            pool_saved = None
+            store = self._pool()
+            if store is not None:
+                try:
+                    saved = store.save(keyword, rows)
+                except search_pool.SearchPoolError as exc:
+                    raise SidecarError(exc.code, exc.message)
+                pool_saved = {"inserted": saved["inserted"], "updated": saved["updated"],
+                              "total": store.stats()["total"]}
             # 🔴 池子记【本次采集到的全部】视频，不只是通过相关度筛选的那部分：
             #    被 minRelevance 筛掉的同样"已经见过"，不记进池子的话，
             #    下一页会把它当新视频重新采集 —— 宿主就会重复处理同一批视频。
@@ -640,11 +756,12 @@ class Sidecar:
                         "skippedSeen": int(meta.get("skipped_seen") or 0),
                         "platformHasMore": meta.get("platform_has_more"),
                         "platformCursor": meta.get("platform_cursor"),
+                        "poolSaved": pool_saved,
                         "filter": page_filter}
             # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
             return {"status": "ok",
                     "videos": out,
-                    "cursor": _encode_cursor(keyword, pool, page_no + 1),
+                    "cursor": _encode_cursor(keyword, pool, page_no + 1, scope),
                     "hasMore": bool(out),
                     "stoppedReason": None,
                     "page": page_no,
@@ -653,9 +770,38 @@ class Sidecar:
                     "skippedSeen": int(meta.get("skipped_seen") or 0),
                     "platformHasMore": meta.get("platform_has_more"),
                     "platformCursor": meta.get("platform_cursor"),
+                    "poolSaved": pool_saved,
                     "filter": page_filter}
         finally:
             page.close()
+
+    def search_pool(self, params):
+        """读取已保存的搜索结果（找视频模块的池子）。只读，不碰浏览器。
+
+        params: keyword（可选，不给就跨关键词返回）/ minRelevance / limit。
+        返回 videos + stats；stats 里给每个关键词的条数，宿主/UI 据此列出
+        「这次搜索有哪些候选」，再用 videoId 交给评论区（见 collect_comments）。
+        """
+        try:
+            limit = int(params.get("limit", 200))
+            min_relevance = int(params.get("minRelevance", 0) or 0)
+        except (TypeError, ValueError):
+            raise SidecarError("invalid_input", "searchPool bounds are invalid")
+        if not 1 <= limit <= 1000 or not 0 <= min_relevance <= 100:
+            raise SidecarError("invalid_input", "searchPool bounds are out of range")
+        keyword = params.get("keyword")
+        if keyword is not None and not isinstance(keyword, str):
+            raise SidecarError("invalid_input", "keyword must be a string")
+        keyword = (keyword or "").strip() or None
+        store = self._pool()
+        if store is None:
+            raise SidecarError("invalid_config", "state-dir is required for the search pool")
+        return {"status": "ok",
+                "videos": store.list(keyword=keyword, limit=limit,
+                                     min_relevance=min_relevance),
+                "stats": store.stats(),
+                "capability": {"verified": True, "source": "local_pool",
+                               "detail": "saved candidates are durable across host restarts"}}
 
     def collect_comments(self, params):
         """采集一条视频的评论，并按「关键词 / 排除词 / 去重」给出目标批次。
@@ -672,7 +818,7 @@ class Sidecar:
         为什么不直接把 events 筛掉：events 是"采集事实"，宿主可能需要原始批次做审计；
         筛选是业务判断，必须能分开追溯（对应架构的审计与状态镜像）。
         """
-        requested_url = safe_url(params.get("url"), "url", keep_query=True)
+        requested_url = _resolve_video_url(self, params)
         max_items, rounds = int(params.get("maxItems", 100)), int(params.get("scrollRounds", 6))
         if not 1 <= max_items <= 500 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "comment bounds are invalid")
@@ -746,6 +892,217 @@ class Sidecar:
                                    "detail": "response bodies plus visible DOM fallback"}}
         finally:
             page.close()
+
+    # ---- comment batch flow: images/11-comment-area-business ----
+    #
+    # 为什么要有这一组：此前评论区只有【单条】发送（collect_comments 拿到候选，
+    # 宿主自己逐条调 send_comment / send_private），没有批次，于是
+    # 「关键词匹配评论 -> 逐条公开回复 -> 确认后私信」这条固定流程只能靠宿主自觉，
+    # 而两阶段契约（只有 sent_confirmed 才允许私信）是无法靠自觉守住的。
+    # 这里把直播间已经跑通的同一套机制（队列 -> 批次 -> 冻结计划 -> 两阶段）搬到评论区。
+
+    def comment_plan(self, params):
+        """采集一条视频的评论、按关键词筛选，形成【评论批次】并冻结话术。
+
+        与直播间 live_plan 的差别（都是刻意的）：
+          · 输入是【视频 URL + 筛选参数】：评论区没有"持续监听"，一次采集就是一批；
+          · 话术由宿主给【一套】，套用到批次内所有目标（comment_flow.build_scripts）；
+          · 采不到命中目标时【不建立批次】，直接返回 empty，宿主据此换视频或换关键词。
+
+        所有边界校验（话术缺失、批次上限、policy）都在打开浏览器之前完成。
+        """
+        url = _resolve_video_url(self, params)
+        try:
+            max_items = int(params.get("maxItems", 20))
+            window_seconds = int(params.get("windowSeconds", comment_flow.WINDOW_DEFAULT))
+            scroll_rounds = int(params.get("scrollRounds", 6))
+            collect_max = int(params.get("collectMaxItems", 200))
+            min_digg = int(params.get("minDigg", 0) or 0)
+        except (TypeError, ValueError):
+            raise SidecarError("invalid_input", "commentPlan bounds are invalid")
+        if not 1 <= max_items <= comment_flow.MAX_BATCH:
+            raise SidecarError("invalid_input", "commentPlan maxItems is out of range")
+        if not 0 <= scroll_rounds <= 40 or not 1 <= collect_max <= 500:
+            raise SidecarError("invalid_input", "commentPlan collection bounds are invalid")
+        if not 0 <= min_digg <= 1000000:
+            raise SidecarError("invalid_input", "commentPlan minDigg is out of range")
+        if params.get("policy") is not None:
+            # 与直播间同一条红线：策略必须由授权服务端签发并校验，
+            # 在这个接线完成之前，边界一律拒绝调用方自带策略。
+            raise SidecarError("policy_not_server_issued",
+                               "policy must be issued by the authorization service, not by the caller")
+        public_text = params.get("publicText")
+        private_text = params.get("privateText")
+        for value, label in ((public_text, "public_text"), (private_text, "private_text")):
+            problem = comment_flow.script_error(value, label)
+            if problem:
+                # fail-closed：话术不完整就不建批次，连浏览器都不开。
+                raise SidecarError("invalid_input", problem)
+        match_mode = str(params.get("matchMode") or "seg")
+        if match_mode not in crawlmod.MATCH_MODES:
+            raise SidecarError("invalid_input",
+                               "matchMode must be one of %s" % "/".join(crawlmod.MATCH_MODES))
+
+        collected = self.collect_comments({
+            "url": url, "maxItems": collect_max, "scrollRounds": scroll_rounds,
+            "commentKeywords": _filter_text(params.get("commentKeywords"), "commentKeywords"),
+            "excludeKeywords": _filter_text(params.get("excludeKeywords"), "excludeKeywords"),
+            "matchMode": match_mode, "minDigg": min_digg,
+            "dedupeAuthors": bool(params.get("dedupeAuthors", True)),
+        })
+        filtered = collected.get("filter") or {}
+        if collected.get("status") in ("login_required", "captcha", "unsupported"):
+            # 终止态直接透传：宿主据此停下，而不是对着一个失效页面继续建批次。
+            return {"status": collected.get("status"), "batch": None, "targets": [],
+                    "blocked": [], "expired": [], "filter": filtered}
+        targets = collected.get("targets") or []
+        if not targets:
+            return {"status": "empty", "batch": None, "targets": [], "blocked": [],
+                    "expired": [], "filter": filtered}
+
+        self.comment_queue.append(targets)
+        batch = self.comment_queue.take_batch(max_items=max_items,
+                                              window_seconds=window_seconds)
+        summary = comment_flow.batch_summary(batch)
+        if not batch["events"]:
+            return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
+                    "expired": batch["expired"], "filter": filtered,
+                    "batchFilter": summary.get("filter") or {}}
+        plan = self.comment_queue.freeze_plan(
+            batch["batchId"],
+            comment_flow.build_scripts(batch["events"], public_text, private_text))
+        # 摘要里的 frozen/status 必须是【冻结之后】的事实：take_batch 那一刻还没冻结，
+        # 直接回传会让宿主以为计划没冻上。
+        summary["frozen"] = True
+        summary["status"] = "frozen"
+        summary["targets"] = len(plan["targets"])
+        summary["blockedCount"] = len(plan["blocked"])
+        return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
+                "targets": plan["targets"], "blocked": plan["blocked"],
+                "expired": batch["expired"],
+                # filter    = 采集侧的评论筛选统计（关键词/排除词/点赞阈值/去重）
+                # batchFilter = 批次窗口内事件筛选统计 —— 两者含义不同，不要混
+                "filter": filtered, "batchFilter": summary.get("filter") or {},
+                "publicTextSha256": (plan["targets"][0]["publicTextSha256"]
+                                     if plan["targets"] else None),
+                "scriptSource": plan.get("scriptSource"),
+                "policy": plan.get("policy"), "policySource": plan.get("policySource")}
+
+    def comment_reply(self, params):
+        """阶段一：对批次内被接受的条目【逐条公开回复】。
+
+        话术必须与冻结时的那份完全一致 —— 不一致就 blocked，不发送：
+        话术是宿主/知识库侧的产物，本侧不改写（与直播间 live_reply 同一红线）。
+        """
+        batch_id, items = _comment_batch_items(params)
+        self.comment_queue.ensure_active(batch_id)
+        plan = self.comment_queue.plan(batch_id)
+        if not plan.get("targets"):
+            raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        results, sendable = [], []
+        for item in items:
+            target = self.comment_queue.target(batch_id, item["eventId"])
+            if target is None:
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "event_not_in_plan"})
+                continue
+            text = item.get("text") or target["publicText"]
+            if text != target["publicText"]:
+                self.comment_queue.mark(item["eventId"], live_flow.BLOCKED, batch_id,
+                                        {"reason": "script_mismatch"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "script_mismatch"})
+                continue
+            sendable.append((item, target, text))
+        if sendable:
+            page, _ = self._page()
+            try:
+                for item, target, text in sendable:
+                    comment_target = {"id": target["eventId"], "roomId": target["roomId"],
+                                      "authorId": target["authorId"],
+                                      "authorName": target["authorName"], "text": target["text"]}
+                    outcome = send_comment(page, self.gate, item["sendId"], comment_target,
+                                            text, "video")
+                    self.comment_queue.mark(item["eventId"],
+                                            str(outcome.get("status") or "unknown"), batch_id,
+                                            {"sendId": item["sendId"],
+                                             "reason": outcome.get("reason")})
+                    results.append(dict(outcome, eventId=item["eventId"]))
+            finally:
+                page.close()
+        allowed, rejected = self.comment_queue.private_candidates(batch_id)
+        return {"status": "ok" if sendable else "blocked", "phase": "public",
+                "results": results,
+                "privateCandidates": [
+                    {"eventId": t["eventId"], "authorId": t["authorId"],
+                     "authorName": t["authorName"],
+                     # 把"这次公屏成功"的 sendId 一并交给宿主：私信阶段要带回来做绑定校验。
+                     "publicSendId": str(((self.comment_queue.find_event(t["eventId"]) or {})
+                                          .get("detail") or {}).get("sendId") or "")}
+                    for t in allowed],
+                "privateRejected": rejected,
+                "checkpoint": self.comment_queue.result(batch_id)["checkpoint"]}
+
+    def comment_private(self, params):
+        """阶段二：只对【公开回复已确认成功】的条目发私信。
+
+        不在候选清单里的条目一律拒绝并给稳定原因：公开回复未确认、被平台拦下、
+        缺评论者标识、超出私信容量 —— 都不得进入私信。
+        """
+        batch_id, items = _comment_batch_items(params)
+        self.comment_queue.ensure_active(batch_id)
+        allowed, rejected = self.comment_queue.private_candidates(batch_id)
+        by_id = {target["eventId"]: target for target in allowed}
+        reasons = {row.get("eventId"): row.get("reason") for row in rejected}
+        results, sendable = [], []
+        for item in items:
+            target = by_id.get(item["eventId"])
+            if target is None:
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": reasons.get(item["eventId"])
+                                          or "not_a_private_candidate"})
+                continue
+            # 防御性校验：宿主给的 publicSendId 必须与【本批次为该事件记录的公屏 sendId】一致。
+            # 队列的 private_candidates 已经按状态守住了闸门，这里再对一次绑定，
+            # 避免"用 A 的公屏成功去给 B 发私信"这种张冠李戴。
+            recorded = str(((self.comment_queue.find_event(item["eventId"]) or {})
+                            .get("detail") or {}).get("sendId") or "")
+            if item["publicSendId"] and recorded and item["publicSendId"] != recorded:
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "public_send_id_mismatch"})
+                continue
+            text = item.get("text") or target.get("privateText") or ""
+            if text != (target.get("privateText") or ""):
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "script_mismatch"})
+                continue
+            sendable.append((item, target, text))
+        if sendable:
+            page, _ = self._page()
+            try:
+                for item, target, text in sendable:
+                    outcome = send_private(page, self.gate, item["sendId"],
+                                            {"authorId": target["authorId"],
+                                             "authorName": target["authorName"]}, text)
+                    self.comment_queue.mark_private(
+                        item["eventId"], str(outcome.get("status") or "unknown"), batch_id,
+                        {"sendId": item["sendId"], "reason": outcome.get("reason")})
+                    results.append(dict(outcome, eventId=item["eventId"]))
+            finally:
+                page.close()
+        return {"status": "ok" if sendable else "blocked", "phase": "private",
+                "results": results, "rejected": rejected,
+                "checkpoint": self.comment_queue.result(batch_id)["checkpoint"]}
+
+    def comment_result(self, params):
+        """批次报告：逐条状态、私信候选与检查点。只读，不碰浏览器。"""
+        batch_id = str(params.get("batchId") or "").strip()
+        if not batch_id:
+            raise SidecarError("invalid_input", "batchId is required")
+        report = self.comment_queue.result(batch_id)
+        report["queue"] = self.comment_queue.stats()
+        report["limits"] = dict(self.gate.limits)
+        return report
 
     def collect_live(self, params):
         url = safe_url(params.get("url"), "url")
@@ -1109,8 +1466,10 @@ class Sidecar:
         return report
 
     def dispatch(self, method, params):
-        allowed = {"capabilities", "launch", "doctor", "open", "search",
-                   "collect_comments", "collect_live", "send_private", "send_comment",
+        allowed = {"capabilities", "launch", "doctor", "open", "search", "search_pool",
+                   "collect_comments", "comment_plan", "comment_reply", "comment_private",
+                   "comment_result", "comment_private_candidates",
+                   "collect_live", "send_private", "send_comment",
                    "comment_private_candidates",
                    "live_listen", "live_plan", "live_reply", "live_private", "live_result",
                    "close"}
