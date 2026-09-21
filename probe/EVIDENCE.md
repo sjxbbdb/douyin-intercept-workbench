@@ -502,6 +502,74 @@ Semi Design 的浮层在隐藏时被放到屏幕外（实测 `(-9947, -9941)`）
 * 这是幂等门禁**在正确工作**（红线 3：不确定结果不得重复触达）；
 * 但报表因此失真，所以调用方必须给每个目标派生独立的 `sendId`（本轮已修）。
 
+---
 
+## 13. 直播间能力 · 四类证据与发行开关冻结（2026-09-21）
 
+> 本节按评审要求把「关键词匹配 / 公屏回复 / 私信门禁 / 平台可见性」四类证据集中列在一处，
+> 并明确发行开关的冻结状态。真机运行记录见第 12 节，回归用例在 `probe/tests/test_probe.py`。
 
+### 13.1 关键词匹配
+
+* 匹配器【复用评论链路同一套】：`live.match_danmaku` → `crawl.comment_matches`
+  （`phrase` / `seg` / `all` / `any` + 排除词优先），两条链路的筛选语义一致。
+* 匹配发生在【成批之前】：不命中的事件标 `filtered`，不占批次名额；命中排除词的直接排除。
+* 批次窗口：`LiveQueue.take_batch` 只取窗口内事件，窗口外标 `expired` 且**永不重放**。
+* 真机：房间 689015985670 自动派生关键词（主播 / 优秀 / 加油 / 感谢），每轮命中 2~9 行可见弹幕。
+* 回归：`CommentFilterTests`、`LiveFlowTests`（批次窗口 / 过期不重放）。
+
+### 13.2 公屏回复（原生「回复 TA」）
+
+* 真实路径：点弹幕正文 → 浮层菜单「资料卡 / 回复 TA」→ **平台插入 @提及** → 真实按键输入 → 回车。
+* 证据：`mentionInserted=true`、`roomEcho=true`；输入框读数 `startsAt=true` / `mention=true` / `mentionCount=1`。
+* 截图：`probe/docs/evidence-2026-09-21/{02-native-reply-menu,03-composer-mention,06-reply-on-screen}.png`。
+* 防护：定位必须唯一命中 + 落在主聊天列表矩形内 + 命中元素文案指纹一致；
+  任何一项不过就**拒绝点击**，每次尝试（含被拒）写入 `click_audit.jsonl`。
+* 回归：`RoomEchoTests`、`ClickGuardTests`、`ChatScrollTests`、`RoomUrlTests`。
+
+### 13.3 私信门禁（逐条公屏确认才允许私信）
+
+三层门禁，缺一不可：
+
+1. **批次候选清单**：只放行公屏状态为 `sent_confirmed` 的事件（默认策略）；
+2. **逐项绑定**：`live_private` 的每个 item 必须带 `publicSendId`；
+3. **归属校验**：该 sendId 必须是**这个事件自己**那次已确认成功的公屏回复。
+
+* 契约判定读 `SendGate.lookup()` 的**原始状态** —— `result()` 会把 `sent_confirmed` 映射成 `unknown`，
+  照它判定就永远进不了私信（这一点在用例里单独钉住）。
+* 拒绝发生在打开浏览器/发送之前，原因是稳定枚举：`public_missing` / `public_not_found` /
+  `public_not_a_reply` / `public_pending` / `public_unknown` / `public_failed` / `public_blocked` /
+  `public_send_mismatch`。
+* 「对方不可私信」是另一类，单独记为**跳过**：`dm_not_available` / `dm_panel_unavailable` /
+  `profile_not_found`，带 `evidence.skipped=true`，不计成发送失败、不重试。
+* 回归：`LivePrivateBindingTests`（四条绕过路径）+ **`LivePrivateLedgerGatingTests`**
+  —— 同一批次两条弹幕、真实台账里一真一假：只有确认过的那条进入发送路径，未确认的那条在发送前被拒并留痕。
+
+### 13.4 平台可见性（决定了"能不能做"的边界）
+
+| 观测 | 值 |
+|---|---|
+| 观众身份按房间不同 | 房间 B 16/16 行带真实 `sec_uid`；房间 A 观众行 `sec_uid` 为空、`uid` 是占位 `111111`、昵称脱敏（只有主播消息带 `sec_uid`） |
+| 占位 id 的后果 | 拼出的主页是错误页（`data-e2e="error-page"`）→ 旧实现会误报成 `login_state_unknown`，现在如实报 `profile_not_found` |
+| 长弹幕 | 平台在列表里**截断渲染**（页面内存「主播优秀优秀优秀优秀」vs DOM「主播优秀优秀优秀」） |
+| 虚拟列表 | 页面内存 79~200 条，DOM 只渲染 11~17 行；上滚找旧弹幕会把最新弹幕顶到可视区下方 |
+| 平台确认框 | 「单次只支持艾特一个人…」是**全屏遮罩**，出现后挡住公屏上所有点击 |
+| 私信可达性 | 私密账号 / 未互关 / 面板打不开 → 网页端**没有**可用私信路径（平台限制，不是实现缺陷） |
+
+回归：`IdentityVisibilityTests`、`ClickGuardTests`、`PrivateSkipTests`、`ChatScrollTests`。
+
+### 13.5 发行开关（冻结状态 · 2026-09-21）
+
+| 能力 | autoEligible | 证据状态 |
+|---|---|---|
+| `video_reply` | **false** | 只有离线 DOM 夹具，无平台响应 |
+| `comment_batch` | **false** | 批次契约有离线用例，真机未闭环 |
+| `live_batch` | **false** | 批次接线完成（契约/适配器/统一台账），真机批次未闭环 |
+| `live_danmaku_reply` | **false** | 有真机 `roomEcho`，**无平台响应** |
+| `live_private_reply` / `private_reply` | **false** | 有真机 `conversationEcho`，IM 走长连接**无 HTTP 响应** |
+| 只读能力（video_capture / comment_filter / video_pool / live_capture / video_search_paging） | true | 采集 / 筛选 / 分页，**不发送** |
+
+> **明确声明**：在拿到**真实平台响应与送达证据**之前，`video_reply`、`comment_batch`、`live_batch`
+> 与全部私信能力保持 `autoEligible: false`，**不得声称"真实抖音自动发送可用"**。
+> 客户端据此 fail-closed：`desktop/src/lib/probe-bridge.js` 的 `canSend()` 只有在
+> `implemented && autoEligible` 同时成立时才允许自动发送，否则一律转人工。
