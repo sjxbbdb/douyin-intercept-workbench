@@ -814,6 +814,12 @@ def _row_helpers_js():
         "if(/^\\d+$/.test(t))continue;"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
         "if(t.indexOf('·')>=0&&/\\d/.test(t))continue;"
+        # 🔴 真机（2026-09-21）：行处于「回复中」时会多出一个「回复@某人」元素，
+        #    它比评论正文长，会被下面「取最长候选」选中 -> bodyText 变成「回复@xxx」
+        #    -> rowMatches 的正文比对失败 -> 报 reply_row_mismatch，
+        #    看起来像「编辑器认不出属于哪一行」，实际是正文提取被污染。
+        #    实测该行 innerText：...求带学PR剪辑 / 回复中 / 回复@风卷残叶飘
+        "if(/^回复@/.test(t))continue;"
         "if(noise.indexOf(t)>=0)continue;"
         "if(t.length>best.length)best=t;}"
         "return best;}"
@@ -902,6 +908,31 @@ _REPLY_COMPOSER_JS = (
     "x:Math.round(r.x+Math.min(80,Math.max(20,r.width/2))),y:Math.round(r.y+r.height/2),"
     "text:(e.innerText||'').replace(/\\u200b/g,'')};})(TARGET)"
 )
+
+
+# 目标行是否【当前】已在渲染层：只读、不滚动、不点击。
+_ROW_PRESENT_JS = (
+    "(function(t){" + _row_helpers_js() +
+    "var rs=rows();"
+    "for(var i=0;i<rs.length;i++){if(rowMatches(rs[i],t))return {present:true,index:i,total:rs.length};}"
+    "return {present:false,count:0,total:rs.length};})(TARGET)"
+)
+
+
+def comment_row_present(cdp, target):
+    """目标行此刻是否已经在渲染层。
+
+    🔴 为什么采集阶段就需要它（真机 2026-09-21）：
+       采集走接口（/aweme/v1/web/comment/list/），一次能拿 100~200 条；
+       回复走 DOM，页面只渲染几十条。两个集合【不重合】。
+       采集到的目标很可能压根不在页面上，回复时必然失败 ——
+       而失败发生在「点不到」这一步，看起来像定位器坏了，其实是目标够不到。
+       所以采集时就标出哪些【当前可见】，让宿主只挑可见的，
+       而不是先选一个再反复重试。
+    只读、不滚动、不点击，因此可以安全地对多条候选调用。
+    """
+    return cdp.eval_json(_ROW_PRESENT_JS.replace("TARGET", _target_json(target))) \
+        or {"present": False}
 
 
 def comment_reply_composer(cdp, target):

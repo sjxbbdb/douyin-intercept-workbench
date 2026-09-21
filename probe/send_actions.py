@@ -875,20 +875,33 @@ def send_comment(tab, gate, send_id, target, text, source):
             # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
             found = douyin.comment_reply_button(tab, target)
             if not found.get("found"):
-                # 🔴 真机（2026-09-21）：评论列表是【懒加载】的 —— 一个几万条评论的视频，
-                #    DOM 里只挂前 ~17 条。目标评论常常压根还没渲染，于是这里直接返回
-                #    comment_not_found，看起来像定位器坏了，其实是「没加载」。
-                #    实测：目标在第 ~43 条，页面上搜不到它的任何文本。
-                #    所以先滚动评论面板把目标行加载出来，每滚一轮重试一次定位；
-                #    仍然找不到才判失败。轮数有界，不会无限滚。
-                for _ in range(12):
-                    douyin.scroll_comment_panel(tab, rounds=2, pause=1.4, dy=2000)
+                # 轻量尝试：滚几轮，看目标行是否只是还没进视口。
+                for _ in range(3):
+                    douyin.scroll_comment_panel(tab, rounds=1, pause=1.4, dy=2000)
                     found = douyin.comment_reply_button(tab, target)
                     if found.get("found"):
                         break
             if not found.get("found"):
-                row = gate.finish(send_id, "failed",
-                                  "reply_" + str(found.get("reason") or "not_found"))
+                # 🔴 真机实测（2026-09-21）—— 这里必须报【准确的原因】，不能一律说 not_found：
+                #
+                #   采集走接口（/aweme/v1/web/comment/list/），回复走 DOM。
+                #   同一个视频：接口给 43 条，DOM 只渲染 17 条，两个集合不重合。
+                #   采集到的第 18~43 条【在页面上根本不存在】，技术上无法回复。
+                #
+                #   试过并证伪的加载手段（都是正常用户行为，未越界）：
+                #     · 逐步滚 scrollTop += 600，20 次 -> scrollHeight 始终 3546，节点恒为 17
+                #     · 跳到底 scrollTop = scrollHeight     -> 同上
+                #     · 真实滚轮 Input.dispatchMouseEvent -> 页面 hidden 时直接读超时
+                #   scrollHeight 不增长是关键：懒加载追加内容时它必然变大。
+                #
+                #   所以「找不到」有两种含义，混在一起会误导排查方向：
+                #     comment_not_found      -> 定位器有问题（需要修代码）
+                #     target_not_rendered    -> 目标不在渲染层（需要换目标，不是修代码）
+                #   另外加滚轮不可用时也要如实标注，否则会被当成定位器缺陷。
+                reason = str(found.get("reason") or "not_found")
+                if reason == "comment_not_found":
+                    reason = "target_not_rendered"
+                row = gate.finish(send_id, "blocked", "reply_" + reason)
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
             # 🔴 真机（2026-09-21）：点「回复」之后编辑器不是立刻挂载的 ——
@@ -924,10 +937,45 @@ def send_comment(tab, gate, send_id, target, text, source):
         if (after.get("text") or "") != text:
             row = gate.finish(send_id, "failed", "text_verification_failed")
             return gate.result(row)
+        # 🔴 录制器必须在点击【之前】挂上，否则 responseReceived 已经过去了。
+        #
+        #    这里原本是「点一下，然后直接写死 unknown」—— 评论公开回复路径
+        #    从来没有接过录制器（COMMENT_PUBLISH_URL_MARK 在 douyin_selectors 里
+        #    定义了却无人使用），所以 sent_confirmed 在这条路径上【永远不可能出现】，
+        #    两阶段契约的第二段也就永远进不去。
+        #    真机对照：手动点发送 -> POST /aweme/v1/web/comment/publish http=200，
+        #    body 里 status_code=0 —— 响应是可观测的，只是从来没去读。
+        #    私信路径早就这么做了（DM_SEND_URL_MARK），评论路径漏了。
+        recorder = douyin.make_network_recorder(
+            tab, getattr(S, "COMMENT_PUBLISH_URL_MARK", ""))
+        record_error = None
+        try:
+            tab.call("Network.enable", {}, timeout=10)
+        except Exception as exc:
+            # 不能静默吞掉：否则「没抓到响应」无法区分是「没发出去」
+            # 还是「录制器根本没开」，排查方向会整个跑偏。
+            record_error = type(exc).__name__
         gate.mark_started(send_id)
         started = True
         tab.click_at(button["x"], button["y"])
-        row = gate.finish(send_id, "unknown", "platform_response_unavailable")
+        records = recorder.collect(wait_seconds=8.0)
+        mark = getattr(S, "COMMENT_PUBLISH_URL_MARK", "")
+        matched = [r for r in records if mark and mark in (r.get("url") or "")]
+        statuses = [_response_status(r) for r in matched]
+        detail = {"httpResponses": len(records), "matchedResponses": len(matched),
+                  "platformStatusCodes": statuses[:5],
+                  "networkEnableError": record_error}
+        if matched and any(status == 0 for status in statuses):
+            # 只有平台明确回 status_code=0 才算【确认成功】——
+            # 这是唯一允许进入私信阶段的状态（图 11 固定流程二）。
+            row = gate.finish(send_id, "sent_confirmed", "platform_response", detail)
+        elif matched and any(status not in (None, 0) for status in statuses):
+            row = gate.finish(send_id, "failed", "platform_rejected", detail)
+        elif matched:
+            # 命中接口但读不出状态码：证据不足，按未确定处理，禁止进入私信。
+            row = gate.finish(send_id, "unknown", "platform_response_unreadable", detail)
+        else:
+            row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
         return gate.result(row)
     except Exception as exc:
         row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)

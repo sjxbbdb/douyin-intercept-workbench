@@ -722,6 +722,15 @@ class Sidecar:
                 item["matchedKeyword"] = str(row.get("matched_keyword") or "")
                 item["digg"] = int(row.get("digg") or 0)
                 targets.append(item)
+            # 只读探测，不滚动不点击：给每个目标标一个"此刻是否在渲染层"。
+            # 探测本身失败记为 None —— 不能把"没探到"当成"不可见"，那是两件事。
+            for item in targets:
+                try:
+                    item["visible"] = bool(
+                        douyin.comment_row_present(page, item).get("present"))
+                except Exception:
+                    item["visible"] = None
+            visible_count = sum(1 for it in targets if it.get("visible"))
             filtered = {
                 "collected": len(rows),
                 "matched": int(fstats.get("matched") or 0),
@@ -734,6 +743,12 @@ class Sidecar:
                 "keywords": list(fstats.get("keywords") or []),
                 "excludeKeywords": list(fstats.get("exclude_keywords") or []),
                 "modeCounts": dict(fstats.get("modes") or {}),
+                # 🔴 可见性是回复能否成功的前提（真机 2026-09-21）：
+                #    采集走接口能拿 100~200 条，回复走 DOM 只渲染几十条，两个集合不重合。
+                #    这里如实告诉宿主哪些目标【此刻在页面上】，让它只挑可见的；
+                #    否则宿主会选到一个够不到的目标，反复重试后才发现是白费。
+                "visibleCount": visible_count,
+                "invisibleCount": len(targets) - visible_count,
             }
             return {"status": status, "events": events, "targets": targets, "filter": filtered,
                     "capability": {"verified": bool(events), "source": "api_or_dom",
