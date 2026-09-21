@@ -734,4 +734,33 @@ testAsync('live batch private step binds each confirmed public send and records 
   assert.equal(priv.checkpoint.skipped, 1);
 });
 
+testAsync('structured workflow requests are validated and the issued plan is verified', async () => {
+  const { requestForWorkflow, buildWorkflowIntent, buildWorkflowContext, planMatchesRequest } = require('../src/lib/workflow-request');
+  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
+  const spec = requestForWorkflow(request);
+  assert.equal(spec.workflowId, 'live.batch');
+  assert.equal(spec.version, '1');
+  assert.deepEqual(spec.params.keywords, ['价格', '多少钱']);
+  // 不在登记表里的流程、缺必填参数、版本不对：都要在打开浏览器之前被拒
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.unknown', params: {} }), /unsupported workflowId/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', params: { keywords: ['价格'] } }), /missing url/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: [] } }), /missing keywords/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'live.batch', version: '2', params: { url: 'https://live.douyin.com/1', keywords: ['价格'] } }), /unsupported live.batch version/);
+  const intent = buildWorkflowIntent(request);
+  assert.match(intent, /live\.douyin\.com\/1/);
+  assert.match(intent, /价格/);
+  assert.match(intent, /原生「回复 TA」/);
+  assert.equal(buildWorkflowContext(request).requestedBy, 'task_panel');
+
+  // 平台签发的计划必须与结构化请求逐项一致，否则拒绝启动
+  const good = { planId: 'plan_1', workflowId: 'live.batch', version: '1', params: { ...spec.params, policy: 'server_issued' } };
+  assert.deepEqual(planMatchesRequest(good, request), { ok: true });
+  assert.equal(planMatchesRequest({ ...good, workflowId: 'live.reply_then_private' }, request).reason, 'workflow_mismatch');
+  assert.equal(planMatchesRequest({ ...good, version: '2' }, request).reason, 'version_mismatch');
+  assert.equal(planMatchesRequest({ ...good, planId: '' }, request).reason, 'plan_id_missing');
+  assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, keywords: ['价格'] } }, request).reason, 'param_mismatch');
+  assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, url: 'https://live.douyin.com/2' } }, request).field, 'url');
+  assert.equal(planMatchesRequest(null, request).reason, 'plan_missing');
+});
+
 Promise.all(pendingTests).then(() => console.log(`\n${passed} desktop tests passed`)).catch(() => { process.exitCode = 1; });

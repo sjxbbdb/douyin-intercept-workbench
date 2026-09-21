@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('agentApi', {
   logout: () => invoke('agent:logout'),
   refreshLicense: () => invoke('agent:refresh-license'),
   listWorkflows: () => invoke('agent:list-workflows'),
+  // 任务面板的结构化启动：平台仍然签发计划，桌面端逐项核对后才启动。
+  startWorkflow: (input) => invoke('agent:start-workflow', input),
   listPlatformAccounts: () => invoke('platform-accounts:list'),
   selectPlatformAccount: (platformId) => invoke('platform-accounts:select', platformId),
   createPlatformAccount: (payload) => invoke('platform-accounts:create', payload),
