@@ -1959,6 +1959,80 @@ class SearchPagingRelevanceTests(unittest.TestCase):
         self.assertEqual(result["poolSize"], 3)
         self.assertEqual(calls[0]["navigate"], True)
 
+    def test_page_record_carries_version_and_paging_outcome(self):
+        """分页记录：页面版本 + 分页终止态（more / exhausted / captcha / login_required）。
+
+        评审意见：找视频要记录「当前页面版本、分页终止态、登录/验证码/空结果」。
+        只有 cursor/hasMore 时，宿主重启后分不清"到底了"和"被验证码打断了"，
+        也认不出手里的游标是哪一版协议产出的 —— 这两件事的处置完全不同：
+        前者停止翻页，后者要人工处理验证码再继续。
+        """
+        import sidecar
+        normal, _ = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(normal["cursorVersion"], sidecar.CURSOR_VERSION)
+        self.assertEqual(normal["pageOutcome"], sidecar.PAGE_OUTCOME_MORE)
+        self.assertEqual(normal["page"], 1)
+
+        captcha, _ = self._run({"keyword": "宝宝辅食"}, stopped="captcha")
+        self.assertEqual(captcha["pageOutcome"], sidecar.PAGE_OUTCOME_CAPTCHA)
+        self.assertEqual(captcha["stoppedReason"], "captcha")
+        self.assertIsNone(captcha["cursor"])
+        self.assertFalse(captcha["hasMore"])
+        self.assertEqual(captcha["cursorVersion"], sidecar.CURSOR_VERSION)
+
+        sidecar_mod, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        try:
+            sidecar.douyin.login_state = lambda page: "required"
+            login = instance.search({"keyword": "宝宝辅食"})
+            sidecar.douyin.login_state = lambda page: "ok"
+            sidecar.crawlmod.search_videos = lambda *args, **kwargs: []
+            empty = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(login["pageOutcome"], sidecar.PAGE_OUTCOME_LOGIN)
+        self.assertIsNone(login["cursor"])
+        self.assertFalse(login["hasMore"])
+        self.assertEqual(empty["pageOutcome"], sidecar.PAGE_OUTCOME_EXHAUSTED)
+        self.assertFalse(empty["hasMore"])
+        self.assertEqual(empty["cursorVersion"], sidecar.CURSOR_VERSION)
+
+    def test_paging_outcome_is_not_confused_with_the_platform_signal(self):
+        """more/exhausted 说的是"我们这边还翻不翻"，platformHasMore 说的是"平台那边还有没有"。
+
+        两者混用会让宿主在平台明明还有结果时提前收工，或者反过来对着验证码继续翻。
+        """
+        import sidecar
+        more, _ = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(more["pageOutcome"], sidecar.PAGE_OUTCOME_MORE)
+        self.assertEqual(more["platformHasMore"], 1)
+        # 本页一条新视频都没有，但平台那边【明明还有】（platform_has_more=1）：
+        # 我们这边停，是因为这一页没有新东西，不是因为平台没有更多结果。
+        sidecar_mod, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+
+        def empty_search(page, keyword, **kwargs):
+            meta = kwargs.get("meta")
+            if isinstance(meta, dict):
+                meta["skipped_seen"] = 0
+                meta["platform_has_more"] = 1
+                meta["platform_cursor"] = "pc-1"
+            return []
+
+        try:
+            sidecar.douyin.login_state = lambda p: "ok"
+            sidecar.crawlmod.search_videos = empty_search
+            exhausted = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(exhausted["pageOutcome"], sidecar.PAGE_OUTCOME_EXHAUSTED)
+        self.assertEqual(exhausted["platformHasMore"], 1,
+                         "我们这边没有新候选，不等于平台没有更多结果")
+
 
 class CommentFlowContractTests(unittest.TestCase):
     """评论区两阶段契约（第 3 项）：公开回复确认成功之前，一律不许私信。
@@ -2584,6 +2658,59 @@ class CommentBatchFlowTests(unittest.TestCase):
                 sidecar.send_comment = original_comment
         self.assertEqual(out["status"], "blocked")
         self.assertEqual(out["results"][0]["reason"], "public_not_found")
+
+    def test_private_refuses_a_public_send_id_that_belongs_to_another_target(self):
+        """错误绑定：拿 B 的公屏成功去给 A 发私信，必须拒绝而不是发送。
+
+        评审意见：确认每条私信都必须绑定【对应的】publicSendId。
+        只校验"存在一个已确认的公屏回复"是不够的 —— 张冠李戴同样会触达错人。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(2)))
+            original_comment = sidecar.send_comment
+            original_private = sidecar.send_private
+            sent = []
+            # 基线的私信门禁会先在【本地台账】里查这个 publicSendId，
+            # 所以这里要真的把两次公屏回复登记成 confirmed，否则会先撞上 public_not_found，
+            # 覆盖不到"绑定张冠李戴"这条。
+            for public_id in ("pub-e1", "pub-e2"):
+                instance.gate.reserve(public_id, "comment:%s:author" % public_id,
+                                      "public text", kind="comment")
+                instance.gate.mark_started(public_id)
+                instance.gate.finish(public_id, "sent_confirmed", "platform_response_recorded")
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "sent_confirmed", "reason": "platform_response_recorded",
+                "sendId": args[2]}
+            sidecar.send_private = lambda *args, **kwargs: sent.append(args) or {
+                "status": "unknown", "reason": "platform_response_unavailable"}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"},
+                    {"eventId": "e2", "sendId": "pub-e2"}]})
+                wrong = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-e2"}]})
+                right = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1b", "publicSendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original_comment
+                sidecar.send_private = original_private
+        self.assertEqual(wrong["results"][0]["reason"], "public_send_id_mismatch")
+        self.assertEqual(len(sent), 1, "只有绑定正确的那一次才允许真的发出去")
+        self.assertEqual(right["results"][0]["status"], "unknown")
+
+    def test_private_without_a_public_send_id_is_refused_by_the_batch_view(self):
+        """缺失绑定：批量清单里没有 publicSendId 的条目一律 public_missing。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            listing = instance.dispatch("comment_private_candidates", {"items": [
+                {"eventId": "e1", "authorId": "author-1", "authorName": "用户1"}]})
+        self.assertEqual(listing["allowed"], [])
+        self.assertEqual(listing["rejected"][0]["reason"], "public_missing")
 
     def test_expired_events_are_not_replayed_into_a_batch(self):
         """批次窗口：过期的候选不会重新进批次（评论区窗口远长于弹幕，但语义一致）。"""
@@ -3284,13 +3411,108 @@ class LivePrivateBindingTests(unittest.TestCase):
                                        os.path.join(td, "profile"), 19232)
             caps = instance.dispatch("capabilities", {})
             capability = caps["capability"]
-            for name in ("private_reply", "video_reply", "live_reply", "live_batch",
-                         "live_danmaku_reply", "live_private_reply", "comment_flow",
-                         "comment_private_candidates"):
+            # 🔴 评审明确的四个必须保持 fail-closed 的发送/批次能力：
+            #    私信(private_reply)、视频公开回复(video_reply)、评论批次(comment_batch)、
+            #    直播间批次(live_batch)。在拿到真实平台响应与送达证据之前，
+            #    谁都不许把它们翻成 true —— 更不能对外声称"真实抖音自动发送可用"。
+            for name in ("private_reply", "video_reply", "comment_batch", "live_batch",
+                         "live_reply", "live_danmaku_reply", "live_private_reply",
+                         "comment_flow", "comment_private_candidates"):
                 self.assertIn(name, capability, name)
                 self.assertFalse(capability[name]["autoEligible"],
                                  "%s 未验证却标记为可自动发送" % name)
             self.assertIn("comment_private_candidates", caps["methods"])
+
+
+class LivePrivateLedgerGatingTests(unittest.TestCase):
+    """真实台账上的【逐条】门禁：同一批次里只有公屏确认成功的那条才允许私信。
+
+    与 LivePrivateBindingTests 的分工：那边每条绕过路径单独验一个事件；这里把
+    【同一批次里的两条弹幕】放进一次真实调用，证明门禁是逐条的、不是整批放行：
+
+      * 两条事件的批次状态都是 sent_confirmed（候选清单允许两条）——
+        所以本用例单独钉的是"逐项台账绑定"，而不是候选清单；
+      * 真实台账里只有一条公屏回复是 sent_confirmed，另一条停在 unknown（真机常态）；
+      * 结果：确认的那条进入浏览器阶段，unknown 的那条在【打开浏览器之前】被拒绝。
+
+    另外钉住一条容易搞错的细节：契约判定读的是 SendGate.lookup() 的【原始状态】，
+    而不是 result() 映射后的对外状态 —— 后者会把 sent_confirmed 映射成 unknown，
+    照它判定就永远进不了私信。
+    """
+
+    class _Page:
+        def close(self):
+            pass
+
+    @staticmethod
+    def _public_reply(gate, send_id, status):
+        gate.reserve(send_id, "live-danmaku-native:%s" % send_id, "谢谢支持", kind="danmaku_reply")
+        if status in ("unknown", "sent_confirmed"):
+            gate.mark_started(send_id)
+        gate.finish(send_id, status, "platform_response_unavailable")
+        return send_id
+
+    def test_only_the_confirmed_item_reaches_the_private_phase(self):
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19233)
+
+            # 注意：混合批次里"有一条可发"就会打开浏览器 —— 那是正确的。
+            # 这里要钉的是【逐条】：未确认的那条绝不能进到发送路径里。
+            instance._page = lambda: (self._Page(), {"pid": 1})
+            instance.live_queue.append([
+                sidecar._event("live", "room-1", {"id": "e-ok", "authorId": "A" * 40,
+                                                  "authorName": "观众甲", "text": "多少钱"}),
+                sidecar._event("live", "room-1", {"id": "e-unknown", "authorId": "B" * 40,
+                                                  "authorName": "观众乙", "text": "多少钱"}),
+            ])
+            scripts = {"e-ok": {"publicText": "谢谢支持", "privateText": "私信话术"},
+                       "e-unknown": {"publicText": "谢谢支持", "privateText": "私信话术"}}
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "replyMode": "danmaku", "scripts": scripts})
+            batch_id = planned["batch"]["batchId"]
+            self.assertEqual(sorted(item["eventId"] for item in planned["targets"]),
+                             ["e-ok", "e-unknown"])
+
+            self._public_reply(instance.gate, "pub-ok", "sent_confirmed")
+            self._public_reply(instance.gate, "pub-unknown", "unknown")
+            for event_id, send_id in (("e-ok", "pub-ok"), ("e-unknown", "pub-unknown")):
+                instance.live_queue.mark(event_id, live_flow.SENT_CONFIRMED, batch_id,
+                                         {"sendId": send_id})
+            candidates, _rejected = instance.live_queue.private_candidates(batch_id)
+            self.assertEqual(len(candidates), 2, "本用例验的是逐项台账门禁，不是候选清单")
+
+            raw = instance.gate.lookup("pub-ok")
+            self.assertEqual(raw["status"], "sent_confirmed")
+            self.assertEqual(instance.gate.result(raw)["status"], "unknown",
+                             "对外 result() 会把 sent_confirmed 映射成 unknown")
+
+            sent = []
+            original = sidecar.send_private
+            sidecar.send_private = lambda _page, _gate, send_id, target, text: (
+                sent.append((send_id, target["authorId"], text)) or
+                {"status": "unknown", "reason": "platform_response_unavailable",
+                 "evidence": {"conversationEcho": True}})
+            try:
+                result = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e-ok", "sendId": "d-ok", "publicSendId": "pub-ok"},
+                    {"eventId": "e-unknown", "sendId": "d-unknown",
+                     "publicSendId": "pub-unknown"}]})
+            finally:
+                sidecar.send_private = original
+
+            by_event = {item["eventId"]: item for item in result["results"]}
+            self.assertEqual(by_event["e-unknown"]["status"], "blocked")
+            self.assertEqual(by_event["e-unknown"]["reason"], "public_unknown")
+            self.assertEqual(by_event["e-ok"]["status"], "unknown")
+            self.assertEqual([item[1] for item in sent], ["A" * 40], "只有确认过的那条进入浏览器阶段")
+            self.assertEqual(sent[0][0], "d-ok")
+            # 拒绝要留痕：台账里能查到原因，不是静默跳过
+            self.assertEqual(instance.live_queue.find_event("e-unknown")["private"]["reason"],
+                             "public_unknown")
+            self.assertEqual(instance.live_queue.find_event("e-ok")["private"]["status"], "unknown")
+            self.assertEqual(result["skipped"], [], "被门禁拒绝不等于对方不可私信，不能计成跳过")
 
 
 # ============================================================================
@@ -3553,6 +3775,9 @@ class SearchTerminalStateTests(unittest.TestCase):
         self.assertFalse(result["hasMore"])
         self.assertIsNone(result["cursor"])
         self.assertEqual(result["stoppedReason"], "pool_exhausted")
+        # pageOutcome 是宿主重启后唯一能复现"为什么停"的字段，必须跟着一起收敛
+        self.assertEqual(result["pageOutcome"], "exhausted")
+        self.assertEqual(result["cursorVersion"], 1)
 
     def test_relevance_filter_does_not_fake_a_terminal_page(self):
         """本页确实采到了视频、只是都被相关度筛掉，这不算"没有下一页"。
@@ -3565,6 +3790,10 @@ class SearchTerminalStateTests(unittest.TestCase):
         self.assertEqual(result["filter"]["filteredByRelevance"], 2)
         self.assertTrue(result["hasMore"], "筛掉不等于没有下一页")
         self.assertIsNotNone(result["cursor"])
+        # 这条最关键：hasMore=true 时 pageOutcome 不能说 exhausted（自相矛盾）。
+        # 本页确实采到了视频，只是都被相关度筛掉 —— 那是 more，不是到头。
+        self.assertEqual(result["pageOutcome"], "more")
+        self.assertEqual(result["cursorVersion"], 1)
 
 
 class InternalFailureReasonTests(unittest.TestCase):
