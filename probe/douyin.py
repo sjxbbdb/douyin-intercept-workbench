@@ -838,18 +838,30 @@ def _row_helpers_js():
         # 正文提取：排除作者链接内、时间/地区、纯数字、固定操作文案，取最长候选
         "function bodyText(row){var noise=" + json.dumps(S.COMMENT_NOISE_TEXTS) + ";"
         "var link=row.querySelector('a[href*=\"/user/\"]');var best='';"
+        # 🔴 真机（2026-09-21 评审）：过滤纯数字是为了避开时间/计数这类噪声，
+        #    但【整条评论就是数字】的情况真实存在（例如「111」「666」「+1」的场景里用户只发数字）。
+        #    原来一律 continue，于是 best 为空 -> rowMatches 永远匹配不到 ->
+        #    采集里有这条、定位恒失败，看起来像定位器坏了。
+        #    所以留一个纯数字兜底：只有在没有任何其它候选时才用它。
+        "var digits='';"
         "var all=row.querySelectorAll('span,div');"
         "for(var i=0;i<all.length;i++){var e=all[i];"
         "if(e.children&&e.children.length>0)continue;"
         "if(link&&link.contains(e))continue;"
         "var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();"
         "if(!t)continue;"
-        "if(/^\\d+$/.test(t))continue;"
+        "if(/^\\d+$/.test(t)){if(!digits)digits=t;continue;}"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
         "if(t.indexOf('·')>=0&&/\\d/.test(t))continue;"
+        # 🔴 真机（2026-09-21）：行处于「回复中」时会多出一个「回复@某人」元素，
+        #    它比评论正文长，会被下面「取最长候选」选中 -> bodyText 变成「回复@xxx」
+        #    -> rowMatches 的正文比对失败 -> 报 reply_row_mismatch，
+        #    看起来像「编辑器认不出属于哪一行」，实际是正文提取被污染。
+        #    实测该行 innerText：...求带学PR剪辑 / 回复中 / 回复@风卷残叶飘
+        "if(/^回复@/.test(t))continue;"
         "if(noise.indexOf(t)>=0)continue;"
         "if(t.length>best.length)best=t;}"
-        "return best;}"
+        "return best||digits;}"
         # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
         "function rowMatches(row,t){"
         "if(t.text&&bodyText(row)!==t.text)return false;"
@@ -878,20 +890,33 @@ def _target_json(target):
 
 
 # --- 1) 「回复」按钮：先滚入视口，再读坐标 ---
+#
+# 🔴 判定口径必须只有一处（2026-09-21 评审）：采集阶段标注"这条能不能回"、
+#    发送阶段决定"能不能点"，如果各写一套匹配逻辑，就会出现
+#    "标注说可以回、发送却必被拒（或反过来）"的不一致 —— 宿主据此挑的目标全是废的。
+#    所以下面把【行匹配 + 按钮查找】抽成共用片段，两处结论都从同一份判定里来：
+#      matches      命中几条（>1 就是 ambiguous_comment，绝不能随便挑一条）
+#      replyReady   唯一命中 且 回复按钮存在、可见、已在视口内
+#      reason       与发送阶段的拒绝原因【同一个枚举】
+_REPLY_BUTTON_LOOKUP_JS = (
+    "function replyButtonIn(row){"
+    "var all=row.querySelectorAll('span,div,button,[role=button]');"
+    "for(var i=0;i<all.length;i++){var e=all[i];"
+    "if(e.children&&e.children.length>0)continue;"
+    "var s=(e.innerText||e.textContent||'').replace(/\\s+/g,'').trim();"
+    "if(s!==" + json.dumps(S.COMMENT_REPLY_BUTTON_TEXT) + ")continue;"
+    "if(!vis(e))continue;return e;}"
+    "return null;}"
+)
+
 _REPLY_BUTTON_JS = (
-    "(function(t){" + _row_helpers_js() +
+    "(function(t){" + _row_helpers_js() + _REPLY_BUTTON_LOOKUP_JS +
     "var rs=rows();"
     "var hits=rs.filter(function(r){return rowMatches(r,t);});"
     "if(hits.length!==1)return {found:false,count:hits.length,"
     "reason:hits.length?'ambiguous_comment':'comment_not_found'};"
     "var row=hits[0];"
-    "var all=row.querySelectorAll('span,div,button,[role=button]');"
-    "var btn=null;"
-    "for(var i=0;i<all.length;i++){var e=all[i];"
-    "if(e.children&&e.children.length>0)continue;"
-    "var s=(e.innerText||e.textContent||'').replace(/\\s+/g,'').trim();"
-    "if(s!==" + json.dumps(S.COMMENT_REPLY_BUTTON_TEXT) + ")continue;"
-    "if(!vis(e))continue;btn=e;break;}"
+    "var btn=replyButtonIn(row);"
     "if(!btn)return {found:false,count:1,reason:'reply_button_not_found'};"
     "if(!inView(btn)){row.scrollIntoView({block:'center'});"
     "return {found:false,count:1,reason:'scrolled_into_view'};}"
@@ -935,6 +960,58 @@ _REPLY_COMPOSER_JS = (
     "x:Math.round(r.x+Math.min(80,Math.max(20,r.width/2))),y:Math.round(r.y+r.height/2),"
     "text:(e.innerText||'').replace(/\\u200b/g,'')};})(TARGET)"
 )
+
+
+# 目标行【此刻】的回复可用性：只读、不滚动、不点击。
+# 分类与 comment_reply_button 完全一致（同一个 reason 枚举），所以"标注"与"发送"不会互相打脸：
+#   present       行是否命中（唯一或歧义都算命中）
+#   matches       命中条数
+#   replyReady    唯一命中 且 回复按钮存在、可见、已在视口内 -> 发送阶段可以直接点
+#   reason        '' | comment_not_found | ambiguous_comment | reply_button_not_found | needs_scroll
+_ROW_PRESENT_JS = (
+    "(function(t){" + _row_helpers_js() + _REPLY_BUTTON_LOOKUP_JS +
+    "var rs=rows();"
+    "var hits=rs.filter(function(r){return rowMatches(r,t);});"
+    "if(hits.length===0)return {present:false,matches:0,total:rs.length,replyReady:false,"
+    "reason:'comment_not_found'};"
+    "if(hits.length>1)return {present:true,matches:hits.length,total:rs.length,replyReady:false,"
+    "reason:'ambiguous_comment'};"
+    "var row=hits[0];"
+    "var btn=replyButtonIn(row);"
+    "if(!btn)return {present:true,matches:1,total:rs.length,replyReady:false,"
+    "reason:'reply_button_not_found'};"
+    "if(!inView(btn))return {present:true,matches:1,total:rs.length,replyReady:false,"
+    "reason:'needs_scroll'};"
+    "return {present:true,matches:1,total:rs.length,replyReady:true,reason:''};})(TARGET)"
+)
+
+
+def comment_row_present(cdp, target):
+    """目标行【此刻】的回复可用性分类（采集标注与发送判定共用这一份结论）。
+
+    返回：{present, matches, total, replyReady, reason}
+      present      行是否命中（唯一或歧义都算命中）
+      matches      命中条数（>1 = 歧义，绝不能随便挑一条去点）
+      replyReady   唯一命中 且 回复按钮存在、可见、已在视口内 —— 发送阶段可直接点击
+      reason       与 comment_reply_button 同一枚举：
+                   '' | comment_not_found | ambiguous_comment | reply_button_not_found | needs_scroll
+
+    🔴 为什么必须同源（2026-09-21 评审）：采集走接口、回复走 DOM，两个集合本来就不重合；
+       如果"标注能不能回"和"实际能不能点"各写一套判断，就会出现
+       "标注 visible=true、发送却必被拒"（例如目标行有两条相同内容 -> 歧义），
+       宿主据此挑出来的候选全是废的。现在两边共用 replyButtonIn + 同一套 reason。
+
+    🔴 为什么采集阶段就需要它（真机 2026-09-21）：
+       采集走接口（/aweme/v1/web/comment/list/），一次能拿 100~200 条；
+       回复走 DOM，页面只渲染几十条。两个集合【不重合】。
+       采集到的目标很可能压根不在页面上，回复时必然失败 ——
+       而失败发生在「点不到」这一步，看起来像定位器坏了，其实是目标够不到。
+       所以采集时就标出哪些【当前可见】，让宿主只挑可见的，
+       而不是先选一个再反复重试。
+    只读、不滚动、不点击，因此可以安全地对多条候选调用。
+    """
+    return cdp.eval_json(_ROW_PRESENT_JS.replace("TARGET", _target_json(target))) \
+        or {"present": False}
 
 
 def comment_reply_composer(cdp, target):

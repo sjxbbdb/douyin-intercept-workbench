@@ -46,6 +46,19 @@
     <span onclick="openReply(this.closest('article'))">回复</span>
   </article>
 
+  <!-- 🔴 正文就是纯数字的评论（真机上真实存在，例如「111」）。
+       旧实现把纯数字一律当噪声过滤，best 为空 -> rowMatches 永远匹配不到 ->
+       采集里有这条、定位恒失败。这里把它固化进夹具，防止兜底被再次删掉。 -->
+  <article data-e2e="comment-item" id="comment-num" data-comment-id="comment-num">
+    <a href="https://www.douyin.com/user/author-num"><span>Numeric</span></a>
+    <div class="more" data-e2e="video-comment-more">...</div>
+    <span>111</span>
+    <span>5小时前·浙江</span>
+    <span>0</span>
+    <div>分享</div>
+    <span onclick="openReply(this.closest('article'))">回复</span>
+  </article>
+
   <article data-e2e="comment-item" id="comment-3" data-comment-id="comment-3">
     <a href="https://www.douyin.com/user/author-3"><span>Bob</span></a>
     <div class="more" data-e2e="video-comment-more">...</div>

@@ -542,6 +542,26 @@ class ChromiumFixtureTests(unittest.TestCase):
             __import__("time").sleep(0.1)
         self.fail("fixture did not load")
 
+    def test_numeric_only_comment_body_still_locates(self):
+        """正文就是纯数字的评论必须仍能定位（评审要求：把纯数字兜底补回）。
+
+        旧实现把纯数字一律当噪声过滤 -> bodyText 为空 -> rowMatches 永远匹配不到，
+        表现是"采集里有这条、定位恒失败"，看起来像定位器坏了。
+        夹具里 comment-num 的正文就是 111，同行的 0（点赞数）与时间都必须【不是】正文。
+        """
+        import douyin
+        self._load("comments.html")
+        target = {"authorId": "author-num", "text": "111"}
+        state = douyin.comment_row_present(self.page, target)
+        self.assertTrue(state.get("present"), state)
+        self.assertEqual(state.get("matches"), 1, "纯数字正文必须唯一命中")
+        self.assertTrue(state.get("replyReady"), state)
+        found = douyin.comment_reply_button(self.page, target, attempts=1, settle=0)
+        self.assertTrue(found.get("found"), found)
+        # 噪声仍然要挡：点赞数 0 不能被当成正文
+        self.assertFalse(douyin.comment_row_present(
+            self.page, {"authorId": "author-num", "text": "0"}).get("present"))
+
     def test_live_capture_and_single_public_click(self):
         import live
         self._load("live.html")
@@ -3423,7 +3443,6 @@ class LivePrivateBindingTests(unittest.TestCase):
                                  "%s 未验证却标记为可自动发送" % name)
             self.assertIn("comment_private_candidates", caps["methods"])
 
-
 class LivePrivateLedgerGatingTests(unittest.TestCase):
     """真实台账上的【逐条】门禁：同一批次里只有公屏确认成功的那条才允许私信。
 
@@ -3970,6 +3989,92 @@ class ReleaseSwitchLockTests(unittest.TestCase):
         self.assertFalse(capability["comment_flow"]["autoEligible"])
         self.assertIn("sent_confirmed_only",
                       capability["comment_flow"]["validation"]["privateGate"])
+
+
+class CommentReplyVisibilityConsistencyTests(unittest.TestCase):
+    """评审要求（2026-09-21）：comment_row_present 与 comment_reply_button 的判定必须一致。
+
+    钉住三条性质（离线可验证，不依赖 headless 浏览器）：
+
+      1. 两处共用同一份"回复按钮查找"片段 —— 结构上不可能各判一套；
+      2. 采集标注的 visible 取自 replyReady（唯一命中 + 按钮存在可见且在视口内），
+         而不是"行在渲染层"这种弱结论；
+      3. 发送阶段的拒绝原因与定位器枚举同名、不叠前缀，宿主能一一对上。
+    """
+
+    def test_both_locators_share_one_button_lookup(self):
+        import douyin
+        lookup = douyin._REPLY_BUTTON_LOOKUP_JS
+        self.assertIn("function replyButtonIn(row)", lookup)
+        self.assertIn(lookup, douyin._REPLY_BUTTON_JS)
+        self.assertIn(lookup, douyin._ROW_PRESENT_JS)
+        for field in ("present", "matches", "replyReady", "reason"):
+            self.assertIn(field + ":", douyin._ROW_PRESENT_JS)
+        self.assertIn("ambiguous_comment", douyin._ROW_PRESENT_JS)
+        self.assertIn("reply_button_not_found", douyin._ROW_PRESENT_JS)
+
+    def test_pure_numeric_body_has_a_fallback_but_noise_is_still_filtered(self):
+        """正文就是纯数字时必须有兜底，且噪声过滤不能被顺手删掉。"""
+        import douyin
+        js = douyin._row_helpers_js()
+        self.assertIn("var digits='';", js)
+        self.assertIn("if(/^\\d+$/.test(t)){if(!digits)digits=t;continue;}", js)
+        self.assertIn("return best||digits;", js)
+
+    def test_refusal_reasons_use_the_locator_enum_without_double_prefix(self):
+        import douyin
+        import send_actions
+
+        class Page:
+            def __init__(self):
+                self.clicks = []
+
+            def call(self, *_args, **_kwargs):
+                return {}
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://www.douyin.com/video/1"
+                return None
+
+            def click_at(self, x, y):
+                self.clicks.append((x, y))
+
+        def run(reason):
+            saved = (douyin.comment_reply_button, send_actions.douyin.login_state,
+                     send_actions.douyin.check_captcha, send_actions.douyin.visibility_state,
+                     send_actions.time.sleep)
+            page = Page()
+            douyin.comment_reply_button = lambda _cdp, _target, attempts=4, settle=1.2: {
+                "found": False, "reason": reason}
+            send_actions.douyin.login_state = lambda _cdp: "verified"
+            send_actions.douyin.check_captcha = lambda _cdp: False
+            send_actions.douyin.visibility_state = lambda _cdp: "visible"
+            send_actions.time.sleep = lambda _seconds: None
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    result = send_actions.send_comment(
+                        page, SendGate(td, "account-a"), "c-%s" % reason,
+                        {"id": "comment-1", "roomId": "https://www.douyin.com/video/1",
+                         "authorId": "author-1", "authorName": "Alice", "text": "same question"},
+                        "our reply", "video")
+            finally:
+                (douyin.comment_reply_button, send_actions.douyin.login_state,
+                 send_actions.douyin.check_captcha, send_actions.douyin.visibility_state,
+                 send_actions.time.sleep) = saved
+            return result, page
+
+        ambiguous, page = run("ambiguous_comment")
+        self.assertEqual(ambiguous["status"], "failed")
+        self.assertEqual(ambiguous["reason"], "reply_ambiguous_comment")
+        self.assertEqual(page.clicks, [], "歧义目标绝不能点")
+
+        missing, page = run("reply_button_not_found")
+        self.assertEqual(missing["reason"], "reply_button_not_found",
+                         "不能出现 reply_reply_button_not_found 这种叠前缀")
+        self.assertEqual(page.clicks, [])
 
 
 if __name__ == "__main__":
