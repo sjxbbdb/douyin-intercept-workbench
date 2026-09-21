@@ -10,6 +10,7 @@
   · 图文帖(note)网页版评论区是右侧小浮层，深评论会被回收 —— 判定为不支持，跳过。
 """
 import json
+import re
 import time
 
 import cdp as cdpmod
@@ -168,7 +169,44 @@ def login_state(cdp):
         "if(r.width>0&&r.height>0&&e.innerText&&e.innerText.trim())return true;}}"
         "return false;})()"
     ))
-    return "verified" if account else "unknown"
+    if account:
+        return "verified"
+    if live_room_signed_in(cdp):
+        return "verified"
+    return "unknown"
+
+
+def live_room_signed_in(cdp):
+    """直播间页面上的已登录判定（真机 2026-09-20）。
+
+    为什么单独一条：www.douyin.com 的账号元素在 live.douyin.com 上不存在，
+    只靠 LOGIN_ACCOUNT_DOM 会把"已登录"判成 unknown，于是公屏回复全被守卫拦下
+    （真机实测：login_state() == unknown，而页面其实已登录）。
+
+    判据（全部是页面可见 DOM，不读 Cookie、不看正文关键词）：
+      · 登录弹窗不存在（调用方已先判过）；
+      · 页首出现账号头像；
+      · 公屏输入框已渲染。
+    ⚠️ 残留风险：这是启发式判据。若未登录时平台仍渲染这几样，会被误判成已登录；
+       后果是发送动作被平台拒绝、结果停在 unknown —— 不会产生假的"发送成功"。
+    """
+    try:
+        return bool(cdp.eval_json(
+            "(function(){"
+            "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+            "return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}"
+            "if(location.hostname!=='live.douyin.com')return false;"
+            "var avatars=" + json.dumps(S.LIVE_LOGIN_AVATAR_DOM) + ",n=0;"
+            "for(var i=0;i<avatars.length;i++){var ns=document.querySelectorAll(avatars[i]);"
+            "for(var j=0;j<ns.length;j++){var r=ns[j].getBoundingClientRect();"
+            "if(vis(ns[j])&&r.top<90)n++;}}"
+            "if(!n)return false;"
+            "var box=document.querySelector(" + json.dumps(S.LIVE_CHAT_EDITOR_BOX) + ");"
+            "return !!(box&&vis(box));"
+            "})()"
+        ))
+    except Exception:
+        return False
 
 
 def check_login_required(cdp):
@@ -195,6 +233,31 @@ def visibility_state(cdp):
         return "unknown"
 
 
+def force_page_active(cdp):
+    """让浏览器把页面当【活跃】处理，返回实际生效的命令列表。
+
+    🔴 真机教训（2026-09-19 采集 / 2026-09-20 私信各踩一次，工作日志第 7 条）：
+      Chrome 窗口即使在前台，只要被别的窗口【遮挡】，document.visibilityState 仍是 "hidden"。
+      后果有两类，都很隐蔽：
+        · 直播间弹幕虚拟列表【一条都不渲染】（WS 还在收帧，DOM 恒空），采集看起来像"没人说话"；
+        · **点击不送达渲染进程** —— 私信按钮点上去了、坐标也对，面板就是不开
+          （人工点同一个页面却正常，最难查的就是这种）。
+      这两条 CDP 命令可以解除：
+        · Page.setWebLifecycleState(active)  把被冻结/降级的页面拉回 active
+        · Emulation.setFocusEmulationEnabled 让页面认为自己在焦点上
+      只影响浏览器自己的调度与页面状态，不触碰平台风控，也不改平台侧任何状态。
+    """
+    applied = []
+    for method, params in (("Page.setWebLifecycleState", {"state": "active"}),
+                           ("Emulation.setFocusEmulationEnabled", {"enabled": True})):
+        try:
+            cdp.call(method, params, timeout=8)
+            applied.append(method)
+        except Exception:
+            pass
+    return applied
+
+
 def ensure_visible(cdp, log=None):
     """尽力把页面变成 visible。返回是否成功。不改变任何平台侧状态。"""
     if visibility_state(cdp) == "visible":
@@ -204,6 +267,8 @@ def ensure_visible(cdp, log=None):
     except Exception:
         pass
     time.sleep(1.0)
+    if visibility_state(cdp) != "visible" and force_page_active(cdp):
+        time.sleep(0.8)
     ok = visibility_state(cdp) == "visible"
     if not ok and log:
         log("[!] 页面 visibilityState=%s —— Chrome 窗口被遮挡/最小化。" % visibility_state(cdp))
@@ -403,6 +468,29 @@ _DM_ENTRY_JS = (
 ) % (S.STRANGER_DM_BLOCKED_RE, S.DM_BUTTON_TEXT)
 
 
+def profile_error_page(cdp):
+    """"内容不存在" 错误页判定。
+
+    🔴 真机事实（2026-09-20，两个真实直播间对比）：
+      房间 689015985670 —— 16/16 条弹幕都带真实 sec_uid（MS4wLjABAAAA…），可私信；
+      房间 423909340168 —— 观众行的 sec_uid 为空、uid 是占位值 111111（昵称也已脱敏），
+      只有主播自己的消息带 sec_uid。拿占位数字拼出的 /user/111111 打开就是错误页。
+    错误页上当然没有账号元素 —— 于是私信会被判成 login_state_unknown，
+    真正的原因（对方主页根本不存在）被掩盖，排查时会误以为是登录态问题。
+    所以这里先识别错误页，让失败原因如实。
+    """
+    try:
+        return bool(cdp.eval_json(
+            "(function(){var sels=" + json.dumps(S.PROFILE_ERROR_DOM) + ";"
+            "for(var i=0;i<sels.length;i++){var ns=document.querySelectorAll(sels[i]);"
+            " for(var j=0;j<ns.length;j++){var r=ns[j].getBoundingClientRect();"
+            "  if(r.width>0&&r.height>0)return true;}}"
+            "return false;})()"
+        ))
+    except Exception:
+        return False
+
+
 def dm_entry(cdp):
     """探测「私信」入口。
 
@@ -521,6 +609,82 @@ def dm_composer_for_recipient(cdp, author_id, author_name=""):
     expr = _DM_COMPOSER_FOR_RECIPIENT_JS.replace("EXPECTED_ID", json.dumps(str(author_id))) \
         .replace("EXPECTED_NAME", json.dumps(str(author_name or "").strip()))
     return cdp.eval_json(expr) or {"found": False}
+
+
+_DM_PANEL_JS = (
+    "(function(expected){"
+    "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/[*＊]/g,'').replace(/\\s+/g,'').trim();}"
+    "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
+    "if(!(box&&vis(box)))return {found:false,reason:'dm_panel_not_open'};"
+    "var ed=null,eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
+    "for(var i=0;i<eds.length;i++){if(vis(eds[i])){ed=eds[i];break;}}"
+    "if(!ed)return {found:false,reason:'dm_editor_not_found'};"
+    "var r=ed.getBoundingClientRect();"
+    "var head=document.querySelector(" + json.dumps(S.DM_CHAT_HEADER_TITLE) + ");"
+    "var headText=head?norm(head.innerText||head.textContent||''):'';"
+    "var full=norm(expected.full||''),prefix=norm(expected.prefix||'');"
+    "var panel=box.closest('[class*=imContainer],[class*=componentsEntry]');"
+    "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
+    "text:String(ed.innerText||ed.value||'').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,''),headerFound:!!head,headerLen:headText.length,"
+    "headerFull:!!(full&&headText===full),headerPrefix:!!(prefix&&headText.indexOf(prefix)===0),"
+    "headerMatch:!!((full&&headText===full)||(prefix&&headText.indexOf(prefix)===0)),"
+    "panelKey:panel?String(panel.className||'').slice(0,60):''};"
+    "})"
+)
+
+
+def _norm_name(value):
+    """昵称归一化：零宽字符、脱敏星号、空白都不参与比较（与页面侧同一套口径）。"""
+    text = str(value or "")
+    for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        text = text.replace(junk, "")
+    for star in ("*", "＊"):
+        text = text.replace(star, "")
+    return re.sub(r"\s+", "", text)
+
+
+def dm_panel_state(cdp, author_name=""):
+    """私信面板状态（真机可用信号：编辑器 + 会话头部标题）。
+
+    🔴 真机实测（2026-09-20）：面板里没有 data-recipient-id / data-user-id，也没有指向
+    /user/<sec_uid> 的链接，所以严格校验收件人的那套选择器在真机上 count=0。
+    真机可用信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
+    返回里只给长度与匹配布尔值，昵称原文不出页面。
+    """
+    expected = {"full": _norm_name(author_name),
+                "prefix": _norm_name(str(author_name or "").split("*")[0])}
+    payload = json.dumps(expected, ensure_ascii=False)
+    return cdp.eval_json("(%s)(%s)" % (_DM_PANEL_JS, payload)) or {"found": False}
+
+
+_CONVERSATION_ECHO_JS = (
+    "(function(){"
+    "function textOf(el){return String((el&&(el.innerText||el.textContent))||'')"
+    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'').replace(/\\s+/g,'');}"
+    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ",out='';"
+    "for(var i=0;i<scopes.length;i++){var ns=document.querySelectorAll(scopes[i]);"
+    "for(var j=0;j<ns.length;j++){var t=textOf(ns[j]);if(t.length>out.length)out=t;}}"
+    "return out.slice(0,4000);})()"
+)
+
+
+def dm_conversation_echo(cdp, text, seconds=6.0, interval=1.2):
+    """等会话区里出现刚发的那条（诊断证据，不是"送达"判据本身）。"""
+    want = re.sub(r"\s+", "", str(text or ""))
+    deadline = time.time() + float(seconds)
+    while True:
+        try:
+            body = cdp.evaluate(_CONVERSATION_ECHO_JS) or ""
+        except Exception:
+            body = ""
+        if want and want in body:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 _DM_SEND_JS = (
