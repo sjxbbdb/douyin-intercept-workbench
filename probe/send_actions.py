@@ -851,7 +851,14 @@ def send_comment(tab, gate, send_id, target, text, source):
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
-        login = douyin.login_state(tab)
+        # 🔴 必须走 _await_login，不能用裸的 login_state。
+        #    主页是 SPA，账号元素是【异步挂载】的：导航后立刻查会得到 unknown，
+        #    于是"明明登录着"却被判成未登录，而且判成 failed —— 这条目标再也进不了私信。
+        #    真机实测：医生(doctor)在页面稳定后判 verified，同一次导航后立刻判却是 unknown。
+        #    私信 / 直播公屏 / 直播私信三条路径早就用了 _await_login，唯独评论回复漏了，
+        #    后果就是评论公开回复在真机上【从未走通过】—— video_reply 至今没有送达证据，
+        #    根因就在这里，不在定位器。
+        login = _await_login(tab)
         if login != "verified":
             row = gate.finish(send_id, "failed", "login_required" if login == "required" else "login_state_unknown")
             return gate.result(row)
