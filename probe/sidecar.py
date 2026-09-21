@@ -226,7 +226,10 @@ def _live_batch_items(params):
         send_id = str(raw.get("sendId") or "").strip()
         if not event_id or not send_id:
             raise SidecarError("invalid_input", "each item needs eventId and sendId")
-        out.append({"eventId": event_id, "sendId": send_id, "text": raw.get("text")})
+        # 🔴 审核意见（2026-09-21）：这里原来只保留 eventId/sendId/text，把 publicSendId 静默丢掉了 ——
+        #    于是第二阶段（私信）永远看不到"公屏那次成功"的绑定，绕过门禁的路径就藏在这个归一化里。
+        out.append({"eventId": event_id, "sendId": send_id, "text": raw.get("text"),
+                    "publicSendId": str(raw.get("publicSendId") or "").strip()})
     return batch_id, out
 
 
@@ -335,6 +338,7 @@ class Sidecar:
             "protocolVersion": 1,
             "methods": ["capabilities", "launch", "doctor", "open", "search",
                          "collect_comments", "collect_live", "send_private", "send_comment",
+                         "comment_private_candidates",
                          "live_listen", "live_plan", "live_reply", "live_private", "live_result",
                          "close"],
             "sendStatuses": ["unknown", "failed", "blocked"],
@@ -347,9 +351,15 @@ class Sidecar:
                 "comment_filter": {"implemented": True, "autoEligible": True,
                                     "validation": {"status": "offline_fixture",
                                                    "delivery": "filter_only"}},
-                "private_reply": {"implemented": True, "autoEligible": True,
+                # 🔴 审核意见（2026-09-21）：私信的真实送达仍是【未知】——
+                #    IM 走长连接，页面侧只能拿到会话回声（conversationEcho），拿不到平台响应。
+                #    按 AGENTS.md 红线 6「未验证能力必须 fail-closed」，这里必须 autoEligible=false，
+                #    不能因为"协作者账号上跑通过一次"就允许自动发送。
+                "private_reply": {"implemented": True, "autoEligible": False,
                                    "validation": {"status": "pr1_real_account_flow", "scope": "collaborator_account",
-                                                   "delivery": "unknown_without_bound_platform_response"}},
+                                                   "delivery": "unknown_without_bound_platform_response",
+                                                   "evidenceLevel": "conversation_echo_only",
+                                                   "releaseCondition": "platform_response_or_explicit_server_policy"}},
                 "video_reply": {"implemented": True, "autoEligible": False,
                                  "validation": {"status": "offline_dom_fixture", "delivery": "unknown"}},
                 "live_capture": {"implemented": True, "autoEligible": True,
@@ -394,6 +404,21 @@ class Sidecar:
                                                                    "public_failed",
                                                                    "public_blocked",
                                                                    "missing_author_id"]}},
+                # 批量私信候选清单（只读，不碰浏览器）：替宿主守住"公屏确认成功才允许私信"这条契约。
+                # 它不是发送动作，所以不参与 autoEligible 发送闸门；但仍然标 autoEligible=false，
+                # 避免任何调用方把它误当成"可以自动发私信"的开关。
+                "comment_private_candidates": {"implemented": True, "autoEligible": False,
+                                                "validation": {"status": "offline_unit_tests",
+                                                               "delivery": "gate_only",
+                                                               "privateGate": "sent_confirmed_only",
+                                                               "rejectReasons": ["public_missing",
+                                                                                 "public_not_found",
+                                                                                 "public_not_a_reply",
+                                                                                 "public_pending",
+                                                                                 "public_unknown",
+                                                                                 "public_failed",
+                                                                                 "public_blocked",
+                                                                                 "missing_author_id"]}},
                 # 采集数据源：优先读页面内存里的弹幕数据模型（带 sec_uid），DOM 文本兜底。
                 "live_capture_source": {"implemented": True, "autoEligible": False,
                                          "validation": {"status": "page_memory_verified_2026_09_19",
@@ -991,10 +1016,41 @@ class Sidecar:
         by_id = {item["eventId"]: item for item in allowed}
         results, sendable = [], []
         for item in items:
+            # 🔴 审核意见（2026-09-21）：直播私信必须【逐项绑定】那一次已确认成功的公屏回复。
+            #    只靠批次候选清单（按事件状态放行）会留下一条绕过路径：
+            #    调用方可以不带 publicSendId 直接要私信，公屏成功门禁就形同虚设。
+            #    三道检查，任一不过就地 blocked，绝不打开浏览器：
+            #      ① public_missing      没给 publicSendId
+            #      ② public_*            台账里该 sendId 不是"已确认成功的公屏回复"（复用 _public_guard）
+            #      ③ public_send_mismatch 给的 sendId 不是这个事件自己那次公屏回复
+            public_send_id = str(item.get("publicSendId") or "").strip()
+            if not public_send_id:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": "public_missing"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "public_missing"})
+                continue
+            refusal = _public_guard(self.gate, public_send_id)
+            if refusal:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": refusal[0]})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": refusal[0]})
+                continue
+            event = self.live_queue.find_event(item["eventId"]) or {}
+            recorded = str((event.get("detail") or {}).get("sendId") or "")
+            if recorded and recorded != public_send_id:
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": "public_send_mismatch"})
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": "public_send_mismatch"})
+                continue
             target = by_id.get(item["eventId"])
             if target is None:
                 reason = next((r["reason"] for r in rejected
                                if r["eventId"] == item["eventId"]), "not_a_private_candidate")
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                                             {"reason": reason})
                 results.append({"eventId": item["eventId"], "status": "blocked", "reason": reason})
                 continue
             text = item.get("text") or target["privateText"]

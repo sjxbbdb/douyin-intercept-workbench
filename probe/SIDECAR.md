@@ -62,10 +62,15 @@ comment and never sends a message.
 
 `capabilities.result.capability` uses stable channel names. `implemented`
 means the action path exists, while `autoEligible` is the host's explicit
-automation gate. `private_reply` records the collaborator account flow
-evidence from PR #1 but still reports delivery as `unknown` unless a response
-is bound to that click. Video and live replies are fixture validated and
-remain `autoEligible: false` until platform validation.
+automation gate. Every channel whose real delivery is still unproven reports
+`autoEligible: false` — the live and DM channels only have page-side echo
+(`roomEcho` / `conversationEcho`), and the IM channel rides a long-lived
+connection that yields no HTTP response at all. That now includes
+`private_reply`, which previously carried `autoEligible: true` from the PR #1
+collaborator run; per `AGENTS.md` red line 6 an unverified capability must
+fail closed, so it stays `false` until a platform response (or an explicit
+server policy) is bound to the click. `comment_private_candidates` is listed
+as well (read-only gate helper, not a send channel).
 
 The send result is deliberately one of `unknown`, `failed`, or `blocked`.
 Once a click is started, a process cancellation leaves the SQLite record
@@ -88,7 +93,7 @@ the platform boundary of images/18 and the script boundary of images/09:
 | `live_listen` | collect one listening round and enqueue it | yes |
 | `live_plan` | take a batch, check the window, freeze host scripts | no |
 | `live_reply` | phase one: public reply per accepted item | only when something is sendable |
-| `live_private` | phase two: private message per derived candidate | only when something is sendable |
+| `live_private` | phase two: private message, each item bound to its own confirmed public send | only when something is sendable |
 | `live_result` | batch report, counts and resume checkpoint | no |
 
 `live_plan` also takes the flow-step-2 filter: `keywords`, `excludeKeywords` and `matchMode`
@@ -155,6 +160,15 @@ same `unknown` semantics as the other send paths.
   ⚠️ `send_gate.result()` 会把 `sent_confirmed` 映射成 `unknown`（避免过度宣称），
   所以契约判定读的是 **`SendGate.lookup()` 返回的原始状态**。
   回归：`CommentFlowContractTests`（5 项，含"不通过就不许打开浏览器"）。
+* **直播私信逐项绑定公屏成功（审核意见 2026-09-21）**：`live_private` 的每个 item 必须带
+  `publicSendId`，且该 sendId 必须满足两条：①在台账里是"已确认成功的公屏回复"；
+  ②就是这个事件自己那次回复（事件详情里记录的 `sendId`）。任一不满足就地 `blocked`，
+  **在打开浏览器之前**拒绝：`public_missing` / `public_not_found` / `public_not_a_reply` /
+  `public_pending` / `public_unknown` / `public_failed` / `public_blocked` /
+  `public_send_mismatch`。
+  只按批次候选清单放行会留下绕过路径（调用方不带 `publicSendId` 直接要私信），
+  所以绑定检查必须落在**每个 item** 上；`_live_batch_items` 也不再丢弃该字段。
+  回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
 
 ### 采集数据源与「回复弹幕」（2026-09-20 真机）
 

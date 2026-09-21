@@ -819,10 +819,17 @@ class LiveFlowTests(unittest.TestCase):
             self.assertEqual(reply["status"], "blocked")
             self.assertEqual(reply["results"][0]["reason"], "script_mismatch")
             self.assertEqual(instance.live_queue.find_event("e1")["state"], "blocked")
+            # 审核意见（2026-09-21）之后契约更严：私信必须【逐项绑定】那次确认成功的公屏回复。
+            # 所以缺 publicSendId 时在打开浏览器之前就按 public_missing 拒绝（原来是按队列状态
+            # public_planned 拒绝 —— 那条路径正是"可以绕过公屏门禁"的来源）。
             private = instance.dispatch("live_private", {"batchId": batch_id, "items": [
                 {"eventId": "e2", "sendId": "s2"}]})
             self.assertEqual(private["status"], "blocked")
-            self.assertEqual(private["results"][0]["reason"], "public_planned")
+            self.assertEqual(private["results"][0]["reason"], "public_missing")
+            # 给了一个台账里不存在的 publicSendId -> 同样在打开浏览器之前拒绝
+            private = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e2", "sendId": "s3", "publicSendId": "no-such-send"}]})
+            self.assertEqual(private["results"][0]["reason"], "public_not_found")
             with self.assertRaises(sidecar.SidecarError) as raised:
                 instance.dispatch("live_result", {"batchId": "does-not-exist"})
             self.assertEqual(raised.exception.code, "unknown_batch")
@@ -2665,14 +2672,121 @@ class PrivateSkipTests(unittest.TestCase):
                     "maxItems": 5, "windowSeconds": 600,
                     "scripts": {"e1": {"publicText": "公开话术", "privateText": "私信话术"}}})
                 batch_id = planned["batch"]["batchId"]
-                instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id)
+                instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id,
+                                         {"sendId": "pub-skip"})
+                instance.gate.reserve("pub-skip", "live-danmaku-native:e1:小明", "公开话术",
+                                      kind="danmaku_reply")
+                instance.gate.mark_started("pub-skip")
+                instance.gate.finish("pub-skip", "sent_confirmed", "platform_response_recorded")
                 result = instance.dispatch("live_private", {"batchId": batch_id, "items": [
-                    {"eventId": "e1", "sendId": "skip-3"}]})
+                    {"eventId": "e1", "sendId": "skip-3", "publicSendId": "pub-skip"}]})
                 self.assertEqual(result["skipped"], [{"eventId": "e1", "reason": "dm_not_available"}])
                 self.assertEqual(result["results"][0]["status"], "blocked")
         finally:
             sidecar.send_private = original_send
             self._restore(saved)
+
+
+class LivePrivateBindingTests(unittest.TestCase):
+    """审核意见（2026-09-21）：直播私信必须逐项绑定"那一次已确认成功的公屏回复"。
+
+    只靠批次候选清单（按事件状态放行）会留下一条绕过路径：调用方不带 publicSendId
+    直接要私信，公屏成功门禁就形同虚设。下面把三条绕过路径都钉住。
+    """
+
+    class _Page:
+        def close(self):
+            pass
+
+    def _setup(self, td, recorded_send_id="pub-1"):
+        import live_flow
+        import sidecar
+        instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19231)
+
+        def explode():
+            raise AssertionError("契约不通过时不得打开浏览器")
+
+        instance._page = explode
+        instance.live_queue.append([sidecar._event("live", "room-1", {
+            "id": "e1", "authorId": "A" * 40, "authorName": "小明", "text": "问一下"})])
+        planned = instance.dispatch("live_plan", {
+            "maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+            "scripts": {"e1": {"publicText": "谢谢支持", "privateText": "私信话术"}}})
+        batch_id = planned["batch"]["batchId"]
+        # 公屏这一phase确实确认成功（并记录那次的 sendId）
+        instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id,
+                                 {"sendId": recorded_send_id})
+        return sidecar, instance, batch_id
+
+    @staticmethod
+    def _confirmed_public(gate, send_id):
+        gate.reserve(send_id, "live-danmaku-native:e1:小明", "谢谢支持", kind="danmaku_reply")
+        gate.mark_started(send_id)
+        gate.finish(send_id, "sent_confirmed", "platform_response_recorded")
+        return send_id
+
+    def test_missing_public_send_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td)
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-1"}]})
+            self.assertEqual(reply["results"][0]["reason"], "public_missing")
+            self.assertEqual(reply["results"][0]["status"], "blocked")
+
+    def test_unconfirmed_public_send_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td)
+            instance.gate.reserve("pub-unconfirmed", "live-danmaku-native:e1:小明", "谢谢支持",
+                                  kind="danmaku_reply")
+            instance.gate.mark_started("pub-unconfirmed")
+            instance.gate.finish("pub-unconfirmed", "unknown", "platform_response_unavailable")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-2", "publicSendId": "pub-unconfirmed"}]})
+            self.assertEqual(reply["results"][0]["reason"], "public_unknown")
+
+    def test_a_public_send_from_another_event_is_refused(self):
+        """拿别人那次的公屏成功来给这个事件开私信 -> public_send_mismatch。"""
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="pub-own")
+            self._confirmed_public(instance.gate, "pub-other")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-3", "publicSendId": "pub-other"}]})
+            self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
+
+    def test_the_bound_public_send_lets_the_private_phase_reach_the_page(self):
+        """绑定正确时确实进入浏览器阶段（用假页面验证走通了门禁，而不是被别的规则拦下）。"""
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="pub-ok")
+            self._confirmed_public(instance.gate, "pub-ok")
+            instance._page = lambda: (self._Page(), {"pid": 1})
+            calls = []
+            original = sidecar.send_private
+            sidecar.send_private = lambda *_a, **_k: (calls.append(1) or
+                                                      {"status": "unknown",
+                                                       "evidence": {"conversationEcho": True}})
+            try:
+                reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "p-4", "publicSendId": "pub-ok"}]})
+            finally:
+                sidecar.send_private = original
+            self.assertEqual(calls, [1])
+            self.assertEqual(reply["results"][0]["status"], "unknown")
+
+    def test_capabilities_keep_unverified_channels_fail_closed(self):
+        """未验证的能力必须 fail-closed；只读的门禁辅助方法也要出现在能力清单里。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19232)
+            caps = instance.dispatch("capabilities", {})
+            capability = caps["capability"]
+            for name in ("private_reply", "video_reply", "live_reply", "live_batch",
+                         "live_danmaku_reply", "live_private_reply", "comment_flow",
+                         "comment_private_candidates"):
+                self.assertIn(name, capability, name)
+                self.assertFalse(capability[name]["autoEligible"],
+                                 "%s 未验证却标记为可自动发送" % name)
+            self.assertIn("comment_private_candidates", caps["methods"])
 
 
 if __name__ == "__main__":
