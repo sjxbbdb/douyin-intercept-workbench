@@ -68,6 +68,12 @@ def _iso(ts=None):
 #    只作为观测信号一起返回，供宿主记录，不作为翻页依据。
 
 CURSOR_VERSION = 1
+# 分页终止态的显式记录（images/10 第 3 步「保存视频池与搜索游标」）。
+# 只有 cursor/hasMore 时，宿主重启后分不清"到底了"和"被验证码/登录打断了"。
+PAGE_OUTCOME_MORE = "more"
+PAGE_OUTCOME_EXHAUSTED = "exhausted"
+PAGE_OUTCOME_CAPTCHA = "captcha"
+PAGE_OUTCOME_LOGIN = "login_required"
 CURSOR_MAX_SEEN = 20000
 
 
@@ -687,6 +693,8 @@ class Sidecar:
                 # 否则上层会自动接着请求，等于对着一个已失效的登录态继续打平台。
                 return {"status": "login_required", "videos": [], "cursor": None,
                         "hasMore": False, "stoppedReason": "login_required",
+                        "pageOutcome": PAGE_OUTCOME_LOGIN,
+                        "cursorVersion": CURSOR_VERSION,
                         "page": page_no, "poolSize": len(seen)}
             # 只有【第一页】或【已经不在搜索页上】才重新导航；
             # 否则保持页面原状、继续往下滚 —— 这才是"读取下一页"。
@@ -750,6 +758,8 @@ class Sidecar:
                         "cursor": None,
                         "hasMore": False,
                         "stoppedReason": "captcha",
+                        "pageOutcome": PAGE_OUTCOME_CAPTCHA,
+                        "cursorVersion": CURSOR_VERSION,
                         "page": page_no,
                         "poolSize": len(pool),
                         "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
@@ -764,6 +774,11 @@ class Sidecar:
                     "cursor": _encode_cursor(keyword, pool, page_no + 1, scope),
                     "hasMore": bool(out),
                     "stoppedReason": None,
+                    # 分页记录：宿主重启后要能复现"这一页为什么停"，也认得出游标是哪一版产出的。
+                    # more / exhausted 与 captcha / login_required 是两类不同的停：
+                    # 前两个是"平台这边就这样了"，后两个是"我们这边被拦住了"。
+                    "pageOutcome": PAGE_OUTCOME_MORE if out else PAGE_OUTCOME_EXHAUSTED,
+                    "cursorVersion": CURSOR_VERSION,
                     "page": page_no,
                     "poolSize": len(pool),
                     "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
