@@ -128,6 +128,10 @@ class ProbeBridge {
     return this.client.request('search', params, { timeoutMs: 60000 });
   }
 
+  async searchPool(params = {}) {
+    return this.client.request('search_pool', params, { timeoutMs: 20000 });
+  }
+
   async collectOnce(source, url, options = {}) {
     const requested = targetUrl(url);
     this.source = source === 'live' ? 'live' : 'video';
@@ -303,6 +307,25 @@ class ProbeBridge {
   async commentPrivateCandidates(items) {
     const params = Array.isArray(items) ? { items } : items;
     return this.client.request('comment_private_candidates', params, { timeoutMs: 20000 });
+  }
+
+  async commentPlan(params) {
+    await this.#launch();
+    return this.client.request('comment_plan', params, { timeoutMs: 60000 });
+  }
+
+  async commentReply(params) {
+    await this.#launch();
+    return this.client.request('comment_reply', params, { timeoutMs: 60000 });
+  }
+
+  async commentPrivate(params) {
+    await this.#launch();
+    return this.client.request('comment_private', params, { timeoutMs: 60000 });
+  }
+
+  async commentResult(params) {
+    return this.client.request('comment_result', params, { timeoutMs: 20000 });
   }
 
   async liveListen(params, maxItems = 100) {

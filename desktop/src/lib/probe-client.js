@@ -5,7 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 
-const METHODS = new Set(['capabilities', 'launch', 'doctor', 'open', 'search', 'collect_comments', 'collect_live', 'send_private', 'send_comment', 'comment_private_candidates', 'live_listen', 'live_plan', 'live_reply', 'live_private', 'live_result', 'close']);
+const METHODS = new Set(['capabilities', 'launch', 'doctor', 'open', 'search', 'search_pool', 'collect_comments', 'comment_plan', 'comment_reply', 'comment_private', 'comment_result', 'collect_live', 'send_private', 'send_comment', 'comment_private_candidates', 'live_listen', 'live_plan', 'live_reply', 'live_private', 'live_result', 'close']);
 const MAX_LINE = 1024 * 1024;
 function requireText(value, name, max = 2000) { if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS'); return value.trim(); }
 function requireUrl(value) { const url = new URL(requireText(value, 'url', 2048)); const allowedHosts = new Set(['douyin.com', 'www.douyin.com', 'live.douyin.com', 'v.douyin.com']); if (url.protocol !== 'https:' || !allowedHosts.has(url.hostname) || url.username || url.password) throw new ProbeError('侧车目标 URL 无效或暂不支持该抖音域名', 'SIDECAR_INVALID_PARAMS'); if (url.hostname === 'douyin.com') url.hostname = 'www.douyin.com'; return url.href; }
@@ -32,7 +32,52 @@ function validateParams(method, params) {
     if (params.cursor != null && params.cursor !== '') result.cursor = requireText(params.cursor, 'cursor', 400000);
     return result;
   }
-  if (method === 'collect_comments') return { url: requireUrl(params.url), maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500), scrollRounds: integer(params.scrollRounds ?? 0, 'scrollRounds', 0, 40) };
+  if (method === 'search_pool') {
+    allowedKeys(params, ['keyword', 'limit', 'minRelevance']);
+    const result = { limit: integer(params.limit ?? 200, 'limit', 1, 1000), minRelevance: integer(params.minRelevance ?? 0, 'minRelevance', 0, 100) };
+    if (params.keyword !== undefined && params.keyword !== null && params.keyword !== '') result.keyword = requireText(params.keyword, 'keyword', 200);
+    return result;
+  }
+  if (method === 'collect_comments') {
+    allowedKeys(params, ['url', 'videoId', 'maxItems', 'scrollRounds', 'commentKeywords', 'excludeKeywords', 'matchMode', 'minDigg', 'maxTargets', 'dedupeAuthors']);
+    const hasUrl = params.url !== undefined && params.url !== null && params.url !== '';
+    const hasVideoId = params.videoId !== undefined && params.videoId !== null && params.videoId !== '';
+    if (hasUrl === hasVideoId) throw new ProbeError('评论采集必须提供 url 或 videoId 之一', 'SIDECAR_INVALID_PARAMS');
+    const result = { maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500), scrollRounds: integer(params.scrollRounds ?? 0, 'scrollRounds', 0, 40) };
+    if (hasUrl) result.url = requireUrl(params.url); else result.videoId = identifier(params.videoId, 'videoId', 240);
+    if (params.commentKeywords !== undefined) result.commentKeywords = textArray(params.commentKeywords, 'commentKeywords');
+    if (params.excludeKeywords !== undefined) result.excludeKeywords = textArray(params.excludeKeywords, 'excludeKeywords');
+    if (params.matchMode !== undefined) { if (!['phrase', 'seg', 'all', 'any'].includes(params.matchMode)) throw new ProbeError('matchMode 参数无效', 'SIDECAR_INVALID_PARAMS'); result.matchMode = params.matchMode; }
+    result.minDigg = integer(params.minDigg ?? 0, 'minDigg', 0, 1000000);
+    result.maxTargets = integer(params.maxTargets ?? 200, 'maxTargets', 1, 500);
+    if (params.dedupeAuthors !== undefined && typeof params.dedupeAuthors !== 'boolean') throw new ProbeError('dedupeAuthors 参数无效', 'SIDECAR_INVALID_PARAMS');
+    result.dedupeAuthors = params.dedupeAuthors === undefined ? true : params.dedupeAuthors;
+    return result;
+  }
+  if (method === 'comment_plan') {
+    allowedKeys(params, ['url', 'videoId', 'maxItems', 'windowSeconds', 'scrollRounds', 'collectMaxItems', 'minDigg', 'commentKeywords', 'excludeKeywords', 'matchMode', 'dedupeAuthors', 'publicText', 'privateText', 'policy']);
+    const hasUrl = params.url !== undefined && params.url !== null && params.url !== '';
+    const hasVideoId = params.videoId !== undefined && params.videoId !== null && params.videoId !== '';
+    if (hasUrl === hasVideoId) throw new ProbeError('评论计划必须提供 url 或 videoId 之一', 'SIDECAR_INVALID_PARAMS');
+    if (params.policy !== undefined) throw new ProbeError('策略必须由授权服务端签发', 'SIDECAR_POLICY_NOT_SERVER_ISSUED');
+    const result = { maxItems: integer(params.maxItems ?? 20, 'maxItems', 1, 50), windowSeconds: integer(params.windowSeconds ?? 3600, 'windowSeconds', 1, 86400), scrollRounds: integer(params.scrollRounds ?? 6, 'scrollRounds', 0, 40), collectMaxItems: integer(params.collectMaxItems ?? 200, 'collectMaxItems', 1, 500), minDigg: integer(params.minDigg ?? 0, 'minDigg', 0, 1000000) };
+    if (hasUrl) result.url = requireUrl(params.url); else result.videoId = identifier(params.videoId, 'videoId', 240);
+    if (params.commentKeywords !== undefined) result.commentKeywords = textArray(params.commentKeywords, 'commentKeywords');
+    if (params.excludeKeywords !== undefined) result.excludeKeywords = textArray(params.excludeKeywords, 'excludeKeywords');
+    if (params.matchMode !== undefined) { if (!['phrase', 'seg', 'all', 'any'].includes(params.matchMode)) throw new ProbeError('matchMode 参数无效', 'SIDECAR_INVALID_PARAMS'); result.matchMode = params.matchMode; }
+    if (params.dedupeAuthors !== undefined && typeof params.dedupeAuthors !== 'boolean') throw new ProbeError('dedupeAuthors 参数无效', 'SIDECAR_INVALID_PARAMS');
+    result.dedupeAuthors = params.dedupeAuthors === undefined ? true : params.dedupeAuthors;
+    result.publicText = requireText(params.publicText, 'publicText', 1000);
+    result.privateText = requireText(params.privateText, 'privateText', 1000);
+    return result;
+  }
+  if (method === 'comment_reply' || method === 'comment_private') {
+    allowedKeys(params, ['batchId', 'items']);
+    const result = { batchId: identifier(params.batchId, 'batchId'), items: batchItems(params.items) };
+    if (!result.items.length) throw new ProbeError('items 参数无效', 'SIDECAR_INVALID_PARAMS');
+    return result;
+  }
+  if (method === 'comment_result') { allowedKeys(params, ['batchId']); return { batchId: identifier(params.batchId, 'batchId') }; }
   if (method === 'collect_live') return { url: requireUrl(params.url), maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500) };
   if (method === 'send_private' || method === 'send_comment') {
     allowedKeys(params, method === 'send_private' ? ['sendId', 'publicSendId', 'target', 'text'] : ['sendId', 'target', 'text', 'source']);
