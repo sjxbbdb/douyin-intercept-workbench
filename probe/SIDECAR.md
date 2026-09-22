@@ -232,6 +232,36 @@ same `unknown` semantics as the other send paths.
   所以绑定检查必须落在**每个 item** 上；`_live_batch_items` 也不再丢弃该字段。
   回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
 
+* **分页记录：页面版本与分页终止态（2026-09-21，评审要求固化）**：`search` 的每次响应都带
+  * `cursorVersion`：产出该 `cursor` 的**协议版本**（当前 `1`）。宿主重启后据此判断手里的游标
+    是不是自己能解析的那一版；不是就重新从第一页开始，而不是拿着解析不了的游标继续请求。
+  * `pageOutcome`：**分页终止态**，取值固定为
+
+    | 取值 | 含义 | 宿主该做什么 |
+    |---|---|---|
+    | `more` | 本页有结果、游标可用 | 可以继续申请下一页 |
+    | `exhausted` | 本页没有新视频（池子到头） | 停止翻页 |
+    | `captcha` | 命中验证码 | **停止**，人工处理后再继续（`cursor=null`、`hasMore=false`） |
+    | `login_required` | 登录失效 | **停止**，人工登录（同样不给游标） |
+
+  ⚠️ `pageOutcome` 与 `platformHasMore` **不是一回事**：前者说的是"我们这边还翻不翻"，
+  后者是平台响应体的观测值（"平台那边还有没有"）。混用会让宿主在平台明明还有结果时提前收工，
+  或者反过来对着验证码继续翻。
+  ⚠️ **桌面端当前没有完整透传这两个字段**（`desktop/` 侧只取 `videos` / `cursor` / `hasMore`）；
+  透传由平台侧补齐，本侧只保证字段名与取值稳定。
+  回归：`SearchPagingRelevanceTests.test_page_record_carries_version_and_paging_outcome`、
+  `test_paging_outcome_is_not_confused_with_the_platform_signal`。
+* **两个 mismatch 枚举不要混用（同义不同名，刻意的）**：公屏回复与私信的绑定校验在两条通道上
+  各有自己的枚举 ——
+  * 评论区：`public_send_id_mismatch`（`comment_private`）；
+  * 直播间：`public_send_mismatch`（`live_private`）。
+
+  两者含义相同（拿别人那次的公屏成功来给这个事件发私信），但**名字不同是有意的**：
+  宿主只看枚举就能知道是哪条通道拒的。写文档、写测试、写桌面端映射时都必须用**准确的那个**，
+  不要把两个名字相互替换。
+  回归：`CommentBatchFlowTests.test_private_refuses_a_public_send_id_that_belongs_to_another_target`、
+  `LivePrivateBindingTests`。
+
 ### 采集数据源与「回复弹幕」（2026-09-20 真机）
 
 * **采集优先读页面内存**：弹幕虚拟列表组件的 React fiber props 里有 originalList（消息数组），

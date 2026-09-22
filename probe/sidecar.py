@@ -235,6 +235,52 @@ def _public_guard(gate, public_send_id):
     return None
 
 
+BINDING_MISMATCH = "public_send_id_mismatch"
+
+
+def _comment_public_binding(queue, event_id, public_send_id):
+    """③ 对应性：这个 publicSendId 必须是【本事件】那一次公屏回复。
+
+    只做 ①② 会留下一条绕过路径：拿 A 的公屏成功去给 B 发私信（张冠李戴）。
+    直播路径早就补了这一道（见 live_private 的 public_send_mismatch），
+    评论区此前【只有执行时校验、候选清单不校验】—— 于是清单说 allowed、
+    执行却 blocked，宿主据此建出来的计划会当场失败。这里让两处用同一个判定。
+
+    找不到本事件的公屏记录时按 fail-closed 拒绝：能走到这里说明该 sendId
+    确实是一次已确认的公屏回复，那就必然是【别的】事件的 —— 不是本条的。
+    """
+    event = queue.find_event(event_id) or {}
+    recorded = str(((event.get("detail") or {}).get("sendId")) or "")
+    if public_send_id != recorded:
+        return BINDING_MISMATCH
+    return None
+
+
+def _private_binding_mismatch(gate, public_send_id, target):
+    """单发私信的 ③ 对应性校验；不一致时返回说明文字，否则 None。
+
+    公屏评论回复的 target_key 形如 source:commentId:authorId（见 send_actions
+    的 gate_key = "%s:%s:%s"），末段就是评论作者。直播弹幕回复的末段是
+    【昵称】而不是 sec_uid（见 send_danmaku_reply），拿它跟私信目标的
+    authorId 比会误杀合法调用 —— 所以这里只对 kind=comment 生效。
+    """
+    if not isinstance(target, dict):
+        return None
+    author_id = str(target.get("authorId") or "").strip()
+    if not author_id:
+        return None
+    row = gate.lookup(str(public_send_id or "").strip())
+    if not row or str(row.get("kind") or "") != "comment":
+        return None
+    parts = str(row.get("target_key") or "").split(":")
+    if len(parts) < 3:
+        return None
+    if parts[-1] != author_id:
+        return ("the bound public reply belongs to another author; "
+                "a private message must bind the reply of the same recipient")
+    return None
+
+
 def _resolve_video_url(instance, params):
     """把 url / videoId 解析成视频地址；videoId 走【搜索池】这条正式交接链路。
 
@@ -516,7 +562,8 @@ class Sidecar:
                                                                    "public_unknown",
                                                                    "public_failed",
                                                                    "public_blocked",
-                                                                   "missing_author_id"]}},
+                                                                   "missing_author_id",
+                                                                   BINDING_MISMATCH]}},
                 # 批量私信候选清单（只读，不碰浏览器）：替宿主守住"公屏确认成功才允许私信"这条契约。
                 # 它不是发送动作，所以不参与 autoEligible 发送闸门；但仍然标 autoEligible=false，
                 # 避免任何调用方把它误当成"可以自动发私信"的开关。
@@ -531,7 +578,8 @@ class Sidecar:
                                                                                  "public_unknown",
                                                                                  "public_failed",
                                                                                  "public_blocked",
-                                                                                 "missing_author_id"]}},
+                                                                                 "missing_author_id",
+                                                                                 BINDING_MISMATCH]}},
                 # 采集数据源：优先读页面内存里的弹幕数据模型（带 sec_uid），DOM 文本兜底。
                 "live_capture_source": {"implemented": True, "autoEligible": False,
                                          "validation": {"status": "page_memory_verified_2026_09_19",
@@ -768,16 +816,42 @@ class Sidecar:
                         "platformCursor": meta.get("platform_cursor"),
                         "poolSaved": pool_saved,
                         "filter": page_filter}
-            # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
+            # 🔴 判"还有没有下一页"必须看 videos（本页采到的新视频），不能看 out。
+            #    out 是【相关度筛过】的列表：minRelevance>0 时本页可能条条被筛掉，
+            #    但那不代表没有下一页。原来 hasMore 取 bool(out)，于是相关度一调高，
+            #    翻页就会在还有下一页的时候提前停住，宿主以为找完了。
+            if not videos:
+                # 本页一条新视频都没有 -> 池子到头了。终止态与验证码/登录同一套收敛：
+                # 不能一边说 hasMore=false，一边又把 cursor 交出去 —— 否则按
+                # 「有 cursor 就继续翻」实现的宿主会一直翻下去。
+                #    poolIds 仍然是【数据】不是翻页指令，照常返回，方便宿主保存去重账。
+                return {"status": "ok",
+                        "videos": out,
+                        "cursor": None,
+                        "hasMore": False,
+                        "stoppedReason": "pool_exhausted",
+                        "pageOutcome": PAGE_OUTCOME_EXHAUSTED,
+                        "cursorVersion": CURSOR_VERSION,
+                        "page": page_no,
+                        "poolSize": len(pool),
+                        "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
+                        "skippedSeen": int(meta.get("skipped_seen") or 0),
+                        "platformHasMore": meta.get("platform_has_more"),
+                        "platformCursor": meta.get("platform_cursor"),
+                        "poolSaved": pool_saved,
+                        "filter": page_filter}
             return {"status": "ok",
                     "videos": out,
                     "cursor": _encode_cursor(keyword, pool, page_no + 1, scope),
-                    "hasMore": bool(out),
+                    "hasMore": True,
                     "stoppedReason": None,
                     # 分页记录：宿主重启后要能复现"这一页为什么停"，也认得出游标是哪一版产出的。
                     # more / exhausted 与 captcha / login_required 是两类不同的停：
                     # 前两个是"平台这边就这样了"，后两个是"我们这边被拦住了"。
-                    "pageOutcome": PAGE_OUTCOME_MORE if out else PAGE_OUTCOME_EXHAUSTED,
+                    # 🔴 这里【必然】是 more：能走到这一行就意味着本页采到了新视频。
+                    #    不能写成 MORE if out else EXHAUSTED —— out 是相关度筛过的列表，
+                    #    本页条条被筛掉时会给出 hasMore=true 却又说 exhausted，自相矛盾。
+                    "pageOutcome": PAGE_OUTCOME_MORE,
                     "cursorVersion": CURSOR_VERSION,
                     "page": page_no,
                     "poolSize": len(pool),
@@ -1120,14 +1194,13 @@ class Sidecar:
                                 "reason": reasons.get(item["eventId"])
                                           or "not_a_private_candidate"})
                 continue
-            # 防御性校验：宿主给的 publicSendId 必须与【本批次为该事件记录的公屏 sendId】一致。
-            # 队列的 private_candidates 已经按状态守住了闸门，这里再对一次绑定，
-            # 避免"用 A 的公屏成功去给 B 发私信"这种张冠李戴。
-            recorded = str(((self.comment_queue.find_event(item["eventId"]) or {})
-                            .get("detail") or {}).get("sendId") or "")
-            if recorded and public_send_id != recorded:
+            # ③ 对应性校验，与候选清单共用同一个判定（见 _comment_public_binding）。
+            # 两边口径必须一致：清单说 allowed 而这里 blocked，宿主据此建的计划
+            # 会当场失败；反过来（清单拦、执行放）则等于清单形同虚设。
+            binding = _comment_public_binding(self.comment_queue, item["eventId"], public_send_id)
+            if binding:
                 results.append({"eventId": item["eventId"], "status": "blocked",
-                                "reason": "public_send_id_mismatch"})
+                                "reason": binding})
                 continue
             text = item.get("text") or target.get("privateText") or ""
             if text != (target.get("privateText") or ""):
@@ -1203,6 +1276,12 @@ class Sidecar:
         refusal = _public_guard(self.gate, params.get("publicSendId"))
         if refusal:
             raise SidecarError(refusal[0], refusal[1])
+        # ③ 对应性：这条公屏回复必须是【收件人本人】那一条。
+        #    单发路径此前只有 ①②，于是"拿 A 的公屏成功去给 B 发私信"走得通 ——
+        #    而单发恰恰是宿主最常直接调用的入口。仍然在打开浏览器之前判定。
+        mismatch = _private_binding_mismatch(self.gate, params.get("publicSendId"), target)
+        if mismatch:
+            raise SidecarError(BINDING_MISMATCH, mismatch)
         page, _ = self._page()
         try:
             return send_private(page, self.gate, send_id, target, text)
@@ -1240,6 +1319,16 @@ class Sidecar:
             if not author_id:
                 rejected.append({"eventId": event_id, "reason": "missing_author_id"})
                 continue
+            # ③ 对应性。清单和执行必须同口径：此前 comment_private 检查绑定、
+            #    清单不检查，于是清单说 allowed 而执行当场 blocked。
+            #    queue 用 getattr 取：测试替身（__new__ 构造）没有 comment_queue，
+            #    而绑定校验属于【加法能力】，不该让只在台账上跑用例的调用方失败。
+            queue = getattr(self, "comment_queue", None)
+            if queue is not None:
+                binding = _comment_public_binding(queue, event_id, public_send_id)
+                if binding:
+                    rejected.append({"eventId": event_id, "reason": binding})
+                    continue
             allowed.append({"eventId": event_id, "authorId": author_id,
                             "authorName": str(item.get("authorName") or "")[:120],
                             "publicSendId": public_send_id})

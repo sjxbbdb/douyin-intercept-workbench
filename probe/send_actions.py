@@ -36,6 +36,23 @@ def _gate_result(gate, reservation, send_id):
     return _bad_result(send_id, "blocked", reservation.get("reason", "send_blocked"), evidence)
 
 
+def _internal_failure(gate, send_id, started, exc, stage):
+    """内部异常也必须有【稳定枚举】的原因，异常类型放进 evidence 供排查。
+
+    原来这里直接把 type(exc).__name__ 当 reason，于是宿主的失败归因表里
+    会冒出任意 Python 类名（KeyError / TypeError / ...）。后果有两层：
+      1) reason 不再是可枚举的契约，宿主无法据此决定重试还是放弃；
+      2) 排查方向被带偏 —— 真机取证时看到 "KeyError" 只会以为是平台或契约问题，
+         而它其实指向代码里一个未守卫的下标。
+    未开始点击时按 failed（什么都没发出去），已点击则按 unknown（红线 3：
+    未知结果不得自动重试）。真实异常类型与信息留在 evidence 里，不丢证据。
+    """
+    row = gate.finish(send_id, "unknown" if started else "failed", "internal_error",
+                      {"stage": stage, "exception": type(exc).__name__,
+                       "exceptionMessage": str(exc)[:200]})
+    return gate.result(row)
+
+
 def _clean_draft(value):
     """输入框里的零宽字符不算草稿。
 
@@ -384,11 +401,7 @@ def send_private(tab, gate, send_id, target, text):
                            "composerCleared": cleared, "conversationEcho": bool(echo)})
         return gate.result(row)
     except Exception as exc:
-        if started:
-            row = gate.finish(send_id, "unknown", type(exc).__name__)
-        else:
-            row = gate.finish(send_id, "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "send_private")
 
 
 def _validate_comment(target, text, source):
@@ -695,8 +708,7 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
                            "roomEchoSource": "page_memory" if echo.get("row") else None})
         return gate.result(row)
     except Exception as exc:
-        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
 
 
 def send_danmaku_reply(tab, gate, send_id, target, text):
@@ -799,8 +811,7 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
                            "roomEchoSource": "page_memory" if echo.get("row") else None})
         return gate.result(row)
     except Exception as exc:
-        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
 
 
 def send_comment(tab, gate, send_id, target, text, source):
@@ -1003,5 +1014,4 @@ def send_comment(tab, gate, send_id, target, text, source):
             row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
         return gate.result(row)
     except Exception as exc:
-        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "send_comment")

@@ -414,6 +414,27 @@ def comment_item_count(cdp):
     return r.get("items", 0)
 
 
+def _rect_center(rect, w, h):
+    """把 rect 折成可用坐标；形状不完整就返回 None（绝不猜、绝不抛）。
+
+    评论容器是平台 DOM，改版会让 getBoundingClientRect 的字段缺席或变成非数字。
+    这里要求四个键齐全且宽高为正，否则交给调用方走固定坐标兜底。
+    """
+    if not isinstance(rect, dict):
+        return None
+    try:
+        x0 = float(rect["x"])
+        y0 = float(rect["y"])
+        rw = float(rect["width"])
+        rh = float(rect["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if rw <= 0 or rh <= 0:
+        return None
+    return (min(max(int(x0 + rw // 2), 20), int(w) - 20),
+            min(max(int(y0 + rh // 2), 60), int(h) - 60))
+
+
 def scroll_comment_panel(cdp, rounds=4, pause=1.6, dy=2000):
     """把评论容器往下滚一轮。返回最后一次的结果 {ok, scrolled, items, wheel}。
 
@@ -426,21 +447,33 @@ def scroll_comment_panel(cdp, rounds=4, pause=1.6, dy=2000):
       3) 不动 documentElement/body —— 视频页整页下滚可能切到下一个视频，会污染数据
     """
     info = {}
+    fallback_reason = None
     for _ in range(rounds):
-        rect = comment_panel_rect(cdp) or {}
+        rect = comment_panel_rect(cdp)
         vw = cdp.eval_json("(function(){return {w:window.innerWidth,h:window.innerHeight};})()") or {}
-        w, h = int(vw.get("w") or 1680), int(vw.get("h") or 876)
-        if rect:
-            x = min(max(rect["x"] + rect["width"] // 2, 20), w - 20)
-            y = min(max(rect["y"] + rect["height"] // 2, 60), h - 60)
-        else:
+        try:
+            w, h = int(vw.get("w") or 1680), int(vw.get("h") or 876)
+        except (TypeError, ValueError):
+            w, h = 1680, 876
+        # 🔴 不能只看 rect 的真假：rect 非空【不代表】它有 x/y/width/height。
+        #    原来直接 rect["x"]，一旦页面返回的形状不是这四个键（DOM 改版，
+        #    或夹具/替身返回别的结构），就抛 KeyError 冒到调用方；
+        #    而调用方只会把它记成一句 "KeyError"，看不出是评论容器定位失败。
+        center = _rect_center(rect, w, h)
+        if center is None:
             x, y = w - 200, h // 2
+            fallback_reason = "panel_rect_unavailable" if rect else "panel_rect_absent"
+        else:
+            x, y = center
+            fallback_reason = None
         via = scroll_by(cdp, dy=dy, x=x, y=y)
         try:
             info = cdp.eval_json(_COMMENT_SCROLL_JS) or {}
         except Exception:
             info = {}
         info["wheel"] = via
+        if fallback_reason:
+            info["wheelFallback"] = fallback_reason
         time.sleep(pause)
     return info
 
@@ -802,16 +835,20 @@ def _row_helpers_js():
         "if(r.width>0&&r.height>0)return ls[i];}return null;}"
         "function rows(){var root=visibleRoot();if(!root)return [];"
         "return Array.from(root.querySelectorAll(" + json.dumps(S.COMMENT_ITEM) + ")).filter(vis);}"
-        # 正文提取：排除作者链接内、时间/地区、纯数字、固定操作文案，取最长候选
+        # 正文提取：排除作者链接内、时间/地区、固定操作文案，取最长候选。
+        # 🔴 真机（2026-09-21）：原来把【纯数字】一律当噪声跳过（本意是滤掉点赞数），
+        #    结果正文就是「111」的评论提不出正文，rowMatches 必然失败、报
+        #    reply_comment_not_found —— 而「111 / 求带」这类短评论恰恰是截流最常见的命中目标。
+        #    现在：非数字候选优先，一个都没有时才退用纯数字候选。
         "function bodyText(row){var noise=" + json.dumps(S.COMMENT_NOISE_TEXTS) + ";"
-        "var link=row.querySelector('a[href*=\"/user/\"]');var best='';"
+        "var link=row.querySelector('a[href*=\"/user/\"]');var best='',numBest='';"
         "var all=row.querySelectorAll('span,div');"
         "for(var i=0;i<all.length;i++){var e=all[i];"
         "if(e.children&&e.children.length>0)continue;"
         "if(link&&link.contains(e))continue;"
         "var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();"
         "if(!t)continue;"
-        "if(/^\\d+$/.test(t))continue;"
+        "if(/^\\d+$/.test(t)){if(t.length>numBest.length)numBest=t;continue;}"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
         "if(t.indexOf('·')>=0&&/\\d/.test(t))continue;"
         # 🔴 真机（2026-09-21）：行处于「回复中」时会多出一个「回复@某人」元素，
@@ -822,7 +859,7 @@ def _row_helpers_js():
         "if(/^回复@/.test(t))continue;"
         "if(noise.indexOf(t)>=0)continue;"
         "if(t.length>best.length)best=t;}"
-        "return best;}"
+        "return best||numBest;}"
         # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
         "function rowMatches(row,t){"
         "if(t.text&&bodyText(row)!==t.text)return false;"
