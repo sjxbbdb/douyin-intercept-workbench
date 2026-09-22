@@ -25,7 +25,7 @@ test('allows empty optional selectors and CSS combinators', () => { assert.equal
 testAsync('platform workflow adapter forwards search paging and keeps unverified sends fail-closed', async () => {
   const calls = [];
   const browser = {
-    search: async (params) => { calls.push({ type: 'search', params }); return { status: 'ok', videos: [{ url: 'https://www.douyin.com/video/1' }], cursor: 'next', hasMore: true }; },
+    search: async (params) => { calls.push({ type: 'search', params }); return { status: 'ok', videos: [{ url: 'https://www.douyin.com/video/1' }], cursor: 'next', hasMore: true, cursorVersion: 1, pageOutcome: 'more' }; },
     canSend: () => false,
     sendReply: async () => { calls.push({ type: 'send' }); return { status: 'sent_confirmed' }; }
   };
@@ -33,7 +33,7 @@ testAsync('platform workflow adapter forwards search paging and keeps unverified
   const search = await adapter.execute({ run: { runId: 'search-1', workflowId: 'video.search' }, plan: { params: { keyword: '暴雨末日', maxVideos: 10, cursor: 'cursor-1', minRelevance: 70 } }, step: { stepId: 'search' } });
   assert.equal(search.status, 'completed');
   assert.deepEqual(search.result.poolIds, undefined);
-  assert.deepEqual(search.checkpoint, { phase: 'search', status: 'ok', count: 1, cursor: 'next', hasMore: true });
+  assert.deepEqual(search.checkpoint, { phase: 'search', status: 'ok', count: 1, cursor: 'next', hasMore: true, cursorVersion: 1, pageOutcome: 'more' });
   assert.deepEqual(calls[0], { type: 'search', params: { keyword: '暴雨末日', maxVideos: 10, scrollRounds: 2, cursor: 'cursor-1', page: undefined, minRelevance: 70, strict: false } });
   const blocked = await adapter.execute({ run: { runId: 'comment-1', workflowId: 'comment.reply_then_private' }, plan: { params: { target: { id: 'c1', roomId: 'https://www.douyin.com/video/1', authorId: 'u1', text: '多少钱' }, publicReply: '请问您想了解哪个型号？' } }, step: { stepId: 'reply_comment' } });
   assert.equal(blocked.status, 'wait_human');
@@ -734,6 +734,55 @@ testAsync('live batch private step binds each confirmed public send and records 
   assert.equal(priv.checkpoint.skipped, 1);
 });
 
+testAsync('comment batch connects search-pool videoId to public reply and bound private follow-up', async () => {
+  const calls = [];
+  const targets = [
+    { eventId: 'c1', authorId: 'u1', authorName: '客户甲', roomId: 'https://www.douyin.com/video/1', text: '价格怎么问', publicText: '可以给您介绍方案', privateText: '方便私信沟通吗' },
+    { eventId: 'c2', authorId: 'u2', authorName: '客户乙', roomId: 'https://www.douyin.com/video/1', text: '多少钱', publicText: '可以给您介绍方案', privateText: '方便私信沟通吗' }
+  ];
+  const browser = {
+    commentPlan: async (params) => { calls.push({ type: 'plan', params }); return { status: 'ok', batch: { batchId: 'comment-batch-1' }, targets, blocked: [], filter: { matched: 2 } }; },
+    commentReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
+    commentPrivate: async (params) => { calls.push({ type: 'private', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
+    commentResult: async (params) => { calls.push({ type: 'result', params }); return { checkpoint: { version: 4 } }; }
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'comment-batch-1', workflowId: 'comment.batch' };
+  const plan = { params: { videoId: 'video-1', keywords: ['价格'], excludeKeywords: ['投诉'], maxSends: 2, publicText: '可以给您介绍方案', privateText: '方便私信沟通吗' } };
+  const planned = await adapter.execute({ run, plan, step: { stepId: 'plan' } });
+  assert.equal(planned.status, 'completed');
+  assert.equal(calls[0].params.videoId, 'video-1');
+  assert.deepEqual(calls[0].params.commentKeywords, ['价格']);
+  const publicReply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'comment-act-1' } });
+  assert.equal(publicReply.status, 'completed');
+  const privateReply = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'comment-act-1' } });
+  assert.equal(privateReply.status, 'completed');
+  assert.deepEqual(calls[2].params.items.map((item) => item.publicSendId), ['comment-act-1~public~c1', 'comment-act-1~public~c2']);
+  assert.deepEqual(calls[2].params.items.map((item) => item.sendId), ['comment-act-1~private~c1', 'comment-act-1~private~c2']);
+  const report = await adapter.execute({ run, plan, step: { stepId: 'report' } });
+  assert.equal(report.result.ledger[0].private.status, 'sent_confirmed');
+  assert.equal(report.checkpoint.platformCheckpoint.version, 4);
+});
+
+testAsync('comment batch never invokes private sidecar when public delivery is unknown', async () => {
+  let privateCalls = 0;
+  const targets = [{ eventId: 'c1', authorId: 'u1', roomId: 'https://www.douyin.com/video/1', text: '价格', publicText: '已收到', privateText: '请私信' }];
+  const browser = {
+    commentPlan: async () => ({ status: 'ok', batch: { batchId: 'comment-batch-unknown' }, targets, blocked: [] }),
+    commentReply: async (params) => ({ status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable' })) }),
+    commentPrivate: async () => { privateCalls += 1; return { status: 'ok', results: [] }; }
+  };
+  const adapter = createWorkflowAdapter({ browser });
+  const run = { runId: 'comment-batch-unknown', workflowId: 'comment.batch' };
+  const plan = { params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicText: '已收到', privateText: '请私信' } };
+  await adapter.execute({ run, plan, step: { stepId: 'plan' } });
+  const publicReply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'comment-act-unknown' } });
+  assert.equal(publicReply.status, 'unknown');
+  const privateReply = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'comment-act-unknown' } });
+  assert.equal(privateReply.error.code, 'PUBLIC_DELIVERY_NOT_CONFIRMED');
+  assert.equal(privateCalls, 0);
+});
+
 testAsync('structured workflow requests are validated and the issued plan is verified', async () => {
   const { requestForWorkflow, buildWorkflowIntent, buildWorkflowContext, planMatchesRequest } = require('../src/lib/workflow-request');
   const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
@@ -751,6 +800,11 @@ testAsync('structured workflow requests are validated and the issued plan is ver
   assert.match(intent, /价格/);
   assert.match(intent, /原生「回复 TA」/);
   assert.equal(buildWorkflowContext(request).requestedBy, 'task_panel');
+  const commentRequest = { workflowId: 'comment.batch', params: { videoId: 'video-1', commentKeywords: ['价格'] } };
+  assert.equal(requestForWorkflow(commentRequest).workflowId, 'comment.batch');
+  assert.match(buildWorkflowIntent(commentRequest), /video-1/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { videoId: 'video-1' } }), /missing commentKeywords/);
+  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { commentKeywords: ['价格'] } }), /missing url or videoId/);
 
   // 平台签发的计划必须与结构化请求逐项一致，否则拒绝启动
   const good = { planId: 'plan_1', workflowId: 'live.batch', version: '1', params: { ...spec.params, policy: 'server_issued' } };

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// 把直播批次固定流程注册进授权中心（平台侧 catalog）。
+// 把固定批次流程注册进授权中心（平台侧 catalog）。默认注册直播批次；
+// 传 --workflow-id comment.batch 可注册评论区批次，保持同一套鉴权和幂等逻辑。
 //
 // 为什么需要它：Agent 聊天（desktop/src/main.js -> runAgentChat）只允许启动
 // 【授权中心 catalog 里 status=active】的流程；catalog 来自服务端 workflow_definitions 表，
@@ -12,7 +13,7 @@
 //   node scripts/register-live-batch-workflow.mjs --endpoint https://api.example.com \
 //        --username admin --password '***'          # 用管理员账号登录换 token
 //   node scripts/register-live-batch-workflow.mjs --endpoint ... --token '***'
-//   node scripts/register-live-batch-workflow.mjs --dry-run   # 只打印将要提交的 payload
+//   node scripts/register-live-batch-workflow.mjs --workflow-id comment.batch --dry-run
 //
 // 环境变量等价写法：DSH_SERVER_ENDPOINT / DSH_ADMIN_USERNAME / DSH_ADMIN_PASSWORD / DSH_ADMIN_TOKEN
 //
@@ -27,9 +28,11 @@ const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..');
 
-const WORKFLOW_ID = 'live.batch';
 const VERSION = '1';
-const NAME = '直播间批次：关键词命中 → 原生回复 → 私信';
+const WORKFLOW_NAMES = Object.freeze({
+  'live.batch': '直播间批次：关键词命中 → 原生回复 → 私信',
+  'comment.batch': '评论区批次：关键词命中 → 评论回复 → 私信'
+});
 
 function parseArgs(argv) {
   const args = {};
@@ -44,13 +47,13 @@ function parseArgs(argv) {
   return args;
 }
 
-function contractFromDesktop() {
+function contractFromDesktop(workflowId) {
   const contracts = require(path.join(repoRoot, 'desktop', 'src', 'lib', 'workflow-contracts.js'));
-  const definition = contracts.platformWorkflowDefinitions().find((item) => item.workflowId === WORKFLOW_ID);
-  if (!definition) throw new Error('桌面端没有 ' + WORKFLOW_ID + ' 契约；请先合并直播批次工作流改动');
-  if (String(definition.version) !== VERSION) throw new Error(WORKFLOW_ID + ' 版本不是 ' + VERSION);
+  const definition = contracts.platformWorkflowDefinitions().find((item) => item.workflowId === workflowId);
+  if (!definition) throw new Error('桌面端没有 ' + workflowId + ' 契约；请先合并对应批次工作流改动');
+  if (String(definition.version) !== VERSION) throw new Error(workflowId + ' 版本不是 ' + VERSION);
   const steps = definition.steps.map((step) => ({ ...step }));
-  return { workflowId: WORKFLOW_ID, version: VERSION, name: NAME, status: 'active', contract: { ...definition, steps } };
+  return { workflowId, version: VERSION, name: WORKFLOW_NAMES[workflowId] || workflowId, status: 'active', contract: { ...definition, steps } };
 }
 
 async function request(endpoint, method, route, { token, body } = {}) {
@@ -85,7 +88,9 @@ async function adminToken(endpoint, args) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const payload = contractFromDesktop();
+  const workflowId = String(args['workflow-id'] || process.env.DSH_WORKFLOW_ID || 'live.batch');
+  if (!WORKFLOW_NAMES[workflowId]) throw new Error('不支持的批次流程：' + workflowId + '（仅支持 live.batch / comment.batch）');
+  const payload = contractFromDesktop(workflowId);
   if (args.status === 'disabled') payload.status = 'disabled';
 
   if (args['dry-run'] || args['print-payload']) {
@@ -99,15 +104,15 @@ async function main() {
 
   const existing = await request(endpoint, 'GET', '/v1/admin/workflows', { token });
   const rows = Array.isArray(existing && existing.workflows) ? existing.workflows : [];
-  const present = rows.find((row) => row.workflowId === WORKFLOW_ID && String(row.version) === VERSION);
+  const present = rows.find((row) => row.workflowId === workflowId && String(row.version) === VERSION);
   if (present) {
-    process.stdout.write('已注册，跳过：' + WORKFLOW_ID + '@' + VERSION + ' status=' + present.status + '\n');
+    process.stdout.write('已注册，跳过：' + workflowId + '@' + VERSION + ' status=' + present.status + '\n');
     return 0;
   }
 
   const created = await request(endpoint, 'POST', '/v1/admin/workflows', { token, body: payload });
-  process.stdout.write('已注册：' + WORKFLOW_ID + '@' + VERSION + ' status=' + (created && created.status) + '\n');
-  process.stdout.write('提示：客户端能否启动它，还取决于账号功能开关 liveInteraction（server/src/workflow-routes.ts 的 ensureWorkflowFeature）。\n');
+  process.stdout.write('已注册：' + workflowId + '@' + VERSION + ' status=' + (created && created.status) + '\n');
+  process.stdout.write('提示：客户端能否启动它，还取决于账号功能开关；服务端按流程前缀校验对应能力。\n');
   return 0;
 }
 

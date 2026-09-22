@@ -65,6 +65,10 @@ function searchEnvelope(result) {
   else if (result?.platformHasMore === 0 || result?.platformHasMore === 1) envelope.platformHasMore = result.platformHasMore === 1;
   const platformCursor = resultText(result?.platformCursor, 500);
   if (platformCursor) envelope.platformCursor = platformCursor;
+  const cursorVersion = resultInteger(result?.cursorVersion, 0, 1000);
+  if (cursorVersion != null) envelope.cursorVersion = cursorVersion;
+  const pageOutcome = resultText(result?.pageOutcome, 40);
+  if (new Set(['more', 'exhausted', 'captcha', 'login_required']).has(pageOutcome)) envelope.pageOutcome = pageOutcome;
   if (result?.filter && typeof result.filter === 'object' && !Array.isArray(result.filter)) {
     const filter = {};
     for (const key of ['collected', 'returned', 'filteredByRelevance', 'minRelevance', 'kept', 'poolAdded']) {
@@ -84,7 +88,7 @@ function searchCheckpoint(envelope, status) {
     cursor: envelope.cursor,
     hasMore: envelope.hasMore
   };
-  for (const key of ['stoppedReason', 'poolIds', 'poolSize', 'page', 'skippedSeen', 'platformHasMore', 'platformCursor', 'filter']) {
+  for (const key of ['stoppedReason', 'poolIds', 'poolSize', 'page', 'skippedSeen', 'platformHasMore', 'platformCursor', 'cursorVersion', 'pageOutcome', 'filter']) {
     if (envelope[key] !== undefined) checkpoint[key] = envelope[key];
   }
   return checkpoint;
@@ -174,6 +178,15 @@ function ledgerFor(state, runId) {
     state.set(runId, current);
   }
   return current.liveLedger;
+}
+
+function commentLedgerFor(state, runId) {
+  const current = state.get(runId) || {};
+  if (!current.commentLedger) {
+    current.commentLedger = { batchId: null, targets: [], entries: new Map(), skipped: [] };
+    state.set(runId, current);
+  }
+  return current.commentLedger;
 }
 
 function ledgerEntry(ledger, eventId) {
@@ -302,6 +315,111 @@ function createWorkflowAdapter({ browser, state = new Map() } = {}) {
       return { status: 'completed', result: envelope, checkpoint: searchCheckpoint(envelope, status) };
     }
 
+    if (workflowId === 'comment.batch') {
+      const params = requiredObject(plan.params || {}, 'workflow params');
+      const ledger = commentLedgerFor(state, run.runId);
+      const baseSendId = optionalText(action?.idempotencyKey || action?.actionId, 300);
+      const targetRows = (value) => (Array.isArray(value) ? value : []).slice(0, 200).map((target) => ({
+        eventId: optionalText(target?.eventId || target?.id, 240),
+        authorId: optionalText(target?.authorId, 240),
+        authorName: optionalText(target?.authorName, 120),
+        roomId: optionalText(target?.roomId, 2048),
+        text: optionalText(target?.text, 500),
+        publicText: optionalText(target?.publicText, 1000),
+        privateText: optionalText(target?.privateText, 1000)
+      })).filter((target) => target.eventId);
+
+      if (step.stepId === 'plan') {
+        if (typeof browser.commentPlan !== 'function') return { status: 'failed', error: { code: 'COMMENT_PLAN_ADAPTER_UNAVAILABLE', message: '侧车未提供 comment_plan' } };
+        const commentKeywords = (Array.isArray(params.commentKeywords) ? params.commentKeywords : Array.isArray(params.keywords) ? params.keywords : []).map((item) => optionalText(item, 200)).filter(Boolean);
+        if (!commentKeywords.length) return { status: 'wait_human', checkpoint: { phase: 'plan', reason: 'comment_keywords_missing' }, error: { code: 'COMMENT_KEYWORDS_MISSING', message: '评论批次必须先冻结至少一个关键词' } };
+        const publicText = optionalText(params.publicText || params.publicReply || params.reply || params.text, 1000);
+        const privateText = optionalText(params.privateText || params.privateReply, 1000);
+        if (!publicText || !privateText) return { status: 'wait_human', checkpoint: { phase: 'plan', reason: 'scripts_missing' }, error: { code: 'COMMENT_SCRIPTS_MISSING', message: '评论批次缺少平台侧下发的话术' } };
+        const request = {
+          maxItems: boundedInteger(params.maxItems, 1, 50, 20),
+          windowSeconds: boundedInteger(params.windowSeconds, 1, 86_400, 3600),
+          scrollRounds: boundedInteger(params.scrollRounds, 0, 40, 6),
+          collectMaxItems: boundedInteger(params.collectMaxItems, 1, 500, 200),
+          minDigg: boundedInteger(params.minDigg, 0, 1_000_000, 0),
+          commentKeywords,
+          excludeKeywords: (Array.isArray(params.excludeKeywords) ? params.excludeKeywords : []).map((item) => optionalText(item, 200)).filter(Boolean),
+          matchMode: MATCH_MODES.has(params.matchMode) ? params.matchMode : 'seg',
+          dedupeAuthors: params.dedupeAuthors !== false,
+          publicText,
+          privateText
+        };
+        const videoId = optionalText(params.videoId, 240);
+        const url = optionalText(params.url, 2048);
+        if (videoId) request.videoId = videoId; else if (url) request.url = url;
+        else return { status: 'wait_human', checkpoint: { phase: 'plan', reason: 'video_reference_missing' }, error: { code: 'COMMENT_VIDEO_REFERENCE_MISSING', message: '评论批次缺少视频 URL 或 videoId' } };
+        const result = await browser.commentPlan(request);
+        const status = String(result?.status || 'unknown');
+        const batchId = optionalText(result?.batch?.batchId, 300);
+        const targets = targetRows(result?.targets);
+        const blockedReasons = (Array.isArray(result?.blocked) ? result.blocked : []).slice(0, 200).map((item) => ({ eventId: optionalText(item?.eventId, 240), reason: optionalText(item?.reason, 120) }));
+        const checkpoint = {
+          phase: 'plan', status, batchId, targets: targets.length,
+          blocked: blockedReasons.length, blockedReasons, expired: Array.isArray(result?.expired) ? result.expired.length : 0,
+          filter: result?.filter || null, batchFilter: result?.batchFilter || null
+        };
+        if (['login_required', 'captcha', 'unsupported'].includes(status)) return { status: 'wait_human', result: { kind: 'comment_plan', status, batchId: batchId || null, filter: result?.filter || null }, checkpoint: { ...checkpoint, reason: status }, error: { code: 'COMMENT_REQUIRES_HUMAN', message: '评论采集需要人工处理（登录 / 验证码 / 页面不可用）' } };
+        if (status === 'empty' || !targets.length || !batchId) return { status: 'wait_human', result: { kind: 'comment_plan', status, batchId: batchId || null, filter: result?.filter || null }, checkpoint: { ...checkpoint, reason: status === 'empty' ? 'no_matching_comments' : 'plan_not_frozen' }, error: { code: 'COMMENT_BATCH_NOT_PLANNED', message: '没有命中关键词的评论或批次未冻结' } };
+        ledger.batchId = batchId;
+        ledger.targets = targets;
+        return { status: 'completed', result: { kind: 'comment_plan', status, batchId, targets: targets.length, blocked: blockedReasons.length, filter: result?.filter || null }, checkpoint };
+      }
+
+      if (step.stepId === 'reply_public' || step.stepId === 'private_message') {
+        const isPrivate = step.stepId === 'private_message';
+        const method = isPrivate ? browser.commentPrivate : browser.commentReply;
+        if (typeof method !== 'function') return { status: 'failed', error: { code: isPrivate ? 'COMMENT_PRIVATE_ADAPTER_UNAVAILABLE' : 'COMMENT_REPLY_ADAPTER_UNAVAILABLE', message: isPrivate ? '侧车未提供 comment_private' : '侧车未提供 comment_reply' } };
+        if (!ledger.batchId) return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'batch_not_planned' }, error: { code: 'COMMENT_BATCH_NOT_PLANNED', message: '没有已冻结的评论批次，禁止发送' } };
+        if (!baseSendId) return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'send_id_missing' }, error: { code: 'SEND_ID_MISSING', message: '评论批次副作用动作缺少幂等发送 ID' } };
+        const limit = boundedInteger(params.maxSends, 1, 50, 10);
+        let items;
+        if (isPrivate) {
+          items = ledgerSnapshot(ledger).filter((entry) => entry.public?.status === 'sent_confirmed' && entry.public.sendId).slice(0, limit).map((entry) => {
+            const target = ledger.targets.find((item) => item.eventId === entry.eventId);
+            return { eventId: entry.eventId, sendId: `${baseSendId}~private~${entry.eventId}`, publicSendId: entry.public.sendId, text: target?.privateText || '' };
+          });
+          for (const target of ledger.targets) {
+            const entry = ledgerEntry(ledger, target.eventId);
+            if (!entry.private && (!entry.public || entry.public.status !== 'sent_confirmed')) entry.private = { status: 'blocked', reason: 'public_delivery_not_confirmed', sendId: null, recordedState: null, skipped: true };
+          }
+          if (!items.length) return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'no_confirmed_public_delivery' }, error: { code: 'PUBLIC_DELIVERY_NOT_CONFIRMED', message: '没有公屏确认成功的评论目标，禁止私信' } };
+        } else {
+          items = ledger.targets.slice(0, limit).map((target) => ({ eventId: target.eventId, sendId: `${baseSendId}~public~${target.eventId}`, text: target.publicText || '' }));
+          if (!items.length) return { status: 'wait_human', checkpoint: { phase: step.stepId, reason: 'no_targets' }, error: { code: 'COMMENT_BATCH_NO_TARGETS', message: '批次里没有可回复的评论目标' } };
+        }
+        const result = await method({ batchId: ledger.batchId, items });
+        const results = Array.isArray(result?.results) ? result.results : [];
+        for (const item of results) {
+          const eventId = optionalText(item?.eventId, 240);
+          if (!eventId) continue;
+          const entry = ledgerEntry(ledger, eventId);
+          const record = { status: String(item?.status || 'unknown'), reason: resultText(item?.reason, 200), sendId: optionalText(item?.sendId, 300), recordedState: resultText(item?.recordedState, 60), skipped: item?.evidence?.skipped === true };
+          if (isPrivate) entry.private = record; else entry.public = record;
+        }
+        const summary = resultSummary(items.map((item) => results.find((row) => row?.eventId === item.eventId)));
+        const aggregate = aggregateSendStatus(summary, isPrivate ? 'private' : 'public');
+        const checkpoint = { phase: step.stepId, batchId: ledger.batchId, attempted: summary.attempted, confirmed: summary.confirmed, unknown: summary.unknown, failed: summary.failed, blocked: summary.blocked, reason: resultText(result?.reason, 200) };
+        const envelope = { deliveryStatus: aggregate.deliveryStatus, kind: isPrivate ? 'comment_private' : 'comment_reply', batchId: ledger.batchId, summary, ledger: ledgerSnapshot(ledger), counts: ledgerCounts(ledger) };
+        if (aggregate.status === 'completed') return { status: 'completed', result: envelope, checkpoint };
+        if (aggregate.status === 'wait_human') return { status: 'wait_human', result: envelope, checkpoint: { ...checkpoint, reason: checkpoint.reason || 'platform_blocked' }, error: { code: isPrivate ? 'COMMENT_PRIVATE_BLOCKED' : 'COMMENT_PUBLIC_BLOCKED', message: isPrivate ? '评论私信被平台拦下，需要人工处理' : '评论公屏回复被平台拦下，需要人工处理' } };
+        return { status: 'unknown', result: envelope, checkpoint, error: { code: 'SIDE_EFFECT_RESULT_UNKNOWN', message: isPrivate ? '评论私信结果未被平台确认' : '评论公屏结果未被平台确认' } };
+      }
+
+      if (step.stepId === 'report') {
+        if (typeof browser.commentResult !== 'function') return { status: 'failed', error: { code: 'COMMENT_RESULT_ADAPTER_UNAVAILABLE', message: '侧车未提供 comment_result' } };
+        const result = ledger.batchId ? await browser.commentResult({ batchId: ledger.batchId }) : null;
+        const counts = ledgerCounts(ledger);
+        const checkpoint = { phase: 'report', batchId: ledger.batchId, counts, platformCheckpoint: result?.checkpoint || null };
+        return { status: 'completed', result: { kind: 'comment_batch_ledger', batchId: ledger.batchId, ledger: ledgerSnapshot(ledger), counts }, checkpoint };
+      }
+      return { status: 'failed', error: { code: 'WORKFLOW_STEP_UNSUPPORTED', message: `未接入固定步骤 comment.batch/${step.stepId}` } };
+    }
+
     if (run.workflowId === 'live.batch') {
       const params = requiredObject(plan.params || {}, 'workflow params');
       const ledger = ledgerFor(state, run.runId);
@@ -360,7 +478,8 @@ function createWorkflowAdapter({ browser, state = new Map() } = {}) {
           phase: 'plan', status, batchId, targets: targets.length,
           blocked: blockedReasons.length, blockedReasons, expired: result?.expired?.length ?? result?.batch?.expiredCount ?? 0,
           filter: result?.filter || result?.batch?.filter || null,
-          replyMode: result?.replyMode || null, replyVia: result?.replyVia || null
+          replyMode: result?.replyMode || (params.replyMode === 'danmaku' ? 'danmaku' : 'composer'),
+          replyVia: result?.replyVia || (params.replyVia === 'mention_text' ? 'mention_text' : 'native')
         };
         if (status === 'empty') return { status: 'wait_human', result: { kind: 'live_plan', status, batchId: batchId || null }, checkpoint: { ...checkpoint, reason: 'no_events_in_window' }, error: { code: 'LIVE_BATCH_EMPTY', message: '批次窗口内没有命中关键词的弹幕' } };
         if (status === 'blocked' || !targets.length || !batchId) {
@@ -368,6 +487,8 @@ function createWorkflowAdapter({ browser, state = new Map() } = {}) {
         }
         ledger.batchId = batchId;
         ledger.targets = targets;
+        ledger.replyMode = checkpoint.replyMode;
+        ledger.replyVia = checkpoint.replyVia;
         return { status: 'completed', result: { kind: 'live_plan', status, batchId, targets: targets.length, blocked: blockedReasons.length, replyMode: checkpoint.replyMode, replyVia: checkpoint.replyVia }, checkpoint };
       }
 
@@ -396,7 +517,7 @@ function createWorkflowAdapter({ browser, state = new Map() } = {}) {
         }
         const request = isPrivate
           ? { batchId: ledger.batchId, items }
-          : { batchId: ledger.batchId, mode: 'danmaku', items };
+          : { batchId: ledger.batchId, mode: ledger.replyMode || 'composer', items };
         const result = await method(request);
         const results = Array.isArray(result?.results) ? result.results : [];
         for (const item of results) {

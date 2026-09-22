@@ -13,6 +13,7 @@ const WORKFLOW_IDS = Object.freeze({
   'live.batch': Object.freeze({ version: '1', required: ['url', 'keywords'], kind: 'live_batch' }),
   'live.reply_then_private': Object.freeze({ version: '1', required: ['url'], kind: 'live_reply_then_private' }),
   'comment.reply_then_private': Object.freeze({ version: '1', required: ['url'], kind: 'comment_reply_then_private' }),
+  'comment.batch': Object.freeze({ version: '1', required: [], kind: 'comment_batch' }),
   'video.search': Object.freeze({ version: '1', required: ['keyword'], kind: 'video_search' })
 });
 
@@ -28,6 +29,11 @@ function requestForWorkflow(value) {
   const version = String(value.version == null ? spec.version : value.version).trim();
   if (version !== spec.version) throw new TypeError('unsupported ' + workflowId + ' version: ' + version);
   const params = isPlainObject(value.params) ? value.params : {};
+  if (workflowId === 'comment.batch') {
+    if (!((typeof params.url === 'string' && params.url.trim()) || (typeof params.videoId === 'string' && params.videoId.trim()))) throw new TypeError('workflow request is missing url or videoId');
+    const keywords = params.commentKeywords ?? params.keywords;
+    if (!Array.isArray(keywords) || !keywords.some((entry) => typeof entry === 'string' && entry.trim())) throw new TypeError('workflow request is missing commentKeywords');
+  }
   for (const key of spec.required) {
     const item = params[key];
     const ok = key === 'keywords'
@@ -51,6 +57,11 @@ function buildWorkflowIntent(request) {
       + (Number.isInteger(params.maxSends) ? params.maxSends : 10) + ' 条。';
   }
   if (spec.workflowId === 'video.search') return '搜索视频：' + params.keyword;
+  if (spec.workflowId === 'comment.batch') {
+    const keywords = (params.commentKeywords || params.keywords || []).join('、');
+    const target = params.videoId ? '视频候选 ' + params.videoId : params.url;
+    return '在 ' + target + ' 的评论区按关键词「' + keywords + '」匹配评论，先公开回复，确认成功后再发送私信。';
+  }
   return '在 ' + params.url + ' 按关键词处理公开评论并在确认成功后发送私信。';
 }
 

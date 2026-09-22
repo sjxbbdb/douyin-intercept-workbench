@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('agentApi', {
   redeem: (code) => invoke('credits:redeem', { code }),
   openTarget: (url) => invoke('browser:open', url),
   searchTargets: (payload) => invoke('browser:search', payload),
+  searchPool: (payload) => invoke('browser:search-pool', payload),
   closeTarget: () => invoke('browser:close'),
   probeSelectors: (profile) => invoke('selectors:probe', profile),
   saveSelectors: (profile) => invoke('selectors:save', profile),
