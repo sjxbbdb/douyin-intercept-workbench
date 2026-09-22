@@ -51,7 +51,12 @@ COMMENT_INPUT_RIGHT_CT = '[class*="commentInput-right"]'
 # 发送键激活色 = 抖音品牌红
 COMMENT_SEND_ACTIVE_FILL = "rgb(254, 44, 85)"
 # 正文提取时要排除的操作文案（时间/地区/纯数字另有规则）
-COMMENT_NOISE_TEXTS = ["分享", "回复", "回复中", "作者", "置顶", "收起"]
+COMMENT_NOISE_TEXTS = [
+    "分享", "回复", "回复中", "作者", "置顶", "收起",
+    # 真机实测（2026-09-21）：行进入「回复中」后还会多出这些，
+    # 它们比短评论长，会被 bodyText 的"取最长候选"选中。
+    "作者赞过", "展开", "收起回复", "查看回复",
+]
 
 # 顶层评论输入框（发布一条新评论，不是回复某个人）
 COMMENT_EDITORS = [

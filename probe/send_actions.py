@@ -5,6 +5,7 @@ platform response is recorded as ``unknown`` and blocks a later retry.
 """
 import json
 import re
+import sys
 import time
 from urllib.parse import urlsplit
 
@@ -12,6 +13,7 @@ import click_guard
 import douyin
 import douyin_selectors as S
 import live
+import winfocus
 from send_gate import GateError, SendGate
 
 
@@ -282,7 +284,24 @@ def send_private(tab, gate, send_id, target, text):
         #    的循环，最多 3 轮；每一轮都用当下最新的按钮坐标，避免用过期坐标点击。
         composer = {"found": False}
         context_mode = "recipient_scoped"
+        visibility_lost = False
         for attempt in range(3):
+            # 🔴 真机实测（2026-09-21）：页面 hidden 时【点击不送达渲染进程】，
+            #    表现就是"私信按钮点上去、面板死活不开"。而 douyin.ensure_visible 是
+            #    CDP 那套（setWebLifecycleState + 焦点模拟），改不了 Windows 的遮挡判定。
+            #    这里改用真正有效的"最小化->还原"，并在仍然隐藏时【如实归因】，
+            #    而不是把它写成 dm_panel_unavailable（那会被误读成"对方不让私信"）。
+            # 只对【明确的 hidden】动手：离线替身/拿不到信号时 visibility_state
+            # 返回 "unknown"，那不代表"页面被遮挡"，不能据此阻断流程（否则单测全挂）。
+            if douyin.visibility_state(tab) == "hidden":
+                try:
+                    winfocus.force_front_any(log=lambda m: print(m, file=sys.stderr))
+                except Exception:
+                    pass
+                time.sleep(0.6)
+            if douyin.visibility_state(tab) == "hidden":
+                visibility_lost = True
+                break
             entry = douyin.dm_entry(tab)
             if entry.get("blocked"):
                 row = gate.finish(send_id, "blocked", "target_dm_not_available")
@@ -317,10 +336,17 @@ def send_private(tab, gate, send_id, target, text):
                 #    （对方未互关 / 私密账号 / 关闭了陌生人私信）。这时我们一条消息都没发，
                 #    应当【跳过并换下一个目标】，而不是把它记成"发送失败"。
                 #    注意：这里只影响"能否触达"的判定，不影响任何发送门槛。
+                if visibility_lost:
+                    # 面板不开是因为【页面不可见、点击不送达】，不是平台限制。
+                    # 如实归因：这条不是"跳过"，是需要人工把窗口拉到前台。
+                    row = gate.finish(send_id, "blocked", "browser_not_visible",
+                                      {"skipped": False, "blockedBy": "page_hidden",
+                                       "entryClicks": 3,
+                                       "hint": "bring the owned browser window to the front"})
+                    return gate.result(row)
                 row = gate.finish(send_id, "blocked", "dm_panel_unavailable",
                                   {"skipped": True, "blockedBy": "panel_not_opened",
                                    "entryClicks": 3})
-                return gate.result(row)
             context_mode = "live_panel_header"
             composer = {"found": True, "x": panel["x"], "y": panel["y"],
                         "text": panel.get("text") or "",
@@ -878,6 +904,25 @@ def send_comment(tab, gate, send_id, target, text, source):
             # 于是永远停在 comment_not_found —— 这是 video_reply 长期不可自动化的原因。
             # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
             found = douyin.comment_reply_button(tab, target)
+            if not found.get("found"):
+                # 🔴 恢复性搜索必须【双向】（真机实测 2026-09-21）：
+                #    采集阶段已经把评论列表滚到底，目标行多半在【上面】——
+                #    原来这里只往下滚（scroll_comment_panel dy=2000），越滚越找不回来，
+                #    真机实测 6 次发送全部停在"找不到目标"。
+                #    所以先回顶部，再逐步向下扫描，每一步都重新定位。
+                try:
+                    douyin.reset_comment_panel(tab)
+                except Exception:
+                    pass
+                found = douyin.comment_reply_button(tab, target)
+                for _ in range(5):
+                    if found.get("found"):
+                        break
+                    try:
+                        douyin.scroll_comment_panel(tab, rounds=1, pause=1.2, dy=1400)
+                    except Exception:
+                        break
+                    found = douyin.comment_reply_button(tab, target)
             if not found.get("found"):
                 row = gate.finish(send_id, "failed",
                                   "reply_" + str(found.get("reason") or "not_found"))

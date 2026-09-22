@@ -1,4 +1,4 @@
-"""抖音页面操作原语。
+﻿"""抖音页面操作原语。
 
 这里沉淀的是 legacy/ 用真账号反复试错换来的知识，逐条对应：
   · 页面同时存在【隐藏与可见两套】comment-list —— 必须先筛出可见的那个，
@@ -478,6 +478,41 @@ def scroll_comment_panel(cdp, rounds=4, pause=1.6, dy=2000):
     return info
 
 
+# 把评论容器（及其可滚动祖先）滚回【顶部】。
+# 与 _COMMENT_SCROLL_JS 对称：那个滚到底，这个滚回顶。
+_COMMENT_SCROLL_TOP_JS = (
+    "(function(){var ls=Array.from(document.querySelectorAll('%s'));"
+    "var root=null;"
+    "for(var i=0;i<ls.length;i++){var r=ls[i].getBoundingClientRect();"
+    " if(r.width>0&&r.height>0){root=ls[i];break;}}"
+    "if(!root) return {ok:false,reason:'no_visible_panel'};"
+    "var n=0,e=root;"
+    "while(e&&e!==document.body&&e!==document.documentElement){"
+    "  if(e.scrollHeight>e.clientHeight+40){"
+    "    var cs=getComputedStyle(e);"
+    "    if(/scroll|auto/.test(cs.overflowY)){e.scrollTop=0;n++;}}"
+    "  e=e.parentElement;}"
+    "return {ok:true,reset:n};})()"
+) % S.COMMENT_LIST
+
+
+def reset_comment_panel(cdp):
+    """把评论列表滚回顶部。
+
+    🔴 为什么必须有这一档（真机实测 2026-09-21）：
+        send_comment 原来在找不到目标时【只往下滚】（scroll_comment_panel，dy=2000）。
+        但采集阶段已经把列表滚到底，目标行多半在【上面】——
+        越往下滚越找不回来，于是 6 次发送全部停在 reply_target_not_rendered。
+        恢复性搜索必须双向：先回顶部，再逐步向下扫，每一步重新定位。
+    只动评论容器及其可滚动祖先，不碰 documentElement/body ——
+    视频页整页下滚可能切到下一个视频，会污染数据。
+    """
+    try:
+        return cdp.eval_json(_COMMENT_SCROLL_TOP_JS) or {"ok": False}
+    except Exception:
+        return {"ok": False}
+
+
 # ===================== 私信入口 =====================
 
 _DM_ENTRY_JS = (
@@ -850,10 +885,16 @@ def _row_helpers_js():
         "if(noise.indexOf(t)>=0)continue;"
         "if(t.length>best.length)best=t;}"
         "return best;}"
-        # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
+        # 目标匹配：🔴 【稳定身份优先】，正文只作兜底。
+        #    原顺序是"先比正文"，于是行一进入「回复中」（多出「回复中」「回复@某人」），
+        #    bodyText 这个启发式就漂了 -> 正文比对先失败短路 -> **连 id 命中都救不回来**。
+        #    真机实测：编辑器明明找到了（1 个、可见、在行内），却报 reply_row_mismatch；
+        #    4 次 comment_composer_not_found 与 6 次 reply_target_not_rendered 都是这一条。
+        #    评论 id 不随行状态变化，所以它必须是主键；正文只在【没有 id】时才当依据
+        #    （DOM 兜底采到的行，id 是指纹，本来也匹配不上 data-comment-id）。
         "function rowMatches(row,t){"
-        "if(t.text&&bodyText(row)!==t.text)return false;"
         "if(t.id&&(row.id===t.id||row.getAttribute('data-comment-id')===t.id))return true;"
+        "if(t.text&&bodyText(row)!==t.text)return false;"
         "if(!t.text)return false;"
         "if(!t.authorId)return true;"
         "var as=row.querySelectorAll('a[href]');"
@@ -935,7 +976,6 @@ _REPLY_COMPOSER_JS = (
     "x:Math.round(r.x+Math.min(80,Math.max(20,r.width/2))),y:Math.round(r.y+r.height/2),"
     "text:(e.innerText||'').replace(/\\u200b/g,'')};})(TARGET)"
 )
-
 
 def comment_reply_composer(cdp, target):
     """Find exactly one editor inside the confirmed target comment row."""

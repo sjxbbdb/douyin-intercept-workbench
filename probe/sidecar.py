@@ -452,6 +452,13 @@ class Sidecar:
             winfocus.bring_process_front(marker.get("pid"), log=lambda msg: print(msg, file=sys.stderr))
             time.sleep(0.4)
         if douyin.visibility_state(page) != "visible":
+            # 🔴 真机实测：上面那一档不够 —— 窗口已是前台窗口时页面仍可能 hidden，
+            #    普通 ShowWindow+SetForegroundWindow 连试 8 次无效。
+            #    只有最小化->还原能刷新遮挡判定，且必须遍历【所有】owner 窗口。
+            winfocus.force_process_front(marker.get("pid"),
+                                         log=lambda msg: print(msg, file=sys.stderr))
+            time.sleep(0.6)
+        if douyin.visibility_state(page) != "visible":
             page.close()
             raise SidecarError("browser_not_visible", "owned browser window must be visible")
         return page, marker
