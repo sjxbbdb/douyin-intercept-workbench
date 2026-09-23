@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import cdp as cdpmod
 import comment_flow
@@ -163,6 +163,74 @@ def _filter_text(value, label, limit=400):
     if len(value) > limit:
         raise SidecarError("invalid_input", "%s is too long" % label)
     return value
+
+
+# 搜索的发布时间区间：口径写死在【北京时间】，与商家/宿主嘴里的"6–9 月"一致。
+# create_time 是 epoch 秒；不约定时区的话，月初/月末那几条会跨月，
+# 表现成"选了 6 月却少一条"，而且没人看得出为什么。
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def _iso_cn(ts):
+    """epoch 秒 -> 北京时间 ISO 串（给 UI 直接显示用）。"""
+    if not ts:
+        return None
+    return datetime.fromtimestamp(int(ts), tz=_CN_TZ).isoformat(timespec="seconds")
+
+
+def _date_bound_epoch(value, label, end=False):
+    """把 YYYY-MM 或 YYYY-MM-DD 解析成 epoch 秒；空值 = 该边界不设。
+
+    只收这两种形状：宿主（以及后面的 UI 日期选择器）给的就是月或日，
+    收窄输入面比兼容一堆格式更安全。end=True 时取该月/该日的【最后一秒】，
+    这样 "2026-06 ~ 2026-09" 天然包含 6 月初到 9 月末。
+    """
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise SidecarError("invalid_input", "%s must be a string" % label)
+    parts = value.strip().split("-")
+    try:
+        if len(parts) == 2:
+            year, month = int(parts[0]), int(parts[1])
+            if not 1 <= month <= 12:
+                raise ValueError("month")
+            if end:
+                nxt = datetime(year + month // 12, month % 12 + 1, 1, tzinfo=_CN_TZ)
+                return int(nxt.timestamp()) - 1
+            return int(datetime(year, month, 1, tzinfo=_CN_TZ).timestamp())
+        if len(parts) == 3:
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            start = datetime(year, month, day, tzinfo=_CN_TZ)
+            return int(start.timestamp()) + (86400 - 1 if end else 0)
+    except (TypeError, ValueError):
+        pass
+    raise SidecarError("invalid_input", "%s must be YYYY-MM or YYYY-MM-DD" % label)
+
+
+def _apply_date_range(rows, date_from, date_to):
+    """按 createTime 过区间。返回 (保留行, 被区间筛掉数, 取不到发布时间数)。
+
+    🔴 拿不到发布时间的【不算通过】：宁可少给一条，也不要交给宿主一条
+       无法证明其发布时间的视频 —— 否则"这批是按 6–9 月采的"这句话就不成立，
+       而宿主会据此去发消息。
+    """
+    if date_from is None and date_to is None:
+        return list(rows), 0, 0
+    kept, dropped, unknown = [], 0, 0
+    for row in rows:
+        ts = row.get("createTime")
+        if not ts:
+            unknown += 1
+            continue
+        if date_from is not None and ts < date_from:
+            dropped += 1
+            continue
+        if date_to is not None and ts > date_to:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped, unknown
 
 
 def _dedupe_by_author(rows):
@@ -730,6 +798,13 @@ class Sidecar:
         # 而游标绑定属于【加法能力】，不该让既有的搜索契约整体失败。
         scope = getattr(self, "account_scope", None)
         seen, page_no = _decode_cursor(cursor_in, keyword, scope)
+        # 发布时间区间：可配置（宿主/后续 UI 给 "YYYY-MM" 或 "YYYY-MM-DD"）。
+        # 为什么不由平台筛选面板决定：面板只给"一天内/一周内/半年内"这类预设，
+        # 表达不了"2026 年 6–9 月"这种自选区间，所以区间判定放在本侧。
+        date_from = _date_bound_epoch(params.get("dateFrom"), "dateFrom")
+        date_to = _date_bound_epoch(params.get("dateTo"), "dateTo", end=True)
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise SidecarError("invalid_input", "dateFrom must not be after dateTo")
 
         min_relevance = int(params.get("minRelevance", 0) or 0)
         if not 0 <= min_relevance <= 100:
@@ -766,15 +841,23 @@ class Sidecar:
                 video_id = str(video.get("aweme_id") or "")
                 if not video_id:
                     continue
+                # create_time 本来就在 crawl.parse_search_item 里解析好了，
+                # 只是此前没有透传给宿主 —— 于是"按发布时间筛"根本无从下手。
+                create_ts = int(video.get("create_time") or 0) or None
                 rows.append({"id": video_id,
                              "url": safe_url(video.get("url"), "video.url"),
                              "title": str(video.get("desc") or "")[:200],
                              "author": str(video.get("author") or "")[:120],
                              "authorId": str(video.get("author_sec_uid") or "")[:200],
+                             "createTime": create_ts,
+                             "publishedAt": _iso_cn(create_ts),
                              "relevance": crawlmod.video_relevance(video.get("desc"), keyword)})
-            out = [row for row in rows if row["relevance"]["score"] >= min_relevance][:max_videos]
-            filtered = len(rows) - len([row for row in rows
-                                        if row["relevance"]["score"] >= min_relevance])
+            passed = [row for row in rows if row["relevance"]["score"] >= min_relevance]
+            filtered = len(rows) - len(passed)
+            # 顺序：相关度 -> 发布时间 -> 截断。截断放最后，否则
+            # maxVideos 会先把候选砍掉、再被日期筛空，看起来像"这个月没视频"。
+            out, filtered_by_date, unknown_date = _apply_date_range(passed, date_from, date_to)
+            out = out[:max_videos]
             # 搜索结果保存：候选落库（按 账号 + 关键词），videoId 从此可以被正式引用。
             pool_saved = None
             store = self._pool()
@@ -792,6 +875,10 @@ class Sidecar:
                                 if v.get("aweme_id")}
             page_filter = {"collected": len(videos), "returned": len(out),
                            "filteredByRelevance": filtered,
+                           "filteredByDate": filtered_by_date,
+                           "unknownDate": unknown_date,
+                           "dateFrom": params.get("dateFrom") or None,
+                           "dateTo": params.get("dateTo") or None,
                            "minRelevance": min_relevance}
             if meta.get("stopped_reason") == "captcha":
                 # 🔴 验证码是【终止状态】，不是"这一页到头了"。

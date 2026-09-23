@@ -1838,7 +1838,9 @@ class SearchRelevanceTests(unittest.TestCase):
         self.assertEqual(result["videos"][0]["relevance"]["reason"], "exact_phrase")
         self.assertEqual(result["videos"][2]["relevance"]["reason"], "no_match")
         self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
-                                            "filteredByRelevance": 0, "minRelevance": 0})
+                                            "filteredByRelevance": 0, "minRelevance": 0,
+                                            "filteredByDate": 0, "unknownDate": 0,
+                                            "dateFrom": None, "dateTo": None})
         # 边界：只发现与筛选，不产生任何发送动作
         for key in ("sent", "sendId", "private", "reply"):
             self.assertNotIn(key, result)
@@ -1847,7 +1849,9 @@ class SearchRelevanceTests(unittest.TestCase):
         result = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
         self.assertEqual([v["id"] for v in result["videos"]], ["1"])
         self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
-                                            "filteredByRelevance": 2, "minRelevance": 60})
+                                            "filteredByRelevance": 2, "minRelevance": 60,
+                                            "filteredByDate": 0, "unknownDate": 0,
+                                            "dateFrom": None, "dateTo": None})
 
     def test_min_relevance_is_validated(self):
         import sidecar
@@ -3970,6 +3974,97 @@ class ReleaseSwitchLockTests(unittest.TestCase):
         self.assertFalse(capability["comment_flow"]["autoEligible"])
         self.assertIn("sent_confirmed_only",
                       capability["comment_flow"]["validation"]["privateGate"])
+
+
+class SearchDateRangeTests(unittest.TestCase):
+    """找视频：按【可配置】的发布时间区间筛（不依赖平台筛选面板）。
+
+    为什么由本侧筛：平台搜索的「筛选」只给"一天内/一周内/半年内"这类预设，
+    表达不了"2026 年 6–9 月"这种自选区间。所以把 crawl 已经解析出来的
+    create_time 透传给宿主，区间判定放在这里，参数化以便后面落到 UI。
+    口径是【北京时间】：商家说的"6 月"就是日历月，不做约定的话月初/月末会跨月。
+    """
+
+    VIDEO = "https://www.douyin.com/video/%d"
+
+    @staticmethod
+    def _cn(iso):
+        import datetime
+        import sidecar
+        return int(datetime.datetime.fromisoformat(iso).replace(tzinfo=sidecar._CN_TZ).timestamp())
+
+    def _videos(self):
+        return [
+            {"aweme_id": "jun", "url": self.VIDEO % 1, "desc": "怎么做副业 六月",
+             "author": "A", "author_sec_uid": "S1", "create_time": self._cn("2026-06-15T12:00:00")},
+            {"aweme_id": "may", "url": self.VIDEO % 2, "desc": "怎么做副业 五月",
+             "author": "B", "author_sec_uid": "S2", "create_time": self._cn("2026-05-31T23:59:59")},
+            {"aweme_id": "sep", "url": self.VIDEO % 3, "desc": "怎么做副业 九月末",
+             "author": "C", "author_sec_uid": "S3", "create_time": self._cn("2026-09-30T23:59:59")},
+            {"aweme_id": "oct", "url": self.VIDEO % 4, "desc": "怎么做副业 十月",
+             "author": "D", "author_sec_uid": "S4", "create_time": self._cn("2026-10-01T00:00:01")},
+            {"aweme_id": "notime", "url": self.VIDEO % 5, "desc": "怎么做副业 无时间",
+             "author": "E", "author_sec_uid": "S5", "create_time": None},
+        ]
+
+    def _run(self, params):
+        import sidecar
+        page = FakeSearchPage()
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        videos = self._videos()
+
+        def fake(_page, _keyword, **kwargs):
+            meta = kwargs.get("meta")
+            if isinstance(meta, dict):
+                meta["skipped_seen"] = 0
+                meta["platform_cursor"] = "pc-1"
+                meta["platform_has_more"] = 1
+            return list(videos)
+
+        sidecar.douyin.login_state = lambda _page: "ok"
+        sidecar.crawlmod.search_videos = fake
+        try:
+            return instance.search(params)
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    def test_a_month_range_covers_the_whole_end_month(self):
+        """2026-06 ~ 2026-09 必须含 6/15 与 9/30 23:59:59，排除 5/31 与 10/1。"""
+        result = self._run({"keyword": "怎么做副业", "dateFrom": "2026-06", "dateTo": "2026-09"})
+        self.assertEqual([v["id"] for v in result["videos"]], ["jun", "sep"])
+        fl = result["filter"]
+        self.assertEqual(fl["dateFrom"], "2026-06")
+        self.assertEqual(fl["dateTo"], "2026-09")
+        self.assertEqual(fl["filteredByDate"], 2, "5/31 与 10/1 应被区间筛掉")
+        self.assertEqual(fl["unknownDate"], 1, "取不到发布时间的要单独计数")
+
+    def test_videos_expose_create_time_for_the_ui(self):
+        """区间功能要落到 UI，就必须把发布时间透传出去（此前只有相关度，没有时间）。"""
+        result = self._run({"keyword": "怎么做副业", "dateFrom": "2026-06", "dateTo": "2026-09"})
+        first = result["videos"][0]
+        self.assertEqual(first["createTime"], self._cn("2026-06-15T12:00:00"))
+        self.assertEqual(first["publishedAt"], "2026-06-15T12:00:00+08:00")
+
+    def test_without_a_range_everything_comes_back(self):
+        """反向保护：不给区间就不许筛 —— 否则这个功能会静默改变既有搜索语义。"""
+        result = self._run({"keyword": "怎么做副业"})
+        self.assertEqual(sorted(v["id"] for v in result["videos"]),
+                         ["jun", "may", "notime", "oct", "sep"])
+        self.assertEqual(result["filter"]["filteredByDate"], 0)
+
+    def test_a_reversed_or_malformed_range_is_refused(self):
+        """边界输入必须在打开浏览器之前拒绝，且不许猜宿主想表达什么。"""
+        import sidecar
+        for params in ({"dateFrom": "2026-09", "dateTo": "2026-06"},
+                       {"dateFrom": "2026-13"}, {"dateFrom": "2026"},
+                       {"dateFrom": "abc"}, {"dateTo": "202606"}, {"dateFrom": 202606}):
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                self._run(dict({"keyword": "怎么做副业"}, **params))
+            self.assertEqual(raised.exception.code, "invalid_input", repr(params))
 
 
 if __name__ == "__main__":
