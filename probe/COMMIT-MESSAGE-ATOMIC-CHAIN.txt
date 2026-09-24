@@ -1,0 +1,18 @@
+docs(probe): 沉淀原子链路真机证据与方法（搜索/采集/筛选/回复/私信）
+
+内容：
+- probe/EVIDENCE-ATOMIC-CHAIN.md：账号资格、环境与页面版本、能力矩阵、失败状态、未验证边界、发行开关条件
+- probe/evidence-atomic-chain/：5 张脱敏证据图 + 生成源 + 工作日志
+- probe/evidence-atomic-chain/reference/：Node/CDP 参考实现（仅证据用途，未接入 sidecar）
+- probe/PR-BODY-ATOMIC-CHAIN.md：PR 说明
+
+关键结论：
+1. 评论回复定位必须原子化（定位+滚入+点击+检测同一次求值），否则虚拟列表会回收节点
+2. 评论关键词支持 char/segment/phrase 三种模式，phrase（字面包含）可把 1165 条收敛到 9 条命中
+3. 私信输入框只能在 im-dialog 内查找；私密账号在打开主页阶段即可识别并跳过
+4. 平台限流与节奏强相关：35–65 秒间隔被静默拦截，45–80 秒间隔同批线索全部发送成功
+
+影响范围：仅新增文档与证据文件，未改动 server/、desktop/、probe/*.py 与 CI 配置。
+依赖：无新增依赖。
+验证：真实账号 + 真实页面的端到端实测（见 EVIDENCE-ATOMIC-CHAIN.md §3/§5）。
+未验证：未接入 sidecar，未跑仓库级接入用例，未覆盖企业号与官方 API。

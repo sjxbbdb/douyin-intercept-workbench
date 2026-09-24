@@ -1,0 +1,40 @@
+﻿<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>原子链路总览</title><style>
+  body{margin:0;padding:28px 34px;font-family:"Microsoft YaHei",system-ui,sans-serif;background:#0f1115;color:#e6e8eb;width:1180px}
+  h1{font-size:26px;margin:0 0 6px;color:#fff}
+  h2{font-size:17px;margin:22px 0 8px;color:#7cc4ff;border-left:4px solid #7cc4ff;padding-left:10px}
+  .sub{color:#8b93a1;font-size:13px;margin-bottom:18px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{border:1px solid #262b34;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#171b22;color:#a9b4c2;font-weight:600}
+  code,pre{font-family:Consolas,"Cascadia Mono",monospace}
+  pre{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:12.5px;line-height:1.75;white-space:pre-wrap;margin:0}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}.dim{color:#6b7280}.hl{color:#7cc4ff}
+  .kv td:first-child{color:#8b93a1;width:220px}
+  .box{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:13.5px;line-height:1.8}
+  ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0;font-size:13.5px}
+</style></head><body>
+<h1>原子链路总览 · 视频搜索 → 评论采集 → 严格筛选 → 评论回复 → 私信触达</h1>
+<div class="sub">环境：Windows 11 + Chrome 153（CDP 9222，商家手动登录）+ Node 22 · 零 npm 依赖 · 不逆向签名 / 不绕风控</div>
+<h2>五步链路</h2>
+<table>
+<tr><th style="width:120px">阶段</th><th style="width:300px">动作</th><th>关键实现点（决定成败的地方）</th></tr>
+<tr><td>1 搜视频</td><td>关键词 → waterfall_item_&lt;awemeId&gt;</td><td>每次开新标签页（复用旧标签会搜不出结果）；先整串匹配，不中再<b>分词 + 顺序无关</b>匹配</td></tr>
+<tr><td>2 抓评论</td><td>拦 <code>Network.responseReceived</code></td><td>不抓 DOM：URL 含 <code>comment</code> 的响应体里才有 cid / 时间 / 地域 / <b>sec_uid</b>（私信必需）</td></tr>
+<tr><td>3 严格筛选</td><td>三种匹配模式</td><td><code>phrase</code>＝字面包含（推荐）；<code>char</code>＝单字命中，噪音极大；纯数字关键词不切分</td></tr>
+<tr><td>4 评论回复</td><td>定位 → 点「回复」→ 输入 → 回车 → 校验</td><td><b>定位+点击必须原子化</b>（同一次 evaluate）；发送以 <code>comment/publish</code> 的 <code>status_code:0</code> 为唯一判据</td></tr>
+<tr><td>5 私信触达</td><td>主页 → 私信 → 输入 → 回车 → 双校验</td><td>输入框只在 <code>im-dialog</code> 内找；<b>私密账号直接跳过</b>；判定＝输入框已清空 且（对话区出现文案 或 message/send 200）</td></tr>
+</table>
+<h2>定位三原则（踩坑总结）</h2>
+<div class="box">
+<b>①只认可见节点</b>：页面上常同时存在隐藏/可见两份（两个 comment-list、两个 im-dialog），<code>querySelector</code> 可能拿到隐藏那份（宽度 0）→ 取宽度最大者。<br>
+<b>②原子操作</b>：找元素 → 滚入视口 → 点击 → 检测结果，必须在同一次 <code>Runtime.evaluate</code> 内完成；分两次会被虚拟列表回收。<br>
+<b>③DOM click 兜底</b>：几何定位失败时直接 <code>element.click()</code>，不要求元素在视口内。
+</div>
+<h2>文本匹配三坑</h2>
+<table>
+<tr><th style="width:180px">坑</th><th>现象</th><th>修法</th></tr>
+<tr><td>零宽字符</td><td>昵称/正文带 U+200B–U+200F、U+034F，比对永远不等</td><td>两侧都剔除；昵称只作<b>优先项</b>，不作硬条件</td></tr>
+<tr><td>表情标记</td><td>目标文本把 <code>[流泪]</code> 整段删掉，页面文本只删方括号 → 对不上</td><td>页面侧同样整段删 <code>[xxx]</code></td></tr>
+<tr><td>多条同文评论</td><td>复制粘贴党导致 XPath 兜底可能匹配到别人</td><td>XPath 文本兜底<b>仅在唯一命中时采用</b>，歧义即放弃</td></tr>
+</table>
+</body></html>
