@@ -22,6 +22,27 @@ from send_gate import SendGate  # noqa: E402
 from url_policy import URLPolicyError, safe_url  # noqa: E402
 
 
+_saved_visibility_state = None
+
+
+def setUpModule():
+    # 本文件的用例关注草稿/行/点击等语义，不关注页面可见性。
+    # 页面可见性口径由 probe/tests/test_winfocus.py 覆盖；这里显式声明 visible，
+    # 避免 unknown 被当成 hidden（平台侧要求 2026-09-26：unknown 不等于 hidden，
+    # 且 unknown 不得自动重试发送）。
+    global _saved_visibility_state
+    import send_actions
+    _saved_visibility_state = send_actions.douyin.visibility_state
+    send_actions.douyin.visibility_state = lambda _cdp: 'visible'
+
+
+def tearDownModule():
+    import send_actions
+    if _saved_visibility_state is not None:
+        send_actions.douyin.visibility_state = _saved_visibility_state
+
+
+
 class Events:
     def __init__(self):
         self.handlers = {}

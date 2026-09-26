@@ -512,15 +512,34 @@ class Sidecar:
         if not tab:
             raise SidecarError("target_not_found", "owned browser target is unavailable")
         page = cdpmod.CDP(tab["webSocketDebuggerUrl"], port=self.port, timeout=30)
-        if douyin.visibility_state(page) != "visible":
+        state = douyin.visibility_state(page)
+        if state == "hidden":
+            # 只有明确 hidden 才尝试恢复；没有可靠 PID 时 fail-closed，
+            # 绝不遍历系统上的 Chrome 窗口（会抢走其它账号的前台状态）。
+            # 先校验 PID：非法值直接 fail-closed，绝不去猜窗口、也不枚举所有 Chrome
+            pid = winfocus.coerce_pid(marker.get("pid"))
+            if pid is None:
+                page.close()
+                raise SidecarError("browser_not_visible",
+                                   "owned browser pid is missing or invalid; bring the window to front manually")
             try:
                 page.call("Page.bringToFront", {}, timeout=5)
             except Exception:
                 pass
-            winfocus.bring_process_front(marker.get("pid"), log=lambda msg: print(msg, file=sys.stderr))
+            winfocus.bring_process_front(pid, log=lambda msg: print(msg, file=sys.stderr))
             time.sleep(0.4)
-        if douyin.visibility_state(page) != "visible":
+            state = douyin.visibility_state(page)
+        elif state == "unknown":
+            # unknown 不等于 hidden：判定不了就交给人工，不猜、不重试。
             page.close()
+            raise SidecarError("page_visibility_unknown",
+                               "cannot determine page visibility; manual check required")
+        if state != "visible":
+            page.close()
+            if state == "unknown":
+                # 判定不了 ≠ 明确不可见：分开上报，避免上层按「窗口不可见」去自动重试
+                raise SidecarError("page_visibility_unknown",
+                                   "cannot determine page visibility after focus recovery; manual check required")
             raise SidecarError("browser_not_visible", "owned browser window must be visible")
         return page, marker
 
