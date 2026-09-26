@@ -1,0 +1,42 @@
+﻿<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>私信证据</title><style>
+  body{margin:0;padding:28px 34px;font-family:"Microsoft YaHei",system-ui,sans-serif;background:#0f1115;color:#e6e8eb;width:1180px}
+  h1{font-size:26px;margin:0 0 6px;color:#fff}
+  h2{font-size:17px;margin:22px 0 8px;color:#7cc4ff;border-left:4px solid #7cc4ff;padding-left:10px}
+  .sub{color:#8b93a1;font-size:13px;margin-bottom:18px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{border:1px solid #262b34;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#171b22;color:#a9b4c2;font-weight:600}
+  code,pre{font-family:Consolas,"Cascadia Mono",monospace}
+  pre{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:12.5px;line-height:1.75;white-space:pre-wrap;margin:0}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}.dim{color:#6b7280}.hl{color:#7cc4ff}
+  .kv td:first-child{color:#8b93a1;width:220px}
+  .box{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:13.5px;line-height:1.8}
+  ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0;font-size:13.5px}
+</style></head><body>
+<h1>私信触达 · 实验观察记录（已脱敏）</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台接口返回的成功状态码外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
+<div class="sub">链路：dm_run.js 调度 → live_dm_worker.js 单条执行 · 抖音私信没有发送按钮，回车即发送 · 实验观察标签：输入框已清空且客户端/接口有回显 —— <b>交付状态仍为 unknown</b></div>
+<h2>客户端观察：发送路径与账号限制跳过（<b>非送达证明</b>）</h2>
+<pre><span class="dim">08:03:41</span> 未发送: &lt;用户A&gt; | <span class="warn">skipped | private_account (私密账号)</span>      <span class="warn">← 主页即识别，直接跳过不重试</span>
+<span class="dim">08:04:37</span> 未发送: &lt;用户B&gt; | <span class="bad">failed | 私信输入框未出现</span>            <span class="bad">← 面板未展开（窗口被遮挡）</span>
+<span class="dim">08:05:31</span> 客户端回显: &lt;用户C&gt; | <span class="ok">composer_cleared_and_message_visible</span>
+<span class="dim">08:06:25</span> 实验标签: &lt;用户D&gt; | <span class="ok">composer_cleared_and_message_visible</span>
+<span class="dim">08:07:20</span> 实验标签: &lt;用户E&gt; | <span class="ok">composer_cleared_and_message_visible</span>
+<span class="dim">08:08:06</span> 实验标签: &lt;用户F&gt; | <span class="ok">composer_cleared_and_message_visible</span>
+<span class="dim">08:09:00</span> 实验标签: &lt;用户G&gt; | <span class="ok">composer_cleared_and_message_visible</span>
+<span class="dim">08:09:40</span> 未发送: &lt;用户H&gt; | <span class="warn">skipped | private_account (私密账号)</span>
+<span class="dim">08:10:34</span> 实验标签: &lt;用户I&gt; | <span class="ok">composer_cleared_and_message_visible</span>
+<span class="dim">08:21:32</span> 实验标签: &lt;用户J&gt; | <span class="ok">composer_cleared_and_send_api_ok</span>          <span class="ok">← 抓到私信发送接口的成功状态码</span></pre>
+<h2>状态口径（以下都是<b>实验观察标签</b>，均不足以证明送达，交付状态保持 unknown）</h2>
+<div class="box">
+<b>① <code>composer_cleared_and_message_visible</code></b>：输入框已清空 <b>且</b> 对话区出现该文案（出现次数增加）<br>
+<b>② <code>composer_cleared_and_send_api_ok</code></b>：输入框已清空 <b>且</b> 捕获<code>私信发送接口</code>返回成功状态码<br>
+<span class="dim">两种都不满足 → 记 failed 并写明原因，绝不标记成功。</span>
+</div>
+<h2>「面板打不开」三因（已定位）</h2>
+<table>
+<tr><th style="width:220px">原因</th><th>表现</th><th style="width:330px">处置</th></tr>
+<tr><td>账号级限制（私密账号/关闭私信）</td><td>点「私信」后输入框始终不出现</td><td><b>主页即判断</b>（私密账号/该用户已设置私密/暂不公开）→ 直接 skipped</td></tr>
+<tr><td>页面存在隐藏的 <code>im-dialog</code></td><td>面板看似打开但宽度 0、无输入框</td><td>面板查询改为<b>取可见/最宽的那个</b></td></tr>
+<tr><td>标签页被判不可见</td><td><code>visibilityState=hidden</code> 时面板不展开</td><td>保证窗口非最小化 + 激活目标标签页；仍失败则如实记录</td></tr>
+</table>
+</body></html>
