@@ -1,0 +1,44 @@
+﻿<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>评论回复证据</title><style>
+  body{margin:0;padding:28px 34px;font-family:"Microsoft YaHei",system-ui,sans-serif;background:#0f1115;color:#e6e8eb;width:1180px}
+  h1{font-size:26px;margin:0 0 6px;color:#fff}
+  h2{font-size:17px;margin:22px 0 8px;color:#7cc4ff;border-left:4px solid #7cc4ff;padding-left:10px}
+  .sub{color:#8b93a1;font-size:13px;margin-bottom:18px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{border:1px solid #262b34;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#171b22;color:#a9b4c2;font-weight:600}
+  code,pre{font-family:Consolas,"Cascadia Mono",monospace}
+  pre{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:12.5px;line-height:1.75;white-space:pre-wrap;margin:0}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}.dim{color:#6b7280}.hl{color:#7cc4ff}
+  .kv td:first-child{color:#8b93a1;width:220px}
+  .box{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:13.5px;line-height:1.8}
+  ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0;font-size:13.5px}
+</style></head><body>
+<h1>评论回复 · 实测证据（已脱敏）</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台响应（HTTP 状态码 / status_code:0）外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
+<div class="sub">样本：严格匹配（phrase）命中「求带 / 求方法 / 怎么做」的评论 · 节奏 45–80 秒/条 · 每条发送均以 publish 响应 status_code:0 判定</div>
+<h2>成功路径（原子操作 → 编辑器 → 回车 → 校验）</h2>
+<pre><span class="dim">08:34:13</span> REPLYING &lt;videoId&gt; cid &lt;commentId&gt; text: 关注我
+  step: 原子操作命中：找到评论并点击「回复」      <span class="ok">← 定位+点击在同一次调用内完成</span>
+  step: inline reply editor found                  <span class="ok">← 内联编辑器已激活</span>
+  step: Enter pressed, posts captured: 1            <span class="ok">← 捕获到 publish 请求</span>
+<span class="dim">08:35:08</span> <span class="ok">DONE &lt;commentId&gt; -> 关注我</span>                    <span class="ok">← status_code:0，确认发布</span>
+
+<span class="dim">08:36:10</span> REPLYING &lt;videoId&gt; cid &lt;commentId&gt; text: 关注我
+  step: 原子操作命中：找到评论并点击「回复」
+  step: inline reply editor found
+  step: Enter pressed, posts captured: 1
+<span class="dim">08:36:40</span> <span class="ok">DONE &lt;commentId&gt; -> 关注我</span></pre>
+<h2>失败分类（全部如实记录，不谎报成功）</h2>
+<table>
+<tr><th style="width:260px">失败标识</th><th>含义</th><th style="width:330px">处置</th></tr>
+<tr><td><code>comment_not_rendered</code></td><td>该评论在接口响应里有，但网页版评论区不渲染（已删除/被折叠）</td><td>标记跳过，不重试（重试无意义）</td></tr>
+<tr><td><code>reply POST not captured</code></td><td>编辑器已打开、文案已输入、回车已发，但平台未接收</td><td>判定＝风控静默拦截；<b>放慢节奏后同样 5 条全部成功</b></td></tr>
+<tr><td><code>publish 被拒绝（空响应）</code></td><td>同上，走另一条判定分支</td><td>如实标失败，不进入 done</td></tr>
+</table>
+<h2>节奏实测（关键结论）</h2>
+<div class="box">
+同一账号、同一批线索：<br>
+· 间隔 <b>35–65 秒</b>、每批 9 条 → 连续报 <code>reply POST not captured</code>（平台静默限流，不弹验证码）<br>
+· 间隔 <b>45–80 秒</b>、每批 3–5 条 → <span class="ok">同样 5 条线索全部发送成功</span><br>
+→ 结论：<b>不是功能问题，是节奏问题</b>。建议 <code>REPLY_GAP_MIN_MS=45000</code>、<code>REPLY_MAX_PER_RUN=5</code>。
+</div>
+</body></html>

@@ -1,0 +1,35 @@
+﻿<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>问题与修复</title><style>
+  body{margin:0;padding:28px 34px;font-family:"Microsoft YaHei",system-ui,sans-serif;background:#0f1115;color:#e6e8eb;width:1180px}
+  h1{font-size:26px;margin:0 0 6px;color:#fff}
+  h2{font-size:17px;margin:22px 0 8px;color:#7cc4ff;border-left:4px solid #7cc4ff;padding-left:10px}
+  .sub{color:#8b93a1;font-size:13px;margin-bottom:18px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{border:1px solid #262b34;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#171b22;color:#a9b4c2;font-weight:600}
+  code,pre{font-family:Consolas,"Cascadia Mono",monospace}
+  pre{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:12.5px;line-height:1.75;white-space:pre-wrap;margin:0}
+  .ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}.dim{color:#6b7280}.hl{color:#7cc4ff}
+  .kv td:first-child{color:#8b93a1;width:220px}
+  .box{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:13.5px;line-height:1.8}
+  ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0;font-size:13.5px}
+</style></head><body>
+<h1>问题 → 原因 → 修复 对照表（实机踩坑）</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台响应（HTTP 状态码 / status_code:0）外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
+<div class="sub">每一条都在真实抖音页面上复现并验证过；此处只保留结论，详细过程见工作日志</div>
+<table>
+<tr><th style="width:250px">现象</th><th style="width:330px">真正原因</th><th>修复 / 处置</th></tr>
+<tr><td>搜索结果 0 个</td><td>复用了长期存在的标签页</td><td>每次搜索开新标签页</td></tr>
+<tr><td>视频关键词命中 0</td><td>标题几乎不含完整连续串</td><td>分词 + 顺序无关匹配</td></tr>
+<tr><td>评论只加载 5 条</td><td>只改 scrollTop 触发不了加载</td><td>滚轮事件 + scrollTop + 点「展开N条回复」</td></tr>
+<tr><td>评论区"存在但不可见"</td><td>隐藏容器里按钮尺寸 0×0</td><td>判断可见性（宽度&gt;0），不判断节点存在</td></tr>
+<tr><td>总拿到隐藏的评论列表</td><td>页面同时存在两份 comment-list</td><td>只查可见那份</td></tr>
+<tr><td><b>评论找到了、按钮找不到</b></td><td>滚动触发虚拟列表回收，节点在两次调用间消失</td><td><b>定位+点击合并为一次 evaluate</b>（原子操作）</td></tr>
+<tr><td>带表情的评论永远匹配不上</td><td><code>[流泪]</code> 两侧处理不一致</td><td>两侧都整段删 <code>[xxx]</code></td></tr>
+<tr><td>昵称永远匹配不上</td><td>昵称含零宽字符 / 被截断</td><td>昵称只作优先项</td></tr>
+<tr><td>接口有、页面没有</td><td>评论网页版不渲染（已删/折叠）</td><td>如实报 <code>comment_not_rendered</code>，不重试</td></tr>
+<tr><td>同一条评论回两次</td><td>入队缺少硬校验</td><td>cid 在队列(含终态)或历史里 → 一律不再入队</td></tr>
+<tr><td><b>私信文案填进顶部搜索框</b></td><td>错误写法：取「全页第一个可见 input」</td><td>只在 <code>im-dialog</code> 内找输入框</td></tr>
+<tr><td>私信面板宽度卡 0–1px</td><td>标签页不可见 / 查到隐藏面板</td><td>唤醒窗口 + 取可见面板</td></tr>
+<tr><td>私密账号发不出去</td><td>平台账号级限制</td><td>主页识别 → 直接跳过（不重试）</td></tr>
+<tr><td>回车看似没发出</td><td>零宽字符让「输入框已清空」判定失败</td><td>校验前剔除 U+200B 等</td></tr>
+</table>
+</body></html>
