@@ -216,6 +216,28 @@ def _response_status(record):
     return data.get("status_code", parsed.get("status_code"))
 
 
+def _visibility_gate(tab, gate, send_id):
+    """页面可见性守卫。返回 None 表示可继续；否则返回已落账的结果。
+
+    🔴 口径（平台侧要求 2026-09-26）：
+      · visibilityState == "unknown" 【不等于 hidden】—— 判定不了就交给人工，
+        不得当成"需要置前"，更不得自动重试发送（重试会造成重复触达）；
+      · 只有明确 hidden 才尝试恢复可见性；恢复失败同样交给人工。
+    """
+    state = douyin.visibility_state(tab)
+    if state == "unknown":
+        row = gate.finish(send_id, "blocked", "page_visibility_unknown",
+                          {"skipped": True, "manualAction": True})
+        return gate.result(row)
+    if state != "visible":
+        douyin.ensure_visible(tab)
+        if douyin.visibility_state(tab) != "visible":
+            row = gate.finish(send_id, "blocked", "browser_not_visible",
+                              {"skipped": True, "manualAction": True})
+            return gate.result(row)
+    return None
+
+
 def send_private(tab, gate, send_id, target, text):
     """Send one private message after a durable preflight reservation."""
     try:
@@ -249,9 +271,10 @@ def send_private(tab, gate, send_id, target, text):
             return gate.result(row)
         # 🔴 真机教训（工作日志第 7 条）：页面 visibilityState=hidden 时点击不送达渲染进程，
         #    表现就是"私信按钮点上去、面板死活不开"（人工点却正常）。先拉活页面。
-        visibility_before = douyin.visibility_state(tab)
-        if visibility_before != "visible":
-            douyin.ensure_visible(tab)
+        # 🔴 unknown 不等于 hidden：交给人工，不自动重试（平台侧要求 2026-09-26）。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
@@ -761,9 +784,10 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
             return gate.result(gate.finish(send_id, "failed", "target_live_room_mismatch"))
         # 🔴 真机教训（工作日志第 7 条）：页面被遮挡时 visibilityState=hidden，点击【不送达渲染进程】。
         #    私信面板"成片打不开"、弹幕定位后点不动，根因都是这个；先把页面拉活再继续。
-        visibility_before = douyin.visibility_state(tab)
-        if visibility_before != "visible":
-            douyin.ensure_visible(tab)
+        # 🔴 unknown 不等于 hidden：交给人工，不自动重试（平台侧要求 2026-09-26）。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             return gate.result(gate.finish(send_id, "blocked", "captcha_requires_manual_action"))
         login = _await_login(tab)

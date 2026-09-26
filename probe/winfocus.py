@@ -1,125 +1,91 @@
-"""Windows 窗口置前 —— 一个被反复踩的坑，单独成文件。
+"""Windows 窗口置前 —— 只允许操作 sidecar 自己启动的浏览器进程树。
 
-为什么需要它（真机两轮教训，都是"静默错误"）：
+安全边界（平台侧要求，2026-09-26 收紧）：
 
-1) 采集侧：Chrome 窗口被别的窗口完全遮挡时，页面 document.visibilityState === "hidden"，
-   此时 Input.dispatchMouseEvent(mouseWheel) 会一直挂到超时，IntersectionObserver 驱动的
-   懒加载也不触发。同一个关键词：可见时 83 条视频，被遮挡时 9 条 —— 而且不报错。
+1) 只允许操作 sidecar 在 browser-owner.json 标记的 PID 及其【子进程】拥有的窗口；
+2) 没有可靠 PID 时直接返回 browser_not_visible 并等待人工 ——
+   不得枚举/激活系统上其它 Chrome 窗口（多账号下会抢走别的账号的前台状态）；
+3) 禁止 HWND_TOPMOST / SetWindowPos 置顶：不改变任何窗口的置顶状态；
+4) 除目标窗口外，不改动其它窗口的前台状态。
 
-2) 发送侧：批量私信时 worker 标签失去"活动标签"地位，visibilityState === "hidden"，
-   点击【不会送达渲染进程】。症状是"私信面板成片打不开"，实测 1 成功 / 5 失败。
+为什么需要它（真机两轮教训，都是「静默错误」）：
+
+1) 采集侧：Chrome 窗口被别的窗口完全遮挡时 document.visibilityState === "hidden"，
+   此时 Input.dispatchMouseEvent(mouseWheel) 会一直挂到超时，懒加载也不触发。
+   同一个关键词：可见时 83 条视频，被遮挡时 9 条 —— 而且不报错。
+
+2) 发送侧：worker 标签失去「活动标签」地位时点击【不会送达渲染进程】，
+   症状是「私信面板成片打不开」。
 
 关键点：CDP 的 Page.bringToFront / Target.activateTarget 【改不了 Windows 的遮挡判定】，
         必须真的把窗口激活一次（user32 ShowWindow + SetForegroundWindow）。
 
-放在这里而不是 probe.py：dm.py 也要用，放 probe.py 会形成循环 import。
 零第三方依赖（ctypes 是标准库）。
 """
 import ctypes
 import os
 
-_HITS = []
+REASON_NOT_VISIBLE = "browser_not_visible"
+REASON_UNSUPPORTED = "unsupported_platform"
+REASON_NO_WINDOW = "browser_not_visible"  # owned 树里没有窗口时，同样交人工，不扩容到别的窗口
+SW_RESTORE = 9
 
 
-def find_chrome_windows():
-    """返回 [(hwnd, title), ...]：可见、标题像 Chrome 的顶层窗口。"""
-    if os.name != "nt":
+def _is_windows():
+    """测试注入点：默认按平台判定。"""
+    return os.name == "nt"
+
+
+def _user32():
+    """测试注入点：默认取真实 user32。"""
+    return ctypes.windll.user32
+
+
+def _kernel32():
+    """测试注入点：默认取真实 kernel32。"""
+    return ctypes.windll.kernel32
+
+
+def _list_windows():
+    """返回 [(hwnd, owner_pid, title), ...]，仅可见顶层窗口。
+
+    单独抽出来是为了让测试可以替换掉它（CI 在 Linux 上跑，不能依赖 WIN 类型）。
+    """
+    if not _is_windows():
         return []
-    try:
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        hits = []
+    from ctypes import wintypes
+    user32 = _user32()
+    hits = []
 
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        def _cb(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            n = user32.GetWindowTextLengthW(hwnd)
-            if n <= 0:
-                return True
-            buf = ctypes.create_unicode_buffer(n + 1)
-            user32.GetWindowTextW(hwnd, buf, n + 1)
-            title = buf.value or ""
-            if "Chrome" in title and ("- Google Chrome" in title or "抖音" in title):
-                hits.append((hwnd, title))
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
             return True
-
-        user32.EnumWindows(_cb, 0)
-        return hits
-    except Exception:
-        return []
-
-
-def bring_chrome_front(log=None):
-    """把 Chrome 主窗口真正置前。返回是否成功。"""
-    hits = find_chrome_windows()
-    if not hits:
-        return False
-    try:
-        user32 = ctypes.windll.user32
-        for hwnd, _title in hits:
-            user32.ShowWindow(hwnd, 9)          # SW_RESTORE
-            user32.SetForegroundWindow(hwnd)
-        if log:
-            log("已把 Chrome 窗口置前 : %s" % hits[0][1][:50])
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        n = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(max(1, n + 1))
+        user32.GetWindowTextW(hwnd, buf, len(buf))
+        hits.append((int(hwnd), int(owner.value), buf.value or ""))
         return True
-    except Exception as exc:
-        if log:
-            log("[!] 置前失败（%s），若结果明显变少，请手动点一下窗口。" % str(exc)[:60])
-        return False
 
-
-def bring_process_front(pid, log=None):
-    """Bring only windows owned by ``pid`` to the foreground."""
-    if os.name != "nt" or not pid:
-        return False
-    try:
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        target = int(pid)
-        owned_pids = _descendant_pids(target)
-        hits = []
-
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        def _cb(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            owner = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if owner.value not in owned_pids:
-                return True
-            n = user32.GetWindowTextLengthW(hwnd)
-            buf = ctypes.create_unicode_buffer(max(1, n + 1))
-            user32.GetWindowTextW(hwnd, buf, len(buf))
-            hits.append((hwnd, buf.value or ""))
-            return True
-
-        user32.EnumWindows(_cb, 0)
-        if not hits:
-            return False
-        hwnd = hits[0][0]
-        user32.ShowWindow(hwnd, 9)
-        return bool(user32.SetForegroundWindow(hwnd))
-    except Exception as exc:
-        if log:
-            log("[!] owned browser window activation failed (%s)" % type(exc).__name__)
-        return False
+    user32.EnumWindows(_cb, 0)
+    return hits
 
 
 def _descendant_pids(root_pid):
-    """Return the launched browser PID plus its own child processes.
+    """返回启动 PID 及其子进程。
 
-    Chrome commonly hands the visible HWND to a child browser process.  The
-    sidecar marker stores the launcher PID, so checking that PID alone misses
-    the window and incorrectly reports ``browser_not_visible``.  Toolhelp is
-    a read-only process table query and keeps the foreground operation scoped
-    to the sidecar's process tree.
+    Chrome 常把可见 HWND 交给子进程，而 marker 存的是启动 PID，
+    只看 PID 本身会漏掉窗口并误报 browser_not_visible。
+    Toolhelp 是只读进程表查询，不触碰任何窗口状态。
     """
     root = int(root_pid)
-    if os.name != "nt":
+    if not _is_windows():
         return {root}
     try:
         from ctypes import wintypes
+
         class PROCESSENTRY32W(ctypes.Structure):
             _fields_ = [
                 ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
@@ -128,7 +94,8 @@ def _descendant_pids(root_pid):
                 ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
                 ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
             ]
-        kernel = ctypes.windll.kernel32
+
+        kernel = _kernel32()
         snap = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
         if snap in (0, -1):
             return {root}
@@ -154,3 +121,61 @@ def _descendant_pids(root_pid):
             kernel.CloseHandle(snap)
     except Exception:
         return {root}
+
+
+def focus_owned_window(pid, log=None):
+    """把 owned pid（或其后代）拥有的窗口置前。
+
+    返回 {"ok": bool, "reason": str, "hwnd": int|None, "touched": int}。
+    reason 为空串表示成功；失败一律 fail-closed，由调用方交给人工处理。
+    """
+    if not _is_windows():
+        return {"ok": False, "reason": REASON_UNSUPPORTED, "hwnd": None, "touched": 0}
+    if not pid:
+        # 关键：宁可 fail-closed 等人工，也不去遍历系统上所有 Chrome 窗口
+        if log:
+            log("[!] 没有可用的浏览器 PID —— 返回 browser_not_visible，等待人工把窗口置前。")
+        return {"ok": False, "reason": REASON_NOT_VISIBLE, "hwnd": None, "touched": 0}
+    try:
+        owned = _descendant_pids(int(pid))
+    except Exception:
+        owned = {int(pid)}
+    try:
+        windows = [w for w in _list_windows() if w[1] in owned]
+    except Exception:
+        windows = []
+    if not windows:
+        if log:
+            log("[!] owned 浏览器进程树里没有可见窗口 —— browser_not_visible")
+        return {"ok": False, "reason": REASON_NO_WINDOW, "hwnd": None, "touched": 0}
+    hwnd = windows[0][0]
+    try:
+        user32 = _user32()
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        ok = bool(user32.SetForegroundWindow(hwnd))
+    except Exception as exc:
+        if log:
+            log("[!] owned browser window activation failed (%s)" % type(exc).__name__)
+        return {"ok": False, "reason": REASON_NOT_VISIBLE, "hwnd": hwnd, "touched": 1}
+    if not ok and log:
+        log("[!] SetForegroundWindow 被系统拒绝 —— 请人工点一下窗口。")
+    return {"ok": ok, "reason": "" if ok else REASON_NOT_VISIBLE, "hwnd": hwnd, "touched": 1}
+
+
+def bring_process_front(pid, log=None):
+    """兼容旧调用：只返回是否成功。"""
+    return bool(focus_owned_window(pid, log=log).get("ok"))
+
+
+def bring_chrome_front(pid=None, log=None):
+    """兼容旧调用名（历史遗留）。
+
+    🔴 已收紧：**必须**传入 sidecar 标记的 PID。不传 PID 时直接 fail-closed ——
+    历史上这里会枚举【所有】Chrome 窗口并把它们全部置前，多账号下会互相抢焦点，
+    也会改变其它账号窗口的前台状态。
+    """
+    if not pid:
+        if log:
+            log("[!] bring_chrome_front() 缺少 PID —— 已 fail-closed，不再遍历所有 Chrome 窗口。")
+        return False
+    return bool(focus_owned_window(pid, log=log).get("ok"))
