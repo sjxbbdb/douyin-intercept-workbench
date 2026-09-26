@@ -13,14 +13,14 @@
   .box{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:13.5px;line-height:1.8}
   ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0;font-size:13.5px}
 </style></head><body>
-<h1>评论回复 · 实测证据（已脱敏）</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台响应（HTTP 状态码 / status_code:0）外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
-<div class="sub">样本：严格匹配（phrase）命中「求带 / 求方法 / 怎么做」的评论 · 节奏 45–80 秒/条 · 每条发送均以 publish 响应 status_code:0 判定</div>
+<h1>评论回复 · 实验观察记录（已脱敏）</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台响应（HTTP 状态码 / 成功状态码）外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
+<div class="sub">样本：严格匹配（phrase）命中「求带 / 求方法 / 怎么做」的评论 · 节奏 45–80 秒/条 · 每条发送以<平台发布接口返回的成功状态码>为观察依据（<b>不等于送达证明</b>）</div>
 <h2>成功路径（原子操作 → 编辑器 → 回车 → 校验）</h2>
 <pre><span class="dim">08:34:13</span> REPLYING &lt;videoId&gt; cid &lt;commentId&gt; text: 关注我
   step: 原子操作命中：找到评论并点击「回复」      <span class="ok">← 定位+点击在同一次调用内完成</span>
   step: inline reply editor found                  <span class="ok">← 内联编辑器已激活</span>
   step: Enter pressed, posts captured: 1            <span class="ok">← 捕获到 publish 请求</span>
-<span class="dim">08:35:08</span> <span class="ok">DONE &lt;commentId&gt; -> 关注我</span>                    <span class="ok">← status_code:0，确认发布</span>
+<span class="dim">08:35:08</span> <span class="ok">DONE &lt;commentId&gt; -> 关注我</span>                    <span class="ok">← 成功状态码，确认发布</span>
 
 <span class="dim">08:36:10</span> REPLYING &lt;videoId&gt; cid &lt;commentId&gt; text: 关注我
   step: 原子操作命中：找到评论并点击「回复」

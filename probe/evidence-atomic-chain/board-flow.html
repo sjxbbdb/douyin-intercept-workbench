@@ -13,16 +13,16 @@
   .box{background:#151920;border:1px solid #262b34;border-radius:6px;padding:14px 16px;font-size:13.5px;line-height:1.8}
   ul{margin:6px 0 0 18px;padding:0}li{margin:3px 0;font-size:13.5px}
 </style></head><body>
-<h1>原子链路总览 · 视频搜索 → 评论采集 → 严格筛选 → 评论回复 → 私信触达</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台响应（HTTP 状态码 / status_code:0）外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
+<h1>原子链路总览 · 视频搜索 → 评论采集 → 严格筛选 → 评论回复 → 私信触达</h1><div style="background:#3a2d0f;border:1px solid #7a5c12;border-radius:6px;padding:10px 14px;font-size:13px;line-height:1.7;color:#f6d98a;margin:0 0 16px">⚠️ 本页为脱敏<b>实验观察</b>，不是平台交付证明：输入框清空、对话回显、公屏回显均不构成送达证明；除平台接口返回的成功状态码外一律记 <b>unknown</b>，且 unknown 不自动重试、不进入下游环节。本记录<b>未接入</b>授权、积分、幂等与审计，相关能力保持 autoEligible=false。</div>
 <div class="sub">环境：Windows 11 + Chrome 153（CDP 9222，商家手动登录）+ Node 22 · 零 npm 依赖 · 不逆向签名 / 不绕风控</div>
 <h2>五步链路</h2>
 <table>
 <tr><th style="width:120px">阶段</th><th style="width:300px">动作</th><th>关键实现点（决定成败的地方）</th></tr>
 <tr><td>1 搜视频</td><td>关键词 → waterfall_item_&lt;awemeId&gt;</td><td>每次开新标签页（复用旧标签会搜不出结果）；先整串匹配，不中再<b>分词 + 顺序无关</b>匹配</td></tr>
-<tr><td>2 抓评论</td><td>拦 <code>Network.responseReceived</code></td><td>不抓 DOM：URL 含 <code>comment</code> 的响应体里才有 cid / 时间 / 地域 / <b>sec_uid</b>（私信必需）</td></tr>
+<tr><td>2 抓评论</td><td>拦 <code>Network.responseReceived</code></td><td>不抓 DOM：URL 含 <code>comment</code> 的响应体里才有 cid / 时间 / 地域 / <b>脱敏身份字段</b>（私信必需）</td></tr>
 <tr><td>3 严格筛选</td><td>三种匹配模式</td><td><code>phrase</code>＝字面包含（推荐）；<code>char</code>＝单字命中，噪音极大；纯数字关键词不切分</td></tr>
-<tr><td>4 评论回复</td><td>定位 → 点「回复」→ 输入 → 回车 → 校验</td><td><b>定位+点击必须原子化</b>（同一次 evaluate）；发送以 <code>comment/publish</code> 的 <code>status_code:0</code> 为唯一判据</td></tr>
-<tr><td>5 私信触达</td><td>主页 → 私信 → 输入 → 回车 → 双校验</td><td>输入框只在 <code>im-dialog</code> 内找；<b>私密账号直接跳过</b>；判定＝输入框已清空 且（对话区出现文案 或 message/send 200）</td></tr>
+<tr><td>4 评论回复</td><td>定位 → 点「回复」→ 输入 → 回车 → 校验</td><td><b>定位+点击必须原子化</b>（同一次 evaluate）；发送以<code>平台发布接口返回的成功状态码</code>为唯一判据</td></tr>
+<tr><td>5 私信触达</td><td>主页 → 私信 → 输入 → 回车 → 双校验</td><td>输入框只在 <code>im-dialog</code> 内找；<b>私密账号直接跳过</b>；判定＝输入框已清空且客户端有回显（<b>仍为实验观察</b>）</td></tr>
 </table>
 <h2>定位三原则（踩坑总结）</h2>
 <div class="box">
