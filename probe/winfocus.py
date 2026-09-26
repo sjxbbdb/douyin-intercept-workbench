@@ -3,10 +3,16 @@
 安全边界（平台侧要求，2026-09-26 收紧）：
 
 1) 只允许操作 sidecar 在 browser-owner.json 标记的 PID 及其【子进程】拥有的窗口；
-2) 没有可靠 PID 时直接返回 browser_not_visible 并等待人工 ——
+2) 没有可靠 PID（缺失或非法）时直接返回 browser_not_visible 并等待人工 ——
    不得枚举/激活系统上其它 Chrome 窗口（多账号下会抢走别的账号的前台状态）；
 3) 禁止 HWND_TOPMOST / SetWindowPos 置顶：不改变任何窗口的置顶状态；
 4) 除目标窗口外，不改动其它窗口的前台状态。
+
+职责归属（避免两套可见性恢复机制）：
+
+  · 本模块 = 【窗口级】恢复（Windows user32），唯一调用方是 Sidecar._page()；
+  · douyin.ensure_visible() = 【页面级】激活（纯 CDP），发送守卫只调它；
+  · 两侧都不得自行枚举窗口，也不得在没有 PID 时"猜"一个窗口。
 
 为什么需要它（真机两轮教训，都是「静默错误」）：
 
@@ -27,7 +33,7 @@ import os
 
 REASON_NOT_VISIBLE = "browser_not_visible"
 REASON_UNSUPPORTED = "unsupported_platform"
-REASON_NO_WINDOW = "browser_not_visible"  # owned 树里没有窗口时，同样交人工，不扩容到别的窗口
+REASON_NO_WINDOW = "browser_not_visible"  # owned 树里没有窗口时同样交人工，不扩容到别的窗口
 SW_RESTORE = 9
 
 
@@ -44,6 +50,26 @@ def _user32():
 def _kernel32():
     """测试注入点：默认取真实 kernel32。"""
     return ctypes.windll.kernel32
+
+
+def coerce_pid(pid):
+    """严格解析 PID：只接受正整数；非法值返回 None（由调用方 fail-closed）。
+
+    🔴 修掉旧实现的二次异常：第一处 int(pid) 抛错后，except 分支里再 int(pid) 会二次抛错。
+    """
+    if isinstance(pid, bool) or pid is None:
+        return None
+    if isinstance(pid, int):
+        return pid if pid > 0 else None
+    if isinstance(pid, float):
+        return int(pid) if pid.is_integer() and pid > 0 else None
+    if isinstance(pid, str):
+        text = pid.strip()
+        if not text or not text.isdigit():
+            return None
+        value = int(text)
+        return value if value > 0 else None
+    return None
 
 
 def _list_windows():
@@ -131,15 +157,16 @@ def focus_owned_window(pid, log=None):
     """
     if not _is_windows():
         return {"ok": False, "reason": REASON_UNSUPPORTED, "hwnd": None, "touched": 0}
-    if not pid:
-        # 关键：宁可 fail-closed 等人工，也不去遍历系统上所有 Chrome 窗口
+    root = coerce_pid(pid)
+    if root is None:
+        # 非法/缺失 PID：直接 fail-closed，不做任何窗口操作，也绝不枚举所有 Chrome
         if log:
-            log("[!] 没有可用的浏览器 PID —— 返回 browser_not_visible，等待人工把窗口置前。")
+            log("[!] 浏览器 PID 非法或缺失（%r）—— browser_not_visible，等待人工置前。" % (pid,))
         return {"ok": False, "reason": REASON_NOT_VISIBLE, "hwnd": None, "touched": 0}
     try:
-        owned = _descendant_pids(int(pid))
+        owned = _descendant_pids(root)
     except Exception:
-        owned = {int(pid)}
+        owned = {root}
     try:
         windows = [w for w in _list_windows() if w[1] in owned]
     except Exception:
@@ -170,12 +197,11 @@ def bring_process_front(pid, log=None):
 def bring_chrome_front(pid=None, log=None):
     """兼容旧调用名（历史遗留）。
 
-    🔴 已收紧：**必须**传入 sidecar 标记的 PID。不传 PID 时直接 fail-closed ——
-    历史上这里会枚举【所有】Chrome 窗口并把它们全部置前，多账号下会互相抢焦点，
-    也会改变其它账号窗口的前台状态。
+    🔴 已收紧：**必须**传入 sidecar 标记的 PID。不传或非法时直接 fail-closed ——
+    历史上这里会枚举【所有】Chrome 窗口并把它们全部置前，多账号下会互相抢焦点。
     """
-    if not pid:
+    if coerce_pid(pid) is None:
         if log:
-            log("[!] bring_chrome_front() 缺少 PID —— 已 fail-closed，不再遍历所有 Chrome 窗口。")
+            log("[!] bring_chrome_front() 缺少或非法 PID —— 已 fail-closed，不再遍历所有 Chrome 窗口。")
         return False
     return bool(focus_owned_window(pid, log=log).get("ok"))

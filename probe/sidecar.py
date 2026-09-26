@@ -516,11 +516,12 @@ class Sidecar:
         if state == "hidden":
             # 只有明确 hidden 才尝试恢复；没有可靠 PID 时 fail-closed，
             # 绝不遍历系统上的 Chrome 窗口（会抢走其它账号的前台状态）。
-            pid = marker.get("pid")
-            if not pid:
+            # 先校验 PID：非法值直接 fail-closed，绝不去猜窗口、也不枚举所有 Chrome
+            pid = winfocus.coerce_pid(marker.get("pid"))
+            if pid is None:
                 page.close()
                 raise SidecarError("browser_not_visible",
-                                   "owned browser pid is unavailable; bring the window to front manually")
+                                   "owned browser pid is missing or invalid; bring the window to front manually")
             try:
                 page.call("Page.bringToFront", {}, timeout=5)
             except Exception:
@@ -533,8 +534,12 @@ class Sidecar:
             page.close()
             raise SidecarError("page_visibility_unknown",
                                "cannot determine page visibility; manual check required")
-        if douyin.visibility_state(page) != "visible":
+        if state != "visible":
             page.close()
+            if state == "unknown":
+                # 判定不了 ≠ 明确不可见：分开上报，避免上层按「窗口不可见」去自动重试
+                raise SidecarError("page_visibility_unknown",
+                                   "cannot determine page visibility after focus recovery; manual check required")
             raise SidecarError("browser_not_visible", "owned browser window must be visible")
         return page, marker
 

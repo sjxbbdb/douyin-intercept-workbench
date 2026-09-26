@@ -259,7 +259,11 @@ def force_page_active(cdp):
 
 
 def ensure_visible(cdp, log=None):
-    """尽力把页面变成 visible。返回是否成功。不改变任何平台侧状态。"""
+    """尽力把页面变成 visible。返回是否成功。不改变任何平台侧状态。
+
+    职责归属：这里只做【页面级】激活（纯 CDP）。【窗口级】恢复（Windows user32）
+    由 Sidecar._page() 独占调用 winfocus 完成，发送路径不碰窗口。
+    """
     if visibility_state(cdp) == "visible":
         return True
     try:
