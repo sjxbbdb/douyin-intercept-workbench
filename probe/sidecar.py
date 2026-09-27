@@ -1678,6 +1678,10 @@ class Sidecar:
             #      ① public_missing      没给 publicSendId
             #      ② public_*            台账里该 sendId 不是"已确认成功的公屏回复"（复用 _public_guard）
             #      ③ public_send_mismatch 给的 sendId 不是这个事件自己那次公屏回复
+            #        （2026-09-26 收紧：原来是 `if recorded and recorded != public_send_id`，
+            #         事件上【没有记录】时会直接放行 —— 等于说任何一条已确认的公屏回复
+            #         都能拿给一个从未公屏回复过的事件去发私信。现在要求"事件自身有记录，
+            #         且记录的 sendId 精确等于传入的 publicSendId"，缺记录同样拒绝。）
             public_send_id = str(item.get("publicSendId") or "").strip()
             if not public_send_id:
                 self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
@@ -1694,7 +1698,9 @@ class Sidecar:
                 continue
             event = self.live_queue.find_event(item["eventId"]) or {}
             recorded = str((event.get("detail") or {}).get("sendId") or "")
-            if recorded and recorded != public_send_id:
+            # 🔴 缺记录也必须拒绝："没有记录"与"记录对不上"是同一类失败 ——
+            #    两者都无法证明这次私信绑定的就是【本事件】那次公屏成功。
+            if not recorded or recorded != public_send_id:
                 self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": "public_send_mismatch"})
                 results.append({"eventId": item["eventId"], "status": "blocked",
