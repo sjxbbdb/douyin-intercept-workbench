@@ -1918,7 +1918,9 @@ class SearchRelevanceTests(unittest.TestCase):
         self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
                                             "filteredByRelevance": 0, "minRelevance": 0,
                                             "filteredByDate": 0, "unknownDate": 0,
-                                            "dateFrom": None, "dateTo": None})
+                                            "dateFrom": None, "dateTo": None,
+                                            "cursorFilters": {"dateFrom": None, "dateTo": None,
+                                                              "minRelevance": 0}})
         # 边界：只发现与筛选，不产生任何发送动作
         for key in ("sent", "sendId", "private", "reply"):
             self.assertNotIn(key, result)
@@ -1929,7 +1931,10 @@ class SearchRelevanceTests(unittest.TestCase):
         self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
                                             "filteredByRelevance": 2, "minRelevance": 60,
                                             "filteredByDate": 0, "unknownDate": 0,
-                                            "dateFrom": None, "dateTo": None})
+                                            "dateFrom": None, "dateTo": None,
+                                            # 游标里绑定的规范化条件：筛选参数一起进游标
+                                            "cursorFilters": {"dateFrom": None, "dateTo": None,
+                                                              "minRelevance": 60}})
 
     def test_min_relevance_is_validated(self):
         import sidecar
@@ -1999,7 +2004,10 @@ class SearchPagingRelevanceTests(unittest.TestCase):
         self.assertEqual(first["poolSize"], 3)
         self.assertEqual(first["poolIds"], ["1", "2", "3"])
 
-        second, calls = self._run({"keyword": "宝宝辅食", "cursor": first["cursor"]})
+        # 续页必须带【同一组筛选条件】：游标现在绑定 minRelevance，
+        # 少写一个就会被拒绝 —— 这正是该报错的地方（两页条件不同却当成同一次搜索）。
+        second, calls = self._run({"keyword": "宝宝辅食", "minRelevance": 60,
+                                   "cursor": first["cursor"]})
         self.assertEqual(second["page"], 2)
         # 续页时池子里必须已经有那两条被筛掉的视频，否则它们会被重新采集一遍
         self.assertEqual(calls[0]["seen_ids"], {"1", "2", "3"})
@@ -3905,7 +3913,7 @@ class SearchTerminalStateTests(unittest.TestCase):
         self.assertEqual(result["stoppedReason"], "pool_exhausted")
         # pageOutcome 是宿主重启后唯一能复现"为什么停"的字段，必须跟着一起收敛
         self.assertEqual(result["pageOutcome"], "exhausted")
-        self.assertEqual(result["cursorVersion"], 1)
+        self.assertEqual(result["cursorVersion"], 2)
 
     def test_relevance_filter_does_not_fake_a_terminal_page(self):
         """本页确实采到了视频、只是都被相关度筛掉，这不算"没有下一页"。
@@ -3921,7 +3929,7 @@ class SearchTerminalStateTests(unittest.TestCase):
         # 这条最关键：hasMore=true 时 pageOutcome 不能说 exhausted（自相矛盾）。
         # 本页确实采到了视频，只是都被相关度筛掉 —— 那是 more，不是到头。
         self.assertEqual(result["pageOutcome"], "more")
-        self.assertEqual(result["cursorVersion"], 1)
+        self.assertEqual(result["cursorVersion"], 2)
 
 
 class InternalFailureReasonTests(unittest.TestCase):
