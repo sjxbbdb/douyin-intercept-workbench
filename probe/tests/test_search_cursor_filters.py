@@ -220,5 +220,72 @@ class SearchPaginationFilterTests(unittest.TestCase):
         self.assertEqual(second["page"], 2)
 
 
+    def test_a_cursor_without_an_account_field_is_refused_when_a_scope_is_expected(self):
+        """带 account_scope 时必须【证明】游标是本账号的：缺 a 与 a 不符一样拒绝。
+
+        原来写成 `if account_scope and payload.get("a") and ...` —— 缺字段直接放行，
+        于是一个不带账号信息的游标可以被任何账号拿去当已见集合。
+        """
+        payload = {"v": sidecar.CURSOR_VERSION, "k": KEYWORD, "n": 2, "seen": ["1"],
+                   "f": sidecar._filter_binding()}
+        with self.assertRaises(sidecar.SidecarError) as raised:
+            sidecar._decode_cursor(token_of(payload), KEYWORD, SCOPE)
+        self.assertEqual(raised.exception.code, "cursor_account_mismatch")
+        # 反向保护：调用方自己也没有账号作用域时不额外要求（它没在声称某个账号）。
+        self.assertEqual(sidecar._decode_cursor(token_of(payload), KEYWORD, None), ({"1"}, 2))
+
+    def test_a_cursor_with_an_empty_account_field_is_refused(self):
+        payload = {"v": sidecar.CURSOR_VERSION, "k": KEYWORD, "n": 2, "seen": ["1"],
+                   "a": "", "f": sidecar._filter_binding()}
+        with self.assertRaises(sidecar.SidecarError) as raised:
+            sidecar._decode_cursor(token_of(payload), KEYWORD, SCOPE)
+        self.assertEqual(raised.exception.code, "cursor_account_mismatch")
+
+    def test_malformed_filter_values_in_a_cursor_are_refused_not_raised(self):
+        """游标里的 "f" 塞了非数字：按【不一致】拒绝，绝不冒裸 ValueError/TypeError。"""
+        bad_values = ({"dateFrom": "abc", "dateTo": None, "minRelevance": 0},
+                      {"dateFrom": None, "dateTo": [], "minRelevance": 0},
+                      {"dateFrom": None, "dateTo": None, "minRelevance": "abc"},
+                      {"dateFrom": [], "dateTo": None, "minRelevance": {}})
+        for bad in bad_values:
+            payload = {"v": sidecar.CURSOR_VERSION, "k": KEYWORD, "n": 2, "seen": ["1"],
+                       "a": SCOPE, "f": bad}
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                sidecar._decode_cursor(token_of(payload), KEYWORD, SCOPE)
+            self.assertEqual(raised.exception.code, "cursor_filter_mismatch", bad)
+
+
+class SearchParameterHardeningTests(unittest.TestCase):
+    """写错/恶意的搜索参数必须给稳定错误码，不能冒裸异常（评审 2026-09-27）。"""
+
+    def test_a_non_numeric_min_relevance_is_invalid_input(self):
+        instance = FakeSidecar(demo_videos())
+        for bad in ("abc", [], {}, True, "1.5", ["60"]):
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                run_search(instance, {"keyword": KEYWORD, "minRelevance": bad})
+            self.assertEqual(raised.exception.code, "invalid_input", repr(bad))
+        self.assertEqual(instance.opened, 0, "参数不合法就不该打开浏览器")
+
+    def test_a_non_numeric_page_size_is_invalid_input(self):
+        instance = FakeSidecar(demo_videos())
+        for name in ("maxVideos", "scrollRounds"):
+            for bad in ("abc", [], {}, True):
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    run_search(instance, {"keyword": KEYWORD, name: bad})
+                self.assertEqual(raised.exception.code, "invalid_input", "%s=%r" % (name, bad))
+        self.assertEqual(instance.opened, 0)
+
+    def test_numeric_strings_are_still_accepted_and_bound_as_integers(self):
+        """宿主原样透传字符串是常态：字符串数字要继续能用，并按整数绑定。"""
+        instance = FakeSidecar(demo_videos())
+        first = run_search(instance, {"keyword": KEYWORD, "maxVideos": "10",
+                                      "minRelevance": "60"})
+        self.assertEqual(first["filter"]["cursorFilters"]["minRelevance"], 60)
+        second = run_search(instance, {"keyword": KEYWORD, "maxVideos": 10,
+                                       "minRelevance": 60, "cursor": first["cursor"]})
+        self.assertEqual(second["page"], 2, "字符串与整数写法代表同一组条件")
+        self.assertEqual(instance.opened, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -120,6 +120,34 @@ PAGE_OUTCOME_LOGIN = "login_required"
 CURSOR_MAX_SEEN = 20000
 
 
+# "没有默认值" 的哨兵：不能用 None —— None 本身是【合法默认值】
+# （dateFrom/dateTo 为空就表示"这一侧不设边界"）。
+_NO_DEFAULT = object()
+
+
+def _int_value(value, label, default=_NO_DEFAULT):
+    """外部参数 -> int。非数字一律 invalid_input —— 绝不让裸 ValueError 冒到协议层。
+
+    收的形状：整数、以及"就是整数"的字符串（宿主常常原样透传字符串）；
+    空值（None / 空串）-> default。
+    🔴 不收 bool：True 是 int 的子类，但语义上不是数量；
+       也不收小数与其它类型 —— 悄悄取整会让人以为筛选条件生效了。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if default is _NO_DEFAULT:
+            raise SidecarError("invalid_input", "%s must be an integer" % label)
+        return default
+    if isinstance(value, bool):
+        raise SidecarError("invalid_input", "%s must be an integer" % label)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("+-").isdigit():
+            return int(text)
+    raise SidecarError("invalid_input", "%s must be an integer" % label)
+
+
 def _filter_binding(date_from=None, date_to=None, min_relevance=0):
     """把筛选条件规范化成游标里存的那三个值。
 
@@ -129,16 +157,9 @@ def _filter_binding(date_from=None, date_to=None, min_relevance=0):
     minRelevance 是整数，直接存。
     """
 
-    def epoch(value):
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    return {"dateFrom": epoch(date_from), "dateTo": epoch(date_to),
-            "minRelevance": int(min_relevance or 0)}
+    return {"dateFrom": _int_value(date_from, "dateFrom", default=None),
+            "dateTo": _int_value(date_to, "dateTo", default=None),
+            "minRelevance": _int_value(min_relevance, "minRelevance", default=0)}
 
 
 def _normalize_binding(filters):
@@ -174,8 +195,10 @@ def _encode_cursor(keyword, seen, page_no, account_scope=None, filters=None):
 def _decode_cursor(value, keyword, account_scope=None, filters=None):
     """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。
 
-    account_scope 给定时，游标里带账号的必须与它一致（老游标不带账号字段，
-    仍然接受 —— 否则宿主手里尚未过期的那一个会被突然判死）。
+    account_scope 给定时，游标必须**证明**自己属于这个账号：带账号字段且一致。
+    🔴 缺账号字段与账号不符一样拒绝 —— 原来的 `payload.get("a") and ...` 会在
+       缺字段时直接放行，于是一个不带账号信息的游标可以被任何账号拿去当已见集合
+       （多账号并行下这是静默的数据错误）。
     """
     if value in (None, ""):
         return set(), 1
@@ -189,7 +212,7 @@ def _decode_cursor(value, keyword, account_scope=None, filters=None):
         raise SidecarError("invalid_input", "cursor version is not supported")
     if payload.get("k") != keyword:
         raise SidecarError("invalid_input", "cursor does not belong to this keyword")
-    if account_scope and payload.get("a") and str(payload["a"]) != str(account_scope):
+    if account_scope and str(payload.get("a") or "") != str(account_scope):
         raise SidecarError("cursor_account_mismatch",
                            "cursor belongs to another account scope")
     # 🔴 筛选条件必须与游标里记的一致。
@@ -197,9 +220,17 @@ def _decode_cursor(value, keyword, account_scope=None, filters=None):
     #    忘了传 filters 的调用方只会被拒绝，不会悄悄放行。
     #    形状不对的 "f" 同样按不一致处理 —— 本版本产出的游标一定带完整三元组。
     recorded = payload.get("f")
-    if (not isinstance(recorded, dict)
-            or set(recorded) != set(CURSOR_FILTER_KEYS)
-            or _normalize_binding(recorded) != _normalize_binding(filters)):
+    if not isinstance(recorded, dict) or set(recorded) != set(CURSOR_FILTER_KEYS):
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor was issued for other search filters; start a new search")
+    try:
+        recorded_binding = _normalize_binding(recorded)
+    except SidecarError:
+        # "f" 里塞了非数字（"abc" / [] / {}）：这不是本版本产出的游标，
+        # 按【不一致】拒绝，绝不把裸 ValueError/TypeError 冒到协议层。
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor filter bindings are malformed; start a new search")
+    if recorded_binding != _normalize_binding(filters):
         raise SidecarError(CURSOR_FILTER_MISMATCH,
                            "cursor was issued for other search filters; start a new search")
     seen = payload.get("seen")
@@ -960,8 +991,10 @@ class Sidecar:
         if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > MAX_KEYWORD:
             raise SidecarError("invalid_input", "keyword is required")
         keyword = keyword.strip()
-        max_videos = int(params.get("maxVideos", 50))
-        rounds = int(params.get("scrollRounds", 6))
+        # 🔴 参数解析必须给出【稳定错误码】：原来直接 int(...)，宿主给 "abc" / [] 时
+        #    会抛出裸 ValueError（协议层只能看到一个没有码的内部错误）。
+        max_videos = _int_value(params.get("maxVideos", 50), "maxVideos", default=50)
+        rounds = _int_value(params.get("scrollRounds", 6), "scrollRounds", default=6)
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
         cursor_in = params.get("cursor")
@@ -976,7 +1009,7 @@ class Sidecar:
         if date_from is not None and date_to is not None and date_from > date_to:
             raise SidecarError("invalid_input", "dateFrom must not be after dateTo")
 
-        min_relevance = int(params.get("minRelevance", 0) or 0)
+        min_relevance = _int_value(params.get("minRelevance", 0), "minRelevance", default=0)
         if not 0 <= min_relevance <= 100:
             raise SidecarError("invalid_input", "minRelevance must be between 0 and 100")
         # 🔴 游标必须在【筛选条件校验之后】才解码：它现在绑定的是解析后的
