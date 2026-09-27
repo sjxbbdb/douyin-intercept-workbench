@@ -37,9 +37,18 @@ first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
 scrolling the same owned tab instead of reloading the first page, and any video
 already in the cursor pool is filtered out. The cursor is opaque to the host —
 the host only stores and returns it — but it is still validated on the
-boundary: a cursor issued for another keyword, an unsupported version, or a
-pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
-page yields no new video, which is the host signal to stop paging.
+boundary: a cursor issued for another keyword or account, an unsupported
+version, or a pool beyond the cap is rejected with `invalid_input`. A cursor is
+also bound to the **normalized search filters** it was issued for
+(`dateFrom` / `dateTo` as epoch bounds, `minRelevance` as an integer):
+continuing a search with different filters is refused with
+`cursor_filter_mismatch` instead of silently mixing two filter sets into one
+result. When the caller has an account scope, the cursor must **prove** it
+belongs to that account (`a` present and equal): a cursor without the account
+field is refused with `cursor_account_mismatch` rather than accepted.
+Non-numeric page sizes or filter values are rejected with `invalid_input`;
+they never surface as a bare `ValueError`. `hasMore` is false when a page
+yields no new video, which is the host signal to stop paging.
 `platformHasMore` / `platformCursor` mirror what the platform response body
 reported; they are read-only telemetry and are never replayed against the API.
 
@@ -210,8 +219,14 @@ same `unknown` semantics as the other send paths.
   回归：`test_policy_ref`（形状 4 个用例 + 直播 7 个 + 评论 4 个）。
 * **发布回执结构化绑定（2026-09-26 评审收尾）**：评论公开回复的回执不再用「原始串包含」判定，
   而是先**解析请求体**（form URL 编码 / JSON / 值里再套一层 JSON / 转义中文），再按字段比对：
-  ① 带 id 的字段**精确等于**目标评论 id（结论性依据，短正文与编码差异都影响不到它）；
-  ② 正文字段等于或包含本次正文（平台可能在正文里插入 @昵称 之类的内容）。
+  ① **白名单 id 字段**（reply_id / reply_comment_id / comment_id / cid / commentid /
+     replyid / reply_cid）**精确等于**目标评论 id（结论性依据，短正文与编码差异都影响不到它）；
+  ② **白名单正文字段**（text / content / comment / reply_text / replytext / comment_text /
+     content_text）等于或包含本次正文（平台可能在正文里插入 @昵称 之类的内容）。
+  🔴 字段名必须**精确命中白名单**：video_id / aweme_id / item_id / user_id / content_type
+     这类无关字段即使值碰巧相同也不参与绑定（2026-09-27 评审：子串匹配会误绑定）。
+  状态码按**数字形态**收：整数、整数值的 float、数字字符串（"0"）都算，
+  于是平台用字符串回 0 时同样落成确认成功；缺失 / null / bool / 非数字串仍是读不出。
   请求体拿不到或解析不出字段 -> `unknown/platform_response_unbound`；
   **归属不明**（多条回执都能绑定、且没有唯一的 id 绑定）-> `unknown/platform_response_ambiguous` ——
   宁可停在 unknown 交人工，也不挑一条「看起来成功」的回执当结论。
@@ -223,7 +238,10 @@ same `unknown` semantics as the other send paths.
   两个不同用户发同一句话（「求带」）会被判成同一条并丢掉其中一条 —— 下游是按人去私信的，
   丢错人就是给错人发消息。昵称那一档只是为了认出「DOM 兜底重读的同一行」，
   什么身份都没有时**各自保留**：宁可多留一条，也不合并两个用户。
-  回归：`test_comment_dedupe_identity`（6 个身份用例 + 4 个抓取键用例 + 3 个 DOM 兜底集成用例）。
+  🔴 **两个不同的非空评论 ID 永远是两条记录**（2026-09-27 评审）：身份兜底只允许把
+     "没有评论 ID 的那一份"（接口副本 / DOM 副本）并进另一条，绝不允许把两个有 ID 的
+     评论并成一条 —— 否则下游会少一条目标，处理账也对不上。
+  回归：`test_comment_dedupe_identity`（11 个身份用例 + 4 个抓取键用例 + 3 个 DOM 兜底集成用例）。
 * **游标绑定规范化后的筛选条件（2026-09-26 评审收尾）**：`cursor` 里新增 `f`，
   装的是**解析后**的 `dateFrom` / `dateTo`（epoch 秒）与 `minRelevance`。
   此前游标只绑定关键词与账号，于是宿主可以带着 `minRelevance=60` 采完第一页、
@@ -236,6 +254,13 @@ same `unknown` semantics as the other send paths.
   继续接受等于把这条缺陷留在协议里，所以直接拒绝（`invalid_input`），
   宿主重新从第一页开始即可 —— 游标是不透明的临时状态，不是持久资产。
   响应 `filter` 新增 `cursorFilters`，把这组规范化条件回显给宿主对账。
+  🔴 两处收紧（2026-09-27 评审）：
+    · 带账号作用域时游标必须**证明**自己属于该账号 —— 缺 `a` 与 `a` 不符一样以
+      `cursor_account_mismatch` 拒绝（原来 `payload.get("a") and ...` 会在缺字段时直接放行，
+      于是不带账号信息的游标可以被任何账号拿去当已见集合）；
+    · 参数与游标里的筛选值一律走**严格整数解析**：非数字给 `invalid_input`（请求参数）
+      或 `cursor_filter_mismatch`（游标里的 `f`），绝不冒裸 `ValueError`，
+      也不把非数字静默当成 0（那会让"条件变了"被判成"条件没变"）。
   回归：`test_search_cursor_filters.CursorFilterBindingTests` 与
   `SearchPaginationFilterTests`。
 * **搜索池持久化发布时间（2026-09-26 评审收尾）**：`search_videos` 新增 `create_time` 与
