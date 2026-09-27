@@ -230,14 +230,7 @@ same `unknown` semantics as the other send paths.
   `public_send_mismatch`。
   只按批次候选清单放行会留下绕过路径（调用方不带 `publicSendId` 直接要私信），
   所以绑定检查必须落在**每个 item** 上；`_live_batch_items` 也不再丢弃该字段。
-  回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 缺队列绑定 / 正确绑定五条路径）。
-  🔴 **事件自身必须存在绑定记录**（2026-09-26 收紧）：原来是
-  `if recorded and recorded != public_send_id` —— 事件上没有记录时直接放行，
-  等于说「任何一条已确认的公屏回复都能拿给一个从未公屏回复过的事件去发私信」。
-  现在要求 **记录的 sendId 精确等于传入的 publicSendId**：缺记录与记录对不上
-  同样以 `public_send_mismatch` 拒绝（两者都无法证明这次私信绑定的是本事件那次成功）。
-  回归补充：`test_an_event_without_a_recorded_send_id_is_refused`、
-  `test_a_record_without_the_send_id_key_is_refused_too`。
+  回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
 
 * **分页记录：页面版本与分页终止态（2026-09-21，评审要求固化）**：`search` 的每次响应都带
   * `cursorVersion`：产出该 `cursor` 的**协议版本**（当前 `1`）。宿主重启后据此判断手里的游标
