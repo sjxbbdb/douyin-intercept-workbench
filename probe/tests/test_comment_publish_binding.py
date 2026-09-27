@@ -145,6 +145,41 @@ class StructuredReceiptBindingTests(unittest.TestCase):
         self.assertEqual(send_actions._publish_binding({'postData': 12345}, TEXT, COMMENT_ID),
                          (False, None))
 
+    def test_unrelated_fields_are_not_used_for_binding(self):
+        """白名单之外的字段名一律不参与绑定（评审 2026-09-27）。
+
+        原来用子串匹配（"id" in name / "text" in name / "content" in name），
+        于是 video_id / aweme_id / user_id / content_type 这类无关字段
+        也会被当成"评论 id 字段 / 正文字段"，值碰巧相等就误绑定。
+        """
+        unrelated = [
+            {"video_id": COMMENT_ID},
+            {"aweme_id": COMMENT_ID, "item_id": COMMENT_ID},
+            {"user_id": COMMENT_ID},
+            {"device_id": COMMENT_ID},
+            {"content_type": TEXT},
+            {"note_text": TEXT},
+        ]
+        for body in unrelated:
+            record = {"postData": json.dumps(body, ensure_ascii=False)}
+            self.assertEqual(send_actions._publish_binding(record, TEXT, COMMENT_ID),
+                             (False, None), body)
+
+    def test_the_whitelisted_field_names_still_bind(self):
+        """反向保护：白名单里的字段名照常绑定（不能因为收紧就整条路径失效）。"""
+        id_fields = ("reply_id", "reply_comment_id", "comment_id", "cid",
+                     "commentid", "replyid", "reply_cid")
+        for name in id_fields:
+            record = {"postData": json.dumps({name: COMMENT_ID})}
+            self.assertEqual(send_actions._publish_binding(record, TEXT, COMMENT_ID),
+                             (True, "comment_id"), name)
+        text_fields = ("text", "content", "comment", "reply_text", "replytext",
+                       "comment_text", "content_text")
+        for name in text_fields:
+            record = {"postData": json.dumps({name: TEXT}, ensure_ascii=False)}
+            self.assertEqual(send_actions._publish_binding(record, TEXT, COMMENT_ID),
+                             (True, "text"), name)
+
     def test_the_legacy_wrapper_still_answers_yes_or_no(self):
         record = {'postData': 'reply_id=' + COMMENT_ID}
         self.assertTrue(send_actions._publish_record_matches(record, TEXT, COMMENT_ID))
@@ -286,6 +321,41 @@ class SendCommentReceiptTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'platform_response')
         self.assertEqual(result['evidence']['boundByCommentId'], 1)
         self.assertEqual(result['evidence']['boundResponses'], 2)
+
+    def _run_with_status(self, send_id, raw, index):
+        """每次换一个目标：同一个目标出过 unknown 之后，门禁会拦住后续发送
+        （target_has_unresolved_send）—— 那是另一条契约，别在本用例里撞上。"""
+        target_id = "%s-%d" % (COMMENT_ID, index)
+        self.target = {"id": target_id, "roomId": ROOM, "authorId": "author-1"}
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + target_id,
+                         "parsed": {"status_code": raw}}]
+        return self._run(send_id)
+
+    def test_a_string_status_code_is_accepted(self):
+        """平台把状态码给成字符串（"0"）时也必须算确认成功（评审 2026-09-27）。"""
+        for index, raw in enumerate(("0", 0, " 0 ", 0.0)):
+            result = self._run_with_status("receipt-status-ok-%d" % index, raw, index)
+            self.assertEqual(result["reason"], "platform_response", repr(raw))
+            self.assertEqual(result["evidence"]["platformStatusCodes"], [0], repr(raw))
+
+    def test_a_string_rejection_is_recorded_as_rejected(self):
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": "5"}}]
+        result = self._run("receipt-status-5")
+        self.assertEqual(result["reason"], "platform_rejected")
+        self.assertEqual(result["evidence"]["platformStatusCodes"], [5])
+
+    def test_a_nested_data_status_code_is_accepted(self):
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"data": {"status_code": "0"}}}]
+        result = self._run("receipt-status-nested")
+        self.assertEqual(result["reason"], "platform_response")
+
+    def test_a_non_numeric_status_code_is_unreadable(self):
+        for index, raw in enumerate(("abc", "", None, True, [], "0.5")):
+            result = self._run_with_status("receipt-status-bad-%d" % index, raw, index)
+            self.assertEqual(result["reason"], "platform_response_unreadable", repr(raw))
+            self.assertEqual(result["evidence"]["platformStatusCodes"], [None], repr(raw))
 
     def test_the_request_body_is_never_persisted(self):
         """请求体只在内存里用于绑定：不写台账、不进 evidence、不写日志文件。"""

@@ -209,11 +209,32 @@ def _canonical_room(url):
 
 
 def _response_status(record):
+    """平台响应里的 status_code，**规范化成 int**；读不出数字返回 None。
+
+    评审 2026-09-27：平台有时把状态码给成字符串（`"status_code": "0"`），
+    原来直接拿原值去比 `== 0`，字符串 "0" 不等于 0 —— 明明成功却落成
+    "读不出状态码 -> unknown"，白丢一次确认。这里把"数字形态"统一收成 int：
+      · int（含 0）-> 原样；
+      · 整数值的 float -> 转 int（平台偶尔给 0.0）；
+      · 数字字符串（允许前后空白与正负号）-> 转 int；
+      · 其余（缺失 / null / bool / 非数字字符串）-> None = 读不出状态码。
+    """
     parsed = record.get("parsed") or {}
     if not isinstance(parsed, dict):
         return None
     data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-    return data.get("status_code", parsed.get("status_code"))
+    value = data.get("status_code", parsed.get("status_code"))
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("+-").isdigit():
+            return int(text)
+    return None
 
 
 def _visibility_gate(tab, gate, send_id):
@@ -854,8 +875,14 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
 # 所以先解析请求体（form URL 编码 / JSON / 值里再套一层 JSON），再按【字段】比对。
 #
 # 🔴 请求体只在内存里用于这一次绑定：不写日志、不写台账、不进 evidence。
+# 🔴 只按【白名单字段名】判定（评审 2026-09-27）。
+#    原来用 `"id" in name` / `"text" in name or "content" in name` 做子串匹配，
+#    于是 video_id / aweme_id / user_id / item_id / content_type 这类无关字段
+#    也会被当成"评论 id 字段 / 正文字段"，一旦值碰巧相等就把别人的回执算成本次的。
+#    白名单外的字段名一律【不参与绑定】—— 宁可落成 unknown 交人工，
+#    也不要靠猜字段名去宣称成功。要加名字必须附真机请求体证据。
 _REQUEST_ID_FIELDS = ("reply_id", "reply_comment_id", "comment_id", "cid",
-                      "commentid", "replyid", "reply_cid")
+                      "commentid", "replyid", "reply_cid", "reply_cid_list")
 _REQUEST_TEXT_FIELDS = ("text", "content", "comment", "reply_text", "replytext",
                         "comment_text", "content_text")
 
@@ -927,11 +954,14 @@ def _publish_binding(record, text, comment_id):
     """这条回执属于【本次】这条评论吗？返回 (是否绑定, 依据)。
 
     优先级：
-      1) 请求体里【带 id 的字段】精确等于目标评论 id -> ("comment_id")
-         —— 精确到值，短正文、编码差异都影响不到它；
-      2) 请求体里【正文字段】等于或包含本次正文 -> ("text")
+      1) 请求体里【白名单里的 id 字段】精确等于目标评论 id -> ("comment_id")
+         —— 字段名与值都要对得上，短正文、编码差异都影响不到它；
+      2) 请求体里【白名单里的正文字段】等于或包含本次正文 -> ("text")
          —— 平台可能在正文前后插入 @昵称 之类的内容，所以用包含判定，
-            但只在正文字段里判，不在整串里判。
+            但只在白名单正文字段里判，不在整串、也不在其它字段里判。
+
+    字段名【精确匹配白名单】：video_id / aweme_id / user_id / content_type 这类
+    无关字段即使值碰巧相同也不会被当成绑定依据。
 
     请求体拿不到、或解析不出任何字段 -> (False, None)：证据不足，
     由调用方按 unknown 处理 —— 绝不"看到发布接口就当自己成功"。
@@ -942,12 +972,12 @@ def _publish_binding(record, text, comment_id):
     wanted_id = str(comment_id or "").strip()
     if wanted_id:
         for name, value in pairs:
-            if "id" in name and value.strip() == wanted_id:
+            if name in _REQUEST_ID_FIELDS and value.strip() == wanted_id:
                 return True, "comment_id"
     wanted_text = str(text or "").strip()
     if wanted_text:
         for name, value in pairs:
-            if name in _REQUEST_TEXT_FIELDS or "text" in name or "content" in name:
+            if name in _REQUEST_TEXT_FIELDS:
                 if value.strip() == wanted_text or wanted_text in value:
                     return True, "text"
     return False, None
