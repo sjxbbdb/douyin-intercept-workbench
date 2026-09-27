@@ -20,6 +20,9 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+# 持久字段（评审 2026-09-26）：除了 videoId 与链接，池子还必须能回答
+# "这个视频什么时候发的" —— create_time（epoch 秒）与 published_at（北京时间 ISO 串）。
+# 老库没有这两列，由 _migrate 原地补；历史行留 NULL，不猜。
 DB_NAME = "search_pool.sqlite3"
 
 
@@ -76,21 +79,63 @@ class SearchPool:
                     relevance_reason TEXT NOT NULL DEFAULT '',
                     first_seen_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
+                    create_time INTEGER,
+                    published_at TEXT,
                     PRIMARY KEY (account_scope, keyword, aweme_id)
                 )
                 """)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_search_videos_scope_keyword "
                 "ON search_videos(account_scope, keyword, relevance_score DESC)")
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn):
+        """给【老库】补列：CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做。
+
+        create_time / published_at 是 2026-09-26 评审要求补的持久字段：
+        此前池子只存链接与相关度，宿主重启后"这个视频什么时候发的"就丢了，
+        而发布时间恰恰是"按 6–9 月筛"的依据，也是交给评论区时必须能复查的事实。
+
+        老库里已有的行补不到历史值（那时根本没采），一律留 NULL，
+        由 sidecar 按 unknownDate 计数 —— 不猜、不编。
+        """
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(search_videos)")}
+        added = []
+        for name, kind in (("create_time", "INTEGER"), ("published_at", "TEXT")):
+            if name not in have:
+                conn.execute("ALTER TABLE search_videos ADD COLUMN %s %s" % (name, kind))
+                added.append(name)
+        return added
+
+    @staticmethod
+    def _publish_time(video):
+        """(create_time, published_at)：取不到就是 None。
+
+        🔴 不拿采集时刻冒充发布日期：池子里的时间字段是【筛选依据】，
+           编一个出来会让"这批是按 6–9 月筛的"变成假话。
+        """
+        raw = video.get("createTime")
+        try:
+            create_time = int(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            create_time = None
+        published = str(video.get("publishedAt") or "")[:40] or None
+        return (create_time or None), published
 
     @staticmethod
     def _row(row):
         if row is None:
             return None
+        create_time = row["create_time"]
         return {"videoId": str(row["aweme_id"]), "url": row["url"], "title": row["title"],
                 "author": row["author"], "authorId": row["author_id"], "keyword": row["keyword"],
                 "relevance": {"score": int(row["relevance_score"]),
                               "reason": row["relevance_reason"]},
+                # 发布时间：重启后也必须读得到（评审 2026-09-26）。
+                # 拿不到就是 None —— 宿主据此把它归到 unknownDate，而不是当成【不限时间】。
+                "createTime": int(create_time) if create_time is not None else None,
+                "publishedAt": row["published_at"] or None,
                 "firstSeenAt": row["first_seen_at"], "updatedAt": row["updated_at"]}
 
     def save(self, keyword, videos, now=None):
@@ -112,6 +157,7 @@ class SearchPool:
                     if not video_id:
                         continue
                     relevance = video.get("relevance") or {}
+                    create_time, published_at = self._publish_time(video)
                     row = conn.execute(
                         "SELECT aweme_id FROM search_videos WHERE account_scope=? AND keyword=? "
                         "AND aweme_id=?", (self.account_scope, keyword, video_id)).fetchone()
@@ -119,19 +165,26 @@ class SearchPool:
                         inserted += 1
                     else:
                         updated += 1
+                    # 发布时间用 COALESCE：它是【筛选依据】。新一次采集没拿到的话，
+                    # 不该把已经知道的那个值擦掉 —— 否则重启后反而比重启前丢信息。
                     conn.execute(
                         "INSERT INTO search_videos(account_scope,keyword,aweme_id,url,title,"
-                        "author,author_id,relevance_score,relevance_reason,first_seen_at,updated_at) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                        "author,author_id,relevance_score,relevance_reason,create_time,"
+                        "published_at,first_seen_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
                         "ON CONFLICT(account_scope,keyword,aweme_id) DO UPDATE SET "
                         "url=excluded.url, title=excluded.title, author=excluded.author, "
                         "author_id=excluded.author_id, relevance_score=excluded.relevance_score, "
-                        "relevance_reason=excluded.relevance_reason, updated_at=excluded.updated_at",
+                        "relevance_reason=excluded.relevance_reason, "
+                        "create_time=COALESCE(excluded.create_time, search_videos.create_time), "
+                        "published_at=COALESCE(excluded.published_at, search_videos.published_at), "
+                        "updated_at=excluded.updated_at",
                         (self.account_scope, keyword, video_id, str(video.get("url") or ""),
                          str(video.get("title") or "")[:200], str(video.get("author") or "")[:120],
                          str(video.get("authorId") or "")[:200],
                          int(relevance.get("score") or 0),
-                         str(relevance.get("reason") or "")[:60], stamp, stamp))
+                         str(relevance.get("reason") or "")[:60],
+                         create_time, published_at, stamp, stamp))
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -166,11 +219,14 @@ class SearchPool:
     def stats(self):
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS total, COUNT(DISTINCT keyword) AS keywords "
+                "SELECT COUNT(*) AS total, COUNT(DISTINCT keyword) AS keywords, "
+                "SUM(CASE WHEN create_time IS NULL THEN 1 ELSE 0 END) AS unknown_date "
                 "FROM search_videos WHERE account_scope=?", (self.account_scope,)).fetchone()
             by_keyword = conn.execute(
                 "SELECT keyword, COUNT(*) AS n FROM search_videos WHERE account_scope=? "
                 "GROUP BY keyword ORDER BY n DESC LIMIT 20", (self.account_scope,)).fetchall()
         return {"total": int(row["total"]), "keywords": int(row["keywords"]),
+                # 取不到发布时间的条数：宿主据此判断"按时间筛过的池子到底干不干净"。
+                "unknownDate": int(row["unknown_date"] or 0),
                 "byKeyword": [{"keyword": r["keyword"], "count": int(r["n"])} for r in by_keyword],
                 "db": DB_NAME}
