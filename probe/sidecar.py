@@ -413,6 +413,69 @@ def _comment_public_binding(queue, event_id, public_send_id):
     return None
 
 
+# ---- 服务端签发策略的【身份】校验（评审 2026-09-26）----
+#
+# 策略内容（放行哪些公开状态、条数上限……）由授权服务端签发并校验，本侧不接收、
+# 也不执行调用方自带的策略（见各处的 policy_not_server_issued）。这里做的是
+# 【身份】层面的两件事：冻结时记下"这次执行用的是哪一版策略"、执行时要求带回来且一致。
+POLICY_REF_MISSING = "policy_ref_missing"
+POLICY_REF_MISMATCH = "policy_ref_mismatch"
+
+
+def _policy_ref(params):
+    """从调用参数里取策略身份；全部缺省返回 None（= 宿主还没接授权端）。
+
+    两种传法都接受，但不许互相矛盾：
+      · 平铺：policyId / policyVersion / knowledgeSetVersion（平台侧命名的字段）；
+      · 嵌套：policyRef 对象 —— 宿主把冻结计划里回显的那个对象原样带回来即可。
+    形状问题一律 invalid_policy_ref：这里只收"稳定的身份标识"，
+    不是随便一个字符串，也不允许借这个口子夹带策略内容。
+    """
+    flat = {key: params.get(key) for key in live_flow.POLICY_REF_FIELDS}
+    nested = params.get("policyRef")
+    has_flat = any(value not in (None, "") for value in flat.values())
+    try:
+        if not has_flat and nested in (None, ""):
+            return None
+        if has_flat and nested not in (None, ""):
+            if not isinstance(nested, dict):
+                raise SidecarError("invalid_policy_ref", "policyRef must be an object")
+            merged = dict(nested)
+            for key, value in flat.items():
+                if value in (None, ""):
+                    continue
+                if str(merged.get(key)) not in (str(value), "None"):
+                    raise SidecarError("invalid_policy_ref",
+                                       "policyRef and the flat policy fields disagree")
+                merged[key] = value
+            return live_flow.normalize_policy_ref(merged)
+        if nested not in (None, ""):
+            return live_flow.normalize_policy_ref(nested)
+        return live_flow.normalize_policy_ref(flat)
+    except live_flow.LiveFlowError as exc:
+        raise SidecarError(exc.code, exc.message)
+
+
+def _policy_ref_refusal(plan, params):
+    """执行阶段：身份必须与冻结计划一致。返回 (code, message) 或 None。
+
+    计划里没记身份（宿主还没接授权端）时不额外要求，保持既有行为；
+    记了身份就必须带回来、而且必须一致 —— 否则"这条批次是按哪一版策略跑的"
+    在计划与执行之间就断了，换一版策略继续发同一条冻结计划，事后无法解释。
+    """
+    frozen = (plan or {}).get("policyRef") or {}
+    if not str(frozen.get("policyId") or ""):
+        return None
+    supplied = _policy_ref(params)
+    if supplied is None:
+        return (POLICY_REF_MISSING,
+                "this batch was frozen under a server-issued policy; send its identity back")
+    if live_flow.normalize_policy_ref(frozen) != supplied:
+        return (POLICY_REF_MISMATCH,
+                "the supplied policy identity is not the one this plan was frozen under")
+    return None
+
+
 def _private_binding_mismatch(gate, public_send_id, target):
     """单发私信的 ③ 对应性校验；不一致时返回说明文字，否则 None。
 
@@ -1247,6 +1310,8 @@ class Sidecar:
             # 在这个接线完成之前，边界一律拒绝调用方自带策略。
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
+        # 🔴 策略身份在【建批次之前】校验：形状不对就不该产生任何队列副作用。
+        policy_ref = _policy_ref(params)
         public_text = params.get("publicText")
         private_text = params.get("privateText")
         for value, label in ((public_text, "public_text"), (private_text, "private_text")):
@@ -1286,7 +1351,8 @@ class Sidecar:
                     "batchFilter": summary.get("filter") or {}}
         plan = self.comment_queue.freeze_plan(
             batch["batchId"],
-            comment_flow.build_scripts(batch["events"], public_text, private_text))
+            comment_flow.build_scripts(batch["events"], public_text, private_text),
+            policy_ref=policy_ref)
         # 摘要里的 frozen/status 必须是【冻结之后】的事实：take_batch 那一刻还没冻结，
         # 直接回传会让宿主以为计划没冻上。
         summary["frozen"] = True
@@ -1302,7 +1368,9 @@ class Sidecar:
                 "publicTextSha256": (plan["targets"][0]["publicTextSha256"]
                                      if plan["targets"] else None),
                 "scriptSource": plan.get("scriptSource"),
-                "policy": plan.get("policy"), "policySource": plan.get("policySource")}
+                "policy": plan.get("policy"), "policySource": plan.get("policySource"),
+                # 服务端策略身份（与计划一起冻结；私信阶段必须原样带回来）
+                "policyRef": plan.get("policyRef")}
 
     def comment_reply(self, params):
         """阶段一：对批次内被接受的条目【逐条公开回复】。
@@ -1315,6 +1383,11 @@ class Sidecar:
         plan = self.comment_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        # 🔴 策略身份必须与冻结计划一致（评审 2026-09-26）：换一版策略继续发同一条
+        #    冻结计划，事后无法解释。校验在打开浏览器之前完成。
+        refusal = _policy_ref_refusal(plan, params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         results, sendable = [], []
         for item in items:
             target = self.comment_queue.target(batch_id, item["eventId"])
@@ -1369,6 +1442,9 @@ class Sidecar:
         """
         batch_id, items = _comment_batch_items(params)
         self.comment_queue.ensure_active(batch_id)
+        refusal = _policy_ref_refusal(self.comment_queue.plan(batch_id), params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         allowed, rejected = self.comment_queue.private_candidates(batch_id)
         by_id = {target["eventId"]: target for target in allowed}
         reasons = {row.get("eventId"): row.get("reason") for row in rejected}
@@ -1615,6 +1691,8 @@ class Sidecar:
             # 在这个接线完成之前，边界一律拒绝调用方自带策略，改用内置的保守默认值。
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
+        # 🔴 策略身份在【建批次之前】校验：形状不对就不该产生任何队列副作用。
+        policy_ref = _policy_ref(params)
         reply_via = str(params.get("replyVia") or "native")
         if reply_via not in live_flow.REPLY_VIAS:
             raise SidecarError("invalid_input",
@@ -1639,12 +1717,14 @@ class Sidecar:
                     "expired": batch["expired"], "filter": batch["filter"]}
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
                                            params.get("policy"), reply_mode=reply_mode,
-                                           reply_via=reply_via)
+                                           reply_via=reply_via, policy_ref=policy_ref)
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
                 "replyMode": plan.get("replyMode"), "replyVia": plan.get("replyVia"),
-                "policy": plan["policy"], "policySource": plan.get("policySource")}
+                "policy": plan["policy"], "policySource": plan.get("policySource"),
+                # 服务端策略身份（与计划一起冻结；阶段二必须原样带回来）
+                "policyRef": plan.get("policyRef")}
 
     def live_reply(self, params):
         """Phase one: public reply for accepted items of a frozen batch.
@@ -1658,6 +1738,11 @@ class Sidecar:
         plan = self.live_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        # 🔴 策略身份必须与冻结计划一致（评审 2026-09-26）：换一版策略继续发同一条
+        #    冻结计划，事后无法解释。校验在打开浏览器之前完成。
+        refusal = _policy_ref_refusal(plan, params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         mode = str(plan.get("replyMode") or "composer")
         reply_via = str(plan.get("replyVia") or "native")
         requested = params.get("mode")
@@ -1732,6 +1817,9 @@ class Sidecar:
         """
         batch_id, items = _live_batch_items(params)
         self.live_queue.ensure_active(batch_id)
+        refusal = _policy_ref_refusal(self.live_queue.plan(batch_id), params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         by_id = {item["eventId"]: item for item in allowed}
         results, sendable = [], []
@@ -1743,6 +1831,10 @@ class Sidecar:
             #      ① public_missing      没给 publicSendId
             #      ② public_*            台账里该 sendId 不是"已确认成功的公屏回复"（复用 _public_guard）
             #      ③ public_send_mismatch 给的 sendId 不是这个事件自己那次公屏回复
+            #        （2026-09-26 收紧：原来是 `if recorded and recorded != public_send_id`，
+            #         事件上【没有记录】时会直接放行 —— 等于说任何一条已确认的公屏回复
+            #         都能拿给一个从未公屏回复过的事件去发私信。现在要求"事件自身有记录，
+            #         且记录的 sendId 精确等于传入的 publicSendId"，缺记录同样拒绝。）
             public_send_id = str(item.get("publicSendId") or "").strip()
             if not public_send_id:
                 self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
@@ -1759,7 +1851,9 @@ class Sidecar:
                 continue
             event = self.live_queue.find_event(item["eventId"]) or {}
             recorded = str((event.get("detail") or {}).get("sendId") or "")
-            if recorded and recorded != public_send_id:
+            # 🔴 缺记录也必须拒绝："没有记录"与"记录对不上"是同一类失败 ——
+            #    两者都无法证明这次私信绑定的就是【本事件】那次公屏成功。
+            if not recorded or recorded != public_send_id:
                 self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": "public_send_mismatch"})
                 results.append({"eventId": item["eventId"], "status": "blocked",

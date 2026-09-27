@@ -3521,6 +3521,38 @@ class LivePrivateBindingTests(unittest.TestCase):
                 {"eventId": "e1", "sendId": "p-3", "publicSendId": "pub-other"}]})
             self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
 
+    def test_an_event_without_a_recorded_send_id_is_refused(self):
+        """事件自身没有公屏绑定记录：即使台账里有【别的】已确认公屏回复，也必须拒绝。
+
+        评审 2026-09-26：原来是 `if recorded and recorded != public_send_id` ——
+        事件上没有记录时直接放行，等于说"任何一条已确认的公屏回复都能拿给一个
+        从未公屏回复过的事件去发私信"。缺记录与记录对不上是同一类失败。
+
+        _setup 把 _page 设成 explode：门禁没拦住就会在这里炸出来。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="")
+            self._confirmed_public(instance.gate, "pub-elsewhere")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-5", "publicSendId": "pub-elsewhere"}]})
+            self.assertEqual(reply["results"][0]["status"], "blocked")
+            self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
+            self.assertEqual(instance.live_queue.find_event("e1")["private"]["reason"],
+                             "public_send_mismatch")
+
+    def test_a_record_without_the_send_id_key_is_refused_too(self):
+        """记录里根本没有 sendId 这个字段（旧版本写入 / 别的路径写入）同样拒绝。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="pub-1")
+            instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id,
+                                     {"reason": "platform_response_recorded"})
+            self._confirmed_public(instance.gate, "pub-1")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-6", "publicSendId": "pub-1"}]})
+            self.assertEqual(reply["results"][0]["status"], "blocked")
+            self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
+
     def test_the_bound_public_send_lets_the_private_phase_reach_the_page(self):
         """绑定正确时确实进入浏览器阶段（用假页面验证走通了门禁，而不是被别的规则拦下）。"""
         with tempfile.TemporaryDirectory() as td:

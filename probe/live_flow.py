@@ -28,6 +28,7 @@ queue, the batch window and the plan validation testable offline.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -66,6 +67,67 @@ REPLY_MODES = ("composer", "danmaku")
 #   native       = 点弹幕 -> 菜单「回复 TA」-> 平台自己插入 @昵称（原生回复，推荐）
 #   mention_text = 在公屏发一条以 @昵称 开头的纯文本消息（回落，脱敏昵称不可用）
 REPLY_VIAS = ("native", "mention_text")
+
+
+# ---- 服务端签发策略的【身份】冻结（评审 2026-09-26）----
+#
+# 策略内容（放行哪些状态、条数上限、话术长度……）由授权服务端签发并校验；
+# 本侧拿不到、也不该拿它的内容，只按内置的保守默认值执行。这里冻结的是
+# 【身份】：这次执行用的是哪一版策略。两件事必须能对上账：
+#   1) 事后对账：这条批次是按哪一版策略跑出来的；
+#   2) 计划冻结之后不许换策略 —— 阶段二带回来的身份必须与冻结时完全一致。
+POLICY_REF_FIELDS = ("policyId", "policyVersion", "knowledgeSetVersion")
+POLICY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _policy_version(value, label):
+    """版本号：正整数，或"就是正整数"的字符串（宿主常常原样透传字符串）。"""
+    if isinstance(value, bool) or value is None:
+        raise LiveFlowError("invalid_policy_ref", "%s must be a positive integer" % label)
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        raise LiveFlowError("invalid_policy_ref", "%s must be a positive integer" % label)
+    if number < 1:
+        raise LiveFlowError("invalid_policy_ref", "%s must be a positive integer" % label)
+    return number
+
+
+def normalize_policy_ref(value):
+    """校验并规范化策略身份；全部缺省返回 None（= 宿主还没接授权端）。
+
+    规则（fail-closed）：
+      · policyId 必填，形状固定（字母数字与 . _ : -，≤128）—— 不是"随便一个字符串"；
+      · policyId 给了就必须给 policyVersion（只有 id 无法判断是哪一版）；
+      · knowledgeSetVersion 可选，给了就要是正整数；
+      · 出现未知字段一律拒绝 —— 策略内容不能借"身份"这个口子夹带进来。
+    """
+    if value in (None, "", {}):
+        return None
+    if not isinstance(value, dict):
+        raise LiveFlowError("invalid_policy_ref", "policyRef must be an object")
+    given = {key: item for key, item in value.items() if item not in (None, "")}
+    if not given:
+        return None
+    unknown = sorted(set(given) - set(POLICY_REF_FIELDS))
+    if unknown:
+        raise LiveFlowError("invalid_policy_ref",
+                            "unknown policy reference field(s): %s" % ", ".join(unknown))
+    policy_id = given.get("policyId")
+    if not isinstance(policy_id, str) or not POLICY_ID_RE.match(policy_id.strip()):
+        raise LiveFlowError("invalid_policy_ref",
+                            "policyId is required and must be a stable identifier")
+    if "policyVersion" not in given:
+        raise LiveFlowError("invalid_policy_ref", "policyVersion is required together with policyId")
+    ref = {"policyId": policy_id.strip(),
+           "policyVersion": _policy_version(given["policyVersion"], "policyVersion"),
+           "knowledgeSetVersion": None}
+    if "knowledgeSetVersion" in given:
+        ref["knowledgeSetVersion"] = _policy_version(given["knowledgeSetVersion"],
+                                                     "knowledgeSetVersion")
+    return ref
 
 
 class LiveFlowError(Exception):
@@ -533,7 +595,7 @@ class LiveQueue:
     # ------------------------------------------------------------------- plan
 
     def freeze_plan(self, batch_id, scripts, policy=None, reply_mode="composer",
-                    reply_via="native"):
+                    reply_via="native", policy_ref=None):
         """Freeze the two-channel plan for one batch.
 
         'scripts' maps an event id (or fingerprint) to an object carrying
@@ -542,6 +604,8 @@ class LiveQueue:
         """
         policy_source = "request" if policy else "builtin_default"
         policy = normalize_policy(policy)
+        # 策略身份在【冻结时】校验并记下：之后的执行阶段必须带回同一个身份。
+        ref = normalize_policy_ref(policy_ref)
         mode = str(reply_mode or "composer")
         if mode not in REPLY_MODES:
             raise LiveFlowError("invalid_input",
@@ -605,6 +669,8 @@ class LiveQueue:
         plan = {"batchId": str(batch_id), "frozenAt": _iso(self.clock()), "policy": policy,
                 "targets": targets, "blocked": blocked, "scriptSource": "host",
                 "policySource": policy_source,
+                # 服务端签发策略的身份（可为 None：宿主还没接授权端）。
+                "policyRef": ref,
                 # 公屏回复的落地方式在【冻结时】定下来，之后不允许中途改：
                 # composer = 公屏发一条普通评论；danmaku = 公屏发一条 @该观众 的评论（回复弹幕）。
                 "replyMode": mode, "replyVia": via}
