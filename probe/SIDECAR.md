@@ -37,14 +37,9 @@ first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
 scrolling the same owned tab instead of reloading the first page, and any video
 already in the cursor pool is filtered out. The cursor is opaque to the host —
 the host only stores and returns it — but it is still validated on the
-boundary: a cursor issued for another keyword or account, an unsupported
-version, or a pool beyond the cap is rejected with `invalid_input`. A cursor is
-also bound to the **normalized search filters** it was issued for
-(`dateFrom` / `dateTo` as epoch bounds, `minRelevance` as an integer):
-continuing a search with different filters is refused with
-`cursor_filter_mismatch` instead of silently mixing two filter sets into one
-result. `hasMore` is false when a page yields no new video, which is the host
-signal to stop paging.
+boundary: a cursor issued for another keyword, an unsupported version, or a
+pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
+page yields no new video, which is the host signal to stop paging.
 `platformHasMore` / `platformCursor` mirror what the platform response body
 reported; they are read-only telemetry and are never replayed against the API.
 
@@ -203,20 +198,6 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
-* **游标绑定规范化后的筛选条件（2026-09-26 评审收尾）**：`cursor` 里新增 `f`，
-  装的是**解析后**的 `dateFrom` / `dateTo`（epoch 秒）与 `minRelevance`。
-  此前游标只绑定关键词与账号，于是宿主可以带着 `minRelevance=60` 采完第一页、
-  第二页把条件改掉继续用同一个游标 —— 两页条件不同，却被当成"同一次搜索"，
-  而"这批是按 6–9 月、相关度 60 以上采的"正是宿主决定给谁发消息的依据。
-  条件一变就以 `cursor_filter_mismatch` 拒绝（**在打开浏览器之前**），
-  让宿主重新发起一次搜索；**语义等价**的写法（`2026-06` 与 `2026-06-01`）解析后相同，
-  不算变化。缺 `f`、`f` 不是对象、`f` 缺键，一律按不一致拒绝。
-  协议版本随之升到 `cursorVersion: 2`：v1 游标里没有条件信息，无法判断它是怎么采的，
-  继续接受等于把这条缺陷留在协议里，所以直接拒绝（`invalid_input`），
-  宿主重新从第一页开始即可 —— 游标是不透明的临时状态，不是持久资产。
-  响应 `filter` 新增 `cursorFilters`，把这组规范化条件回显给宿主对账。
-  回归：`test_search_cursor_filters.CursorFilterBindingTests` 与
-  `SearchPaginationFilterTests`。
 * **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
   以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
   续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
@@ -252,7 +233,7 @@ same `unknown` semantics as the other send paths.
   回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
 
 * **分页记录：页面版本与分页终止态（2026-09-21，评审要求固化）**：`search` 的每次响应都带
-  * `cursorVersion`：产出该 `cursor` 的**协议版本**（当前 `2`；v2 起游标同时绑定筛选条件）。宿主重启后据此判断手里的游标
+  * `cursorVersion`：产出该 `cursor` 的**协议版本**（当前 `1`）。宿主重启后据此判断手里的游标
     是不是自己能解析的那一版；不是就重新从第一页开始，而不是拿着解析不了的游标继续请求。
   * `pageOutcome`：**分页终止态**，取值固定为
 
