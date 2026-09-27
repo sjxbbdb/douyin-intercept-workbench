@@ -231,6 +231,18 @@ same `unknown` semantics as the other send paths.
   只按批次候选清单放行会留下绕过路径（调用方不带 `publicSendId` 直接要私信），
   所以绑定检查必须落在**每个 item** 上；`_live_batch_items` 也不再丢弃该字段。
   回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
+* **直播监听的恢复语义（2026-09-26 评审收尾）**：监听是持续动作，宿主会重启、会换房间、
+  平台会重发旧事件、批次会超窗。这些情况下：
+  ① 队列与未冻结的批次都还在，`take_batch` **复用同一个 batchId**（不会凭空多出批次）；
+  ② 平台重发同一条事件只计 `duplicates`，不会变成新事件；
+  ③ 已经出过结果的事件（`sent_confirmed` / `unknown` / `failed` / `blocked`）
+  **不会回到队列**，也不会被后来的批次再发一次；
+  ④ `unknown` 的公屏结果永远不进私信候选（红线：未知不得自动重试）；
+  ⑤ 每个目标各自绑自己的房间：换房间不会把旧房间的事件当成新房间的，
+  同一个人在另一个房间说同一句话也不算同一条事件；
+  ⑥ 超窗批次在 `ensure_active` 处以 `batch_expired` 拒绝，计划中的事件一并作废、不重发；
+  ⑦ checkpoint（`phase` / `pendingEvents` / `frozenAt` / `planTargets`）重启后照常可读。
+  回归：`test_live_recovery`（8 个队列用例 + 1 个 sidecar 入口用例，全部离线）。
 
 * **分页记录：页面版本与分页终止态（2026-09-21，评审要求固化）**：`search` 的每次响应都带
   * `cursorVersion`：产出该 `cursor` 的**协议版本**（当前 `1`）。宿主重启后据此判断手里的游标
