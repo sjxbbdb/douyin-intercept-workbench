@@ -198,6 +198,16 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
+* **服务端签发策略的「身份」冻结（2026-09-26 评审收尾）**：本侧**不接收策略内容**
+  （`policy` 对象继续以 `policy_not_server_issued` 拒绝），但支持把策略**身份**冻结进计划：
+  `policyId` + `policyVersion`（+ 可选 `knowledgeSetVersion`），
+  或直接把计划回显的 `policyRef` 对象原样带回来。
+  * 形状不对 -> `invalid_policy_ref`，且**在建批次之前**拒绝（不产生队列副作用）；
+  * 冻结之后，执行阶段（`live_reply` / `live_private` / `comment_reply` / `comment_private`）
+    必须把同一身份带回来：缺 -> `policy_ref_missing`，不一致 -> `policy_ref_mismatch`；
+  * 完全不带身份时保持既有行为（授权端还没接线），这条是加法能力。
+  授权端签发、策略存储与积分扣除都在平台侧，本侧只做身份冻结与一致性校验。
+  回归：`test_policy_ref`（形状 4 个用例 + 直播 7 个 + 评论 4 个）。
 * **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
   以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
   续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
