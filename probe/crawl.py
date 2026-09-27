@@ -28,6 +28,7 @@ import os
 import random
 import re
 import time
+import uuid
 from urllib.parse import quote
 
 import cdp as cdpmod
@@ -686,7 +687,32 @@ def _parse_comment(c, aweme_id, video_title, source="api"):
 
 
 def _comment_key(row):
-    return (row.get("sec_uid") or "", normalize_search_text(row.get("text")))
+    """抓取期"这一行是不是已经收过"的键（评审 2026-09-26）。
+
+    优先级：评论 ID -> 作者标识 + 正文 -> 昵称 + 正文 -> 谁都不像谁（不合并）。
+
+    🔴 绝不用【空身份 + 正文】当键：两个都没有 sec_uid 的用户发同一句话（"求带"）
+       会撞在同一个键上，第二条被直接丢掉 —— 而下游是按人去私信的，
+       这是给错人发消息的源头，不是"少收一条"的小事。
+       宁可多留一条（同一行被重读），也不能把不同用户并成一条。
+
+    为什么还留 (昵称 + 正文) 这一档：DOM 兜底每轮都会把可见行重读一遍，
+    必须有东西认出"还是那一行"。昵称不如 sec_uid 稳定，但比"空"强得多，
+    而且不同昵称绝不会因为正文相同被并掉。
+    """
+    cid = str(row.get("cid") or row.get("comment_id") or "").strip()
+    if cid:
+        return ("cid", cid)
+    norm = normalize_search_text(row.get("text"))
+    author = str(row.get("sec_uid") or row.get("author_sec_uid") or "").strip()
+    if author:
+        return ("author", author, norm)
+    nick = str(row.get("user") or row.get("nick") or "").strip()
+    if nick:
+        return ("nick", nick, norm)
+    # 既没有评论 ID、也没有任何身份字段：给一个【唯一】键，
+    # 让这一行自己留着，而不是跟别的匿名行撞在一起被丢掉。
+    return ("anonymous", uuid.uuid4().hex)
 
 
 def _absorb_comments(rec, comments, aweme_id, video_title, stats):
@@ -761,25 +787,57 @@ def _richer(a, b):
     """哪条记录信息更全。接口记录有 cid / digg / 地区 / 头像，优先它。"""
     if (a.get("source") == "api") != (b.get("source") == "api"):
         return a.get("source") == "api"
+    # 有评论 ID 的那条是【下游能正式引用】的那条（回复要按评论 ID 定位），
+    # 同一条评论的两份记录里优先留它。
+    if bool(a.get("cid")) != bool(b.get("cid")):
+        return bool(a.get("cid"))
     return len(a.get("text") or "") > len(b.get("text") or "")
 
 
 def dedupe_comments(rows):
-    """同一用户在同一视频下的同一条评论只留一条（留信息更全的那条）。"""
-    out, by_uid = [], {}
+    """同一条评论只留一条（留信息更全的那条），但【绝不合并不同用户】。
+
+    合并依据（评审 2026-09-26）：
+      1) 评论 ID：有 ID 就按 ID 合并 —— 平台对同一条评论给的稳定标识，最可信；
+      2) 作者 + 正文：拿得到 sec_uid 时才允许按正文前缀合并
+         （接口带表情、DOM 丢表情，同一条评论会被收两次，见 _same_comment）；
+      3) 昵称 + 正文：DOM 兜底行常常没有 sec_uid，用昵称认出"还是那一行"；
+      4) 什么都没有：【各自保留】。
+
+    🔴 第 4 条是这次修的核心：原来是按 (sec_uid or "") 分组，没有 sec_uid 的
+       全部落进同一个空身份的桶里，于是两个不同用户发同一句话（"求带"）
+       会被 _same_comment 判成同一条并丢掉其中一条。下游是按人去私信的，
+       丢错人 = 给错人发消息。宁可留下一条重复，也不能合并两个用户。
+    """
+    out, by_cid, by_identity = [], {}, {}
     for row in rows:
-        uid = row.get("sec_uid") or ""
         norm = normalize_search_text(row.get("text"))
+        cid = str(row.get("cid") or row.get("comment_id") or "").strip()
+        author = str(row.get("sec_uid") or row.get("author_sec_uid") or "").strip()
+        nick = str(row.get("user") or row.get("nick") or "").strip()
+        # 身份 = 作者标识优先；没有作者标识时才退到昵称；都没有就不参与按正文合并。
+        identity = ("author", author) if author else (("nick", nick) if nick else None)
         dup = None
-        for idx in by_uid.get(uid, []):
-            if _same_comment(norm, out[idx].get("_norm", "")):
-                dup = idx
-                break
+        if cid and cid in by_cid:
+            dup = by_cid[cid]
+        elif identity is not None:
+            for idx in by_identity.get(identity, []):
+                if _same_comment(norm, out[idx].get("_norm", "")):
+                    dup = idx
+                    break
         if dup is None:
             row["_norm"] = norm
-            by_uid.setdefault(uid, []).append(len(out))
+            index = len(out)
+            if cid:
+                by_cid[cid] = index
+            if identity is not None:
+                by_identity.setdefault(identity, []).append(index)
             out.append(row)
-        elif _richer(row, out[dup]):
+            continue
+        if cid:
+            # 同一条评论的另一次采集：把 ID 指向留下的那一条，后面的同名记录也能合并。
+            by_cid[cid] = dup
+        if _richer(row, out[dup]):
             row["_norm"] = norm
             out[dup] = row
     for r in out:
