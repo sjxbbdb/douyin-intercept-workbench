@@ -844,6 +844,23 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
         return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
 
 
+def _publish_record_matches(record, text, comment_id):
+    """这条发布回执是否属于【本次】这条评论。
+
+    绑定依据（优先级从高到低）：
+      1) 请求体里出现本次回复正文 —— 这条请求就是我们发出去的；
+      2) 请求体里出现目标评论 id —— 平台回复某条评论时会带上。
+    只有拿到请求体（postData）才可能绑定；拿不到就返回 False，
+    由调用方按 unknown 处理 —— 绝不"看到发布接口就当自己成功"。
+    """
+    payload = str((record or {}).get("postData") or "")
+    if not payload:
+        return False
+    if text and text in payload:
+        return True
+    return bool(comment_id and comment_id in payload)
+
+
 def send_comment(tab, gate, send_id, target, text, source):
     """Safely locate one visible comment before a single click.
 
@@ -889,6 +906,11 @@ def send_comment(tab, gate, send_id, target, text, source):
         ):
             row = gate.finish(send_id, "failed", "target_live_room_mismatch")
             return gate.result(row)
+        # 评审要求（2026-09-26）：评论（视频/直播公屏）发送路径也必须复用统一的可见性门禁 ——
+        # unknown 不等于 hidden：判定不了就交人工，不自动重试。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
@@ -1013,7 +1035,8 @@ def send_comment(tab, gate, send_id, target, text, source):
         #    body 里 status_code=0 —— 响应是可观测的，只是从来没去读。
         #    私信路径早就这么做了（DM_SEND_URL_MARK），评论路径漏了。
         recorder = douyin.make_network_recorder(
-            tab, getattr(S, "COMMENT_PUBLISH_URL_MARK", ""))
+            tab, getattr(S, "COMMENT_PUBLISH_URL_MARK", ""),
+            capture_post_data=True)  # 回执要绑定到具体评论正文，必须留档请求体
         record_error = None
         try:
             tab.call("Network.enable", {}, timeout=10)
@@ -1027,19 +1050,27 @@ def send_comment(tab, gate, send_id, target, text, source):
         records = recorder.collect(wait_seconds=8.0)
         mark = getattr(S, "COMMENT_PUBLISH_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
-        statuses = [_response_status(r) for r in matched]
+        # 🔴 评审要求（2026-09-26）：回执必须绑定到【这一条评论】。
+        #    只按 URL 匹配时，同一页面里任何一次发布请求都会被算成本次动作的回执
+        #    （并发/重试下张冠李戴）。绑定依据见 _publish_record_matches。
+        bound = [r for r in matched if _publish_record_matches(r, text, target_id)]
+        statuses = [_response_status(r) for r in bound]
         detail = {"httpResponses": len(records), "matchedResponses": len(matched),
+                  "boundResponses": len(bound),
                   "platformStatusCodes": statuses[:5],
                   "networkEnableError": record_error}
-        if matched and any(status == 0 for status in statuses):
+        if bound and any(status == 0 for status in statuses):
             # 只有平台明确回 status_code=0 才算【确认成功】——
             # 这是唯一允许进入私信阶段的状态（图 11 固定流程二）。
             row = gate.finish(send_id, "sent_confirmed", "platform_response", detail)
-        elif matched and any(status not in (None, 0) for status in statuses):
+        elif bound and any(status not in (None, 0) for status in statuses):
             row = gate.finish(send_id, "failed", "platform_rejected", detail)
-        elif matched:
+        elif bound:
             # 命中接口但读不出状态码：证据不足，按未确定处理，禁止进入私信。
             row = gate.finish(send_id, "unknown", "platform_response_unreadable", detail)
+        elif matched:
+            # 命中发布接口但无法绑定到本条评论/正文：证据不足，禁止进入私信。
+            row = gate.finish(send_id, "unknown", "platform_response_unbound", detail)
         else:
             row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
         return gate.result(row)

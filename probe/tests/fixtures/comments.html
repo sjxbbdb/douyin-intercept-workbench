@@ -54,9 +54,13 @@
     <div class="more" data-e2e="video-comment-more">...</div>
     <span>111</span>
     <span>5小时前·浙江</span>
-    <span>0</span>
-    <div>分享</div>
-    <span onclick="openReply(this.closest('article'))">回复</span>
+    <!-- 真机结构：点赞数 / 分享 / 回复 都在 comment-item-stats-container 里；
+         夹具必须一致，否则「点赞数 0 不得当正文」这条约束测不出来。 -->
+    <div class="comment-item-stats-container">
+      <span>0</span>
+      <div>分享</div>
+      <span onclick="openReply(this.closest('article'))">回复</span>
+    </div>
   </article>
 
   <article data-e2e="comment-item" id="comment-3" data-comment-id="comment-3">
