@@ -54,6 +54,36 @@ def _iso(ts=None):
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+_DURABLE_SEND_STATES = {"failed", "blocked", "unknown", "sent_confirmed"}
+_PUBLIC_QUEUE_STATES = _DURABLE_SEND_STATES | {"sent_echoed"}
+
+
+def _durable_send_state(gate, send_id, outcome):
+    """Return the raw ledger state used by phase-two gating.
+
+    ``SendGate.result`` intentionally projects ``sent_confirmed`` to the
+    public ``unknown`` status.  That projection is safe for callers, but it
+    cannot be used to decide whether a private follow-up is allowed.  Batch
+    queues therefore read the durable ledger row and fall back to the public
+    outcome only when no row exists (for validation failures before reserve).
+    """
+    fallback = str((outcome or {}).get("status") or "unknown")
+    # Only the conservative public ``unknown`` projection may be resolved from
+    # the ledger.  A failed/blocked outcome (for example an idempotency
+    # conflict) must never inherit an older sent_confirmed row under the same
+    # sendId and unlock a private follow-up for a new attempt.
+    if fallback != "unknown":
+        return fallback if fallback in _PUBLIC_QUEUE_STATES else "unknown"
+    try:
+        raw = gate.lookup(send_id)
+        state = str((raw or {}).get("status") or "")
+    except Exception:
+        state = ""
+    if state in _DURABLE_SEND_STATES:
+        return state
+    return fallback if fallback in _DURABLE_SEND_STATES else "unknown"
+
+
 # ---------- 搜索游标（架构依据 images/10-video-search-flow）----------
 #
 # 图 10 要求：「读取一页结果 -> 按固定条件筛选并去重 -> 保存视频池与搜索游标
@@ -1244,10 +1274,12 @@ class Sidecar:
                                       "authorName": target["authorName"], "text": target["text"]}
                     outcome = send_comment(page, self.gate, item["sendId"], comment_target,
                                             text, "video")
+                    recorded_state = _durable_send_state(self.gate, item["sendId"], outcome)
                     self.comment_queue.mark(item["eventId"],
-                                            str(outcome.get("status") or "unknown"), batch_id,
+                                            recorded_state, batch_id,
                                             {"sendId": item["sendId"],
-                                             "reason": outcome.get("reason")})
+                                             "reason": outcome.get("reason"),
+                                             "recordedState": recorded_state})
                     results.append(dict(outcome, eventId=item["eventId"]))
             finally:
                 page.close()
@@ -1602,7 +1634,7 @@ class Sidecar:
                     else:
                         outcome = send_comment(page, self.gate, item["sendId"], comment_target,
                                                text, "live")
-                    status = str(outcome.get("status") or "unknown")
+                    status = _durable_send_state(self.gate, item["sendId"], outcome)
                     evidence = outcome.get("evidence") or {}
                     if mode == "danmaku" and evidence.get("roomEcho"):
                         # 房间消息流里出现了自己刚发的那条：本通道目前能拿到的最强证据（真机实测）。

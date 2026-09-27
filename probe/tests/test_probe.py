@@ -897,6 +897,43 @@ class LiveFlowTests(unittest.TestCase):
             self.assertEqual(report["checkpoint"]["planTargets"], 1)
             self.assertEqual(report["checkpoint"]["phase"], "private")
 
+    def test_live_reply_uses_raw_ledger_state_for_private_candidates(self):
+        """对外结果可保持 unknown，但已落账的 sent_confirmed 必须进入二阶段。"""
+        import sidecar
+
+        class Page:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19228)
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "composer",
+                "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance._page = lambda: (Page(), {"pid": 1})
+            original = sidecar.send_comment
+
+            def confirmed_but_projected_unknown(_page, gate, send_id, target, text, source):
+                gate.reserve(send_id, target["authorId"], text, kind="comment")
+                gate.mark_started(send_id)
+                row = gate.finish(send_id, "sent_confirmed", "platform_response")
+                return gate.result(row)
+
+            sidecar.send_comment = confirmed_but_projected_unknown
+            try:
+                reply = instance.dispatch("live_reply", {
+                    "batchId": batch_id, "items": [{"eventId": "e1", "sendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+
+        self.assertEqual(reply["results"][0]["status"], "unknown")
+        self.assertEqual(reply["results"][0]["recordedState"], "sent_confirmed")
+        self.assertEqual(reply["privateCandidates"][0]["eventId"], "e1")
+
+
     def test_live_listen_enqueues_deduped_events(self):
         import sidecar
 
@@ -2593,6 +2630,53 @@ class CommentBatchFlowTests(unittest.TestCase):
         self.assertEqual(reply["privateRejected"][0]["reason"], "public_unknown")
         self.assertEqual(private["status"], "blocked")
         self.assertEqual(private["results"][0]["reason"], "public_unknown")
+
+    def test_projected_unknown_keeps_raw_confirmed_public_candidate(self):
+        """SendGate 对外把 sent_confirmed 映射为 unknown，队列仍须读原始台账。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original = sidecar.send_comment
+
+            def confirmed_but_projected_unknown(_page, gate, send_id, target, text, source):
+                gate.reserve(send_id, target["authorId"], text, kind="comment")
+                gate.mark_started(send_id)
+                row = gate.finish(send_id, "sent_confirmed", "platform_response")
+                return gate.result(row)
+
+            sidecar.send_comment = confirmed_but_projected_unknown
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                reply = instance.comment_reply({
+                    "batchId": plan["batch"]["batchId"],
+                    "items": [{"eventId": "e1", "sendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(reply["results"][0]["status"], "unknown")
+        self.assertEqual(reply["privateCandidates"][0]["eventId"], "e1")
+        self.assertEqual(reply["privateCandidates"][0]["publicSendId"], "pub-e1")
+
+    def test_failed_outcome_cannot_inherit_stale_confirmed_ledger_row(self):
+        """sendId 冲突时不能拿旧的 sent_confirmed 解锁新的私信阶段。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            instance.gate.reserve("pub-e1", "video:e1:author-1", self.PUBLIC, kind="comment")
+            instance.gate.mark_started("pub-e1")
+            instance.gate.finish("pub-e1", "sent_confirmed", "old_attempt_confirmed")
+            original = sidecar.send_comment
+            sidecar.send_comment = lambda *_args, **_kwargs: {
+                "status": "failed", "reason": "idempotency_conflict", "sendId": "pub-e1"}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                reply = instance.comment_reply({
+                    "batchId": plan["batch"]["batchId"],
+                    "items": [{"eventId": "e1", "sendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(reply["results"][0]["status"], "failed")
+        self.assertEqual(reply["privateCandidates"], [])
+        self.assertEqual(reply["privateRejected"][0]["reason"], "public_failed")
 
     def test_confirmed_public_reply_opens_the_private_phase(self):
         """只有 sent_confirmed 放行私信；放行后私信阶段的 sendId 绑定要留痕。"""
