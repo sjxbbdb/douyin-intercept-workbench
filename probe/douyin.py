@@ -863,7 +863,6 @@ def _row_helpers_js():
         "if(!t)continue;"
         "if(more&&more.contains(e))continue;"
         "if(stats&&stats.contains(e))continue;"
-        "if(stats&&stats.contains(e))continue;"
         "if(/^[.。．·…]+$/.test(t))continue;"
         "if(/^\\d+$/.test(t)){if(!digits)digits=t;continue;}"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
