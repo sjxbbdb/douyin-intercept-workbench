@@ -845,6 +845,10 @@ def _row_helpers_js():
         # 🔴 真机/夹具（2026-09-26）：「更多」菜单里的省略号是个【长文本候选】，
         #    会把纯数字兜底挡住（best='...' 比 '111' 长）-> 采集里有这条、定位却恒失败。
         "var more=row.querySelector('[data-e2e=\"video-comment-more\"]');"
+        # 评审要求（2026-09-26）：点赞数 0 与 分享/回复 属于【统计/操作行】，绝不能当正文。
+        #    真机上它们包在 class 含 stats 的容器里（comment-item-stats-container），
+        #    整棵子树排除在正文候选之外 —— 纯数字兜底只会看到真正的正文（例如 111）。
+        "var stats=row.querySelector('[class*=\"stats\"]');"
         # 🔴 真机（2026-09-21 评审）：过滤纯数字是为了避开时间/计数这类噪声，
         #    但【整条评论就是数字】的情况真实存在（例如「111」「666」「+1」的场景里用户只发数字）。
         #    原来一律 continue，于是 best 为空 -> rowMatches 永远匹配不到 ->
@@ -858,6 +862,8 @@ def _row_helpers_js():
         "var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();"
         "if(!t)continue;"
         "if(more&&more.contains(e))continue;"
+        "if(stats&&stats.contains(e))continue;"
+        "if(stats&&stats.contains(e))continue;"
         "if(/^[.。．·…]+$/.test(t))continue;"
         "if(/^\\d+$/.test(t)){if(!digits)digits=t;continue;}"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
@@ -872,7 +878,16 @@ def _row_helpers_js():
         "if(t.length>best.length)best=t;}"
         "return best||digits;}"
         # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
-        "function rowMatches(row,t){"
+        # 评审要求（2026-09-26）：定位以【评论 ID】为首要依据 ——
+        #   ① 目标带稳定 ID：先用 ID 找行；找到就以 ID 为准，但【仍做一次正文一致性校验】，
+        #      正文不符即 0 条命中（绝不因为 ID 对了就凑合发）；
+        #   ② 目标不带 ID（或行上没有稳定 ID）时，才回落到正文 + 作者匹配。
+        #   两遍共用同一个行集合，避免标注与发送各自挑到不同的行。
+        "function matchRows(rs,t){" +
+        "if(t.id){var byId=rs.filter(function(r){var rid=r.id||r.getAttribute('data-comment-id')||'';return rid&&rid===t.id;});" +
+        "if(byId.length)return byId.filter(function(r){return rowTextMatches(r,t);});}" +
+        "return rs.filter(function(r){return rowTextMatches(r,t);});}"
+        "function rowTextMatches(row,t){"
         "if(t.text&&bodyText(row)!==t.text)return false;"
         "if(t.id&&(row.id===t.id||row.getAttribute('data-comment-id')===t.id))return true;"
         "if(!t.text)return false;"
@@ -921,7 +936,7 @@ _REPLY_BUTTON_LOOKUP_JS = (
 _REPLY_BUTTON_JS = (
     "(function(t){" + _row_helpers_js() + _REPLY_BUTTON_LOOKUP_JS +
     "var rs=rows();"
-    "var hits=rs.filter(function(r){return rowMatches(r,t);});"
+    "var hits=matchRows(rs,t);"
     "if(hits.length!==1)return {found:false,count:hits.length,"
     "reason:hits.length?'ambiguous_comment':'comment_not_found'};"
     "var row=hits[0];"
@@ -960,7 +975,7 @@ _REPLY_COMPOSER_JS = (
     "if(open.length!==1)return {found:false,count:open.length,"
     "reason:open.length?'ambiguous_reply_open':'reply_not_open'};"
     "var row=open[0];"
-    "if(!rowMatches(row,t))return {found:false,count:1,reason:'reply_row_mismatch'};"
+    "if(matchRows([row],t).length!==1)return {found:false,count:1,reason:'reply_row_mismatch'};"
     "var eds=Array.from(row.querySelectorAll(" + json.dumps(S.COMMENT_REPLY_EDITOR_SELECTOR) + ")).filter(vis);"
     "if(eds.length!==1)return {found:false,count:eds.length,"
     "reason:eds.length?'ambiguous_reply_editor':'reply_editor_not_found'};"
@@ -976,11 +991,11 @@ _REPLY_COMPOSER_JS = (
 #   present       行是否命中（唯一或歧义都算命中）
 #   matches       命中条数
 #   replyReady    唯一命中 且 回复按钮存在、可见、已在视口内 -> 发送阶段可以直接点
-#   reason        '' | comment_not_found | ambiguous_comment | reply_button_not_found | needs_scroll
+#   reason        '' | comment_not_found | ambiguous_comment | reply_button_not_found | scrolled_into_view
 _ROW_PRESENT_JS = (
     "(function(t){" + _row_helpers_js() + _REPLY_BUTTON_LOOKUP_JS +
     "var rs=rows();"
-    "var hits=rs.filter(function(r){return rowMatches(r,t);});"
+    "var hits=matchRows(rs,t);"
     "if(hits.length===0)return {present:false,matches:0,total:rs.length,replyReady:false,"
     "reason:'comment_not_found'};"
     "if(hits.length>1)return {present:true,matches:hits.length,total:rs.length,replyReady:false,"
@@ -990,7 +1005,7 @@ _ROW_PRESENT_JS = (
     "if(!btn)return {present:true,matches:1,total:rs.length,replyReady:false,"
     "reason:'reply_button_not_found'};"
     "if(!inView(btn))return {present:true,matches:1,total:rs.length,replyReady:false,"
-    "reason:'needs_scroll'};"
+    "reason:'scrolled_into_view'};"
     "return {present:true,matches:1,total:rs.length,replyReady:true,reason:''};})(TARGET)"
 )
 
@@ -1003,7 +1018,7 @@ def comment_row_present(cdp, target):
       matches      命中条数（>1 = 歧义，绝不能随便挑一条去点）
       replyReady   唯一命中 且 回复按钮存在、可见、已在视口内 —— 发送阶段可直接点击
       reason       与 comment_reply_button 同一枚举：
-                   '' | comment_not_found | ambiguous_comment | reply_button_not_found | needs_scroll
+                   '' | comment_not_found | ambiguous_comment | reply_button_not_found | scrolled_into_view
 
     🔴 为什么必须同源（2026-09-21 评审）：采集走接口、回复走 DOM，两个集合本来就不重合；
        如果"标注能不能回"和"实际能不能点"各写一套判断，就会出现
@@ -1035,7 +1050,7 @@ _REPLY_SEND_JS = (
     "if(open.length!==1)return {found:false,count:open.length,"
     "reason:open.length?'ambiguous_reply_open':'reply_not_open'};"
     "var row=open[0];"
-    "if(!rowMatches(row,t))return {found:false,count:1,reason:'reply_row_mismatch'};"
+    "if(matchRows([row],t).length!==1)return {found:false,count:1,reason:'reply_row_mismatch'};"
     "var ct=row.querySelector(" + json.dumps(S.COMMENT_INPUT_RIGHT_CT) + ");"
     "if(!ct)return {found:false,count:0,reason:'comment_input_right_not_found'};"
     "var cands=Array.from(ct.querySelectorAll('span,div,svg'));"
@@ -1091,8 +1106,9 @@ def wait_comment_panel(cdp, timeout=25):
     return False
 
 
-def make_network_recorder(cdp, url_mark):
+def make_network_recorder(cdp, url_mark, capture_post_data=False):
     if callable(url_mark):
-        return NetworkRecorder(cdp, url_mark)
+        return NetworkRecorder(cdp, url_mark, capture_post_data=capture_post_data)
     mark = str(url_mark or "")
-    return NetworkRecorder(cdp, lambda u: bool(mark) and mark in (u or ""))
+    return NetworkRecorder(cdp, lambda u: bool(mark) and mark in (u or ""),
+        capture_post_data=capture_post_data)
