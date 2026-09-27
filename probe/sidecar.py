@@ -97,7 +97,20 @@ def _durable_send_state(gate, send_id, outcome):
 #    去重由 crawl.search_videos(seen_ids=...) 负责。平台自己的 has_more / cursor
 #    只作为观测信号一起返回，供宿主记录，不作为翻页依据。
 
-CURSOR_VERSION = 1
+# 游标版本 2：payload 增加 "f"（规范化后的筛选条件绑定）。
+# 🔴 版本必须升：老版本游标里【没有】筛选条件，无法判断它是在什么条件下采的，
+#    继续接受就等于把"条件变了也能接着翻"这条缺陷留在协议里。老游标一律拒绝，
+#    宿主重新发起一次搜索即可 —— 游标本来就是不透明的临时状态，不是持久资产。
+CURSOR_VERSION = 2
+# 筛选条件绑定失败（评审 2026-09-26）：
+#   游标此前只绑定【关键词 + 账号】。于是宿主可以带着 minRelevance=60 采完第一页，
+#   第二页把 minRelevance 调成 0 继续用同一个游标 —— 两页条件不同，却被当成
+#   "同一次搜索"，"这批是按 6–9 月、相关度 60 以上采的"这句话就不成立了，
+#   而宿主会据此决定给谁发消息。所以条件一变就必须拒绝旧游标，让它重新开始。
+CURSOR_FILTER_MISMATCH = "cursor_filter_mismatch"
+# 游标 "f" 里必须【三个键齐全】：少一个就说明它不是本版本产出的（或被人改过），
+# 按不一致拒绝 —— 不能拿"缺省值恰好相等"当通过，那是猜。
+CURSOR_FILTER_KEYS = ("dateFrom", "dateTo", "minRelevance")
 # 分页终止态的显式记录（images/10 第 3 步「保存视频池与搜索游标」）。
 # 只有 cursor/hasMore 时，宿主重启后分不清"到底了"和"被验证码/登录打断了"。
 PAGE_OUTCOME_MORE = "more"
@@ -107,7 +120,62 @@ PAGE_OUTCOME_LOGIN = "login_required"
 CURSOR_MAX_SEEN = 20000
 
 
-def _encode_cursor(keyword, seen, page_no, account_scope=None):
+# "没有默认值" 的哨兵：不能用 None —— None 本身是【合法默认值】
+# （dateFrom/dateTo 为空就表示"这一侧不设边界"）。
+_NO_DEFAULT = object()
+
+
+def _int_value(value, label, default=_NO_DEFAULT):
+    """外部参数 -> int。非数字一律 invalid_input —— 绝不让裸 ValueError 冒到协议层。
+
+    收的形状：整数、以及"就是整数"的字符串（宿主常常原样透传字符串）；
+    空值（None / 空串）-> default。
+    🔴 不收 bool：True 是 int 的子类，但语义上不是数量；
+       也不收小数与其它类型 —— 悄悄取整会让人以为筛选条件生效了。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if default is _NO_DEFAULT:
+            raise SidecarError("invalid_input", "%s must be an integer" % label)
+        return default
+    if isinstance(value, bool):
+        raise SidecarError("invalid_input", "%s must be an integer" % label)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("+-").isdigit():
+            return int(text)
+    raise SidecarError("invalid_input", "%s must be an integer" % label)
+
+
+def _filter_binding(date_from=None, date_to=None, min_relevance=0):
+    """把筛选条件规范化成游标里存的那三个值。
+
+    存的是【解析后的区间边界（epoch 秒）】而不是宿主给的原始字符串：
+    "2026-06" 与 "2026-06-01" 指向同一个区间，语义相同，不该被判成"条件变了"；
+    反过来 "2026-06" 与 "2026-07" 语义不同，必须被判出来。
+    minRelevance 是整数，直接存。
+    """
+
+    return {"dateFrom": _int_value(date_from, "dateFrom", default=None),
+            "dateTo": _int_value(date_to, "dateTo", default=None),
+            "minRelevance": _int_value(min_relevance, "minRelevance", default=0)}
+
+
+def _normalize_binding(filters):
+    """把筛选绑定收敛成规范三元组；缺省 = 不设任何筛选。
+
+    游标里的 "f" 来自外部（宿主可能原样转存过别人给它的串），
+    所以这里不信任它的形状：不是对象就当成"没有条件"，
+    由 decode 决定这算不算不一致（按不一致拒绝）。
+    """
+    if not isinstance(filters, dict):
+        return _filter_binding()
+    return _filter_binding(filters.get("dateFrom"), filters.get("dateTo"),
+                           filters.get("minRelevance"))
+
+
+def _encode_cursor(keyword, seen, page_no, account_scope=None, filters=None):
     """游标 = 不透明字符串。带 account_scope 之后，跨账号复用会被拒绝。
 
     为什么必须带：游标里的 seen 是"已经见过哪些视频"的池子。
@@ -115,18 +183,22 @@ def _encode_cursor(keyword, seen, page_no, account_scope=None):
     （多账号并行时这是静默的数据错误，不是权限问题）。
     """
     payload = {"v": CURSOR_VERSION, "k": keyword, "n": int(page_no),
-               "seen": sorted(str(x) for x in seen)}
+               "seen": sorted(str(x) for x in seen),
+               # 筛选条件一起绑定：条件变了，这个游标就不再代表"同一次搜索"。
+               "f": _normalize_binding(filters)}
     if account_scope:
         payload["a"] = str(account_scope)
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _decode_cursor(value, keyword, account_scope=None):
+def _decode_cursor(value, keyword, account_scope=None, filters=None):
     """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。
 
-    account_scope 给定时，游标里带账号的必须与它一致（老游标不带账号字段，
-    仍然接受 —— 否则宿主手里尚未过期的那一个会被突然判死）。
+    account_scope 给定时，游标必须**证明**自己属于这个账号：带账号字段且一致。
+    🔴 缺账号字段与账号不符一样拒绝 —— 原来的 `payload.get("a") and ...` 会在
+       缺字段时直接放行，于是一个不带账号信息的游标可以被任何账号拿去当已见集合
+       （多账号并行下这是静默的数据错误）。
     """
     if value in (None, ""):
         return set(), 1
@@ -140,9 +212,27 @@ def _decode_cursor(value, keyword, account_scope=None):
         raise SidecarError("invalid_input", "cursor version is not supported")
     if payload.get("k") != keyword:
         raise SidecarError("invalid_input", "cursor does not belong to this keyword")
-    if account_scope and payload.get("a") and str(payload["a"]) != str(account_scope):
+    if account_scope and str(payload.get("a") or "") != str(account_scope):
         raise SidecarError("cursor_account_mismatch",
                            "cursor belongs to another account scope")
+    # 🔴 筛选条件必须与游标里记的一致。
+    #    默认（filters=None）= "我期望一个不带筛选的游标"，这是 fail-closed 的方向：
+    #    忘了传 filters 的调用方只会被拒绝，不会悄悄放行。
+    #    形状不对的 "f" 同样按不一致处理 —— 本版本产出的游标一定带完整三元组。
+    recorded = payload.get("f")
+    if not isinstance(recorded, dict) or set(recorded) != set(CURSOR_FILTER_KEYS):
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor was issued for other search filters; start a new search")
+    try:
+        recorded_binding = _normalize_binding(recorded)
+    except SidecarError:
+        # "f" 里塞了非数字（"abc" / [] / {}）：这不是本版本产出的游标，
+        # 按【不一致】拒绝，绝不把裸 ValueError/TypeError 冒到协议层。
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor filter bindings are malformed; start a new search")
+    if recorded_binding != _normalize_binding(filters):
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor was issued for other search filters; start a new search")
     seen = payload.get("seen")
     if not isinstance(seen, list) or len(seen) > CURSOR_MAX_SEEN:
         raise SidecarError("invalid_input", "cursor pool is invalid")
@@ -901,15 +991,16 @@ class Sidecar:
         if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > MAX_KEYWORD:
             raise SidecarError("invalid_input", "keyword is required")
         keyword = keyword.strip()
-        max_videos = int(params.get("maxVideos", 50))
-        rounds = int(params.get("scrollRounds", 6))
+        # 🔴 参数解析必须给出【稳定错误码】：原来直接 int(...)，宿主给 "abc" / [] 时
+        #    会抛出裸 ValueError（协议层只能看到一个没有码的内部错误）。
+        max_videos = _int_value(params.get("maxVideos", 50), "maxVideos", default=50)
+        rounds = _int_value(params.get("scrollRounds", 6), "scrollRounds", default=6)
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
         cursor_in = params.get("cursor")
         # account_scope 用 getattr 取：测试替身（__new__ 构造）没有这个属性，
         # 而游标绑定属于【加法能力】，不该让既有的搜索契约整体失败。
         scope = getattr(self, "account_scope", None)
-        seen, page_no = _decode_cursor(cursor_in, keyword, scope)
         # 发布时间区间：可配置（宿主/后续 UI 给 "YYYY-MM" 或 "YYYY-MM-DD"）。
         # 为什么不由平台筛选面板决定：面板只给"一天内/一周内/半年内"这类预设，
         # 表达不了"2026 年 6–9 月"这种自选区间，所以区间判定放在本侧。
@@ -918,9 +1009,13 @@ class Sidecar:
         if date_from is not None and date_to is not None and date_from > date_to:
             raise SidecarError("invalid_input", "dateFrom must not be after dateTo")
 
-        min_relevance = int(params.get("minRelevance", 0) or 0)
+        min_relevance = _int_value(params.get("minRelevance", 0), "minRelevance", default=0)
         if not 0 <= min_relevance <= 100:
             raise SidecarError("invalid_input", "minRelevance must be between 0 and 100")
+        # 🔴 游标必须在【筛选条件校验之后】才解码：它现在绑定的是解析后的
+        #    dateFrom/dateTo/minRelevance 三元组，先解码就没得比。
+        binding = _filter_binding(date_from, date_to, min_relevance)
+        seen, page_no = _decode_cursor(cursor_in, keyword, scope, binding)
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
@@ -991,7 +1086,10 @@ class Sidecar:
                            "unknownDate": unknown_date,
                            "dateFrom": params.get("dateFrom") or None,
                            "dateTo": params.get("dateTo") or None,
-                           "minRelevance": min_relevance}
+                           "minRelevance": min_relevance,
+                           # 游标里绑定的规范化筛选条件（epoch 秒）。宿主可据此核对
+                           # "这个游标属于哪一组条件"，不必自己解析游标。
+                           "cursorFilters": dict(binding)}
             if meta.get("stopped_reason") == "captcha":
                 # 🔴 验证码是【终止状态】，不是"这一页到头了"。
                 #    继续返回 cursor / hasMore=true，上层就会自动接着翻页 ——
@@ -1041,7 +1139,7 @@ class Sidecar:
                         "filter": page_filter}
             return {"status": "ok",
                     "videos": out,
-                    "cursor": _encode_cursor(keyword, pool, page_no + 1, scope),
+                    "cursor": _encode_cursor(keyword, pool, page_no + 1, scope, binding),
                     "hasMore": True,
                     "stoppedReason": None,
                     # 分页记录：宿主重启后要能复现"这一页为什么停"，也认得出游标是哪一版产出的。
