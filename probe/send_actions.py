@@ -6,7 +6,7 @@ platform response is recorded as ``unknown`` and blocks a later retry.
 import json
 import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import click_guard
 import douyin
@@ -844,21 +844,118 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
         return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
 
 
-def _publish_record_matches(record, text, comment_id):
-    """这条发布回执是否属于【本次】这条评论。
+# ---- 发布回执的结构化绑定（评审 2026-09-26）----
+#
+# 原来只做【原始串包含】：请求体里出现正文或评论 id 就算绑定。两个坑：
+#   1) JSON 请求体里的中文会被转义成 \uXXXX，用原文比对永远不命中 ——
+#      "发出去了、平台也回了 200，却因为编码不同被判成绑定不上"；
+#   2) 短正文（"111"、"0"）会撞上 id、时间戳等别的字段，
+#      把【别人的】回执算成本次的 -> 过度宣称成功。
+# 所以先解析请求体（form URL 编码 / JSON / 值里再套一层 JSON），再按【字段】比对。
+#
+# 🔴 请求体只在内存里用于这一次绑定：不写日志、不写台账、不进 evidence。
+_REQUEST_ID_FIELDS = ("reply_id", "reply_comment_id", "comment_id", "cid",
+                      "commentid", "replyid", "reply_cid")
+_REQUEST_TEXT_FIELDS = ("text", "content", "comment", "reply_text", "replytext",
+                        "comment_text", "content_text")
 
-    绑定依据（优先级从高到低）：
-      1) 请求体里出现本次回复正文 —— 这条请求就是我们发出去的；
-      2) 请求体里出现目标评论 id —— 平台回复某条评论时会带上。
-    只有拿到请求体（postData）才可能绑定；拿不到就返回 False，
+
+def _leaf_value(value):
+    """非字符串的叶子值也转成字符串：平台的 id 常常是 JSON 数字。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _json_pairs(value, depth=0):
+    """JSON 对象/数组 -> [(小写字段名, 字符串值)]；认不得的结构返回 []。"""
+    pairs = []
+    if depth > 2:
+        return pairs
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = str(key).lower()
+            if isinstance(item, str):
+                pairs.append((name, item))
+            elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                pairs.append((name, _leaf_value(item)))
+            elif isinstance(item, (dict, list)):
+                pairs.extend(_json_pairs(item, depth + 1))
+        return pairs
+    if isinstance(value, list):
+        for item in value:
+            pairs.extend(_json_pairs(item, depth + 1))
+    return pairs
+
+
+def _request_pairs(record):
+    """把回执请求体解析成 [(字段名, 值)]；解析不出来就是 []（= 绑定不上，按 unknown）。
+
+    认三种形状：form URL 编码（会解百分号与 + 号）、JSON、以及 form 值里再套一层 JSON。
+    """
+    payload = (record or {}).get("postData")
+    if not isinstance(payload, str) or not payload.strip():
+        return []
+    text = payload.strip()
+    pairs = []
+    if text[:1] in ("{", "["):
+        try:
+            pairs = _json_pairs(json.loads(text))
+        except ValueError:
+            pairs = []
+        if pairs:
+            return pairs
+    try:
+        form = parse_qs(text, keep_blank_values=True)
+    except Exception:
+        form = {}
+    for name, values in form.items():
+        for value in values:
+            pairs.append((str(name).lower(), str(value)))
+            nested = str(value).strip()
+            if nested[:1] in ("{", "["):
+                try:
+                    pairs.extend(_json_pairs(json.loads(nested)))
+                except ValueError:
+                    pass
+    return pairs
+
+
+def _publish_binding(record, text, comment_id):
+    """这条回执属于【本次】这条评论吗？返回 (是否绑定, 依据)。
+
+    优先级：
+      1) 请求体里【带 id 的字段】精确等于目标评论 id -> ("comment_id")
+         —— 精确到值，短正文、编码差异都影响不到它；
+      2) 请求体里【正文字段】等于或包含本次正文 -> ("text")
+         —— 平台可能在正文前后插入 @昵称 之类的内容，所以用包含判定，
+            但只在正文字段里判，不在整串里判。
+
+    请求体拿不到、或解析不出任何字段 -> (False, None)：证据不足，
     由调用方按 unknown 处理 —— 绝不"看到发布接口就当自己成功"。
     """
-    payload = str((record or {}).get("postData") or "")
-    if not payload:
-        return False
-    if text and text in payload:
-        return True
-    return bool(comment_id and comment_id in payload)
+    pairs = _request_pairs(record)
+    if not pairs:
+        return False, None
+    wanted_id = str(comment_id or "").strip()
+    if wanted_id:
+        for name, value in pairs:
+            if "id" in name and value.strip() == wanted_id:
+                return True, "comment_id"
+    wanted_text = str(text or "").strip()
+    if wanted_text:
+        for name, value in pairs:
+            if name in _REQUEST_TEXT_FIELDS or "text" in name or "content" in name:
+                if value.strip() == wanted_text or wanted_text in value:
+                    return True, "text"
+    return False, None
+
+
+def _publish_record_matches(record, text, comment_id):
+    """兼容旧调用点的薄封装：只要绑定依据。新代码请用 _publish_binding。"""
+    return _publish_binding(record, text, comment_id)[0]
 
 
 def send_comment(tab, gate, send_id, target, text, source):
@@ -1053,26 +1150,40 @@ def send_comment(tab, gate, send_id, target, text, source):
         # 🔴 评审要求（2026-09-26）：回执必须绑定到【这一条评论】。
         #    只按 URL 匹配时，同一页面里任何一次发布请求都会被算成本次动作的回执
         #    （并发/重试下张冠李戴）。绑定依据见 _publish_record_matches。
-        bound = [r for r in matched if _publish_record_matches(r, text, target_id)]
-        statuses = [_response_status(r) for r in bound]
+        bound = []
+        for record in matched:
+            ok, basis = _publish_binding(record, text, target_id)
+            if ok:
+                bound.append((record, basis))
+        # 🔴 按评论 ID 绑定的那一条是【结论性】的：它精确到值，优先采信；
+        #    只有正文绑定时，多条回执就无法区分归属（并发、双击、页面重试）。
+        by_id = [item for item in bound if item[1] == "comment_id"]
+        chosen = by_id if by_id else bound
+        statuses = [_response_status(record) for record, _ in chosen]
+        # ⚠️ detail 里只放计数与状态码：请求体（postData）本身【不进台账、不进日志】。
         detail = {"httpResponses": len(records), "matchedResponses": len(matched),
-                  "boundResponses": len(bound),
+                  "boundResponses": len(bound), "boundByCommentId": len(by_id),
                   "platformStatusCodes": statuses[:5],
                   "networkEnableError": record_error}
-        if bound and any(status == 0 for status in statuses):
+        if len(chosen) > 1:
+            # 归属于哪一条无法判定：证据不足，按未确定处理，禁止进入私信。
+            # 宁可停在 unknown 交人工，也不能挑一条"看起来成功"的回执当结论。
+            row = gate.finish(send_id, "unknown", "platform_response_ambiguous", detail)
+        elif not chosen:
+            if matched:
+                # 命中发布接口但绑定不到本条评论/正文：证据不足，禁止进入私信。
+                row = gate.finish(send_id, "unknown", "platform_response_unbound", detail)
+            else:
+                row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
+        elif statuses[0] == 0:
             # 只有平台明确回 status_code=0 才算【确认成功】——
             # 这是唯一允许进入私信阶段的状态（图 11 固定流程二）。
             row = gate.finish(send_id, "sent_confirmed", "platform_response", detail)
-        elif bound and any(status not in (None, 0) for status in statuses):
+        elif statuses[0] is not None:
             row = gate.finish(send_id, "failed", "platform_rejected", detail)
-        elif bound:
+        else:
             # 命中接口但读不出状态码：证据不足，按未确定处理，禁止进入私信。
             row = gate.finish(send_id, "unknown", "platform_response_unreadable", detail)
-        elif matched:
-            # 命中发布接口但无法绑定到本条评论/正文：证据不足，禁止进入私信。
-            row = gate.finish(send_id, "unknown", "platform_response_unbound", detail)
-        else:
-            row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
         return gate.result(row)
     except Exception as exc:
         return _internal_failure(gate, send_id, started, exc, "send_comment")
