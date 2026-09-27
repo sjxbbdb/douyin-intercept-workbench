@@ -198,6 +198,15 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
+* **搜索池持久化发布时间（2026-09-26 评审收尾）**：`search_videos` 新增 `create_time` 与
+  `published_at`，`search_pool` 返回的每条候选都带 `createTime` / `publishedAt`
+  （取不到就是 `null`，**不拿采集时刻冒充发布日期**）。此前池子只存链接与相关度，
+  宿主重启后"这个视频什么时候发的"就丢了 —— 而发布时间恰恰是"按 6–9 月筛"的依据。
+  老库由 `SearchPool._migrate` **原地补列**（`ALTER TABLE`），已有的历史行留 NULL，
+  由 `stats.unknownDate` 计数；重新采集时用 `COALESCE` 保留已知值
+  （新一页没拿到发布时间，不该把已经知道的值擦掉）。
+  `videoId -> 评论区` 的正式交接（`SearchPool.get`）语义不变。
+  回归：`test_search_pool_persistence.SearchPoolPersistenceTests`。
 * **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
   以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
   续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
