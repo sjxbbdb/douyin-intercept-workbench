@@ -808,6 +808,10 @@ def dedupe_comments(rows):
        全部落进同一个空身份的桶里，于是两个不同用户发同一句话（"求带"）
        会被 _same_comment 判成同一条并丢掉其中一条。下游是按人去私信的，
        丢错人 = 给错人发消息。宁可留下一条重复，也不能合并两个用户。
+
+    🔴 第 1 条【优先于】第 2/3 条（评审 2026-09-27）：两个【不同的非空评论 ID】
+       永远是两条记录 —— 哪怕作者与正文都一样。身份兜底只允许把"没有评论 ID 的
+       那一份"并进另一条（接口副本 / DOM 副本），绝不允许把两个有 ID 的评论并成一条。
     """
     out, by_cid, by_identity = [], {}, {}
     for row in rows:
@@ -822,11 +826,17 @@ def dedupe_comments(rows):
             dup = by_cid[cid]
         elif identity is not None:
             for idx in by_identity.get(identity, []):
+                other_cid = str(out[idx].get("_cid") or "")
+                # 🔴 两个【不同的】非空评论 ID 必须是两条记录：作者与正文相同也不行。
+                #    只有"本条没有 ID"，或"对方没有 ID"（DOM 副本）时才允许按身份兜底合并。
+                if cid and other_cid and cid != other_cid:
+                    continue
                 if _same_comment(norm, out[idx].get("_norm", "")):
                     dup = idx
                     break
         if dup is None:
             row["_norm"] = norm
+            row["_cid"] = cid
             index = len(out)
             if cid:
                 by_cid[cid] = index
@@ -839,9 +849,11 @@ def dedupe_comments(rows):
             by_cid[cid] = dup
         if _richer(row, out[dup]):
             row["_norm"] = norm
+            row["_cid"] = cid
             out[dup] = row
     for r in out:
         r.pop("_norm", None)
+        r.pop("_cid", None)
     return out
 
 

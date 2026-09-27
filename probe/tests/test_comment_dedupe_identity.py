@@ -86,6 +86,50 @@ class CommentDedupeIdentityTests(unittest.TestCase):
         self.assertEqual(rows[0]["cid"], "cid-9", "留下能被下游正式引用的那条")
 
 
+    def test_two_different_comment_ids_are_never_merged(self):
+        """两个【不同的非空评论 ID】必须是两条记录：作者与正文相同也不行。
+
+        评审 2026-09-27：身份兜底逻辑会把"同作者 + 同正文"并成一条，
+        但评论 ID 不同就是两条不同的评论 —— 合并会让下游漏掉一条目标，
+        也会让"这条评论有没有被处理过"的账对不上。
+        """
+        rows = crawl.dedupe_comments([
+            row(text=TEXT, cid="cid-1", sec_uid="sec-1", nick="甲", source="api"),
+            row(text=TEXT, cid="cid-2", sec_uid="sec-1", nick="甲", source="api"),
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(r["cid"] for r in rows), ["cid-1", "cid-2"])
+
+    def test_two_different_comment_ids_are_kept_without_any_author_id(self):
+        """只有昵称、但有不同评论 ID：同样不能合并（昵称不是身份，ID 才是）。"""
+        rows = crawl.dedupe_comments([
+            row(text=TEXT, cid="cid-1", nick="甲"),
+            row(text=TEXT, cid="cid-2", nick="甲"),
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r.get("_cid") for r in rows], [None, None],
+                         "内部去重键不得泄漏到调用方")
+
+    def test_a_dom_copy_still_merges_into_the_id_bearing_record(self):
+        """反向保护：没有评论 ID 的那一份（DOM 副本）仍然要并进有 ID 的记录。"""
+        rows = crawl.dedupe_comments([
+            row(text="谢谢了", sec_uid="sec-1", nick="甲"),
+            row(text="谢谢了[握手]", cid="cid-1", sec_uid="sec-1", source="api", digg=2),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cid"], "cid-1", "留下能被下游正式引用的那条")
+
+    def test_two_ids_and_a_dom_copy_produce_two_records(self):
+        """混合场景：两条不同 ID 的评论 + 一条 DOM 副本 = 两条记录（副本并进其中一条）。"""
+        rows = crawl.dedupe_comments([
+            row(text=TEXT, cid="cid-1", sec_uid="sec-1", nick="甲", source="api"),
+            row(text=TEXT, cid="cid-2", sec_uid="sec-1", nick="甲", source="api"),
+            row(text=TEXT, sec_uid="sec-1", nick="甲"),
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(r["cid"] for r in rows), ["cid-1", "cid-2"])
+
+
 class CommentAbsorbKeyTests(unittest.TestCase):
     """抓取期的键：_comment_key 是 comments 字典的键，撞了就直接丢。"""
 
