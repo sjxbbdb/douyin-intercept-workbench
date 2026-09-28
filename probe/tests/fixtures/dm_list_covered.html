@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dm conversation list covered by the open chat</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; }
+</style>
+<body>
+  <!-- 真机事实（2026-09-26）：会话打开之后，整列会话列表【仍然挂在 DOM 里、仍然有真实尺寸】，
+       但整列被会话内容盖住 —— elementFromPoint 命中的是消息气泡，不是列表行。
+       照坐标点下去就是点进对方的会话里（可能点到消息里的链接），所以必须判成不可点。 -->
+  <div class="componentsEntrywrapper imContainer">
+    <div class="conversationConversationItemwrapper" id="row-other" style="position:absolute;left:700px;top:200px;width:320px;height:64px">
+      <div class="conversationConversationItemtitle">Other Person</div>
+      <div class="ConversationItemHinttextBox">对方回复或关注你之前，只能发送一条文字消息</div>
+    </div>
+    <div class="conversationConversationItemwrapper" id="row-target" style="position:absolute;left:700px;top:280px;width:320px;height:64px">
+      <div class="conversationConversationItemtitle">Target User</div>
+      <div class="ConversationItemHinttextBox">你好，看到你在直播间的提问</div>
+    </div>
+    <div id="chat" style="position:absolute;left:690px;top:60px;width:335px;height:838px;background:#111;color:#eee;z-index:5">
+      <div class="messageMessageBoxmessageBox" style="position:absolute;left:60px;top:130px;width:200px;height:40px">
+        <span class="TextMessageTextpureText">你好，看到你在直播间的提问</span>
+      </div>
+    </div>
+  </div>
+</body>

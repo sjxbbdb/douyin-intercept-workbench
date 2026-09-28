@@ -527,6 +527,21 @@ Semi Design 的浮层在隐藏时被放到屏幕外（实测 `(-9947, -9941)`）
 * 新增跳过原因 `dm_conversation_unavailable`（面板开了、但列表里没有对方那一行），
   evidence 里带 `attempts`（每轮的面板/会话状态）与 `entryClicks`。
 
+🔴 同一次真机复盘中还发现第二个坑（同一类问题，一起修）：**会话打开之后，整列会话列表仍然
+挂在 DOM 里、仍然有真实尺寸**，但整列被会话内容盖住 —— 真机实测 `elementFromPoint` 命中的是
+`TextMessageTextpureText`（消息气泡），不是列表行：
+
+```
+一日九万里    x=852 y=201  hit=DIV.messageMessageBoxmessageBox   inside=false
+Mr.吉～～     x=852 y=268  hit=SPAN.TextMessageTextpureText      inside=false
+紫风玲        x=852 y=335  hit=DIV(空 class)                     inside=false
+```
+
+照这种「伪可见」的坐标点下去就是点进对方的会话里（可能点到消息里的链接），所以会话行现在和
+私信入口走**同一套遮挡判定**：行中心必须自己接住 `elementFromPoint`，否则返回
+`conversation_row_covered`，一个点击都不发。真机复核：会话打开时四个目标全部 `covered`，
+随机名仍然是 `conversation_row_not_found`。
+
 ⚠️ 平台那句「对方回复或关注你之前，只能发送一条文字消息。请礼貌发言…」**不是拒绝**：
 平台允许发一条，遇到它必须照常发出去（用户 2026-09-26 明确）。
 
