@@ -207,19 +207,6 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
-* **私信面板里"挑输入框"和"判回显"都不许被搜索框骗（2026-09-28 真机反馈）**：私信面板左上是
-  【搜索】框，和发消息输入框一样是可见 editable；面板里还有会话列表。
-  * 挑输入框：`searchish()` 守卫（placeholder / 自身或祖先 class / data-e2e 含 search）已加进
-    `dm_composer` / `dm_composer_for_recipient` / `dm_panel_state` / `dm_send_button_for_recipient`，
-    保证"发消息的输入框"永远唯一命中 —— 否则文字会打进搜索框，消息根本没发出去；
-  * 判回显：旧实现把会话 scopes 里最长的一段 innerText 拼起来做【子串】匹配，
-    而 `[class*="imChat"]` 会命中输入框容器 `messageEditorimChatEditorContainer`
-    （真机实测 `editorInsideConversationScope: true`）——"刚敲进输入框、还没发出去"的文字
-    也会被判成会话回显（假证据）。现在只在会话区找【叶子节点、全文相等】的元素，
-    并显式排除输入框与搜索框子树。
-  真机验证：把标记词打进输入框（不发送）-> `dm_conversation_echo` 返回 `False`；
-  会话里真的存在的那条 -> 返回 `True`。
-  回归：`test_probe.ChromiumFixtureTests` 新增 2 个用例（夹具里补了搜索框与会话列表）。
 * **服务端签发策略的「身份」冻结（2026-09-26 评审收尾）**：本侧**不接收策略内容**
   （`policy` 对象继续以 `policy_not_server_issued` 拒绝），但支持把策略**身份**冻结进计划：
   `policyId` + `policyVersion`（+ 可选 `knowledgeSetVersion`），
@@ -357,6 +344,19 @@ same `unknown` semantics as the other send paths.
   透传由平台侧补齐，本侧只保证字段名与取值稳定。
   回归：`SearchPagingRelevanceTests.test_page_record_carries_version_and_paging_outcome`、
   `test_paging_outcome_is_not_confused_with_the_platform_signal`。
+* **私信面板里"挑输入框"和"判回显"都不许被搜索框骗（2026-09-28 真机反馈）**：私信面板左上是
+  【搜索】框，和发消息输入框一样是可见 editable；面板里还有会话列表。
+  * 挑输入框：`searchish()` 守卫（placeholder / 自身或祖先 class / data-e2e 含 search）已加进
+    `dm_composer` / `dm_composer_for_recipient` / `dm_panel_state` / `dm_send_button_for_recipient`，
+    保证"发消息的输入框"永远唯一命中 —— 否则文字会打进搜索框，消息根本没发出去；
+  * 判回显：旧实现把会话 scopes 里最长的一段 innerText 拼起来做【子串】匹配，
+    而 `[class*="imChat"]` 会命中输入框容器 `messageEditorimChatEditorContainer`
+    （真机实测 `editorInsideConversationScope: true`）——"刚敲进输入框、还没发出去"的文字
+    也会被判成会话回显（假证据）。现在只在会话区找【叶子节点、全文相等】的元素，
+    并显式排除输入框与搜索框子树。
+  真机验证：把标记词打进输入框（不发送）-> `dm_conversation_echo` 返回 `False`；
+  会话里真的存在的那条 -> 返回 `True`。
+  回归：`test_probe.ChromiumFixtureTests` 新增 2 个用例（夹具里补了搜索框与会话列表）。
 * **两个 mismatch 枚举不要混用（同义不同名，刻意的）**：公屏回复与私信的绑定校验在两条通道上
   各有自己的枚举 ——
   * 评论区：`public_send_id_mismatch`（`comment_private`）；
