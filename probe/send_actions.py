@@ -586,12 +586,12 @@ def _mention_matches(composer_text, author_name):
     return bool(want) and want in norm(composer_text)
 
 
-def _restore_chat_bottom(tab, scrolled_steps):
+def _restore_chat_bottom(tab, scrolled_px):
     """上滚找过旧弹幕之后把列表滚回最新（best-effort，失败不影响发送结论）。"""
-    if not scrolled_steps:
+    if not scrolled_px:
         return
     try:
-        live.resume_chat_bottom(tab)
+        live.resume_chat_bottom(tab, distance=scrolled_px)
     except Exception:
         pass
 
@@ -671,14 +671,14 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
         state = None
         refusal = None
         last_mismatch = None
-        scrolled_steps = 0
+        scrolled_px = 0
         for attempt in range(3):
             # placed：调用方刚读到的"此刻可见坐标"。第一次点击直接用它 ——
             # 重新定位要多花几百毫秒，高流量房间里那条弹幕已经被顶走了（真机实测）。
             menu = live.open_reply_menu(tab, {"authorName": author_name, "text": danmaku_text},
                                         placed=placed if attempt == 0 else None)
-            # 为了找到这条已经滚走的弹幕，定位器可能上滚了几步：记下来，最后把列表滚回最新。
-            scrolled_steps = max(scrolled_steps, int(menu.get("scrolledSteps") or 0))
+            # 为了找到这条已经滚走的弹幕，定位器可能上滚了几千像素：记下来，最后把列表滚回最新。
+            scrolled_px = max(scrolled_px, int(menu.get("scrolledPx") or 0))
             if not menu.get("ok"):
                 refusal = menu.get("reason") or "reply_menu_not_opened"
                 continue
@@ -753,8 +753,8 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
             break
         if state is None:
             # 上滚找过旧弹幕就把列表滚回最新（否则下一轮采集看到的还是那批旧弹幕）。
-            _restore_chat_bottom(tab, scrolled_steps)
-            evidence = {"scrolledSteps": scrolled_steps}
+            _restore_chat_bottom(tab, scrolled_px)
+            evidence = {"scrolledPx": scrolled_px}
             if last_mismatch:
                 evidence["mismatch"] = last_mismatch
             return gate.result(gate.finish(send_id, "failed", refusal or "reply_menu_not_opened",
@@ -768,11 +768,11 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
         else:
             tab.press_key("Enter", code="Enter", key_code=13)
         echo = live.wait_room_echo(tab, text)
-        _restore_chat_bottom(tab, scrolled_steps)
+        _restore_chat_bottom(tab, scrolled_px)
         row = gate.finish(send_id, "unknown", "platform_response_unavailable",
                           {"mechanism": mechanism, "via": "native_reply_ta",
                            "mentionInserted": True, "danmakuLocated": True,
-                           "scrolledSteps": scrolled_steps,
+                           "scrolledPx": scrolled_px,
                            "composerCleared": echo.get("composerCleared"),
                            "roomEcho": bool(echo.get("row")),
                            "roomEchoSource": "page_memory" if echo.get("row") else None})

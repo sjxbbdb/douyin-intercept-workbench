@@ -3058,7 +3058,8 @@ class ChatScrollTests(unittest.TestCase):
             (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
              live.scroll_chat_list, live.click_guard.click_checked) = original
         self.assertTrue(menu["ok"], menu)
-        self.assertGreaterEqual(menu["scrolledSteps"], 1, "必须真的上滚去找过那条弹幕")
+        self.assertGreaterEqual(menu["scrolledPx"], live.RECOVERY_SCROLL_PX,
+                                "必须真的上滚去找过那条弹幕（420px 在快房间里只够买一秒）")
         self.assertIn("up", calls["scroll"])
         self.assertEqual(calls["clicks"], [(1100, 400)], "找到之后点的是定位到的那条")
 
@@ -3070,12 +3071,15 @@ class ChatScrollTests(unittest.TestCase):
         live.scroll_chat_list = lambda _cdp, direction="up", amount=420, times=1, box=None: (
             seen.append(direction), {"ok": True})[1]
         try:
-            result = live.resume_chat_bottom(object(), times=2)
+            result = live.resume_chat_bottom(object(), distance=3 * live.RECOVERY_SCROLL_PX)
+            short = live.resume_chat_bottom(object(), distance=0)
         finally:
             live.scroll_chat_list = original
         self.assertTrue(result["ok"])
-        self.assertEqual(seen, ["down", "down"])
-        self.assertEqual(result["scrolled"], 2)
+        self.assertEqual(seen, ["down"] * 6)
+        self.assertGreaterEqual(result["distance"], 3 * live.RECOVERY_SCROLL_PX,
+                                "回滚距离至少要覆盖刚才上滚的像素数")
+        self.assertEqual(short["scrolled"], 3, "没上滚过也要回到底部（防呆）")
 
 class RoomUrlTests(unittest.TestCase):
     """真机回归（2026-09-20）：抖音直播广场点进来的房间，房间号在【查询串】里。

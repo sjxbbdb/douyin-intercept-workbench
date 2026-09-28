@@ -552,18 +552,25 @@ def scroll_chat_list(cdp, direction="up", amount=420, times=1, box=None):
     return {"ok": True, "box": list(box), "delta": delta * max(1, int(times))}
 
 
-def resume_chat_bottom(cdp, box=None, times=3):
+# 上滚找回「已经滚出可视区」的弹幕：真机量出来的距离（见 open_reply_menu 里的注释）。
+RECOVERY_SCROLL_PX = 1200
+RECOVERY_ATTEMPTS = 5
+
+
+def resume_chat_bottom(cdp, box=None, distance=0, min_steps=3, max_steps=12):
     """把聊天列表滚回最新（best-effort）。
 
     上滚找旧弹幕之后必须回到最新：否则下一次采集看到的还是那批旧弹幕，
-    新弹幕全落在列表可视区下方。
+    新弹幕全落在列表可视区下方。distance 是刚才上滚的像素数，回滚至少要覆盖它。
     """
+    steps = (max(0, int(distance)) + RECOVERY_SCROLL_PX - 1) // RECOVERY_SCROLL_PX
+    steps = max(int(min_steps), min(int(max_steps), steps))
     scrolled = 0
-    for _ in range(max(1, int(times))):
+    for _ in range(steps):
         if not scroll_chat_list(cdp, "down", 420, 1, box).get("ok"):
             break
         scrolled += 1
-    return {"ok": True, "scrolled": scrolled}
+    return {"ok": True, "scrolled": scrolled, "distance": steps * RECOVERY_SCROLL_PX}
 
 
 def pause_autoscroll(cdp, settle=1.3, box=None):
@@ -1029,20 +1036,20 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
         #    正确做法是 fail-closed：没有主列表矩形就不点。
         return {"ok": False, "reason": "main_chat_list_not_found"}
     last = None
-    scrolled_steps = 0
+    scrolled_px = 0
     pending = placed if isinstance(placed, dict) and placed.get("x") is not None else None
-    for index in range(4):
+    for index in range(RECOVERY_ATTEMPTS):
         if index == 1:
             settled = pause_autoscroll(cdp)
             box = settled.get("box") or box
         elif index >= 2:
-            # 🔴 真机（2026-09-26，高流量房间）：从采集到回复只要几秒，那条弹幕就已经被新弹幕
-            #    顶出可视区（DOM 只渲染十几行，被顶走的那条连节点都没了），表现为
-            #    danmaku_not_found_in_list 成片出现。真人的做法是往上滚一点去找更早的弹幕，
-            #    所以这里带着上限滚 1 步再重新定位；滚了还找不到就老实 fail-closed，绝不猜坐标。
-            if scroll_chat_list(cdp, "up", 420, 1, box).get("ok"):
-                scrolled_steps += 1
-            time.sleep(0.5)
+            # 🔴 真机量出来的（2026-09-26，高流量房间 685317364746，公屏每秒好几条）：
+            #    采集后 0s 四条全部能直接定位；15s 时一条都定不到，但【上滚 3600px 找回一半】；
+            #    30s / 60s 之后连上滚 6000px 都找不回来（页面的历史窗口已经过去了）。
+            #    所以上滚距离必须够大 —— 420px 在快房间里只够买一秒。
+            if scroll_chat_list(cdp, "up", RECOVERY_SCROLL_PX, 1, box).get("ok"):
+                scrolled_px += RECOVERY_SCROLL_PX
+            time.sleep(0.6)
         if pending is not None:
             # 🔴 真机教训（2026-09-20，高流量房间）：先读"此刻可见的行"拿到坐标，
             #    再重新定位会多花几百毫秒到几秒 —— 期间那条弹幕已经被新弹幕顶走，
@@ -1077,13 +1084,13 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
             menu = cdp.eval_json(MENU_ITEMS_JS)
             if isinstance(menu, dict) and menu.get("found"):
                 return {"ok": True, "items": menu["items"], "placed": found,
-                        "attempts": index + 1, "scrolledSteps": scrolled_steps}
+                        "attempts": index + 1, "scrolledPx": scrolled_px}
             if time.time() >= deadline:
                 break
             time.sleep(interval)
         last = "reply_menu_not_opened"
     return {"ok": False, "reason": last or "reply_menu_not_opened",
-            "scrolledSteps": scrolled_steps}
+            "scrolledPx": scrolled_px}
 
 
 def choose_reply_menu_item(cdp, menu, labels=NATIVE_REPLY_LABELS):
