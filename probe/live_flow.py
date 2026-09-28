@@ -595,14 +595,16 @@ class LiveQueue:
     # ------------------------------------------------------------------- plan
 
     def freeze_plan(self, batch_id, scripts, policy=None, reply_mode="composer",
-                    reply_via="native", policy_ref=None):
+                    reply_via="native", policy_ref=None, policy_source=None):
         """Freeze the two-channel plan for one batch.
 
         'scripts' maps an event id (or fingerprint) to an object carrying
         'publicText' and 'privateText'.  Both channels are required for a target
         to stay sendable; this module never fills them itself.
         """
-        policy_source = "request" if policy else "builtin_default"
+        # 策略来源：调用方自带（request）/ 授权端下发的文件（server_file）/ 内置保守默认值。
+        # 🔴 只有 server_file 才有资格扩大放行范围（见 sidecar 的 _policy_public_echo）。
+        policy_source = str(policy_source or ("request" if policy else "builtin_default"))
         policy = normalize_policy(policy)
         # 策略身份在【冻结时】校验并记下：之后的执行阶段必须带回同一个身份。
         ref = normalize_policy_ref(policy_ref)

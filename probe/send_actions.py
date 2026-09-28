@@ -1135,10 +1135,13 @@ def send_comment(tab, gate, send_id, target, text, source):
         tab.click_at(composer["x"], composer["y"])
         tab.type_text(text)
         if source == "live":
+            # 🔴 真机（2026-09-20 起结论、2026-09-28 在直播间复现）：
+            #    直播公屏这条通道的发送键是【回车】—— 右侧那个图标点下去内容会原样留在框里。
+            #    所以"能找到发送按钮"只是快路径；找不到/不可用时按回车发送，
+            #    不能因为按钮不在就把整条公屏通道判成 failed（真机实测就是这条把它拦死的）。
             button = live.find_send_button(tab)
-            if not button.get("found") or button.get("disabled"):
-                row = gate.finish(send_id, "failed", "comment_send_button_unavailable")
-                return gate.result(row)
+            if not (button.get("found") and not button.get("disabled")):
+                button = {"found": False, "mechanism": "enter"}
         else:
             # ⚠️ 语义变化：comment_reply_send_button 的 found 表示【处于激活态】。
             # 真机上发送键是 <svg>，没有 disabled 属性，旧判据永远为假；
@@ -1173,7 +1176,11 @@ def send_comment(tab, gate, send_id, target, text, source):
             record_error = type(exc).__name__
         gate.mark_started(send_id)
         started = True
-        tab.click_at(button["x"], button["y"])
+        if source == "live" and not button.get("found"):
+            # 直播公屏：回车发送（真机验证过的机制，见上面的说明）。
+            tab.press_key("Enter", code="Enter", key_code=13)
+        else:
+            tab.click_at(button["x"], button["y"])
         records = recorder.collect(wait_seconds=8.0)
         mark = getattr(S, "COMMENT_PUBLISH_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
@@ -1194,6 +1201,8 @@ def send_comment(tab, gate, send_id, target, text, source):
         detail = {"httpResponses": len(records), "matchedResponses": len(matched),
                   "boundResponses": len(bound), "boundByCommentId": len(by_id),
                   "platformStatusCodes": statuses[:5],
+                  # 用的是哪种发送机制（直播公屏走回车、视频评论走发送键）—— 排障时要看这个。
+                  "mechanism": ("enter" if (source == "live" and not button.get("found")) else "click"),
                   "networkEnableError": record_error}
         if len(chosen) > 1:
             # 归属于哪一条无法判定：证据不足，按未确定处理，禁止进入私信。

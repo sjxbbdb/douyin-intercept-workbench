@@ -24,6 +24,7 @@ import douyin_selectors as S
 import click_guard
 import live
 import live_flow
+import policy_file
 import search_pool
 import winfocus
 from send_actions import (send_comment, send_danmaku_reply,
@@ -426,6 +427,46 @@ def _public_guard(gate, public_send_id):
 BINDING_MISMATCH = "public_send_id_mismatch"
 
 
+def _policy_allowed_states(server_policy):
+    """授权端策略里放行的公开状态集合；没有策略文件就是空集。"""
+    if not server_policy:
+        return set()
+    states = (server_policy.get("content") or {}).get("allowPublicStates") or []
+    return {str(item) for item in states}
+
+
+def _policy_public_echo(server_policy, event, public_send_id):
+    """服务端策略是否放行了本事件那次【只有页面回声】的公屏回复。
+
+    为什么需要它：直播公屏走 WebSocket —— 真机抓包实证（整段只有埋点请求，
+    没有带本次正文的 HTTP 请求），所以平台回执永远拿不到：
+    台账状态只能是 unknown，队列里最多记到 sent_echoed。
+    "只有 sent_confirmed 才允许私信"这条默认口径于是让直播私信永远走不到。
+
+    只有三个条件同时成立才放行（否则维持原口径）：
+      1) 配置了授权端下发的策略文件（CLI 传入，平台侧落盘）；
+      2) 该策略显式把本事件记录的公开状态列进 allowPublicStates；
+      3) 事件里记的 sendId 精确等于传入的 publicSendId —— 绑定关系一点没松。
+    """
+    if not server_policy:
+        return None
+    detail = (event or {}).get("detail") or {}
+    # 公开状态在两处之一：评论区批次写在 detail.recordedState，直播批次写在事件的 state 列。
+    recorded = str(detail.get("recordedState") or (event or {}).get("state") or "")
+    if not recorded or recorded == PUBLIC_CONFIRMED:
+        return None
+    if str(detail.get("sendId") or "").strip() != str(public_send_id or "").strip():
+        return None
+    if recorded not in _policy_allowed_states(server_policy):
+        return None
+    identity = server_policy.get("identity") or {}
+    return {"policySource": "server_file",
+            "policyId": identity.get("policyId"),
+            "policyVersion": identity.get("policyVersion"),
+            "policySha256": server_policy.get("sha256"),
+            "recordedState": recorded}
+
+
 def _comment_public_binding(queue, event_id, public_send_id):
     """③ 对应性：这个 publicSendId 必须是【本事件】那一次公屏回复。
 
@@ -640,7 +681,7 @@ def _navigate(page, url):
 
 
 class Sidecar:
-    def __init__(self, state_dir, profile_dir, port):
+    def __init__(self, state_dir, profile_dir, port, policy_path=None):
         self.state_dir = self._external_dir(state_dir, "state-dir")
         self.profile_dir = self._external_dir(profile_dir, "profile-dir")
         self.port = int(port)
@@ -658,6 +699,28 @@ class Sidecar:
         # 搜索结果池：按【账号 + 关键词】落库，候选可以被 videoId 正式引用（交接给评论区）。
         self.video_pool = search_pool.SearchPool(self.state_dir, self.account_scope)
         self.marker_path = os.path.join(self.state_dir, "browser-owner.json")
+        # 🔴 策略内容只能来自【授权端下发的文件】（CLI 传入，平台侧落盘）。
+        #    params 里自带的策略一律拒绝（policy_not_server_issued）：
+        #    最弱的那条路径就是实际生效的那条，这个口子不能开。
+        self.policy_path = policy_path
+        self._policy_cache = None
+
+    def _server_policy(self):
+        """读取并校验授权端下发的策略文件；没配置就返回 None（= 内置保守默认值）。
+
+        任何异常（文件缺失 / JSON 坏了 / 哈希对不上 / 过期）都抛 SidecarError：
+        fail-closed —— 宁可拒绝执行，也不用半信半疑的策略去放开红线。
+        """
+        cached = getattr(self, "_policy_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            loaded = policy_file.load(getattr(self, "policy_path", None))
+        except policy_file.PolicyFileError as exc:
+            raise SidecarError(exc.code, exc.message)
+        # 测试替身（__new__ 构造）没有 __init__ 设过的属性，所以这里一律用赋值补上。
+        self._policy_cache = loaded
+        return loaded
 
     @staticmethod
     def _external_dir(value, label):
@@ -1382,10 +1445,13 @@ class Sidecar:
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
                     "expired": batch["expired"], "filter": filtered,
                     "batchFilter": summary.get("filter") or {}}
+        server_policy = self._server_policy()
         plan = self.comment_queue.freeze_plan(
             batch["batchId"],
             comment_flow.build_scripts(batch["events"], public_text, private_text),
-            policy_ref=policy_ref)
+            policy=(server_policy or {}).get("content"),
+            policy_ref=policy_ref,
+            policy_source=("server_file" if server_policy else None))
         # 摘要里的 frozen/status 必须是【冻结之后】的事实：take_batch 那一刻还没冻结，
         # 直接回传会让宿主以为计划没冻上。
         summary["frozen"] = True
@@ -1748,9 +1814,13 @@ class Sidecar:
             # 关键词未命中或队列为空：都不建立批次，下一次监听到达后会形成新的批次
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
                     "expired": batch["expired"], "filter": batch["filter"]}
+        # 策略内容只能来自【授权端下发的文件】；params 里的 policy 仍然被拒（见方法开头）。
+        server_policy = self._server_policy()
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
-                                           params.get("policy"), reply_mode=reply_mode,
-                                           reply_via=reply_via, policy_ref=policy_ref)
+                                           (server_policy or {}).get("content"),
+                                           reply_mode=reply_mode,
+                                           reply_via=reply_via, policy_ref=policy_ref,
+                                           policy_source=("server_file" if server_policy else None))
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
@@ -1875,14 +1945,15 @@ class Sidecar:
                 results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "public_missing"})
                 continue
+            event = self.live_queue.find_event(item["eventId"]) or {}
             refusal = _public_guard(self.gate, public_send_id)
-            if refusal:
+            by_policy = _policy_public_echo(self._server_policy(), event, public_send_id) if refusal else None
+            if refusal and not by_policy:
                 self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": refusal[0]})
                 results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": refusal[0]})
                 continue
-            event = self.live_queue.find_event(item["eventId"]) or {}
             recorded = str((event.get("detail") or {}).get("sendId") or "")
             # 🔴 缺记录也必须拒绝："没有记录"与"记录对不上"是同一类失败 ——
             #    两者都无法证明这次私信绑定的就是【本事件】那次公屏成功。
@@ -1983,9 +2054,14 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--port", required=True, type=int)
+    # 授权端下发的策略文件：由平台侧落盘、主进程按账号作用域传进来。
+    # 不传 = 内置保守默认值（行为与今天完全一致）；传了但校验不过 = fail-closed 拒绝。
+    parser.add_argument("--policy-file", default=None,
+                        help="server-issued policy file (optional; hash-checked)")
     args = parser.parse_args(argv)
     try:
-        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port)
+        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port,
+                          policy_path=args.policy_file)
     except Exception as exc:
         _emit({"id": None, "ok": False, "error": {"code": getattr(exc, "code", "invalid_config"),
                                                       "message": _err_message(getattr(exc, "message", exc))}})
