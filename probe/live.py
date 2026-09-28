@@ -552,6 +552,20 @@ def scroll_chat_list(cdp, direction="up", amount=420, times=1, box=None):
     return {"ok": True, "box": list(box), "delta": delta * max(1, int(times))}
 
 
+def resume_chat_bottom(cdp, box=None, times=3):
+    """把聊天列表滚回最新（best-effort）。
+
+    上滚找旧弹幕之后必须回到最新：否则下一次采集看到的还是那批旧弹幕，
+    新弹幕全落在列表可视区下方。
+    """
+    scrolled = 0
+    for _ in range(max(1, int(times))):
+        if not scroll_chat_list(cdp, "down", 420, 1, box).get("ok"):
+            break
+        scrolled += 1
+    return {"ok": True, "scrolled": scrolled}
+
+
 def pause_autoscroll(cdp, settle=1.3, box=None):
     """上滚一点让列表脱离底部（真人的做法），再用"尾部是否不再变化"验证。
 
@@ -1015,11 +1029,20 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
         #    正确做法是 fail-closed：没有主列表矩形就不点。
         return {"ok": False, "reason": "main_chat_list_not_found"}
     last = None
+    scrolled_steps = 0
     pending = placed if isinstance(placed, dict) and placed.get("x") is not None else None
     for index in range(4):
         if index == 1:
             settled = pause_autoscroll(cdp)
             box = settled.get("box") or box
+        elif index >= 2:
+            # 🔴 真机（2026-09-26，高流量房间）：从采集到回复只要几秒，那条弹幕就已经被新弹幕
+            #    顶出可视区（DOM 只渲染十几行，被顶走的那条连节点都没了），表现为
+            #    danmaku_not_found_in_list 成片出现。真人的做法是往上滚一点去找更早的弹幕，
+            #    所以这里带着上限滚 1 步再重新定位；滚了还找不到就老实 fail-closed，绝不猜坐标。
+            if scroll_chat_list(cdp, "up", 420, 1, box).get("ok"):
+                scrolled_steps += 1
+            time.sleep(0.5)
         if pending is not None:
             # 🔴 真机教训（2026-09-20，高流量房间）：先读"此刻可见的行"拿到坐标，
             #    再重新定位会多花几百毫秒到几秒 —— 期间那条弹幕已经被新弹幕顶走，
@@ -1054,12 +1077,13 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
             menu = cdp.eval_json(MENU_ITEMS_JS)
             if isinstance(menu, dict) and menu.get("found"):
                 return {"ok": True, "items": menu["items"], "placed": found,
-                        "attempts": index + 1}
+                        "attempts": index + 1, "scrolledSteps": scrolled_steps}
             if time.time() >= deadline:
                 break
             time.sleep(interval)
         last = "reply_menu_not_opened"
-    return {"ok": False, "reason": last or "reply_menu_not_opened"}
+    return {"ok": False, "reason": last or "reply_menu_not_opened",
+            "scrolledSteps": scrolled_steps}
 
 
 def choose_reply_menu_item(cdp, menu, labels=NATIVE_REPLY_LABELS):

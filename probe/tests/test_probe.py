@@ -3010,6 +3010,73 @@ class ChatScrollTests(unittest.TestCase):
         self.assertFalse(moving["paused"], "列表仍在动时必须如实报告，不能假装停住了")
 
 
+    def test_open_reply_menu_scrolls_up_when_the_row_rolled_away(self):
+        """真机（2026-09-26，高流量房间）：从采集到回复只要几秒，那条弹幕就已经被新弹幕顶出
+        可视区（DOM 只渲染十几行，被顶走的那条连节点都没了）—— 对外表现就是
+        danmaku_not_found_in_list 成片出现。定位器要像真人一样往上滚去找，找到才点。
+        """
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"find": 0, "scroll": [], "clicks": []}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked)
+
+        class Cdp:
+            def eval_json(self, expression):
+                if expression == live.MENU_ITEMS_JS:
+                    return {"found": True, "items": [{"label": "回复 TA", "text": "回复 TA",
+                                                     "x": 1100, "y": 400}]}
+                return None
+
+        def find(_cdp, _target, box=None):
+            calls["find"] += 1
+            if calls["find"] < 3:
+                return {"ok": False, "reason": "danmaku_not_found_in_list", "box": box}
+            return {"ok": True, "x": 1100, "y": 400, "box": box}
+
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = find
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": True, "box": list(box)}
+
+        def scroll(_cdp, direction="up", amount=420, times=1, box=None):
+            calls["scroll"].append(direction)
+            return {"ok": True, "box": list(box or [])}
+
+        live.scroll_chat_list = scroll
+
+        def click(_cdp, x, y, **_kwargs):
+            calls["clicks"].append((x, y))
+            return {"ok": True}
+
+        live.click_guard.click_checked = click
+        old_sleep = live.time.sleep
+        live.time.sleep = lambda _seconds: None
+        try:
+            menu = live.open_reply_menu(Cdp(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            live.time.sleep = old_sleep
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked) = original
+        self.assertTrue(menu["ok"], menu)
+        self.assertGreaterEqual(menu["scrolledSteps"], 1, "必须真的上滚去找过那条弹幕")
+        self.assertIn("up", calls["scroll"])
+        self.assertEqual(calls["clicks"], [(1100, 400)], "找到之后点的是定位到的那条")
+
+    def test_resume_chat_bottom_goes_back_to_the_newest_messages(self):
+        """上滚找过旧弹幕之后必须滚回最新，否则下一轮采集看到的还是那批旧弹幕。"""
+        import live
+        original = live.scroll_chat_list
+        seen = []
+        live.scroll_chat_list = lambda _cdp, direction="up", amount=420, times=1, box=None: (
+            seen.append(direction), {"ok": True})[1]
+        try:
+            result = live.resume_chat_bottom(object(), times=2)
+        finally:
+            live.scroll_chat_list = original
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, ["down", "down"])
+        self.assertEqual(result["scrolled"], 2)
+
 class RoomUrlTests(unittest.TestCase):
     """真机回归（2026-09-20）：抖音直播广场点进来的房间，房间号在【查询串】里。
 
