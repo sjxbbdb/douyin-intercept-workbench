@@ -818,6 +818,19 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(send["containerKey"], "target-panel")
 
 
+    def test_dm_conversation_rows_covered_by_the_open_chat_are_not_clickable(self):
+        """真机（2026-09-26）：会话打开时，整列会话列表仍在 DOM 里且有真实尺寸，
+        但整列被会话内容盖住 —— 照坐标点下去就是点进对方的会话（可能点到消息里的链接）。
+        """
+        import douyin
+        self._load("dm_list_covered.html")
+        row = douyin.dm_conversation_row(self.page, "Target User")
+        self.assertFalse(row["found"], "被盖住的行绝不许返回可点坐标")
+        self.assertEqual(row["reason"], "conversation_row_covered")
+        self.assertGreaterEqual(row["covered"], 1)
+        self.assertLessEqual(row["covered"], row["rowsSeen"])
+        self.assertFalse(douyin.dm_row_preview_matches(self.page, "Target User", "你好，看到你")["found"])
+
     def test_dm_conversation_row_picks_the_target_row_only(self):
         """真机（2026-09-26）：面板停在消息列表时，要在列表里点开对方那一行。
 

@@ -727,7 +727,7 @@ _DM_ROWS_FIND_JS = (
     "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
     ".replace(/[*＊]/g,'').replace(/\\s+/g,'').trim();}"
     "var full=norm(expected.full||''),prefix=norm(expected.prefix||'');"
-    "var rows=document.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM) + "),hits=[],seen=0;"
+    "var rows=document.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM) + "),hits=[],seen=0,covered=0;"
     "for(var i=0;i<rows.length;i++){var row=rows[i];if(!vis(row))continue;seen++;"
     "var nodes=row.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM_TITLE) + "),title='';"
     "for(var j=0;j<nodes.length;j++){var t=norm(nodes[j].innerText||nodes[j].textContent||'');"
@@ -735,12 +735,18 @@ _DM_ROWS_FIND_JS = (
     "if(!title)continue;"
     "if(!((full&&title===full)||(prefix&&title.indexOf(prefix)===0)))continue;"
     "var r=row.getBoundingClientRect();"
+    # 🔴 真机（2026-09-26）：会话打开时，整列会话列表仍然挂在 DOM 里、仍然有真实尺寸，
+    #    但【整列被会话内容盖住】—— elementFromPoint 命中的是消息气泡而不是行。
+    #    这时候照坐标点下去就是点进对方的会话里（可能点到消息里的链接），
+    #    所以先做遮挡判定（与私信入口同一套规则），被盖住的行一律不返回。
+    "var cx=Math.round(r.x+r.width/2),cy=Math.round(r.y+r.height/2);"
+    "var hit=document.elementFromPoint(cx,cy);"
+    "if(!(hit&&(hit===row||row.contains(hit)))){covered++;continue;}"
     "hits.push({titleLen:title.length,titleFull:!!(full&&title===full),"
     "titlePrefix:!!(prefix&&title.indexOf(prefix)===0),"
     "body:norm(row.innerText||row.textContent||''),"
-    "x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
-    "w:Math.round(r.width),h:Math.round(r.height)});}"
-    "return {hits:hits,seen:seen};}"
+    "x:cx,y:cy,w:Math.round(r.width),h:Math.round(r.height)});}"
+    "return {hits:hits,seen:seen,covered:covered};}"
 )
 
 _DM_ROW_JS = (
@@ -748,7 +754,9 @@ _DM_ROW_JS = (
     + _DM_ROWS_FIND_JS +
     "var found=dmRows(expected),hits=found.hits;"
     "if(hits.length!==1)return {found:false,matched:false,count:hits.length,rowsSeen:found.seen,"
-    "reason:hits.length?'ambiguous_conversation_row':'conversation_row_not_found'};"
+    "covered:found.covered,"
+    "reason:hits.length?'ambiguous_conversation_row':"
+    "(found.covered?'conversation_row_covered':'conversation_row_not_found')};"
     "var h=hits[0];"
     "return {found:true,matched:true,count:1,rowsSeen:found.seen,titleLen:h.titleLen,"
     "titleFull:h.titleFull,titlePrefix:h.titlePrefix,x:h.x,y:h.y,w:h.w,h:h.h};})(EXPECTED)"
@@ -758,7 +766,7 @@ _DM_ROW_PREVIEW_JS = (
     "(function(expected,want){"
     + _DM_ROWS_FIND_JS +
     "var found=dmRows(expected),hits=found.hits;"
-    "if(hits.length!==1)return {found:false,count:hits.length,rowsSeen:found.seen};"
+    "if(hits.length!==1)return {found:false,count:hits.length,rowsSeen:found.seen,covered:found.covered};"
     "var body=hits[0].body,needle=String(want||'');"
     "return {found:true,count:1,rowsSeen:found.seen,bodyLen:body.length,"
     "containsText:!!(needle&&body.indexOf(needle)>=0)};})(EXPECTED,WANT)"
