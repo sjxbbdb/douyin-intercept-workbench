@@ -207,6 +207,19 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
+* **页面不可见时点击不送达渲染进程（2026-09-28 真机复现）**：Chrome 窗口被遮挡/最小化时
+  `document.visibilityState === "hidden"`，`Input.dispatchMouseEvent` 的点击【不生效】——
+  现象正是"私信按钮坐标是对的、点上去、面板就是不开"（人工点同一个页面却正常）。
+  实测同一次点击：hidden 时面板 12 秒都不开；`Page.bringToFront` 之后同一个坐标立刻打开
+  （会话头部匹配、输入框出现、输入后清空、会话里出现回声）。
+  * 发送路径现在在【每次点击之前】再确认一次可见性（`_click_ready`），不可见先尝试恢复、
+    仍不可见就【不点】；
+  * 归因分开：一次都没能在可见状态下点下去 -> `blocked/page_not_visible`
+    （`skipped: false`、`manualAction: true`，人工把窗口切到前台再试）；
+    只有【页面可见但面板确实打不开】才是 `blocked/dm_panel_unavailable`
+    （`skipped: true`，对方未互关/私密/关闭了陌生人私信）—— 这两件事混在一起会把
+    可触达的用户误判成私密用户。
+  回归：`test_probe.PrivateSkipTests`（新增 2 个）+ `test_comment_publish_binding`（新增 1 个）。
 * **服务端签发策略的「身份」冻结（2026-09-26 评审收尾）**：本侧**不接收策略内容**
   （`policy` 对象继续以 `policy_not_server_issued` 拒绝），但支持把策略**身份**冻结进计划：
   `policyId` + `policyVersion`（+ 可选 `knowledgeSetVersion`），

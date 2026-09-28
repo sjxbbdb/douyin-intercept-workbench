@@ -263,6 +263,24 @@ def _visibility_gate(tab, gate, send_id):
     return None
 
 
+def _click_ready(tab):
+    """点击【之前】再确认一次页面可见；不可见时先尝试恢复，仍不行返回 False。
+
+    🔴 真机复现（2026-09-28）：
+      Chrome 窗口被遮挡/最小化时 document.visibilityState == "hidden"，
+      Input.dispatchMouseEvent 的点击【不送达渲染进程】—— 表现就是
+      "私信按钮坐标是对的、点上去、面板就是不开"（人工点同一个页面却正常）。
+      实测同一个坐标：hidden 时面板不开；Page.bringToFront 之后立刻打开、
+      会话头部匹配、输入框清空、会话里出现回声。
+    所以点击前必须再确认一次。确认不了就【不点】：把"没点着"记成
+    "对方不可私信"会把可触达的用户误判成私密用户（用户最在意的那类错误）。
+    """
+    if douyin.visibility_state(tab) == "visible":
+        return True
+    douyin.ensure_visible(tab)
+    return douyin.visibility_state(tab) == "visible"
+
+
 def send_private(tab, gate, send_id, target, text):
     """Send one private message after a durable preflight reservation."""
     try:
@@ -330,6 +348,7 @@ def send_private(tab, gate, send_id, target, text):
         #    的循环，最多 3 轮；每一轮都用当下最新的按钮坐标，避免用过期坐标点击。
         composer = {"found": False}
         context_mode = "recipient_scoped"
+        clicked_while_ready = False
         for attempt in range(3):
             entry = douyin.dm_entry(tab)
             if entry.get("blocked"):
@@ -337,6 +356,11 @@ def send_private(tab, gate, send_id, target, text):
                 return gate.result(row)
             if not entry.get("found"):
                 break
+            # 🔴 点击前再确认页面可见：hidden 时点击不送达渲染进程（见 _click_ready）。
+            #    不可见就不点 —— 点了也不会生效，只会把结论带偏。
+            if not _click_ready(tab):
+                break
+            clicked_while_ready = True
             tab.click_at(entry["x"], entry["y"])
             # 面板是异步挂载的：同时等「收件人作用域内的输入框」和「会话头部标题」，
             # 两者都指向同一个收件人才算打开成功。
@@ -359,6 +383,16 @@ def send_private(tab, gate, send_id, target, text):
             #    data-user-id，也没有指向 /user/<sec_uid> 的链接（实测 count=0），所以上面那套
             #    严格校验在真机上永远匹配不到，私信会一直停在 composer_not_found。
             #    真机可用的收件人信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
+            #
+            # 🔴 归因分两种（2026-09-28 真机）：一次都没能在【页面可见】时点下去，
+            #    "面板没开"就【不能】说明对方不可私信 —— 那是页面不可见导致的点击无效，
+            #    属于可重试 + 需人工把窗口切到前台的情况。所以先判这个，再判面板。
+            if not clicked_while_ready:
+                row = gate.finish(send_id, "blocked", "page_not_visible",
+                                  {"skipped": False, "manualAction": True,
+                                   "blockedBy": "page_hidden_while_clicking",
+                                   "entryClicks": 0})
+                return gate.result(row)
             panel = douyin.dm_panel_state(tab, author_name)
             if not (panel.get("found") and panel.get("headerMatch")):
                 # 🔴 真机与用户反馈（2026-09-21）：有的目标私信入口点得动、面板却始终不开
@@ -1171,6 +1205,14 @@ def send_comment(tab, gate, send_id, target, text, source):
             # 不能静默吞掉：否则「没抓到响应」无法区分是「没发出去」
             # 还是「录制器根本没开」，排查方向会整个跑偏。
             record_error = type(exc).__name__
+        # 🔴 同一条真机结论（2026-09-28）：页面不可见时点击不送达渲染进程，
+        #    表现是"发送键点了没反应"。这里在【落 started 之前】再确认一次：
+        #    确认不了按可重试的 page_not_visible 拒绝，不要记成定位器/选择器问题。
+        if not _click_ready(tab):
+            row = gate.finish(send_id, "blocked", "page_not_visible",
+                              {"skipped": True, "manualAction": True,
+                               "blockedBy": "page_hidden_while_clicking"})
+            return gate.result(row)
         gate.mark_started(send_id)
         started = True
         tab.click_at(button["x"], button["y"])

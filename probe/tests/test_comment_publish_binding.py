@@ -357,6 +357,20 @@ class SendCommentReceiptTests(unittest.TestCase):
             self.assertEqual(result["reason"], "platform_response_unreadable", repr(raw))
             self.assertEqual(result["evidence"]["platformStatusCodes"], [None], repr(raw))
 
+    def test_a_page_that_hides_before_the_click_is_refused(self):
+        """真机结论（2026-09-28）：页面 hidden 时 Input 点击不送达渲染进程，
+        发送键点了没反应。必须在【点击之前】拦住，并给出可重试的 page_not_visible，
+        而不是让它变成"定位器找不到/发送键不可用"这种误导性的结论。
+        """
+        self.states = ["visible"] + ["hidden"] * 4
+        send_actions.douyin.ensure_visible = lambda tab, **kw: self.ensure_calls.append(tab) or True
+        result = self._run("vis-hide-late")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_not_visible")
+        # 前置的两次点击（回复按钮、输入框）是流程本身，无害；
+        # 真正要紧的是【发送键 (5,6)】—— 页面不可见时绝不能点它。
+        self.assertNotIn((5, 6), self.tab.clicks, "页面不可见时不得点发送键")
+
     def test_the_request_body_is_never_persisted(self):
         """请求体只在内存里用于绑定：不写台账、不进 evidence、不写日志文件。"""
         marker = 'NONCE-abc123'

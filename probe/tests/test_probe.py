@@ -3365,13 +3365,15 @@ class PrivateSkipTests(unittest.TestCase):
         import send_actions
         page = self.Page()
         saved = (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
-                 send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+                 send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible,
+                 send_actions.douyin.dm_entry,
                  send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
                  send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
                  send_actions.douyin.make_network_recorder, send_actions.time.sleep)
         send_actions.douyin.login_state = lambda _cdp: "verified"
         send_actions.douyin.check_captcha = lambda _cdp: False
         send_actions.douyin.visibility_state = lambda _cdp: "visible"
+        send_actions.douyin.ensure_visible = lambda *_a, **_k: True
         send_actions.douyin.dm_entry = lambda _cdp: dict(entry)
         send_actions.douyin.dm_panel_state = lambda _cdp, _name: dict(panel or {"found": False})
         send_actions.douyin.dm_composer_for_recipient = lambda *_a, **_k: {"found": False}
@@ -3383,7 +3385,8 @@ class PrivateSkipTests(unittest.TestCase):
     def _restore(self, saved):
         import send_actions
         (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
-         send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+         send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible,
+         send_actions.douyin.dm_entry,
          send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
          send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
          send_actions.douyin.make_network_recorder, send_actions.time.sleep) = saved
@@ -3403,6 +3406,47 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertEqual(result["reason"], "dm_not_available")
         self.assertTrue(result["evidence"]["skipped"])
         self.assertEqual(page.clicks, [], "对方不可私信时一个点击都不许发出去")
+
+    def test_a_page_that_hides_before_the_click_is_not_reported_as_dm_unavailable(self):
+        """真机复现（2026-09-28）：页面 hidden 时点击【不送达渲染进程】，面板就是不开。
+
+        归因必须是可重试的 page_not_visible（人工把窗口切到前台即可），
+        不能记成 dm_panel_unavailable/skipped —— 那等于把可触达的人误判成私密用户。
+        做法：入口守卫那一刻还 visible，到点击前变 hidden。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        states = ["visible"] + ["hidden"] * 4
+        send_actions.douyin.visibility_state = lambda _cdp: (states.pop(0) if states else "hidden")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "vis-late",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_not_visible")
+        self.assertFalse(result["evidence"]["skipped"], "不可见不等于对方不可私信")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertEqual(page.clicks, [], "看不见的时候一个点击都不发出去")
+
+    def test_a_panel_that_never_opens_on_a_visible_page_is_still_skipped(self):
+        """反向保护：页面一直可见、面板确实打不开 -> 仍然是 skipped（对方不可私信）。"""
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "vis-ok",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["reason"], "dm_panel_unavailable")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(len(page.clicks), 3)
 
     def test_a_panel_that_never_opens_is_skipped_not_failed(self):
         import send_actions
