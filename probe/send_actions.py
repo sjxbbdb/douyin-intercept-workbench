@@ -288,6 +288,25 @@ def _await_dm_panel(tab, author_name, tries=16):
     return panel
 
 
+def _await_row_preview(tab, author_name, text, tries=3, interval=2.0):
+    """看会话列表那一行的预览是不是已经变成刚发的话术 —— 平台是异步更新，所以有界重试。
+
+    🔴 真机（2026-09-26）：刚回车就立刻读，平台常常还没把预览换过来 —— 实测「八月」
+    「宽容」「世内高人」都是"当时读到 false，整页重载后消息确实在"。所以隔 2 秒再看，最多 3 次。
+    它仍然只是【页面观察】：读到 false 不等于没发出去（可能只是平台还没更新），
+    读到 true 也证明不了送达 —— 私信没有 HTTP 回执，状态一律 unknown。
+    """
+    preview = {"found": False, "tries": 0}
+    for index in range(max(1, int(tries))):
+        preview = dict(douyin.dm_row_preview_matches(tab, author_name, text) or {})
+        preview["tries"] = index + 1
+        if preview.get("containsText"):
+            return preview
+        if index + 1 < int(tries):
+            time.sleep(interval)
+    return preview
+
+
 def _reopen_profile(tab, author_id):
     """重新导航回目标主页。
 
@@ -525,15 +544,16 @@ def send_private(tab, gate, send_id, target, text):
         # 没能发出去的行只显示平台提示语。它是有力旁证，但私信没有 HTTP 回执（红线 2），
         # 所以状态仍然是 unknown，绝不因为这一条就宣告 sent_confirmed。
         try:
-            row_preview = douyin.dm_row_preview_matches(tab, author_name, text)
+            row_preview = _await_row_preview(tab, author_name, text)
         except Exception:
-            row_preview = {"found": False}
+            row_preview = {"found": False, "tries": 0}
         row = gate.finish(send_id, "unknown", "platform_response_unavailable",
                           {"httpResponses": len(records), "matchedResponses": len(matched),
                            "platformStatusCodes": statuses[:5], "mechanism": mechanism,
                            "recipientVerification": context_mode,
                            "composerCleared": cleared, "conversationEcho": bool(echo),
-                           "conversationListPreview": bool(row_preview.get("containsText"))})
+                           "conversationListPreview": bool(row_preview.get("containsText")),
+                           "conversationListPreviewTries": int(row_preview.get("tries") or 0)})
         return gate.result(row)
     except Exception as exc:
         return _internal_failure(gate, send_id, started, exc, "send_private")

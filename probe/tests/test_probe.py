@@ -3593,6 +3593,57 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertEqual(len(page.clicks), 2, "面板打不开时按入口重试次数上报，且不发消息")
         self.assertEqual(page.clicks[0], page.clicks[1], "重试仍然用当下重新取到的入口坐标")
 
+    def test_the_row_preview_is_reread_because_the_platform_updates_it_late(self):
+        """真机（2026-09-26）：刚回车就立刻读会话列表预览，平台常常还没换过来 ——
+        「八月」「宽容」「世内高人」都是"当时读到 false、整页重载后消息确实在"。
+        所以要有界重试；它仍然只是页面观察，读到 false 也不改状态（状态永远是 unknown）。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper"})
+        seen = []
+        original = send_actions.douyin.dm_row_preview_matches
+
+        def preview(_tab, _name, _text):
+            seen.append(1)
+            if len(seen) < 3:
+                return {"found": True, "containsText": False}
+            return {"found": True, "containsText": True}
+
+        send_actions.douyin.dm_row_preview_matches = preview
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "late-1",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            send_actions.douyin.dm_row_preview_matches = original
+            self._restore(saved)
+        self.assertEqual(len(seen), 3, "前两次读到 false 时必须再看一次，不能就此下结论")
+        self.assertTrue(result["evidence"]["conversationListPreview"])
+        self.assertEqual(result["evidence"]["conversationListPreviewTries"], 3)
+        self.assertEqual(result["status"], "unknown", "预览只进 evidence，永远不改状态")
+
+    def test_a_preview_that_never_updates_is_recorded_as_false(self):
+        """预览始终读不到我们的话术：照实记 false（只说明"当时没看到"，不等于没发出去）。"""
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper"},
+                                    preview={"found": True, "containsText": False})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "late-2",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            self._restore(saved)
+        self.assertFalse(result["evidence"]["conversationListPreview"])
+        self.assertEqual(result["evidence"]["conversationListPreviewTries"], 3)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(page.typed, ["你好呀"], "预览读数不影响发出去这个动作本身")
+
     def test_a_panel_showing_the_one_message_notice_still_sends(self):
         """用户 2026-09-26 明确：页面顶部那句「对方回复或关注你之前，只能发送一条文字消息」
         不是拒绝 —— 平台允许发一条，遇到它必须照常发出去。
