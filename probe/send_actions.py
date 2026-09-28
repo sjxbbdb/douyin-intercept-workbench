@@ -263,6 +263,50 @@ def _visibility_gate(tab, gate, send_id):
     return None
 
 
+def _panel_as_composer(panel):
+    """把「会话头部匹配的私信面板」当成编辑器来用（真机可用的收件人信号）。"""
+    return {"found": True, "x": panel["x"], "y": panel["y"],
+            "text": panel.get("text") or "",
+            "containerKey": panel.get("panelKey") or "messageEditor"}
+
+
+def _await_dm_panel(tab, author_name, tries=16):
+    """等私信面板出现（编辑器可见）。返回最后看到的面板状态，不做任何点击。
+
+    探测本身出异常时按「没看到面板」处理，并把异常名带回 evidence —— 面板等待只是探针；
+    探测失败绝不能被当成「面板开着」（那会让下一步点到面板内部的搜索框上）。
+    """
+    panel = {"found": False}
+    for _ in range(int(tries)):
+        try:
+            panel = douyin.dm_panel_state(tab, author_name) or {"found": False}
+        except Exception as exc:
+            panel = {"found": False, "probeError": type(exc).__name__}
+        if panel.get("found"):
+            return panel
+        time.sleep(0.5)
+    return panel
+
+
+def _reopen_profile(tab, author_id):
+    """重新导航回目标主页。
+
+    🔴 真机（2026-09-26）：第一次点「私信」可能真的点空（页面还在渲染）。要重试就
+    【重新导航】，让坐标与面板状态都回到干净状态 —— 绝不拿着旧坐标在可能已经打开的面板上
+    再点一次（那里是面板内部的搜索框）。
+    """
+    try:
+        tab.call("Page.navigate", {"url": douyin.profile_url(author_id)}, timeout=25)
+    except Exception:
+        return False
+    if not _wait_ready(tab):
+        return False
+    try:
+        return bool(_exact_profile_url(tab.evaluate("location.href") or "", author_id))
+    except Exception:
+        return False
+
+
 def send_private(tab, gate, send_id, target, text):
     """Send one private message after a durable preflight reservation."""
     try:
@@ -325,54 +369,88 @@ def send_private(tab, gate, send_id, target, text):
         if not context.get("verified"):
             row = gate.finish(send_id, "failed", "target_context_not_confirmed")
             return gate.result(row)
-        # 🔴 真机教训（2026-09-20）：主页从直播间跳过来时头部还在渲染，按旧坐标点一次
-        #    「私信」经常点空（面板根本没打开）。所以这里改成【重新取入口 -> 点 -> 校验面板】
-        #    的循环，最多 3 轮；每一轮都用当下最新的按钮坐标，避免用过期坐标点击。
+        # 🔴 真机教训（2026-09-26，用户反馈"打开了私信却没有真的去发私信"）：
+        #    点「私信」之后，入口按钮的坐标（约 963,132）就落在【已经打开的消息面板内部】
+        #    （搜索框/标题栏那一带）。所以"面板没开就再点一次入口"这套重试是有害的：
+        #    第 1 次点击把面板打开，第 2、3 次却点在面板里，把面板切到「消息列表」，
+        #    最后判定 panel_not_opened —— 我们一条消息都没输入就跳过了这个目标。
+        #    真机实测（2026-09-26）：面板 1.5s 就开了；面板停在会话列表时，列表里
+        #    对方那一行的标题就是对方昵称，点它就能进入会话。
+        #    新流程分三步，任何一步不成立都停在原地、绝不猜：
+        #      1) 面板已经开着且会话头部 = 对方 -> 直接用；
+        #      2) 面板没开 -> 点一次入口（坐标现取），等面板出现；
+        #      3) 面板开着但停在会话列表 -> 点开对方那一行，再等会话头部匹配。
         composer = {"found": False}
         context_mode = "recipient_scoped"
+        panel_probe = []
+        entry_clicks = 0
+        panel = {"found": False}
         for attempt in range(3):
-            entry = douyin.dm_entry(tab)
-            if entry.get("blocked"):
-                row = gate.finish(send_id, "blocked", "target_dm_not_available")
-                return gate.result(row)
-            if not entry.get("found"):
+            probe = {"attempt": attempt + 1, "panelOpen": bool(panel.get("found")),
+                     "headerMatch": bool(panel.get("headerMatch"))}
+            panel_probe.append(probe)
+            if panel.get("found") and panel.get("headerMatch"):
+                composer = _panel_as_composer(panel)
+                context_mode = "live_panel_header"
                 break
-            tab.click_at(entry["x"], entry["y"])
-            # 面板是异步挂载的：同时等「收件人作用域内的输入框」和「会话头部标题」，
-            # 两者都指向同一个收件人才算打开成功。
-            for _ in range(10):
-                time.sleep(0.5)
-                composer = douyin.dm_composer_for_recipient(tab, author_id, author_name)
-                if composer.get("found"):
+            # 入口只在【面板是关着的】时候点，而且最多两次：
+            #   第 2 次必须先重新导航回主页（坐标与面板状态都回到干净状态）。
+            #   面板一旦开着，入口坐标就落在面板内部，再点等于去按面板里的搜索框。
+            if not panel.get("found") and (entry_clicks == 0 or
+                                           (entry_clicks == 1 and _reopen_profile(tab, author_id))):
+                entry = douyin.dm_entry(tab)
+                if entry.get("blocked"):
+                    row = gate.finish(send_id, "blocked", "target_dm_not_available")
+                    return gate.result(row)
+                if not entry.get("found"):
                     break
-                panel = douyin.dm_panel_state(tab, author_name)
-                if panel.get("found") and panel.get("headerMatch"):
-                    context_mode = "live_panel_header"
-                    composer = {"found": True, "x": panel["x"], "y": panel["y"],
-                                "text": panel.get("text") or "",
-                                "containerKey": panel.get("panelKey") or "messageEditor"}
-                    break
-            if composer.get("found"):
+                tab.click_at(entry["x"], entry["y"])
+                entry_clicks += 1
+                probe["entryClick"] = entry_clicks
+                # 面板是异步挂载的：等它出现（真机实测 1.5-4s）。
+                panel = _await_dm_panel(tab, author_name)
+                probe["panelOpenAfterClick"] = bool(panel.get("found"))
+                probe["headerMatchAfterClick"] = bool(panel.get("headerMatch"))
+            # 严格收件人作用域的输入框（真机上永远 0 命中，离线夹具里能命中）：
+            # 它一旦命中就是最强的收件人证据，优先采用。
+            strict = douyin.dm_composer_for_recipient(tab, author_id, author_name)
+            probe["strictComposer"] = bool(strict.get("found"))
+            if strict.get("found"):
+                composer = strict
+                context_mode = "recipient_scoped"
                 break
+            if panel.get("found") and panel.get("headerMatch"):
+                composer = _panel_as_composer(panel)
+                context_mode = "live_panel_header"
+                break
+            if not panel.get("found"):
+                continue
+            # 面板开着，但会话不是对方（真机上常见：停在「消息列表」）。
+            # 真机事实：面板里没有 data-recipient-id / 指向 /user/<sec_uid> 的链接
+            # （实测 count=0），能用的收件人信号是【会话头部标题 = 对方昵称】；
+            # 会话列表里那一行的标题也是对方昵称，所以点它就能进对会话。
+            conv_row = douyin.dm_conversation_row(tab, author_name)
+            probe["conversationRowFound"] = bool(conv_row.get("found"))
+            probe["conversationRowMatched"] = bool(conv_row.get("matched"))
+            probe["conversationRowsSeen"] = conv_row.get("rowsSeen")
+            if not (conv_row.get("found") and conv_row.get("matched")):
+                break
+            tab.click_at(conv_row["x"], conv_row["y"])
+            panel = _await_dm_panel(tab, author_name)
+            probe["headerMatchAfterRowClick"] = bool(panel.get("headerMatch"))
         if not composer.get("found"):
-            # 🔴 真机回退（2026-09-20，真实主页实测）：真机私信面板里【没有】data-recipient-id /
-            #    data-user-id，也没有指向 /user/<sec_uid> 的链接（实测 count=0），所以上面那套
-            #    严格校验在真机上永远匹配不到，私信会一直停在 composer_not_found。
-            #    真机可用的收件人信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
-            panel = douyin.dm_panel_state(tab, author_name)
-            if not (panel.get("found") and panel.get("headerMatch")):
-                # 🔴 真机与用户反馈（2026-09-21）：有的目标私信入口点得动、面板却始终不开
-                #    （对方未互关 / 私密账号 / 关闭了陌生人私信）。这时我们一条消息都没发，
-                #    应当【跳过并换下一个目标】，而不是把它记成"发送失败"。
-                #    注意：这里只影响"能否触达"的判定，不影响任何发送门槛。
-                row = gate.finish(send_id, "blocked", "dm_panel_unavailable",
-                                  {"skipped": True, "blockedBy": "panel_not_opened",
-                                   "entryClicks": 3})
-                return gate.result(row)
-            context_mode = "live_panel_header"
-            composer = {"found": True, "x": panel["x"], "y": panel["y"],
-                        "text": panel.get("text") or "",
-                        "containerKey": panel.get("panelKey") or "messageEditor"}
+            # 两种都按【跳过】处理：我们一条消息都没发出去。
+            #   panel_not_opened       —— 面板压根没开（对方未互关 / 私密账号 / 关闭陌生人私信）
+            #   conversation_not_opened —— 面板开了但停在列表，且列表里没有对方那一行
+            # ⚠️ 页面顶部那句「对方回复或关注你之前，只能发送一条文字消息」【不是】拒绝：
+            #    平台允许发一条，遇到它必须照常发出去（用户 2026-09-26 明确）。
+            ever_open = any(p.get("panelOpen") or p.get("panelOpenAfterClick") for p in panel_probe)
+            reason = "dm_conversation_unavailable" if ever_open else "dm_panel_unavailable"
+            row = gate.finish(send_id, "blocked", reason,
+                              {"skipped": True,
+                               "blockedBy": "conversation_not_opened" if ever_open else "panel_not_opened",
+                               "entryClicks": entry_clicks, "attempts": panel_probe})
+            return gate.result(row)
         existing_text = _clean_draft(composer.get("text"))
         if existing_text and existing_text != _clean_draft(text):
             row = gate.finish(send_id, "failed", "composer_has_different_draft")
@@ -442,11 +520,20 @@ def send_private(tab, gate, send_id, target, text):
                 cleared = not str(state.get("text") or "").strip()
         except Exception:
             cleared = None
+        # 页面观察（不是回执）：会话列表里对方那一行的预览，是不是已经变成刚发的这句话。
+        # 真机实测（2026-09-26）：真发出去的那条会出现在该行预览里，整页重载后仍在；
+        # 没能发出去的行只显示平台提示语。它是有力旁证，但私信没有 HTTP 回执（红线 2），
+        # 所以状态仍然是 unknown，绝不因为这一条就宣告 sent_confirmed。
+        try:
+            row_preview = douyin.dm_row_preview_matches(tab, author_name, text)
+        except Exception:
+            row_preview = {"found": False}
         row = gate.finish(send_id, "unknown", "platform_response_unavailable",
                           {"httpResponses": len(records), "matchedResponses": len(matched),
                            "platformStatusCodes": statuses[:5], "mechanism": mechanism,
                            "recipientVerification": context_mode,
-                           "composerCleared": cleared, "conversationEcho": bool(echo)})
+                           "composerCleared": cleared, "conversationEcho": bool(echo),
+                           "conversationListPreview": bool(row_preview.get("containsText"))})
         return gate.result(row)
     except Exception as exc:
         return _internal_failure(gate, send_id, started, exc, "send_private")

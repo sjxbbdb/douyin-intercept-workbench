@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dm conversation list</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; }
+  .row { position: absolute; left: 700px; width: 320px; height: 64px; }
+</style>
+<body>
+  <!-- 真机结构（2026-09-26）：面板根 componentsEntrywrapper.imContainer，
+       一行一个会话 conversationConversationItemwrapper，
+       行标题 conversationConversationItemtitle（= 对方昵称），
+       行预览 ConversationItemHinttextBox（最后一条消息 / 平台提示语）。 -->
+  <div class="componentsEntrywrapper imContainer">
+    <div class="conversationConversationItemwrapper" id="row-other" style="top:200px">
+      <div class="conversationConversationItemtitle">Other Person</div>
+      <div class="ConversationItemHinttextBox">对方回复或关注你之前，只能发送一条文字消息</div>
+    </div>
+    <div class="conversationConversationItemwrapper" id="row-target" style="top:280px">
+      <div class="conversationConversationItemtitle">Target User</div>
+      <div class="ConversationItemHinttextBox">你好，看到你在直播间的提问，我整理了一份入门步骤</div>
+    </div>
+    <div class="conversationConversationItemwrapper" id="row-hidden" style="top:360px; display:none">
+      <div class="conversationConversationItemtitle">Target User</div>
+      <div class="ConversationItemHinttextBox">隐藏的同名行不许参与匹配</div>
+    </div>
+    <div class="conversationConversationItemwrapper" id="row-twin" style="top:440px">
+      <div class="conversationConversationItemtitle">Twin User</div>
+      <div class="ConversationItemHinttextBox">还没有消息</div>
+    </div>
+    <div class="conversationConversationItemwrapper" id="row-twin2" style="top:520px">
+      <div class="conversationConversationItemtitle">Twin User</div>
+      <div class="ConversationItemHinttextBox">还没有消息</div>
+    </div>
+    <div class="conversationConversationItemwrapper" id="row-star" style="top:600px">
+      <div class="conversationConversationItemtitle">Star*User</div>
+      <div class="ConversationItemHinttextBox">还没有消息</div>
+    </div>
+  </div>
+</body>

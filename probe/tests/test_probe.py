@@ -743,6 +743,46 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(send["containerKey"], "target-panel")
 
 
+    def test_dm_conversation_row_picks_the_target_row_only(self):
+        """真机（2026-09-26）：面板停在消息列表时，要在列表里点开对方那一行。
+
+        夹具里故意放了同名的隐藏行（display:none）、两行同名（Twin User）和一个带星号的
+        脱敏昵称：隐藏行不参与、同名多行返回 not found（不猜）、星号按同一套口径归一化。
+        """
+        import douyin
+        self._load("dm_list.html")
+        row = douyin.dm_conversation_row(self.page, "Target User")
+        self.assertTrue(row["found"], row)
+        self.assertTrue(row["matched"])
+        self.assertEqual(row["rowsSeen"], 5, "隐藏行不算，可见行 5 个")
+        box = self.page.eval_json("(function(){var b=document.querySelector('#row-target').getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height};})()")
+        self.assertGreaterEqual(row["x"], box["x"])
+        self.assertLessEqual(row["x"], box["x"] + box["w"])
+        self.assertGreaterEqual(row["y"], box["y"])
+        self.assertLessEqual(row["y"], box["y"] + box["h"])
+        self.assertFalse(douyin.dm_conversation_row(self.page, "Nobody Here")["found"])
+        twin = douyin.dm_conversation_row(self.page, "Twin User")
+        self.assertFalse(twin["found"], "两行同名时不许猜")
+        self.assertEqual(twin["reason"], "ambiguous_conversation_row")
+        self.assertTrue(douyin.dm_conversation_row(self.page, "Star User")["found"],
+                        "脱敏星号不参与比较")
+
+    def test_dm_row_preview_reports_the_sent_text_as_page_observation(self):
+        """行预览是页面观察：发出去的那条会出现在该行预览里，没发出去的行只有平台提示语。
+
+        它是有力旁证，但私信没有 HTTP 回执（红线 2），所以只进 evidence，不改状态。
+        """
+        import douyin
+        self._load("dm_list.html")
+        ours = "你好，看到你在直播间的提问，我整理了一份入门步骤"
+        hit = douyin.dm_row_preview_matches(self.page, "Target User", ours)
+        self.assertTrue(hit["found"], hit)
+        self.assertTrue(hit["containsText"], "对方那一行的预览里就是刚发的话术")
+        miss = douyin.dm_row_preview_matches(self.page, "Other Person", ours)
+        self.assertTrue(miss["found"], miss)
+        self.assertFalse(miss["containsText"], "只有平台提示语的行不算发出去")
+        self.assertFalse(douyin.dm_row_preview_matches(self.page, "Target User", "")["found"])
+
 class LiveFlowTests(unittest.TestCase):
     """Offline coverage for the live batch flow (images/12) and its two
     boundaries: host-provided scripts (images/09) and per-action idempotency
@@ -3343,6 +3383,8 @@ class PrivateSkipTests(unittest.TestCase):
     class Page:
         def __init__(self):
             self.clicks = []
+            self.typed = []
+            self.keys = []
 
         def call(self, *_args, **_kwargs):
             return {}
@@ -3354,37 +3396,78 @@ class PrivateSkipTests(unittest.TestCase):
                 return "https://www.douyin.com/user/" + ("A" * 40)
             return None
 
+        def eval_json(self, expression):
+            return None
+
         def click_at(self, *args):
             self.clicks.append(args)
+
+        def type_text(self, text):
+            self.typed.append(text)
+
+        def press_key(self, key, code=None, key_code=None):
+            self.keys.append((key, code, key_code))
 
         def close(self):
             pass
 
-    def _patched(self, entry, panel=None, clicks_expected=0):
+    def _patched(self, entry, panel=None, clicks_expected=0, row=None, preview=None, states=None):
+        """Patch the browser-facing pieces of the DM path.
+
+        states is an optional list of panel states consumed one per call, so a test
+        can act out: panel closed -> click entry -> panel opens on the message list
+        -> click the conversation row -> the panel now shows the chat header.
+        """
         import douyin
         import send_actions
         page = self.Page()
         saved = (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
                  send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
                  send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+                 send_actions.douyin.dm_conversation_row, send_actions.douyin.dm_row_preview_matches,
+                 send_actions.douyin.dm_conversation_echo,
                  send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
                  send_actions.douyin.make_network_recorder, send_actions.time.sleep)
+        queue = list(states) if states else None
+        # 队列用尽后停在上一次看到的状态（真机上面板不会自己变回去）。
+        fallback = dict(panel) if panel else (dict(states[-1]) if states else {"found": False})
+
+        def panel_state(_cdp, _name):
+            state = dict(queue.pop(0)) if queue else dict(fallback)
+            if page.typed and state.get("found"):
+                # 真机里编辑器会立刻显示刚输入的内容；假页面照做，
+                # 这样发送前的 text_verification 才有东西可比。
+                state["text"] = page.typed[-1]
+            return state
+
         send_actions.douyin.login_state = lambda _cdp: "verified"
         send_actions.douyin.check_captcha = lambda _cdp: False
         send_actions.douyin.visibility_state = lambda _cdp: "visible"
         send_actions.douyin.dm_entry = lambda _cdp: dict(entry)
-        send_actions.douyin.dm_panel_state = lambda _cdp, _name: dict(panel or {"found": False})
+        send_actions.douyin.dm_panel_state = panel_state
         send_actions.douyin.dm_composer_for_recipient = lambda *_a, **_k: {"found": False}
+        send_actions.douyin.dm_conversation_row = lambda *_a, **_k: dict(row or {"found": False})
+        send_actions.douyin.dm_row_preview_matches = lambda *_a, **_k: dict(preview or {"found": False})
+        send_actions.douyin.dm_conversation_echo = lambda *_a, **_k: False
         send_actions.douyin.recipient_context = lambda *_a, **_k: {"verified": True}
         send_actions.douyin.profile_error_page = lambda _cdp: False
+        send_actions.douyin.make_network_recorder = lambda *_a, **_k: self.Recorder()
         send_actions.time.sleep = lambda _seconds: None
         return page, saved
+
+    class Recorder:
+        """No platform response is captured, exactly like the live DM path."""
+
+        def collect(self, wait_seconds=0.0):
+            return []
 
     def _restore(self, saved):
         import send_actions
         (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
          send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
          send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+         send_actions.douyin.dm_conversation_row, send_actions.douyin.dm_row_preview_matches,
+         send_actions.douyin.dm_conversation_echo,
          send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
          send_actions.douyin.make_network_recorder, send_actions.time.sleep) = saved
 
@@ -3418,8 +3501,94 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reason"], "dm_panel_unavailable")
         self.assertTrue(result["evidence"]["skipped"])
-        self.assertEqual(len(page.clicks), 3, "面板打不开时按入口重试次数上报，且不发消息")
+        self.assertEqual(result["evidence"]["blockedBy"], "panel_not_opened")
+        self.assertEqual(len(page.clicks), 2, "面板打不开时按入口重试次数上报，且不发消息")
+        self.assertEqual(page.clicks[0], page.clicks[1], "重试仍然用当下重新取到的入口坐标")
 
+    def test_a_panel_showing_the_one_message_notice_still_sends(self):
+        """用户 2026-09-26 明确：页面顶部那句「对方回复或关注你之前，只能发送一条文字消息」
+        不是拒绝 —— 平台允许发一条，遇到它必须照常发出去。
+
+        真机实测（2026-09-26）：面板 1.5s 就开，会话头部标题 = 对方昵称，回车即可发出。
+        这条路径就是直播私信最常见的那一种：面板打开了、会话里只有那句提示语。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper imContainer"},
+                                    preview={"found": True, "containsText": True})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(
+                    page, SendGate(td, "account-a"), "notice-1",
+                    {"authorId": author, "authorName": "小明"}, "你好，看到你在直播间的提问")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "platform_response_unavailable")
+        self.assertEqual(result["evidence"]["mechanism"], "enter")
+        self.assertTrue(result["evidence"]["conversationListPreview"])
+        self.assertEqual(page.clicks, [(963, 132), (795, 860)],
+                         "点一次入口 + 点一次编辑器；入口坐标绝不会被点第二次（那是面板内部）")
+        self.assertEqual(page.typed, ["你好，看到你在直播间的提问"])
+        self.assertEqual(page.keys, [("Enter", "Enter", 13)])
+
+    def test_a_panel_stuck_on_the_message_list_opens_the_target_row(self):
+        """真机（2026-09-26）：点完「私信」面板有时停在消息列表。旧代码会在同一个坐标上
+        再点两次 —— 那里其实是面板内部的搜索框 —— 最后判 panel_not_opened，一条消息都没发。
+        现在改成：在会话列表里点开对方那一行（真机里行标题 = 对方昵称）。
+        """
+        import send_actions
+        author = "A" * 40
+        chat = {"found": True, "headerMatch": True, "x": 795, "y": 860, "text": "",
+                "panelKey": "componentsEntrywrapper imContainer"}
+        states = [{"found": False},                      # 点入口之前：面板没开
+                  {"found": True, "headerMatch": False},  # 点完入口：停在消息列表
+                  dict(chat),                            # 点开对方那一行之后
+                  dict(chat)]                            # 输入之后复核
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    states=states,
+                                    row={"found": True, "matched": True, "x": 800, "y": 300,
+                                         "rowsSeen": 4})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "list-1",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(page.clicks[0], (963, 132), "第一次点私信入口")
+        self.assertEqual(page.clicks[1], (800, 300),
+                         "第二次必须落在会话列表那一行上，而不是已经打开的面板内部（入口坐标）")
+        self.assertEqual(page.clicks[2], (795, 860), "第三次点会话里的编辑器")
+        self.assertEqual(len(page.clicks), 3, "一个动作都不许多余")
+        self.assertEqual(page.typed, ["你好呀"])
+        self.assertEqual(page.keys, [("Enter", "Enter", 13)])
+
+    def test_a_message_list_without_the_target_row_is_skipped(self):
+        """面板开了、但列表里没有对方那一行：跳过，不发任何东西，也不误报成通道故障。"""
+        import send_actions
+        author = "A" * 40
+        states = [{"found": False},
+                  {"found": True, "headerMatch": False}]
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    states=states,
+                                    row={"found": False, "matched": False, "rowsSeen": 4,
+                                         "reason": "conversation_row_not_found"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "list-2",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "dm_conversation_unavailable")
+        self.assertEqual(result["evidence"]["blockedBy"], "conversation_not_opened")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(result["evidence"]["entryClicks"], 1)
+        self.assertEqual(page.typed, [], "没进到对方会话时一个字都不许输入")
+        self.assertEqual(page.keys, [], "更不许按回车")
     def test_sidecar_returns_the_skipped_list_separately(self):
         import live_flow
         import send_actions
