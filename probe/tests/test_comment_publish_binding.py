@@ -362,27 +362,6 @@ class SendCommentReceiptTests(unittest.TestCase):
             self.assertEqual(result["reason"], "platform_response_unreadable", repr(raw))
             self.assertEqual(result["evidence"]["platformStatusCodes"], [None], repr(raw))
 
-    def test_it_does_not_reload_the_video_page_it_is_already_on(self):
-        """真机（2026-09-28）：重新导航会把采集时滚动加载出来的评论列表清空，
-        目标行于是再也找不到（reply_target_not_rendered）。已经在目标视频页上时不得重新导航。
-        """
-        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
-                         "parsed": {"status_code": 0}}]
-        result = self._run("no-reload")
-        self.assertEqual(result["reason"], "platform_response")
-        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
-        self.assertEqual(navigations, [], "已经在目标视频页上时不得重新导航")
-
-    def test_it_still_navigates_when_the_tab_is_somewhere_else(self):
-        """反向保护：不在目标页上时必须照旧导航（安全校验不能少）。"""
-        self.tab = FakeTab(url="https://www.douyin.com/video/999")
-        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
-                         "parsed": {"status_code": 0}}]
-        result = self._run("needs-navigate")
-        self.assertEqual(result["reason"], "platform_response")
-        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
-        self.assertEqual(len(navigations), 1, "不在目标页上必须导航过去")
-        self.assertEqual(navigations[0][1], {"url": ROOM})
 
     def test_the_request_body_is_never_persisted(self):
         """请求体只在内存里用于绑定：不写台账、不进 evidence、不写日志文件。"""
@@ -405,5 +384,26 @@ class SendCommentReceiptTests(unittest.TestCase):
         self.assertNotIn(marker, blob, '请求体不得进入任何持久化位置')
 
 
+    def test_it_does_not_reload_the_video_page_it_is_already_on(self):
+        """真机（2026-09-28）：重新导航会把采集时滚动加载出来的评论列表清空，
+        目标行于是再也找不到（reply_target_not_rendered）。已经在目标视频页上时不得重新导航。
+        """
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("no-reload")
+        self.assertEqual(result["reason"], "platform_response")
+        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
+        self.assertEqual(navigations, [], "已经在目标视频页上时不得重新导航")
+
+    def test_it_still_navigates_when_the_tab_is_somewhere_else(self):
+        """反向保护：不在目标页上时必须照旧导航（安全校验不能少）。"""
+        self.tab = FakeTab(url="https://www.douyin.com/video/999")
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("needs-navigate")
+        self.assertEqual(result["reason"], "platform_response")
+        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
+        self.assertEqual(len(navigations), 1, "不在目标页上必须导航过去")
+        self.assertEqual(navigations[0][1], {"url": ROOM})
 if __name__ == '__main__':
     unittest.main()
