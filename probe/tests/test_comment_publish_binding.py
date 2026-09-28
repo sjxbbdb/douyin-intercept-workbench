@@ -362,7 +362,6 @@ class SendCommentReceiptTests(unittest.TestCase):
             self.assertEqual(result["reason"], "platform_response_unreadable", repr(raw))
             self.assertEqual(result["evidence"]["platformStatusCodes"], [None], repr(raw))
 
-
     def test_the_request_body_is_never_persisted(self):
         """请求体只在内存里用于绑定：不写台账、不进 evidence、不写日志文件。"""
         marker = 'NONCE-abc123'
