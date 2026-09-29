@@ -207,6 +207,19 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
+* **页面不可见时点击不送达渲染进程（2026-09-28 真机复现）**：Chrome 窗口被遮挡/最小化时
+  `document.visibilityState === "hidden"`，`Input.dispatchMouseEvent` 的点击【不生效】——
+  现象正是"私信按钮坐标是对的、点上去、面板就是不开"（人工点同一个页面却正常）。
+  实测同一次点击：hidden 时面板 12 秒都不开；`Page.bringToFront` 之后同一个坐标立刻打开
+  （会话头部匹配、输入框出现、输入后清空、会话里出现回声）。
+  * 发送路径现在在【每次点击之前】再确认一次可见性（`_click_ready`），不可见先尝试恢复、
+    仍不可见就【不点】；
+  * 归因分开：一次都没能在可见状态下点下去 -> `blocked/page_not_visible`
+    （`skipped: false`、`manualAction: true`，人工把窗口切到前台再试）；
+    只有【页面可见但面板确实打不开】才是 `blocked/dm_panel_unavailable`
+    （`skipped: true`，对方未互关/私密/关闭了陌生人私信）—— 这两件事混在一起会把
+    可触达的用户误判成私密用户。
+  回归：`test_probe.PrivateSkipTests`（新增 2 个）+ `test_comment_publish_binding`（新增 1 个）。
 * **服务端签发策略的「身份」冻结（2026-09-26 评审收尾）**：本侧**不接收策略内容**
   （`policy` 对象继续以 `policy_not_server_issued` 拒绝），但支持把策略**身份**冻结进计划：
   `policyId` + `policyVersion`（+ 可选 `knowledgeSetVersion`），
@@ -344,6 +357,19 @@ same `unknown` semantics as the other send paths.
   透传由平台侧补齐，本侧只保证字段名与取值稳定。
   回归：`SearchPagingRelevanceTests.test_page_record_carries_version_and_paging_outcome`、
   `test_paging_outcome_is_not_confused_with_the_platform_signal`。
+* **私信面板里"挑输入框"和"判回显"都不许被搜索框骗（2026-09-28 真机反馈）**：私信面板左上是
+  【搜索】框，和发消息输入框一样是可见 editable；面板里还有会话列表。
+  * 挑输入框：`searchish()` 守卫（placeholder / 自身或祖先 class / data-e2e 含 search）已加进
+    `dm_composer` / `dm_composer_for_recipient` / `dm_panel_state` / `dm_send_button_for_recipient`，
+    保证"发消息的输入框"永远唯一命中 —— 否则文字会打进搜索框，消息根本没发出去；
+  * 判回显：旧实现把会话 scopes 里最长的一段 innerText 拼起来做【子串】匹配，
+    而 `[class*="imChat"]` 会命中输入框容器 `messageEditorimChatEditorContainer`
+    （真机实测 `editorInsideConversationScope: true`）——"刚敲进输入框、还没发出去"的文字
+    也会被判成会话回显（假证据）。现在只在会话区找【叶子节点、全文相等】的元素，
+    并显式排除输入框与搜索框子树。
+  真机验证：把标记词打进输入框（不发送）-> `dm_conversation_echo` 返回 `False`；
+  会话里真的存在的那条 -> 返回 `True`。
+  回归：`test_probe.ChromiumFixtureTests` 新增 2 个用例（夹具里补了搜索框与会话列表）。
 * **两个 mismatch 枚举不要混用（同义不同名，刻意的）**：公屏回复与私信的绑定校验在两条通道上
   各有自己的枚举 ——
   * 评论区：`public_send_id_mismatch`（`comment_private`）；

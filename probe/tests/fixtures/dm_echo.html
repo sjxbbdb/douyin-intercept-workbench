@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dm conversation echo counting</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; }
+  .messageEditor { display: block; border: 1px solid #333; padding: 8px; width: 300px; }
+  .head { width: 300px; padding: 4px; }
+  .bubble { display: block; padding: 2px 4px; }
+</style>
+<body>
+  <!-- 真机结构（2026-09-29）：会话头部标题 = 收件人；消息列表里一个气泡一个叶子节点。
+       回显判定必须【绑定收件人 + 本次发送动作】，所以夹具里放：
+         · 历史里已经有一条和本次话术完全相同的消息（不能被当成本次的证据）；
+         · 输入框里也有一份同样文字（还没发出去，更不算）。 -->
+  <div class="componentsEntrywrapper imContainer">
+    <div class="StackLayoutStackChatHeadertitle head" id="head">小明</div>
+    <div class="messageMessageList" id="list">
+      <span class="TextMessageTextpureText bubble" id="old">你好</span>
+    </div>
+    <div class="messageEditor" id="panel">
+      <div contenteditable="true" id="editor">你好</div>
+    </div>
+  </div>
+</body>
