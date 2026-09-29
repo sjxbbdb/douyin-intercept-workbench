@@ -813,6 +813,87 @@ def dm_row_preview_matches(cdp, author_name, text):
     return cdp.eval_json(expr) or {"found": False}
 
 
+# 🔴 评审要求（2026-09-29）：「私信回显必须绑定目标收件人和本次发送动作；历史会话中出现相同文字
+#    不能被判定为本次发送成功」。所以回显改成【计数】：调用方在发送前先取一次基线，发送后只有
+#    计数真的增加了，才算"这次看到了新的一条"。历史里已有的同样文字不会造成假证据。
+_CONVERSATION_ECHO_COUNT_JS = (
+    "(function(want){" + _SEARCH_GUARD_JS +
+    "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/\\s+/g,'').trim();}"
+    # 收件人绑定：会话头部标题必须仍然等于目标昵称，否则这份"回显"根本不证明是对的人。
+    "var head=document.querySelector(" + json.dumps(S.DM_CHAT_HEADER_TITLE) + ");"
+    "var expected=norm(want.name||''),headText=head?norm(head.innerText||head.textContent||''):'';"
+    "if(!expected||headText!==expected)return JSON.stringify({found:false,count:0,"
+    "reason:'recipient_not_confirmed'});"
+    # 输入框子树被排除：刚敲进去还没发的文字不是回显。
+    "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
+    "var ed=null;"
+    "if(box&&vis(box)){var eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
+    "for(var k=0;k<eds.length;k++){if(vis(eds[k])&&!searchish(eds[k])){ed=eds[k];break;}}}"
+    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ",wantText=norm(want.text||''),count=0;"
+    "for(var s=0;s<scopes.length;s++){var nodes=document.querySelectorAll(scopes[s]);"
+    "for(var i=0;i<nodes.length;i++){var node=nodes[i];"
+    "var els=[node].concat(Array.prototype.slice.call(node.querySelectorAll('*')));"
+    "for(var j=0;j<els.length;j++){var el=els[j];"
+    "if(el.children&&el.children.length>0)continue;"
+    "if(!vis(el))continue;"
+    "if(searchish(el))continue;"
+    "if(ed&&(el===ed||ed.contains(el)))continue;"
+    "if(norm(el.innerText||el.textContent)!==wantText)continue;"
+    "count++;}}}"
+    "return JSON.stringify({found:true,count:count,headerLen:headText.length});})"
+)
+
+
+def dm_conversation_echo_count(cdp, text, author_name=""):
+    """数一数【当前这个会话里】和本次话术完全相同的消息气泡有几个。
+
+    🔴 绑两件事（评审 2026-09-29）：
+      · 收件人：会话头部标题必须等于目标昵称，否则返回 recipient_not_confirmed ——
+        别人会话里的同样文字不算数；
+      · 本次动作：调用方先取基线计数，发送后只认【计数增加】，历史里已有的那条不算。
+    它仍然是页面观测（不是平台回执），所以调用方只把它写进 evidence。
+    """
+    payload = json.dumps({"text": re.sub(r"\s+", "", str(text or "")),
+                          "name": _norm_name(author_name)}, ensure_ascii=False)
+    try:
+        raw = cdp.evaluate(_CONVERSATION_ECHO_COUNT_JS + "(" + payload + ")") or ""
+    except Exception as exc:
+        return {"found": False, "count": 0, "reason": "echo_lookup_failed",
+                "error": type(exc).__name__}
+    try:
+        detail = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {}
+    except Exception:
+        detail = {}
+    if not detail:
+        return {"found": False, "count": 0, "reason": "echo_lookup_failed"}
+    return detail
+
+
+def dm_conversation_echo_after_send(cdp, text, author_name, baseline, seconds=6.0, interval=1.2):
+    """发送后等【新的一条】出现：计数必须超过基线。返回 {"echo","baseline","count"}。
+
+    基线取不到的（收件人未确认 / 读取失败）一律 echo=False：宁可漏报，
+    也不把"历史里本来就有这句字"当成这次发送的证据。
+    """
+    base = int((baseline or {}).get("count") or 0)
+    if not (baseline or {}).get("found"):
+        return {"echo": False, "baseline": None, "count": None,
+                "reason": (baseline or {}).get("reason") or "baseline_unavailable"}
+    deadline = time.time() + float(seconds)
+    while True:
+        detail = dm_conversation_echo_count(cdp, text, author_name)
+        if detail.get("found") and int(detail.get("count") or 0) > base:
+            return {"echo": True, "baseline": base, "count": int(detail.get("count") or 0)}
+        if time.time() >= deadline:
+            return {"echo": False, "baseline": base,
+                    "count": (int(detail.get("count")) if detail.get("found") else None),
+                    "reason": detail.get("reason")}
+        time.sleep(interval)
+
+
 _CONVERSATION_ECHO_JS = (
     "(function(want){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"

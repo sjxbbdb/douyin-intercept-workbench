@@ -666,6 +666,10 @@ def send_private(tab, gate, send_id, target, text):
             row = gate.finish(send_id, refusal["status"], refusal["reason"],
                               refusal["evidence"])
             return gate.result(row)
+        # 🔴 评审要求（2026-09-29）：回显必须绑定【目标收件人 + 本次发送动作】。
+        #    所以发送【之前】先取一次"这个会话里和本次话术完全相同的消息有几条"作为基线，
+        #    发送后只认【计数增加】—— 历史里本来就有同样文字时不会造成假证据。
+        echo_baseline = douyin.dm_conversation_echo_count(tab, text, author_name)
         # The durable started marker is the last operation before the send.
         gate.mark_started(send_id)
         started = True
@@ -686,7 +690,9 @@ def send_private(tab, gate, send_id, target, text):
         mark = getattr(S, "DM_SEND_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
         statuses = [_response_status(r) for r in matched]
-        echo = douyin.dm_conversation_echo(tab, text)
+        # 回显：必须比基线多出一条，才说明"这次真的看到了新消息"（仍然是页面观测）。
+        echo_detail = douyin.dm_conversation_echo_after_send(tab, text, author_name, echo_baseline)
+        echo = bool(echo_detail.get("echo"))
         cleared = None
         try:
             state = douyin.dm_panel_state(tab, author_name)
@@ -709,7 +715,11 @@ def send_private(tab, gate, send_id, target, text):
                           {"httpResponses": len(records), "matchedResponses": len(matched),
                            "platformStatusCodes": statuses[:5], "mechanism": mechanism,
                            "recipientVerification": context_mode,
-                           "composerCleared": cleared, "conversationEcho": bool(echo),
+                           "composerCleared": cleared, "conversationEcho": echo,
+                           # 回显的绑定证据：基线（发送前有几条相同文字）、发送后计数、未命中原因。
+                           "conversationEchoBaseline": echo_detail.get("baseline"),
+                           "conversationEchoCount": echo_detail.get("count"),
+                           "conversationEchoReason": echo_detail.get("reason"),
                            "conversationListPreview": bool(row_preview.get("containsText")),
                            "conversationListPreviewTries": int(row_preview.get("tries") or 0),
                            "sendRace": send_race})
