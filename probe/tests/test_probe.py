@@ -3493,6 +3493,80 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertTrue(result["evidence"]["manualAction"])
         self.assertEqual(page.clicks, [], "看不见的时候一个点击都不发出去")
 
+    def test_unknown_visibility_is_never_treated_as_recoverable(self):
+        """评审 2026-09-28 第 1 条：_click_ready() 曾把 unknown 当成可恢复状态。
+
+        unknown 不等于 hidden：只有 hidden 才尝试恢复（被遮挡/最小化真的能救回来），
+        unknown 一律【不恢复、不点】，直接交人工。
+        """
+        import send_actions
+        calls = {"ensure": 0}
+        saved = (send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible)
+        send_actions.douyin.visibility_state = lambda _cdp: "unknown"
+        ensure = lambda *_a, **_k: calls.__setitem__("ensure", calls["ensure"] + 1) or True
+        send_actions.douyin.ensure_visible = ensure
+        try:
+            decided = send_actions._click_ready(object())
+        finally:
+            send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible = saved
+        self.assertEqual(decided, "unknown")
+        self.assertEqual(calls["ensure"], 0, "unknown 不许拿去恢复")
+
+    def test_a_page_that_is_unknown_at_the_entry_click_goes_to_manual(self):
+        """unknown 出现在入口点击那一刻：不点、不恢复，落 blocked + manualAction 交人工。"""
+        import send_actions
+        author = "A" * 40
+        calls = {"ensure": 0}
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        states = ["visible"] + ["unknown"] * 6
+        send_actions.douyin.visibility_state = lambda _cdp: (states.pop(0) if states else "unknown")
+        ensure = lambda *_a, **_k: calls.__setitem__("ensure", calls["ensure"] + 1) or True
+        send_actions.douyin.ensure_visible = ensure
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "unk-entry",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_visibility_unknown")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertFalse(result["evidence"]["skipped"], "读不到状态不等于对方不可私信")
+        self.assertEqual(calls["ensure"], 0, "unknown 不许拿去恢复")
+        self.assertEqual(page.clicks, [], "读不到状态时一个点击都不发")
+
+    def test_a_page_that_hides_right_after_the_entry_click_is_not_reported_as_dm_unavailable(self):
+        """评审 2026-09-28 第 2 条：入口点击时可见、点完之后页面隐藏。
+
+        这一下很可能根本没送达渲染进程 —— 必须转人工（page_not_visible），
+        绝不能记成 dm_panel_unavailable：那等于把可触达的人判成「不可私信」。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        flags = {"clicked": False}
+        original_click = page.click_at
+
+        def click_at(*args):
+            original_click(*args)
+            flags["clicked"] = True
+
+        page.click_at = click_at
+        send_actions.douyin.visibility_state = lambda _cdp: ("hidden" if flags["clicked"] else "visible")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "late-hide",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_not_visible")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertFalse(result["evidence"]["skipped"], "页面不可见不等于对方不可私信")
+        self.assertEqual(page.typed, [], "没进到会话里，一个字都没输入")
+
     def test_a_panel_that_never_opens_on_a_visible_page_is_still_skipped(self):
         """反向保护：页面一直可见、面板确实打不开 -> 仍然是 skipped（对方不可私信）。"""
         import send_actions

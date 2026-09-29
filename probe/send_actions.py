@@ -263,8 +263,23 @@ def _visibility_gate(tab, gate, send_id):
     return None
 
 
+def _page_state(tab):
+    """当前页面可见性三态（visible / hidden / unknown）。
+
+    读不到就按 unknown —— **不是** hidden（平台侧 2026-09-26 的要求：unknown 只交人工，
+    不许拿它去恢复、去点击）。所有"临时再确认一次"的地方都走这里，
+    免得散落的 raw 判断把 unknown 当成可恢复状态。
+    """
+    try:
+        return douyin.visibility_state(tab)
+    except Exception:
+        return "unknown"
+
+
 def _click_ready(tab):
-    """点击【之前】再确认一次页面可见；不可见时先尝试恢复，仍不行返回 False。
+    """点击【之前】再确认一次页面可见。
+
+    返回三态：`"visible"` / `"hidden"` / `"unknown"` —— 调用方据此决定点、修、还是交人工。
 
     🔴 真机复现（2026-09-28）：
       Chrome 窗口被遮挡/最小化时 document.visibilityState == "hidden"，
@@ -272,13 +287,40 @@ def _click_ready(tab):
       "私信按钮坐标是对的、点上去、面板就是不开"（人工点同一个页面却正常）。
       实测同一个坐标：hidden 时面板不开；Page.bringToFront 之后立刻打开、
       会话头部匹配、输入框清空、会话里出现回声。
-    所以点击前必须再确认一次。确认不了就【不点】：把"没点着"记成
-    "对方不可私信"会把可触达的用户误判成私密用户（用户最在意的那类错误）。
+
+    🔴 评审意见（2026-09-28）：「_click_ready() 把 unknown 当成可恢复状态」——确实如此，
+    这里修掉：**unknown 不等于 hidden**（平台侧 2026-09-26 已明确），只有 hidden 才尝试
+    恢复（那是"被遮挡/最小化"这种真的能救回来的情况）；unknown 一律【不恢复、不点】，
+    直接交给人工 —— 读不到状态还去点，等于在"不知道页面是什么状态"的时候动手。
     """
-    if douyin.visibility_state(tab) == "visible":
-        return True
+    state = _page_state(tab)
+    if state == "visible":
+        return "visible"
+    if state != "hidden":
+        return "unknown"
+    # 只有 hidden 才尝试恢复；恢复后仍然读一次真实状态（可能变 unknown）。
     douyin.ensure_visible(tab)
-    return douyin.visibility_state(tab) == "visible"
+    after = _page_state(tab)
+    if after == "visible":
+        return "visible"
+    return "hidden" if after == "hidden" else "unknown"
+
+
+def _visibility_refusal(send_id, state, extra=None, skipped=False):
+    """点击前可见性不给过时的统一收口：一律 blocked + 手工处置，绝不记成目标不可触达。
+
+    两种状态都交人工，但原因分开，便于排查到底是"窗口被挡"还是"读不到状态"：
+      hidden  -> page_not_visible
+      unknown -> page_visibility_unknown
+    """
+    evidence = {"skipped": bool(skipped), "manualAction": True,
+                "blockedBy": "page_hidden_while_clicking" if state == "hidden"
+                            else "page_visibility_unknown_while_clicking"}
+    if extra:
+        evidence.update(extra)
+    return {"status": "blocked",
+            "reason": "page_not_visible" if state == "hidden" else "page_visibility_unknown",
+            "sendId": str(send_id), "evidence": evidence}
 
 
 def _final_send_click(tab, act, label="send"):
@@ -400,6 +442,9 @@ def send_private(tab, gate, send_id, target, text):
         composer = {"found": False}
         context_mode = "recipient_scoped"
         clicked_while_ready = False
+        # 点击前可见性不给过时的状态（hidden / unknown）—— 结束时据此转人工，
+        # 绝不把"没点着"记成"对方不可私信"（评审 2026-09-28）。
+        entry_blocked_state = None
         for attempt in range(3):
             entry = douyin.dm_entry(tab)
             if entry.get("blocked"):
@@ -407,9 +452,11 @@ def send_private(tab, gate, send_id, target, text):
                 return gate.result(row)
             if not entry.get("found"):
                 break
-            # 🔴 点击前再确认页面可见：hidden 时点击不送达渲染进程（见 _click_ready）。
-            #    不可见就不点 —— 点了也不会生效，只会把结论带偏。
-            if not _click_ready(tab):
+            # 🔴 点击前再确认页面可见（见 _click_ready）：hidden 时 Input 事件不送达
+            #    渲染进程；unknown 更不许碰（读不到状态就别动手）。两种情况都不点。
+            ready = _click_ready(tab)
+            if ready != "visible":
+                entry_blocked_state = ready
                 break
             clicked_while_ready = True
             tab.click_at(entry["x"], entry["y"])
@@ -438,11 +485,25 @@ def send_private(tab, gate, send_id, target, text):
             # 🔴 归因分两种（2026-09-28 真机）：一次都没能在【页面可见】时点下去，
             #    "面板没开"就【不能】说明对方不可私信 —— 那是页面不可见导致的点击无效，
             #    属于可重试 + 需人工把窗口切到前台的情况。所以先判这个，再判面板。
-            if not clicked_while_ready:
-                row = gate.finish(send_id, "blocked", "page_not_visible",
-                                  {"skipped": False, "manualAction": True,
-                                   "blockedBy": "page_hidden_while_clicking",
-                                   "entryClicks": 0})
+            # 🔴 归因三分（评审 2026-09-28 第 2 条）：
+            #   ① 点击前就不给点（hidden / unknown）-> 转人工；
+            #   ② 点了，但点完之后页面已经不可见（点击很可能根本没送达渲染进程）
+            #      -> 同样转人工，【不能】记成 dm_panel_unavailable；
+            #   ③ 页面全程可见、面板就是不开 -> 才是真的"对方不可私信"（跳过）。
+            if entry_blocked_state:
+                refusal = _visibility_refusal(send_id, entry_blocked_state,
+                                              {"entryClicks": 1 if clicked_while_ready else 0,
+                                               "pageStateAtEntryClick": entry_blocked_state})
+                row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                                  refusal["evidence"])
+                return gate.result(row)
+            late = _page_state(tab) if clicked_while_ready else "visible"
+            if late != "visible":
+                refusal = _visibility_refusal(
+                    send_id, "hidden" if late == "hidden" else "unknown",
+                    {"entryClicks": 1, "blockedByLate": "page_lost_after_entry_click"})
+                row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                                  refusal["evidence"])
                 return gate.result(row)
             panel = douyin.dm_panel_state(tab, author_name)
             if not (panel.get("found") and panel.get("headerMatch")):
@@ -507,11 +568,11 @@ def send_private(tab, gate, send_id, target, text):
         #    私信面板能开、字也能打进去，但最后一按等于没按 —— 必须在【落 started 之前】
         #    再确认一次；确认不了就什么都没发出去（blocked + manualAction），
         #    绝不把"没按着"记成平台拒绝。
-        if not _click_ready(tab):
-            row = gate.finish(send_id, "blocked", "page_not_visible",
-                              {"skipped": False, "manualAction": True,
-                               "blockedBy": "page_hidden_while_clicking",
-                               "mechanism": mechanism})
+        ready = _click_ready(tab)
+        if ready != "visible":
+            refusal = _visibility_refusal(send_id, ready, {"mechanism": mechanism})
+            row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                              refusal["evidence"])
             return gate.result(row)
         # The durable started marker is the last operation before the send.
         gate.mark_started(send_id)
@@ -1278,10 +1339,12 @@ def send_comment(tab, gate, send_id, target, text, source):
         # 🔴 同一条真机结论（2026-09-28）：页面不可见时点击不送达渲染进程，
         #    表现是"发送键点了没反应"。这里在【落 started 之前】再确认一次：
         #    确认不了按可重试的 page_not_visible 拒绝，不要记成定位器/选择器问题。
-        if not _click_ready(tab):
-            row = gate.finish(send_id, "blocked", "page_not_visible",
-                              {"skipped": True, "manualAction": True,
-                               "blockedBy": "page_hidden_while_clicking"})
+        ready = _click_ready(tab)
+        if ready != "visible":
+            # hidden 与 unknown 都交人工（unknown 不当作可恢复状态，见 _click_ready）。
+            refusal = _visibility_refusal(send_id, ready, skipped=True)
+            row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                              refusal["evidence"])
             return gate.result(row)
         gate.mark_started(send_id)
         started = True

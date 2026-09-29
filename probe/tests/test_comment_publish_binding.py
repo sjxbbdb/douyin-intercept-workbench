@@ -357,6 +357,21 @@ class SendCommentReceiptTests(unittest.TestCase):
             self.assertEqual(result["reason"], "platform_response_unreadable", repr(raw))
             self.assertEqual(result["evidence"]["platformStatusCodes"], [None], repr(raw))
 
+    def test_an_unknown_page_state_before_the_send_is_refused_too(self):
+        """评审 2026-09-28：unknown 不是可恢复状态。
+
+        发送键那一刻读不到可见性 -> 不点、不恢复、交人工（page_visibility_unknown），
+        而不是 attempt 恢复后继续点。
+        """
+        self.states = ["visible"] + ["unknown"] * 4
+        send_actions.douyin.ensure_visible = lambda tab, **kw: self.ensure_calls.append(tab) or True
+        result = self._run("vis-unknown-late")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_visibility_unknown")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertEqual(self.ensure_calls, [], "unknown 不许拿去恢复")
+        self.assertNotIn((5, 6), self.tab.clicks, "读不到状态时不得点发送键")
+
     def test_a_page_that_hides_before_the_click_is_refused(self):
         """真机结论（2026-09-28）：页面 hidden 时 Input 点击不送达渲染进程，
         发送键点了没反应。必须在【点击之前】拦住，并给出可重试的 page_not_visible，
