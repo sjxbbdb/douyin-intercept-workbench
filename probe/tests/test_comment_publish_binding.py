@@ -32,18 +32,23 @@ COMMENT_ID = 'comment-1'
 
 
 class FakeTab:
-    def __init__(self):
+    def __init__(self, url=ROOM):
         self.clicks = []
         self.typed = []
         self.calls = []
+        self.url = url
 
     def call(self, *args, **kwargs):
         self.calls.append(args)
+        # 更忠实的替身：真的导航过一次之后，location.href 就是新地址
+        # （否则"导航后校验目标页"这条永远拿到旧 URL，测不出真实行为）。
+        if args and args[0] == 'Page.navigate' and len(args) > 1 and isinstance(args[1], dict):
+            self.url = args[1].get('url') or self.url
         return {}
 
     def evaluate(self, expression):
         if expression == 'location.href':
-            return ROOM
+            return self.url
         if expression == 'document.readyState':
             return 'complete'
         return None
@@ -465,5 +470,26 @@ class SendCommentReceiptTests(unittest.TestCase):
         self.assertNotIn(marker, blob, '请求体不得进入任何持久化位置')
 
 
+    def test_it_does_not_reload_the_video_page_it_is_already_on(self):
+        """真机（2026-09-28）：重新导航会把采集时滚动加载出来的评论列表清空，
+        目标行于是再也找不到（reply_target_not_rendered）。已经在目标视频页上时不得重新导航。
+        """
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("no-reload")
+        self.assertEqual(result["reason"], "platform_response")
+        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
+        self.assertEqual(navigations, [], "已经在目标视频页上时不得重新导航")
+
+    def test_it_still_navigates_when_the_tab_is_somewhere_else(self):
+        """反向保护：不在目标页上时必须照旧导航（安全校验不能少）。"""
+        self.tab = FakeTab(url="https://www.douyin.com/video/999")
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("needs-navigate")
+        self.assertEqual(result["reason"], "platform_response")
+        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
+        self.assertEqual(len(navigations), 1, "不在目标页上必须导航过去")
+        self.assertEqual(navigations[0][1], {"url": ROOM})
 if __name__ == '__main__':
     unittest.main()
