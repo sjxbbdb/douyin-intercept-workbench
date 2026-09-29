@@ -2859,6 +2859,100 @@ class CommentBatchFlowTests(unittest.TestCase):
         params.update(overrides)
         return params
 
+    class _ReachPage:
+        """带 URL 的假页面：让 _reply_reachable_split 能走到真正的探针调用。"""
+
+        def __init__(self, url):
+            self.url = url
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return self.url
+            return None
+
+        def close(self):
+            pass
+
+    def _reachable_instance(self, td, collected, reachable_authors):
+        """把"页面上此刻能不能点开回复"替换成按作者判定；返回 (sidecar, instance)。"""
+        import sidecar
+        sidecar_mod, instance = self._instance(td, collected)
+        instance._page = lambda: (self._ReachPage(self.VIDEO), {"pid": 1})
+        original = sidecar.douyin.comment_row_present
+
+        def probe(_page, target, **kwargs):
+            hit = str(target.get("authorId") or "") in reachable_authors
+            return {"present": hit, "matches": 1 if hit else 0, "replyReady": hit,
+                    "reason": "" if hit else "comment_not_found"}
+
+        sidecar.douyin.comment_row_present = probe
+        instance._restore_comment_row_present = lambda: setattr(
+            sidecar.douyin, "comment_row_present", original)
+        return sidecar_mod, instance
+
+    def test_only_comments_replyable_right_now_are_frozen(self):
+        """评审 2026-09-29 真机结论：接口采到的评论里，页面上没渲染的无法回复。
+
+        计划阶段就按 replyReady 筛一遍：只冻结此刻真的能点开「回复」的那些，
+        并把 reachable/unreachable 计数写进 filter，宿主提前止损。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._reachable_instance(
+                td, self._collected(self._targets(2)), {"author-1"})
+            try:
+                planned = instance.comment_plan(self._plan_params())
+            finally:
+                instance._restore_comment_row_present()
+        self.assertEqual(planned["status"], "ok", planned)
+        self.assertEqual(len(planned["targets"]), 1, "只有 author-1 那条能点开回复")
+        self.assertEqual(planned["targets"][0]["authorId"], "author-1")
+        self.assertTrue(planned["filter"]["replyReachabilityChecked"])
+        self.assertEqual(planned["filter"]["replyReachable"], 1)
+        self.assertEqual(planned["filter"]["replyUnreachable"], 1,
+                         "另一条在页面上点不开 —— 不冻进批次，宿主提前止损")
+
+    def test_when_nothing_can_be_replied_to_no_batch_is_frozen(self):
+        """页面上一条都点不开「回复」：返回 empty + 稳定原因，不冻一批注定失败的批次。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._reachable_instance(
+                td, self._collected(self._targets(2)), set())
+            try:
+                planned = instance.comment_plan(self._plan_params())
+            finally:
+                instance._restore_comment_row_present()
+        self.assertEqual(planned["status"], "empty", planned)
+        self.assertEqual(planned["reason"], "no_replyable_comment")
+        self.assertIsNone(planned["batch"], "不冻结批次")
+        self.assertEqual(planned["filter"]["replyReachable"], 0)
+        self.assertEqual(planned["filter"]["replyUnreachable"], 2)
+
+    def test_a_broken_probe_falls_back_to_the_previous_behaviour(self):
+        """探针本身坏了不许把批次清空：checked=False，退回"按接口候选冻结"。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(2)))
+            instance._page = lambda: (self._ReachPage(self.VIDEO), {"pid": 1})
+            original = sidecar.douyin.comment_row_present
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("probe broken")
+
+            sidecar.douyin.comment_row_present = boom
+            try:
+                planned = instance.comment_plan(self._plan_params())
+            finally:
+                sidecar.douyin.comment_row_present = original
+        self.assertEqual(planned["status"], "ok", planned)
+        self.assertEqual(len(planned["targets"]), 2, "探针坏了按旧行为冻结，不清空")
+        self.assertFalse(planned["filter"]["replyReachabilityChecked"])
+
     def test_an_unknown_event_id_never_touches_the_queue_or_the_browser(self):
         """评审 2026-09-29：不存在的 eventId 不许先 mark_private 再抛 unknown_event。
 

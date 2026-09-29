@@ -1439,6 +1439,45 @@ class Sidecar:
     # 而两阶段契约（只有 sent_confirmed 才允许私信）是无法靠自觉守住的。
     # 这里把直播间已经跑通的同一套机制（队列 -> 批次 -> 冻结计划 -> 两阶段）搬到评论区。
 
+    def _reply_reachable_split(self, url, targets, limit=24):
+        """按【此刻页面上真的能点开「回复」】把候选分堆（只读，不下任何单）。
+
+        🔴 真机结论（2026-09-29）：视频页只渲染【几行】评论，而我们是按评论接口采的
+        （实测接口 179 条 / 命中 49 条，页面只渲染 5 行），两个集合【不重合】——
+        接口里有、页面上没有的评论技术上无法回复，冻结进批次只会让回复阶段成片
+        reply_target_not_rendered。直播间那条早就有 pick_reply_target 做这件事，评论区一直缺。
+
+        判据直接用 comment_row_present 的 replyReady（唯一命中 + 回复按钮可见且在视口内），
+        与发送阶段同源，避免"标注能回、真去点却点不着"。
+
+        返回 (reachable, unreachable, checked)。任何探针异常都返回 checked=False，
+        上层据此退回旧行为 —— 不因为探针坏了就把批次清空。
+        """
+        page = None
+        try:
+            page, _ = self._page()
+            _navigate(page, url)
+            if not _wait_document(page):
+                return list(targets), [], False
+            reachable, unreachable = [], []
+            for index, target in enumerate(targets):
+                if index >= limit:
+                    # 超出检查上限的按"可回复"处理（best-effort，不无限探）。
+                    reachable.extend(targets[index:])
+                    break
+                state = douyin.comment_row_present(
+                    page, {"authorId": target.get("authorId"), "text": target.get("text")})
+                if state.get("replyReady"):
+                    reachable.append(target)
+                else:
+                    unreachable.append(target)
+            return reachable, unreachable, True
+        except Exception:
+            return list(targets), [], False
+        finally:
+            if page is not None:
+                page.close()
+
     def comment_plan(self, params):
         """采集一条视频的评论、按关键词筛选，形成【评论批次】并冻结话术。
 
@@ -1499,8 +1538,23 @@ class Sidecar:
         if not targets:
             return {"status": "empty", "batch": None, "targets": [], "blocked": [],
                     "expired": [], "filter": filtered}
-
-        self.comment_queue.append(targets)
+        # 🔴 真机（2026-09-29）：先按"此刻页面上能不能点开「回复」"筛一遍再冻结。
+        #    接口采到的评论里，页面上没渲染的那些【技术上无法回复】——
+        #    冻进批次只会让回复阶段成片 reply_target_not_rendered（实测 8 条里 6 条）。
+        video_url = collected.get("url") or url
+        reachable, unreachable, checked = self._reply_reachable_split(video_url, targets)
+        filtered = dict(filtered or {})
+        filtered["replyReachable"] = len(reachable)
+        filtered["replyUnreachable"] = len(unreachable)
+        filtered["replyReachabilityChecked"] = checked
+        if checked and not reachable:
+            # 页面上一条都点不开：不冻批次，让宿主换视频/换关键词，
+            # 而不是冻一批注定失败的（宿主据此提前止损，不必等到回复阶段才发现）。
+            return {"status": "empty", "batch": None, "targets": [], "blocked": [],
+                    "expired": [], "filter": filtered,
+                    "reason": "no_replyable_comment"}
+        pool = reachable if checked else targets
+        self.comment_queue.append(pool)
         batch = self.comment_queue.take_batch(max_items=max_items,
                                               window_seconds=window_seconds)
         summary = comment_flow.batch_summary(batch)
