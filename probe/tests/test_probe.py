@@ -3177,6 +3177,283 @@ class ChatScrollTests(unittest.TestCase):
         self.assertFalse(moving["paused"], "列表仍在动时必须如实报告，不能假装停住了")
 
 
+    def test_the_pause_scroll_is_counted_so_the_list_can_be_restored(self):
+        """评审 2026-09-28：pause_autoscroll() 的第一次上滚以前不计入 scrolled_px。
+
+        如果目标正是在那一步被找到的，列表就不会被恢复到最新位置，下一轮采集看到的
+        还是那批旧弹幕。这里钉住：那一次【实测】滚动的像素必须计进 scrolledPx。
+        """
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"find": 0}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked, live.time.sleep)
+
+        class Cdp:
+            def eval_json(self, expression):
+                if expression == live.MENU_ITEMS_JS:
+                    return {"found": True, "items": [{"label": "回复 TA", "text": "回复 TA",
+                                                     "x": 1100, "y": 400}]}
+                return None
+
+        def find(_cdp, _target, box=None):
+            calls["find"] += 1
+            if calls["find"] < 2:
+                return {"ok": False, "reason": "danmaku_not_found_in_list", "box": box}
+            return {"ok": True, "x": 1100, "y": 400, "box": box}
+
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = find
+        # 停滚这一步真的滚了 360 像素（并且列表停住了）。
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": True, "box": list(box),
+                                                   "moved": 360, "atBottom": False}
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": True, "moved": 0, "atBottom": False}
+        live.click_guard.click_checked = lambda *_a, **_k: {"ok": True}
+        live.time.sleep = lambda _s: None
+        try:
+            menu = live.open_reply_menu(Cdp(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked, live.time.sleep) = original
+        self.assertTrue(menu["ok"], menu)
+        self.assertEqual(menu["scrolledPx"], 360,
+                         "停滚那一次的实测位移必须计入，否则列表回不到最新")
+
+    def test_open_reply_menu_scrolls_up_when_the_row_rolled_away(self):
+        """真机（2026-09-26，高流量房间）：从采集到回复只要几秒，那条弹幕就已经被新弹幕顶出
+        可视区（DOM 只渲染十几行，被顶走的那条连节点都没了）—— 对外表现就是
+        danmaku_not_found_in_list 成片出现。定位器要像真人一样往上滚去找，找到才点。
+        """
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"find": 0, "scroll": [], "clicks": []}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked)
+
+        class Cdp:
+            def eval_json(self, expression):
+                if expression == live.MENU_ITEMS_JS:
+                    return {"found": True, "items": [{"label": "回复 TA", "text": "回复 TA",
+                                                     "x": 1100, "y": 400}]}
+                return None
+
+        def find(_cdp, _target, box=None):
+            calls["find"] += 1
+            if calls["find"] < 3:
+                return {"ok": False, "reason": "danmaku_not_found_in_list", "box": box}
+            return {"ok": True, "x": 1100, "y": 400, "box": box}
+
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = find
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": True, "box": list(box)}
+
+        def scroll(_cdp, direction="up", amount=420, times=1, box=None):
+            calls["scroll"].append(direction)
+            # 现在是【实测】距离记账：假列表每滚一次就真的动了 RECOVERY_SCROLL_PX 像素。
+            return {"ok": True, "box": list(box or []), "moved": live.RECOVERY_SCROLL_PX,
+                    "atBottom": False}
+
+        live.scroll_chat_list = scroll
+
+        def click(_cdp, x, y, **_kwargs):
+            calls["clicks"].append((x, y))
+            return {"ok": True}
+
+        live.click_guard.click_checked = click
+        old_sleep = live.time.sleep
+        live.time.sleep = lambda _seconds: None
+        try:
+            menu = live.open_reply_menu(Cdp(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            live.time.sleep = old_sleep
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked) = original
+        self.assertTrue(menu["ok"], menu)
+        self.assertGreaterEqual(menu["scrolledPx"], live.RECOVERY_SCROLL_PX,
+                                "必须真的上滚去找过那条弹幕（420px 在快房间里只够买一秒）")
+        self.assertIn("up", calls["scroll"])
+        self.assertEqual(calls["clicks"], [(1100, 400)], "找到之后点的是定位到的那条")
+
+    def test_resume_chat_bottom_stops_when_the_list_is_really_at_the_bottom(self):
+        """回滚判据是【真的到底了没有】，不是"滚了几次"（2026-09-28 复查）。
+
+        每次滚完读一次 scrollTop：atBottom 为真就停；距离只用来给步数一个上限。
+        """
+        import live
+        original = live.scroll_chat_list
+        seen = []
+        scripted = [{"ok": True, "moved": 400, "atBottom": False},
+                    {"ok": True, "moved": 400, "atBottom": False},
+                    {"ok": True, "moved": 120, "atBottom": True}]
+
+        def scroll(_cdp, direction="up", amount=420, times=1, box=None):
+            seen.append(direction)
+            return scripted.pop(0) if scripted else {"ok": True, "moved": 0, "atBottom": True}
+
+        live.scroll_chat_list = scroll
+        try:
+            result = live.resume_chat_bottom(object(), distance=3 * live.RECOVERY_SCROLL_PX)
+        finally:
+            live.scroll_chat_list = original
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, ["down", "down", "down"])
+        self.assertTrue(result["atBottom"], "到底了才算回滚成功")
+        self.assertEqual(result["moved"], 920)
+
+    def test_resume_chat_bottom_survives_a_failing_scroll(self):
+        """滚轮发不出去/读不到滚动容器时不许抛异常：如实回报，调用方照常收尾。"""
+        import live
+        original = live.scroll_chat_list
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": False, "reason": "wheel_failed"}
+        try:
+            result = live.resume_chat_bottom(object(), distance=2400)
+        finally:
+            live.scroll_chat_list = original
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "wheel_failed")
+
+    def test_scroll_chat_list_reports_the_measured_distance_not_the_delta(self):
+        """滚轮 delta 不等于实际滚动量：delta 请求 420，列表只动了 300 就得记 300。"""
+        import live
+        original = (live.main_chat_list, live.chat_scroll_state)
+        tops = [1000, 700]
+
+        class Cdp:
+            def call(self, *_a, **_k):
+                return {}
+
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        live.chat_scroll_state = lambda _cdp, box=None: {"ok": True, "top": tops.pop(0),
+                                                         "height": 4000, "client": 600,
+                                                         "atBottom": False}
+        try:
+            result = live.scroll_chat_list(Cdp(), "up", amount=420)
+        finally:
+            live.main_chat_list, live.chat_scroll_state = original
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["delta"], -420, "请求值照旧回报")
+        self.assertEqual(result["moved"], 300, "记的是实测滚到的像素")
+        self.assertEqual(result["measured"], 1)
+        self.assertFalse(result["atBottom"])
+
+    def test_scroll_chat_list_without_a_scroller_does_not_raise(self):
+        """读不到滚动容器（scroll_container_not_found）时 moved 记 0，不抛异常。"""
+        import live
+        original = (live.main_chat_list, live.chat_scroll_state)
+
+        class Cdp:
+            def call(self, *_a, **_k):
+                return {}
+
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        live.chat_scroll_state = lambda _cdp, box=None: {"ok": False,
+                                                         "reason": "scroll_container_not_found"}
+        try:
+            result = live.scroll_chat_list(Cdp(), "up", amount=420)
+        finally:
+            live.main_chat_list, live.chat_scroll_state = original
+        self.assertTrue(result["ok"], "滚轮发出去了就算 ok，读不到容器只是记 0")
+        self.assertEqual(result["moved"], 0)
+        self.assertEqual(result["measured"], 0)
+        self.assertIsNone(result["atBottom"])
+
+    def test_scroll_chat_list_reports_a_wheel_failure_instead_of_raising(self):
+        """滚轮事件本身发不出去（CDP 传输失败）时也不许抛：如实记 wheel_failed。"""
+        import live
+        original = live.main_chat_list
+
+        class Cdp:
+            def call(self, *_a, **_k):
+                raise RuntimeError("simulated wheel transport failure")
+
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        try:
+            result = live.scroll_chat_list(Cdp(), "up", amount=420)
+        finally:
+            live.main_chat_list = original
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "wheel_failed")
+        self.assertEqual(result["error"], "RuntimeError")
+
+    def test_the_chat_list_is_restored_when_the_reply_raises_after_scrolling(self):
+        """异常恢复（2026-09-28）：上滚找旧弹幕之后流程炸了，也必须把列表还给最新。
+
+        否则下一轮采集看到的还是那批旧弹幕 —— 这条通道的坑就是这么埋下的。
+        """
+        import live
+        import send_actions
+        restored = []
+        original = (live.clear_composer, live.dismiss_confirm_modal, live.open_reply_menu,
+                    live.choose_reply_menu_item, live.composer_mention, live.find_composer,
+                    live.find_send_control, live.resume_chat_bottom,
+                    send_actions._visibility_gate, send_actions._await_login,
+                    send_actions.douyin.check_captcha, send_actions.click_guard.click_checked,
+                    send_actions.time.sleep)
+
+        class Page:
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                return "https://live.douyin.com/123456"
+
+            def call(self, *_a, **_k):
+                return {}
+
+            def click_at(self, *_a):
+                pass
+
+            def type_text(self, *_a):
+                pass
+
+        def boom(*_a, **_k):
+            raise RuntimeError("simulated failure after scrolling")
+
+        send_actions._visibility_gate = lambda *_a, **_k: None
+        send_actions._await_login = lambda *_a, **_k: "verified"
+        send_actions.douyin.check_captcha = lambda *_a, **_k: False
+        send_actions.click_guard.click_checked = lambda *_a, **_k: {"ok": True}
+        send_actions.time.sleep = lambda _seconds: None
+        live.clear_composer = lambda *_a, **_k: {"ok": True}
+        live.dismiss_confirm_modal = lambda *_a, **_k: {"handled": False}
+        live.open_reply_menu = lambda *_a, **_k: {
+            "ok": True, "items": [{"label": "回复 TA", "x": 1, "y": 2}], "scrolledPx": 3600}
+        live.choose_reply_menu_item = lambda *_a, **_k: {"ok": True}
+        live.composer_mention = lambda *_a, **_k: {"found": True, "startsAt": True,
+                                                  "text": "@小明 你好"}
+        live.find_composer = lambda *_a, **_k: {"found": True, "x": 5, "y": 6, "text": "关注我"}
+        live.find_send_control = boom
+        live.resume_chat_bottom = lambda _cdp, **kwargs: restored.append(kwargs) or {"ok": True}
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_danmaku_reply_native(
+                    Page(), SendGate(td, "account-a"), "restore-1",
+                    {"id": "e1", "roomId": "https://live.douyin.com/123456",
+                     "authorId": "u1", "authorName": "小明", "text": "怎么做"}, "关注我")
+        finally:
+            (live.clear_composer, live.dismiss_confirm_modal, live.open_reply_menu,
+             live.choose_reply_menu_item, live.composer_mention, live.find_composer,
+             live.find_send_control, live.resume_chat_bottom,
+             send_actions._visibility_gate, send_actions._await_login,
+             send_actions.douyin.check_captcha, send_actions.click_guard.click_checked,
+             send_actions.time.sleep) = original
+        self.assertEqual(result["reason"], "internal_error")
+        self.assertEqual(restored, [{"distance": 3600}],
+                         "异常路径也必须按实测上滚距离把列表滚回最新")
+
+    def test_restore_chat_bottom_is_a_no_op_when_nothing_was_scrolled(self):
+        """没上滚过就不要空滚（避免每一条成功的回复都白滚几次）。"""
+        import live
+        import send_actions
+        calls = []
+        original = live.resume_chat_bottom
+        live.resume_chat_bottom = lambda *_a, **_k: calls.append(1) or {"ok": True}
+        try:
+            send_actions._restore_chat_bottom(object(), 0)
+            send_actions._restore_chat_bottom(object(), 2400)
+        finally:
+            live.resume_chat_bottom = original
+        self.assertEqual(len(calls), 1, "0 像素不滚，>0 才滚")
+
 class RoomUrlTests(unittest.TestCase):
     """真机回归（2026-09-20）：抖音直播广场点进来的房间，房间号在【查询串】里。
 
