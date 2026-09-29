@@ -2821,6 +2821,85 @@ class CommentBatchFlowTests(unittest.TestCase):
         params.update(overrides)
         return params
 
+    def test_an_unknown_event_id_never_touches_the_queue_or_the_browser(self):
+        """评审 2026-09-29：不存在的 eventId 不许先 mark_private 再抛 unknown_event。
+
+        现在先判归属（纯读、无副作用）-> 稳定返回 blocked/event_not_in_plan；
+        既不起浏览器，也不给队列写任何私有记录。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            planned = instance.comment_plan(self._plan_params())
+            batch_id = planned["batch"]["batchId"]
+            calls = []
+            original = instance.comment_queue.mark_private
+            instance.comment_queue.mark_private = (
+                lambda *args, **kwargs: calls.append(args) or original(*args, **kwargs))
+            result = instance.comment_private({"batchId": batch_id, "items": [
+                {"eventId": "ghost-event", "sendId": "priv-1", "publicSendId": "pub-1"}]})
+        item = result["results"][0]
+        self.assertEqual(item["status"], "blocked")
+        self.assertEqual(item["reason"], "event_not_in_plan")
+        self.assertEqual(calls, [], "不属于本批次的事件不许落私有台账")
+
+    def test_an_event_that_exists_but_is_not_in_this_batch_is_not_in_plan(self):
+        """事件在队列里、但不在本批次：同样 event_not_in_plan（不猜、不落台账）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(2)),
+                                                   explode=True)
+            planned = instance.comment_plan(self._plan_params(maxItems=1))
+            batch_id = planned["batch"]["batchId"]
+            planned_ids = [target["eventId"] for target in planned["targets"]]
+            outside = next((name for name in ("e1", "e2") if name not in planned_ids), None)
+            self.assertIsNotNone(outside, "夹具应当有一个落在批次外的事件")
+            self.assertIsNotNone(instance.comment_queue.find_event(outside),
+                                 "这个事件在队列里确实存在")
+            result = instance.comment_private({"batchId": batch_id, "items": [
+                {"eventId": outside, "sendId": "priv-2", "publicSendId": "pub-1"}]})
+        self.assertEqual(result["results"][0]["reason"], "event_not_in_plan")
+
+    def test_a_batch_item_without_the_public_send_id_is_refused_before_the_browser(self):
+        """逐项结果必须稳定：缺 publicSendId -> blocked/public_missing，且不开浏览器。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            planned = instance.comment_plan(self._plan_params())
+            batch_id = planned["batch"]["batchId"]
+            event_id = planned["targets"][0]["eventId"]
+            result = instance.comment_private({"batchId": batch_id, "items": [
+                {"eventId": event_id, "sendId": "priv-3"}]})
+        self.assertEqual(result["results"][0]["status"], "blocked")
+        self.assertEqual(result["results"][0]["reason"], "public_missing")
+
+    def test_private_input_is_validated_before_the_browser_opens(self):
+        """评审 2026-09-29：通用私信入口的输入预检必须在打开浏览器之前完成。
+
+        参数级错误（sendId / target 类型 / authorId 形状 / text）以前会一路走到
+        send_actions 才失败 —— 那时浏览器已经开了。_instance(explode=True) 的 _page
+        会抛异常，等于证明这些拒绝都发生在开浏览器之前。
+        """
+        import sidecar
+        cases = [
+            ({"target": {"authorId": "author-1"}, "text": "你好"}, "sendId"),
+            ({"sendId": "s1", "target": "not-an-object", "text": "你好"}, "target"),
+            ({"sendId": "s1", "target": {}, "text": "你好"}, "authorId"),
+            ({"sendId": "s1", "target": {"authorId": "bad id!"}, "text": "你好"}, "authorId"),
+            ({"sendId": "s1", "target": {"authorId": "author-1"}, "text": ""}, "text"),
+            ({"sendId": "s1", "target": {"authorId": "author-1"}, "text": "x" * 2001}, "text"),
+        ]
+        for params, field in cases:
+            with tempfile.TemporaryDirectory() as td:
+                sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                       explode=True)
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.send_private(params)
+            self.assertEqual(raised.exception.code, "invalid_input", (field, params))
+            self.assertIn(field, str(raised.exception.message), field)
+
     def test_plan_refuses_missing_scripts_before_any_browser_action(self):
         """话术不完整就不建批次 —— fail-closed，连浏览器都不开。"""
         import sidecar
@@ -3300,6 +3379,34 @@ class ChatScrollTests(unittest.TestCase):
             live.main_chat_list, live.chat_list_tail, live.scroll_chat_list = original
         self.assertFalse(moving["paused"], "列表仍在动时必须如实报告，不能假装停住了")
 
+
+    def test_a_live_private_item_for_an_unknown_event_is_blocked_without_side_effects(self):
+        """评审 2026-09-29：live_private 遇到不存在的 eventId 时，不许先 mark_private 再抛
+        unknown_event —— 先判归属，统一返回 blocked/event_not_in_plan，且不开浏览器。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19279)
+            instance.live_queue.append([sidecar._event("live", "room-1", {
+                "id": "u1", "authorId": "author-1", "authorName": "小明", "text": "怎么做"})])
+            planned = instance.live_plan({"maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                                          "replyVia": "native",
+                                          "scripts": {"u1": {"publicText": "关注我",
+                                                             "privateText": "你好"}}})
+            batch_id = planned["batch"]["batchId"]
+            calls = []
+            original = instance.live_queue.mark_private
+            instance.live_queue.mark_private = (
+                lambda *args, **kwargs: calls.append(args) or original(*args, **kwargs))
+            opened = []
+            instance._page = lambda: opened.append(1) or (None, {"pid": 1})
+            result = instance.live_private({"batchId": batch_id, "items": [
+                {"eventId": "ghost-event", "sendId": "priv-9", "publicSendId": "pub-9"}]})
+        item = result["results"][0]
+        self.assertEqual(item["status"], "blocked")
+        self.assertEqual(item["reason"], "event_not_in_plan")
+        self.assertEqual(calls, [], "不存在的事件不许落私有台账")
+        self.assertEqual(opened, [], "没有可发送项时不许打开浏览器")
 
     def test_an_unknown_live_public_state_never_unlocks_the_private_message(self):
         """评审 2026-09-29：公屏状态是 unknown 时不得自动解锁私信。
