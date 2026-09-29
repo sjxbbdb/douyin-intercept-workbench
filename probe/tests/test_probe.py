@@ -818,6 +818,45 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(send["containerKey"], "target-panel")
 
 
+    def test_the_conversation_row_match_is_strict_not_prefix(self):
+        """用户要求（2026-09-28）：严格昵称匹配 —— 前缀不算同一个人。
+
+        夹具里有一行标题是 "Target"（正好是 "Target User" 的前缀）：如果还按前缀匹配，
+        查询 "Target User" 会同时命中两行 -> ambiguous -> 什么都点不了；
+        严格等值必须只命中标题完全相等的那一行。
+        """
+        import douyin
+        self._load("dm_list.html")
+        row = douyin.dm_conversation_row(self.page, "Target User")
+        self.assertTrue(row["found"], row)
+        self.assertEqual(row["count"], 1, "前缀诱饵行不许参与命中")
+        box = self.page.eval_json("(function(){var b=document.querySelector('#row-target').getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height};})()")
+        self.assertGreaterEqual(row["x"], box["x"])
+        self.assertLessEqual(row["y"], box["y"] + box["h"])
+        decoy = douyin.dm_conversation_row(self.page, "Target")
+        self.assertTrue(decoy["found"], "按它自己的完整标题查当然查得到")
+        self.assertNotEqual((decoy["x"], decoy["y"]), (row["x"], row["y"]))
+
+    def test_the_panel_header_match_is_strict_not_prefix(self):
+        """面板头部标题只做严格等值：标题是"小明"时，不能当成"小明同学"那一条会话。
+
+        脱敏星号与零宽字符仍然先归一化（"Star*User" == "StarUser"），否则脱敏昵称永远发不出去。
+        """
+        import douyin
+        self._load("dm_headers.html")
+        exact = douyin.dm_panel_state(self.page, "小明")
+        self.assertTrue(exact["found"], exact)
+        self.assertTrue(exact["headerMatch"], "完全相等必须命中")
+        prefixed = douyin.dm_panel_state(self.page, "小明同学")
+        self.assertFalse(prefixed["headerMatch"], "标题只是前缀 -> 不是同一个人，必须拒绝")
+        self.assertFalse(prefixed["headerFull"])
+        # 脱敏昵称（星号）归一化之后仍然必须严格相等，否则脱敏用户永远发不出去。
+        self.page.evaluate("document.querySelector('[class*=ChatHeadertitle]').innerText='Star*User'")
+        masked = douyin.dm_panel_state(self.page, "StarUser")
+        self.assertTrue(masked["headerMatch"], "脱敏星号归一化之后仍然严格相等")
+        self.assertFalse(douyin.dm_panel_state(self.page, "StarUserX")["headerMatch"],
+                         "多一个字就不是同一个人")
+
     def test_dm_conversation_rows_covered_by_the_open_chat_are_not_clickable(self):
         """真机（2026-09-26）：会话打开时，整列会话列表仍在 DOM 里且有真实尺寸，
         但整列被会话内容盖住 —— 照坐标点下去就是点进对方的会话（可能点到消息里的链接）。
@@ -842,7 +881,7 @@ class ChromiumFixtureTests(unittest.TestCase):
         row = douyin.dm_conversation_row(self.page, "Target User")
         self.assertTrue(row["found"], row)
         self.assertTrue(row["matched"])
-        self.assertEqual(row["rowsSeen"], 5, "隐藏行不算，可见行 5 个")
+        self.assertEqual(row["rowsSeen"], 6, "隐藏行不算：可见行 6 个（含一个前缀诱饵行）")
         box = self.page.eval_json("(function(){var b=document.querySelector('#row-target').getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height};})()")
         self.assertGreaterEqual(row["x"], box["x"])
         self.assertLessEqual(row["x"], box["x"] + box["w"])

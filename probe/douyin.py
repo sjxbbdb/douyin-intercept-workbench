@@ -689,8 +689,12 @@ _DM_PANEL_JS = (
     "var panel=box.closest('[class*=imContainer],[class*=componentsEntry]');"
     "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
     "text:String(ed.innerText||ed.value||'').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,''),headerFound:!!head,headerLen:headText.length,"
+    # 🔴 用户要求（2026-09-28）：收件人判定改为【严格昵称匹配】——
+    #    前缀命中不再算数（"小明" 不能当成 "小明同学"）。脱敏星号与零宽字符仍然
+    #    在 norm() 里先归一化，所以 "张*三" 与 "张三" 仍然相等；被截断的标题
+    #    则一律不匹配（宁可跳过，也不要把消息发给另一个人）。
     "headerFull:!!(full&&headText===full),headerPrefix:!!(prefix&&headText.indexOf(prefix)===0),"
-    "headerMatch:!!((full&&headText===full)||(prefix&&headText.indexOf(prefix)===0)),"
+    "headerMatch:!!(full&&headText===full),"
     "panelKey:panel?String(panel.className||'').slice(0,60):''};"
     "})"
 )
@@ -711,7 +715,7 @@ def dm_panel_state(cdp, author_name=""):
 
     🔴 真机实测（2026-09-20）：面板里没有 data-recipient-id / data-user-id，也没有指向
     /user/<sec_uid> 的链接，所以严格校验收件人的那套选择器在真机上 count=0。
-    真机可用信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
+    真机可用信号是【会话头部标题 = 对方昵称】（严格等值；脱敏星号与零宽字符先归一化）。
     返回里只给长度与匹配布尔值，昵称原文不出页面。
     """
     expected = {"full": _norm_name(author_name),
@@ -733,7 +737,9 @@ _DM_ROWS_FIND_JS = (
     "for(var j=0;j<nodes.length;j++){var t=norm(nodes[j].innerText||nodes[j].textContent||'');"
     "if(t){title=t;break;}}"
     "if(!title)continue;"
-    "if(!((full&&title===full)||(prefix&&title.indexOf(prefix)===0)))continue;"
+    # 严格昵称匹配（2026-09-28 用户要求）：只有归一化后【完全相等】才算命中，
+    # 前缀命中一律不算 —— 列表里"小明"那一行不是"小明同学"，点错就是发给另一个人。
+    "if(!(full&&title===full))continue;"
     "var r=row.getBoundingClientRect();"
     # 🔴 真机（2026-09-26）：会话打开时，整列会话列表仍然挂在 DOM 里、仍然有真实尺寸，
     #    但【整列被会话内容盖住】—— elementFromPoint 命中的是消息气泡而不是行。
