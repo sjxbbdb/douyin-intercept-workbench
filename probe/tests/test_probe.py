@@ -3010,6 +3010,48 @@ class ChatScrollTests(unittest.TestCase):
         self.assertFalse(moving["paused"], "列表仍在动时必须如实报告，不能假装停住了")
 
 
+    def test_the_pause_scroll_is_counted_so_the_list_can_be_restored(self):
+        """评审 2026-09-28：pause_autoscroll() 的第一次上滚以前不计入 scrolled_px。
+
+        如果目标正是在那一步被找到的，列表就不会被恢复到最新位置，下一轮采集看到的
+        还是那批旧弹幕。这里钉住：那一次【实测】滚动的像素必须计进 scrolledPx。
+        """
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"find": 0}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked, live.time.sleep)
+
+        class Cdp:
+            def eval_json(self, expression):
+                if expression == live.MENU_ITEMS_JS:
+                    return {"found": True, "items": [{"label": "回复 TA", "text": "回复 TA",
+                                                     "x": 1100, "y": 400}]}
+                return None
+
+        def find(_cdp, _target, box=None):
+            calls["find"] += 1
+            if calls["find"] < 2:
+                return {"ok": False, "reason": "danmaku_not_found_in_list", "box": box}
+            return {"ok": True, "x": 1100, "y": 400, "box": box}
+
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = find
+        # 停滚这一步真的滚了 360 像素（并且列表停住了）。
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": True, "box": list(box),
+                                                   "moved": 360, "atBottom": False}
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": True, "moved": 0, "atBottom": False}
+        live.click_guard.click_checked = lambda *_a, **_k: {"ok": True}
+        live.time.sleep = lambda _s: None
+        try:
+            menu = live.open_reply_menu(Cdp(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked, live.time.sleep) = original
+        self.assertTrue(menu["ok"], menu)
+        self.assertEqual(menu["scrolledPx"], 360,
+                         "停滚那一次的实测位移必须计入，否则列表回不到最新")
+
     def test_open_reply_menu_scrolls_up_when_the_row_rolled_away(self):
         """真机（2026-09-26，高流量房间）：从采集到回复只要几秒，那条弹幕就已经被新弹幕顶出
         可视区（DOM 只渲染十几行，被顶走的那条连节点都没了）—— 对外表现就是

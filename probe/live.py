@@ -670,12 +670,17 @@ def pause_autoscroll(cdp, settle=1.3, box=None):
             return {"ok": False, "reason": picked.get("reason") or "main_chat_list_not_found"}
         box = picked["box"]
     before = chat_list_tail(cdp, box)
-    scroll_chat_list(cdp, "up", 420, 1, box)
+    # 🔴 评审意见（2026-09-28）：这一步的上滚以前【不计入 scrolled_px】——
+    #    如果目标正是在这一步被找到的，列表就不会被恢复到最新位置，下一轮采集会受影响。
+    #    所以把【实测】滚到的像素一并回报，由调用方累计。
+    step = scroll_chat_list(cdp, "up", 420, 1, box)
     time.sleep(settle)
     after = chat_list_tail(cdp, box)
     paused = bool(before.get("ok") and after.get("ok") and before.get("key") == after.get("key"))
     return {"ok": True, "paused": paused, "box": list(box),
-            "before": before.get("key"), "after": after.get("key")}
+            "before": before.get("key"), "after": after.get("key"),
+            "moved": (int(step.get("moved") or 0) if step.get("ok") else 0),
+            "atBottom": step.get("atBottom")}
 
 
 def scroll_to_danmaku(cdp, target, max_steps=4, amount=420):
@@ -1128,6 +1133,9 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
         if index == 1:
             settled = pause_autoscroll(cdp)
             box = settled.get("box") or box
+            # 这一步也真的滚动了列表：把实测像素计进 scrolled_px，
+            # 否则"正好在这一步找到目标"时，列表不会被恢复到最新（评审 2026-09-28）。
+            scrolled_px += max(0, int(settled.get("moved") or 0))
         elif index >= 2:
             # 🔴 真机量出来的（2026-09-26，高流量房间 685317364746，公屏每秒好几条）：
             #    采集后 0s 四条全部能直接定位；15s 时一条都定不到，但【上滚 3600px 找回一半】；
