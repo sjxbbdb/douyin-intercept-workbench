@@ -512,7 +512,7 @@ def send_private(tab, gate, send_id, target, text):
         composer = {"found": False}
         context_mode = "recipient_scoped"
         clicked_while_ready = False
-        entry_click_blocked_hidden = False
+        entry_blocked_state = None
         panel_probe = []
         entry_clicks = 0
         panel = {"found": False}
@@ -535,12 +535,13 @@ def send_private(tab, gate, send_id, target, text):
                     return gate.result(row)
                 if not entry.get("found"):
                     break
-                # 🔴 点击前再确认页面可见（#48）：hidden 时点击不送达渲染进程。
-                #    确认不了就不点 —— 点了也不会生效，只会把结论带偏：
-                #    把"没点着"记成"对方不可私信"会把可触达的人误判成私密用户。
-                if not _click_ready(tab):
-                    entry_click_blocked_hidden = True
-                    probe["pageHiddenBeforeEntryClick"] = True
+                # 🔴 点击前再确认页面可见（#48）：hidden 时点击不送达渲染进程；
+                #    unknown 更不许碰（读不到状态就别动手）。两种情况都不点，
+                #    也不把"没点着"记成"对方不可私信"。
+                ready = _click_ready(tab)
+                if ready != "visible":
+                    entry_blocked_state = ready
+                    probe["pageStateBeforeEntryClick"] = ready
                     break
                 clicked_while_ready = True
                 tab.click_at(entry["x"], entry["y"])
@@ -578,18 +579,30 @@ def send_private(tab, gate, send_id, target, text):
             panel = _await_dm_panel(tab, author_name)
             probe["headerMatchAfterRowClick"] = bool(panel.get("headerMatch"))
         if not composer.get("found"):
-            # 🔴 归因分三种（#48 + #54）：
-            #   · 一次都没能在【页面可见】时点下去 -> page_not_visible（可重试 + 需人工前置窗口），
-            #     绝不能记成"对方不可私信"；
-            #   · 面板压根没开 -> dm_panel_unavailable（跳过，换下一个目标）；
-            #   · 面板开了但停在列表、且列表里没有对方那一行 -> dm_conversation_unavailable（跳过）。
+            # 🔴 归因四分（#48 的边界 + #54 的新流程）：
+            #   ① 点击前就不给点（hidden / unknown）-> 转人工（不猜目标不可私信）；
+            #   ② 点了，但点完之后页面已经不可见（点击很可能没送达渲染进程）-> 同样转人工，
+            #      【绝不】记成 dm_panel_unavailable（评审 2026-09-28 第 2 条）；
+            #   ③ 面板压根没开、页面全程可见 -> dm_panel_unavailable（跳过，换下一个目标）；
+            #   ④ 面板开了但停在列表、且列表里没有对方那一行 -> dm_conversation_unavailable（跳过）。
             # ⚠️ 页面顶部那句「对方回复或关注你之前，只能发送一条文字消息」【不是】拒绝：
             #    平台允许发一条，遇到它必须照常发出去（用户 2026-09-26 明确）。
-            if entry_click_blocked_hidden:
-                row = gate.finish(send_id, "blocked", "page_not_visible",
-                                  {"skipped": False, "manualAction": True,
-                                   "blockedBy": "page_hidden_while_clicking",
-                                   "entryClicks": entry_clicks, "attempts": panel_probe})
+            if entry_blocked_state:
+                refusal = _visibility_refusal(send_id, entry_blocked_state,
+                                              {"entryClicks": entry_clicks,
+                                               "pageStateAtEntryClick": entry_blocked_state,
+                                               "attempts": panel_probe})
+                row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                                  refusal["evidence"])
+                return gate.result(row)
+            late = _page_state(tab) if clicked_while_ready else "visible"
+            if late != "visible":
+                refusal = _visibility_refusal(
+                    send_id, "hidden" if late == "hidden" else "unknown",
+                    {"entryClicks": entry_clicks, "attempts": panel_probe,
+                     "blockedByLate": "page_lost_after_entry_click"})
+                row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                                  refusal["evidence"])
                 return gate.result(row)
             ever_open = any(p.get("panelOpen") or p.get("panelOpenAfterClick") for p in panel_probe)
             reason = "dm_conversation_unavailable" if ever_open else "dm_panel_unavailable"
