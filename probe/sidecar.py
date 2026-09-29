@@ -766,7 +766,7 @@ def _navigate(page, url):
 
 
 class Sidecar:
-    def __init__(self, state_dir, profile_dir, port):
+    def __init__(self, state_dir, profile_dir, port, gate_limits=None):
         self.state_dir = self._external_dir(state_dir, "state-dir")
         self.profile_dir = self._external_dir(profile_dir, "profile-dir")
         self.port = int(port)
@@ -774,7 +774,10 @@ class Sidecar:
             raise SidecarError("invalid_port", "port must be between 1024 and 65535")
         os.makedirs(self.state_dir, exist_ok=True)
         self.account_scope = hashlib.sha256(self.profile_dir.encode("utf-8")).hexdigest()[:32]
-        self.gate = SendGate(self.state_dir, self.account_scope)
+        # 本地安全阀（每目标 1 条 / 每小时 / 每天）。默认值保持不变；
+        # 授信调用方可以显式调高（真机验收、压测等场景）—— 这是【本地】限额，
+        # 不是平台配额，调高它不等于绕过平台风控（见 send_gate 的说明）。
+        self.gate = SendGate(self.state_dir, self.account_scope, limits=gate_limits)
         # 点击审计：每次（含被拒绝的）点击都写一行，便于事后复核落点
         click_guard.set_audit_path(os.path.join(self.state_dir, "click_audit.jsonl"))
         self.live_queue = live_flow.LiveQueue(self.state_dir, self.account_scope)
@@ -2194,9 +2197,26 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--port", required=True, type=int)
+    # 本地安全阀（可选覆盖）：默认 每目标 1 / 每小时 20 / 每天 50。
+    # 授信调用方可在真机验收或压测时调高 —— 这是【本地】限额，不是平台配额。
+    parser.add_argument("--per-user-limit", type=int, default=None)
+    parser.add_argument("--hourly-limit", type=int, default=None)
+    parser.add_argument("--daily-limit", type=int, default=None)
     args = parser.parse_args(argv)
+    limits = {}
+    for key, value in (("per_user", args.per_user_limit),
+                       ("hourly", args.hourly_limit),
+                       ("daily", args.daily_limit)):
+        if value is not None:
+            if value < 0:
+                _emit({"id": None, "ok": False,
+                       "error": {"code": "invalid_config",
+                                 "message": "%s limit must not be negative" % key}})
+                return 2
+            limits[key] = int(value)
     try:
-        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port)
+        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port,
+                          gate_limits=limits or None)
     except Exception as exc:
         _emit({"id": None, "ok": False, "error": {"code": getattr(exc, "code", "invalid_config"),
                                                       "message": _err_message(getattr(exc, "message", exc))}})

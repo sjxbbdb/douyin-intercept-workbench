@@ -96,6 +96,21 @@ class SendGateTests(unittest.TestCase):
             self.assertEqual(kinds.count("reserved"), 1)
             self.assertEqual(kinds.count("blocked"), 1)
 
+    def test_gate_limits_default_unchanged_and_can_be_raised_explicitly(self):
+        """本地安全阀：默认值不动，授信调用方可以显式调高（真机验收时需要）。
+
+        这是【本地】限额，不是平台配额；调高它不改变任何发送门禁语义
+        （两阶段契约、unknown 不重试、幂等键都还在）。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            default = sidecar.Sidecar(os.path.join(td, "s1"), os.path.join(td, "p1"), 19291)
+            raised = sidecar.Sidecar(os.path.join(td, "s2"), os.path.join(td, "p2"), 19292,
+                                     gate_limits={"hourly": 60, "daily": 200})
+        self.assertEqual(default.gate.limits, {"per_user": 1, "hourly": 20, "daily": 50},
+                         "默认本地安全阀保持不变")
+        self.assertEqual(raised.gate.limits, {"per_user": 1, "hourly": 60, "daily": 200})
+
     def test_account_scopes_are_isolated(self):
         with tempfile.TemporaryDirectory() as td:
             a = SendGate(os.path.join(td, "a"), "account-a")
