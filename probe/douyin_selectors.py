@@ -169,6 +169,13 @@ DM_SEND_TEXT = "发送"          # 兜底：某些版本可能有文字
 DM_BUTTON_TEXT = "私信"      # innerText 去空白后严格相等
 SEND_BUTTON_TEXT = "发送"
 
+# ---- 消息面板里的「会话列表」（2026-09-26 真机实测）----
+# 真机事实：点主页上的「私信」之后，面板有时候停在【消息列表】而不是直接进入会话。
+# 要发私信就得像真人一样先在列表里点开对方那一行，再从会话里的编辑器输入。
+# （面板根 div.componentsEntrywrapper.imContainer，行 wrapper / 行标题见下。）
+DM_CONVERSATION_ITEM = '[class*="ConversationItemwrapper"]'
+DM_CONVERSATION_ITEM_TITLE = '[class*="ConversationItemtitle"]'
+
 # ---- 发送【被平台拦下】的文案（2026-09-19 真机抓到的原文）----
 # 🔴 为什么必须单独识别它：
 #    "文案出现在会话面板里"这个判据，分不清两种情况——
@@ -272,6 +279,8 @@ REGISTRY = {
     "dmEditorScope":  {"value": DM_EDITOR_SCOPES[0],"offline_verified_at": None,      "live_verified_at": "2026-09-19", "confidence": "high"},
     "searchBar":      {"value": SEARCH_BAR,      "offline_verified_at": None,        "live_verified_at": "2026-09-19", "confidence": "high"},
     "dmSendButton":   {"value": DM_SEND_BUTTON,  "offline_verified_at": None,        "live_verified_at": "2026-09-19", "confidence": "high"},
+    "dmConversationItem": {"value": DM_CONVERSATION_ITEM, "offline_verified_at": None, "live_verified_at": "2026-09-26", "confidence": "high"},
+    "dmConversationItemTitle": {"value": DM_CONVERSATION_ITEM_TITLE, "offline_verified_at": None, "live_verified_at": "2026-09-26", "confidence": "high"},
     "noteDetail":     {"value": NOTE_DETAIL,    "offline_verified_at": "2026-09-18", "live_verified_at": None, "confidence": "high"},
 }
 
@@ -296,3 +305,12 @@ DM_MESSAGE_EDITOR_SCOPE = '[class*="messageEditor"]'
 DM_CHAT_HEADER_TITLE = '[class*="ChatHeadertitle"]'
 DM_CONVERSATION_SCOPES = ['[class*="messageMessageList"]', '[class*="MessageBox"]',
                           '[class*="messageList"]', '[class*="imChat"]']
+
+# ---------- 消息面板里的「会话列表」（2026-09-26 真机实测） ----------
+# 真机事实：点主页上的「私信」之后，面板有时候停在【消息列表】而不是直接进入会话
+#   div.componentsEntrywrapper.imContainer            <- 面板根
+#     └ div.conversationConversationItemwrapper       <- 一行一个会话
+#         ├ div.conversationConversationItemtitle     <- 行标题（= 对方昵称）
+#         └ div.ConversationItemHinttextBox/Desc      <- 行预览（最后一条消息 / 平台提示语）
+# 要发私信就得像真人一样先在列表里点开对方那一行，再从会话里的编辑器输入。
+# 选择器常量定义在文件上方（DM_CONVERSATION_ITEM / DM_CONVERSATION_ITEM_TITLE）。

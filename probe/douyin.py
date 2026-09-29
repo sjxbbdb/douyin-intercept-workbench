@@ -689,8 +689,12 @@ _DM_PANEL_JS = (
     "var panel=box.closest('[class*=imContainer],[class*=componentsEntry]');"
     "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
     "text:String(ed.innerText||ed.value||'').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,''),headerFound:!!head,headerLen:headText.length,"
+    # 🔴 用户要求（2026-09-28）：收件人判定改为【严格昵称匹配】——
+    #    前缀命中不再算数（"小明" 不能当成 "小明同学"）。脱敏星号与零宽字符仍然
+    #    在 norm() 里先归一化，所以 "张*三" 与 "张三" 仍然相等；被截断的标题
+    #    则一律不匹配（宁可跳过，也不要把消息发给另一个人）。
     "headerFull:!!(full&&headText===full),headerPrefix:!!(prefix&&headText.indexOf(prefix)===0),"
-    "headerMatch:!!((full&&headText===full)||(prefix&&headText.indexOf(prefix)===0)),"
+    "headerMatch:!!(full&&headText===full),"
     "panelKey:panel?String(panel.className||'').slice(0,60):''};"
     "})"
 )
@@ -711,13 +715,102 @@ def dm_panel_state(cdp, author_name=""):
 
     🔴 真机实测（2026-09-20）：面板里没有 data-recipient-id / data-user-id，也没有指向
     /user/<sec_uid> 的链接，所以严格校验收件人的那套选择器在真机上 count=0。
-    真机可用信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
+    真机可用信号是【会话头部标题 = 对方昵称】（严格等值；脱敏星号与零宽字符先归一化）。
     返回里只给长度与匹配布尔值，昵称原文不出页面。
     """
     expected = {"full": _norm_name(author_name),
                 "prefix": _norm_name(str(author_name or "").split("*")[0])}
     payload = json.dumps(expected, ensure_ascii=False)
     return cdp.eval_json("(%s)(%s)" % (_DM_PANEL_JS, payload)) or {"found": False}
+
+
+_DM_ROWS_FIND_JS = (
+    "function dmRows(expected){"
+    "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/[*＊]/g,'').replace(/\\s+/g,'').trim();}"
+    "var full=norm(expected.full||''),prefix=norm(expected.prefix||'');"
+    "var rows=document.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM) + "),hits=[],seen=0,covered=0;"
+    "for(var i=0;i<rows.length;i++){var row=rows[i];if(!vis(row))continue;seen++;"
+    "var nodes=row.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM_TITLE) + "),title='';"
+    "for(var j=0;j<nodes.length;j++){var t=norm(nodes[j].innerText||nodes[j].textContent||'');"
+    "if(t){title=t;break;}}"
+    "if(!title)continue;"
+    # 严格昵称匹配（2026-09-28 用户要求）：只有归一化后【完全相等】才算命中，
+    # 前缀命中一律不算 —— 列表里"小明"那一行不是"小明同学"，点错就是发给另一个人。
+    "if(!(full&&title===full))continue;"
+    "var r=row.getBoundingClientRect();"
+    # 🔴 真机（2026-09-26）：会话打开时，整列会话列表仍然挂在 DOM 里、仍然有真实尺寸，
+    #    但【整列被会话内容盖住】—— elementFromPoint 命中的是消息气泡而不是行。
+    #    这时候照坐标点下去就是点进对方的会话里（可能点到消息里的链接），
+    #    所以先做遮挡判定（与私信入口同一套规则），被盖住的行一律不返回。
+    "var cx=Math.round(r.x+r.width/2),cy=Math.round(r.y+r.height/2);"
+    "var hit=document.elementFromPoint(cx,cy);"
+    "if(!(hit&&(hit===row||row.contains(hit)))){covered++;continue;}"
+    "hits.push({titleLen:title.length,titleFull:!!(full&&title===full),"
+    "titlePrefix:!!(prefix&&title.indexOf(prefix)===0),"
+    "body:norm(row.innerText||row.textContent||''),"
+    "x:cx,y:cy,w:Math.round(r.width),h:Math.round(r.height)});}"
+    "return {hits:hits,seen:seen,covered:covered};}"
+)
+
+_DM_ROW_JS = (
+    "(function(expected){"
+    + _DM_ROWS_FIND_JS +
+    "var found=dmRows(expected),hits=found.hits;"
+    "if(hits.length!==1)return {found:false,matched:false,count:hits.length,rowsSeen:found.seen,"
+    "covered:found.covered,"
+    "reason:hits.length?'ambiguous_conversation_row':"
+    "(found.covered?'conversation_row_covered':'conversation_row_not_found')};"
+    "var h=hits[0];"
+    "return {found:true,matched:true,count:1,rowsSeen:found.seen,titleLen:h.titleLen,"
+    "titleFull:h.titleFull,titlePrefix:h.titlePrefix,x:h.x,y:h.y,w:h.w,h:h.h};})(EXPECTED)"
+)
+
+_DM_ROW_PREVIEW_JS = (
+    "(function(expected,want){"
+    + _DM_ROWS_FIND_JS +
+    "var found=dmRows(expected),hits=found.hits;"
+    "if(hits.length!==1)return {found:false,count:hits.length,rowsSeen:found.seen,covered:found.covered};"
+    "var body=hits[0].body,needle=String(want||'');"
+    "return {found:true,count:1,rowsSeen:found.seen,bodyLen:body.length,"
+    "containsText:!!(needle&&body.indexOf(needle)>=0)};})(EXPECTED,WANT)"
+)
+
+
+def _expected_name(author_name):
+    return {"full": _norm_name(author_name),
+            "prefix": _norm_name(str(author_name or "").split("*")[0])}
+
+
+def dm_conversation_row(cdp, author_name):
+    """在消息面板的【会话列表】里定位对方那一行（真机里这一行标题就是对方昵称）。
+
+    🔴 真机（2026-09-26，用户反馈"打开了私信却没有真的发私信"）：点主页上的「私信」
+    之后，面板有时候停在【消息列表】——会话并没有打开，而入口按钮的坐标（约 963,132）
+    正好落在已经打开的面板内部（搜索框/标题栏那一带）。于是在这里像真人一样：
+    在列表里点开对方那一行，再从会话里的编辑器输入。
+    只回报长度与匹配布尔值，昵称原文不出页面；多行同名时返回 not found（不猜）。
+    """
+    expr = _DM_ROW_JS.replace("EXPECTED", json.dumps(_expected_name(author_name), ensure_ascii=False))
+    return cdp.eval_json(expr) or {"found": False}
+
+
+def dm_row_preview_matches(cdp, author_name, text):
+    """会话列表里对方那一行的预览，是不是已经变成刚发出去的那句话。
+
+    这是【页面观察】，不是平台回执：私信走长连接、没有 HTTP 回执（红线 2），
+    所以它只能作为证据，永远不足以宣告 sent_confirmed。
+    真机实测（2026-09-26）：发出去的那条会出现在该行预览里，整页重载后仍在；
+    没发出去的行只显示平台提示语（"对方回复或关注你之前，只能发送一条文字消息"）。
+    """
+    needle = _norm_name(text)[:6]
+    if not needle:
+        return {"found": False, "reason": "empty_text"}
+    expr = _DM_ROW_PREVIEW_JS.replace("EXPECTED", json.dumps(_expected_name(author_name), ensure_ascii=False)) \
+                            .replace("WANT", json.dumps(needle, ensure_ascii=False))
+    return cdp.eval_json(expr) or {"found": False}
 
 
 _CONVERSATION_ECHO_JS = (
