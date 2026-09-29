@@ -723,6 +723,81 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(douyin.comment_reply_composer(self.page, other)["reason"], "reply_row_mismatch")
 
 
+    def test_the_dm_composer_never_picks_the_search_box(self):
+        """面板里同时有【搜索框】与【发消息输入框】：只能挑后者（2026-09-28 用户反馈）。
+
+        真机现象：文字打进了私信面板的搜索框，消息根本没发出去；
+        而搜索框里出现同一段文字还可能把"会话回显"判真（假证据）。
+        """
+        import douyin
+        self._load("private.html")
+        opener = self.page.eval_json(
+            "(function(){var e=document.querySelector('#open-dm');var r=e.getBoundingClientRect();"
+            "return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};})()")
+        self.page.click_at(opener["x"], opener["y"])
+        found = {"found": False}
+        for _ in range(20):
+            found = douyin.dm_composer(self.page)
+            if found.get("found"):
+                break
+            __import__("time").sleep(0.1)
+        self.assertTrue(found["found"], "面板出现后必须找得到输入框")
+        self.assertNotIn("search", str(found.get("cls") or "").lower(),
+                         "挑中的不能是搜索框")
+        # 收件人作用域的那一套必须【唯一命中】输入框：搜索框在同一个面板里，
+        # 如果它也算候选，就会退化成 ambiguous_recipient_composer（真机上正是这样踩的坑）。
+        scoped = {"found": False}
+        for _ in range(20):
+            scoped = douyin.dm_composer_for_recipient(self.page, "target-user", "Target User")
+            if scoped.get("found"):
+                break
+            __import__("time").sleep(0.1)
+        self.assertTrue(scoped["found"], "收件人作用域的输入框必须唯一命中：%r" % (scoped,))
+        self.assertEqual(scoped.get("containerKey"), "target-panel")
+        x, y = int(scoped["x"]), int(scoped["y"])
+        inside = self.page.evaluate(
+            "(function(){var ed=document.querySelector('#target-panel [contenteditable=true]');"
+            "var r=ed.getBoundingClientRect();"
+            "return " + str(x) + ">=r.x&&" + str(x) + "<=r.x+r.width&&"
+            + str(y) + ">=r.y&&" + str(y) + "<=r.y+r.height;})()")
+        self.assertTrue(inside, "点击坐标必须落在发消息的输入框里")
+        on_search = self.page.evaluate(
+            "(function(){var s=document.querySelector('.searchSearchInputsearch_header input');"
+            "var r=s.getBoundingClientRect();"
+            "return " + str(x) + ">=r.x&&" + str(x) + "<=r.x+r.width&&"
+            + str(y) + ">=r.y&&" + str(y) + "<=r.y+r.height;})()")
+        self.assertFalse(on_search, "点击坐标绝不能落在搜索框上")
+
+    def test_the_conversation_echo_ignores_text_that_is_only_in_the_composer(self):
+        """输入框里的文字不是"会话回显"：没发出去就不许当成功证据。
+
+        旧实现按"会话 scopes 里最长的 innerText"做子串匹配，而 [class*="imChat"]
+        会命中输入框容器 —— 于是刚敲进去的文字被判成回显（2026-09-28 修的假证据）。
+        """
+        import douyin
+        import json as jsonmod
+        self._load("private.html")
+        opener = self.page.eval_json(
+            "(function(){var e=document.querySelector('#open-dm');var r=e.getBoundingClientRect();"
+            "return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};})()")
+        self.page.click_at(opener["x"], opener["y"])
+        text = "你好"
+        for _ in range(20):
+            if self.page.evaluate("document.querySelector('#target-panel').style.display") == "block":
+                break
+            __import__("time").sleep(0.1)
+        self.page.evaluate(
+            "(function(){var ed=document.querySelector('#target-panel [contenteditable=true]');"
+            "ed.innerText=" + jsonmod.dumps(text) + ";return true;})()")
+        self.assertFalse(douyin.dm_conversation_echo(self.page, text, seconds=0.6, interval=0.2),
+                         "只在输入框里的文字不能算会话回显")
+        self.page.evaluate(
+            "(function(){var d=document.createElement('div');d.className='TextMessageTextpureText';"
+            "d.innerText=" + jsonmod.dumps(text) + ";"
+            "document.querySelector('.messageMessageList').appendChild(d);return true;})()")
+        self.assertTrue(douyin.dm_conversation_echo(self.page, text, seconds=0.6, interval=0.2),
+                        "会话区真的出现这条才算回显")
+
     def test_private_async_target_context_excludes_wrong_history(self):
         import douyin
         self._load("private.html")

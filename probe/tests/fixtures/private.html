@@ -8,6 +8,10 @@
 </div>
 <div id="target-panel" class="messageEditor" data-recipient-id="target-user">
   <div class="message-header"><a href="https://www.douyin.com/user/target-user">Target User</a></div>
+  <!-- 真机同款结构（2026-09-28）：面板左上是【搜索】框，和发消息输入框一样是可见 editable。
+       按"第一个可见 editable"去挑就会挑中它 —— 文字打进去只是搜索，消息根本没发出去。 -->
+  <div class="LeftPanelHeader searchSearchInputsearch_header"><input class="semi-input" placeholder="搜索"></div>
+  <div class="messageMessageList"><div class="TextMessageTextpureText">旧的会话消息</div></div>
   <div data-e2e="message-input" contenteditable="true"></div>
   <button class="e2e-send-msg-btn">发送</button>
 </div>
