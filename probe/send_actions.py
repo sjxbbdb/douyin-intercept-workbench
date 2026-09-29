@@ -1013,7 +1013,21 @@ def send_comment(tab, gate, send_id, target, text, source):
 
     started = False
     try:
-        tab.call("Page.navigate", {"url": room_url}, timeout=25)
+        # 🔴 真机（2026-09-28）：评论回复此前【无条件重新导航】，于是采集阶段滚动加载出来的
+        #    那些评论行在发送前被整页刷新清空，只剩首屏那几行 —— 定位器于是报
+        #    comment_not_found，最终归成 reply_target_not_rendered；
+        #    而同一刻 comment_row_present（探测）明明说 present / scrolled_into_view。
+        #    所以：已经在目标页上就【不重新导航】，保留已经渲染出来的评论列表。
+        #    不在目标页上（或 URL 读不到）仍然照旧导航 —— 后面的目标页校验一行都没少。
+        already_here = False
+        try:
+            here = _resolved_room_url(tab.evaluate("location.href") or "")
+            wanted = _canonical_room(room_url)
+            already_here = bool(here) and bool(wanted) and _canonical_room(here) == wanted
+        except Exception:
+            already_here = False
+        if not already_here:
+            tab.call("Page.navigate", {"url": room_url}, timeout=25)
         if not _wait_ready(tab):
             row = gate.finish(send_id, "failed", "page_not_ready")
             return gate.result(row)
