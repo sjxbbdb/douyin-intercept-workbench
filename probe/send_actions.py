@@ -281,6 +281,57 @@ def _click_ready(tab):
     return douyin.visibility_state(tab) == "visible"
 
 
+def _final_send_click(tab, act, label="send"):
+    """执行【最后一步】发送点击，并如实回报"点击前后页面是否可见 / 点击本身有没有抛异常"。
+
+    🔴 真机（2026-09-28）：页面 hidden 时 Input 事件【不送达渲染进程】，表现就是
+    "发送键点了没反应"。而"可见性检查 -> 真正点下去"之间还有好几次 CDP 往返（取坐标、
+    点输入框、读回显、点发送键），几百毫秒里页面完全可能被切到后台（用户切窗口 / 锁屏 /
+    最小化）。竞态窗口消不掉，但可以把话说到位：
+
+      · 点之前再确认一次可见（调用方用 _click_ready）：不满足 -> blocked，什么都没发出去；
+      · 点之后【立刻】再确认一次：不满足就说明"这一下可能送达了、也可能没有" ——
+        这正是红线 3 的未知结果，只能记 unknown 并禁止自动重试；
+      · 点击本身抛异常（CDP 传输失败）同理：也可能已经送达，绝不能猜成 failed。
+
+    返回 {"clicked","visibleBefore","visibleAfter","error","label"}；本函数自己不抛异常。
+    """
+    info = {"clicked": False, "visibleBefore": False, "visibleAfter": False,
+            "error": None, "label": str(label)}
+    try:
+        info["visibleBefore"] = douyin.visibility_state(tab) == "visible"
+    except Exception as exc:
+        info["error"] = type(exc).__name__
+    try:
+        act()
+        info["clicked"] = True
+    except Exception as exc:
+        info["error"] = info["error"] or type(exc).__name__
+    try:
+        info["visibleAfter"] = douyin.visibility_state(tab) == "visible"
+    except Exception:
+        info["visibleAfter"] = False
+    return info
+
+
+def _send_race_reason(info):
+    """最后一步发送踩到竞态或传输失败时的原因枚举。
+
+    只在【拿不到平台回执】时用它 —— 有回执就该以回执为准（回执是平台自己的话）。
+    三种情况都属于"可能发出去了、也可能没有"，一律 unknown + 禁止自动重试：
+      send_click_transport_failure  点击本身没发出去（CDP 传输失败 / 抛异常）
+      page_hidden_during_send       点完那一刻页面已经不可见
+      page_hidden_while_sending     点之前那一瞬间页面就已经不可见
+    """
+    if not info.get("clicked"):
+        return "send_click_transport_failure"
+    if not info.get("visibleAfter"):
+        return "page_hidden_during_send"
+    if not info.get("visibleBefore"):
+        return "page_hidden_while_sending"
+    return None
+
+
 def send_private(tab, gate, send_id, target, text):
     """Send one private message after a durable preflight reservation."""
     try:
@@ -452,6 +503,16 @@ def send_private(tab, gate, send_id, target, text):
                 row = gate.finish(send_id, "failed", "target_session_changed")
                 return gate.result(row)
 
+        # 🔴 与评论路径同一条真机结论（2026-09-28）：hidden 时 Input 事件不送达渲染进程。
+        #    私信面板能开、字也能打进去，但最后一按等于没按 —— 必须在【落 started 之前】
+        #    再确认一次；确认不了就什么都没发出去（blocked + manualAction），
+        #    绝不把"没按着"记成平台拒绝。
+        if not _click_ready(tab):
+            row = gate.finish(send_id, "blocked", "page_not_visible",
+                              {"skipped": False, "manualAction": True,
+                               "blockedBy": "page_hidden_while_clicking",
+                               "mechanism": mechanism})
+            return gate.result(row)
         # The durable started marker is the last operation before the send.
         gate.mark_started(send_id)
         started = True
@@ -460,10 +521,14 @@ def send_private(tab, gate, send_id, target, text):
             tab.call("Network.enable", {}, timeout=10)
         except Exception:
             pass
+        # 最后一步同样要盯住竞态：点之前/之后各看一次可见性，点击抛异常也接住。
         if mechanism == "button":
-            tab.click_at(button["x"], button["y"])
+            send_race = _final_send_click(tab, lambda: tab.click_at(button["x"], button["y"]),
+                                          label="dm_send_button")
         else:
-            tab.press_key("Enter", code="Enter", key_code=13)
+            send_race = _final_send_click(
+                tab, lambda: tab.press_key("Enter", code="Enter", key_code=13),
+                label="dm_enter")
         records = recorder.collect(wait_seconds=8.0)
         mark = getattr(S, "DM_SEND_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
@@ -476,11 +541,16 @@ def send_private(tab, gate, send_id, target, text):
                 cleared = not str(state.get("text") or "").strip()
         except Exception:
             cleared = None
-        row = gate.finish(send_id, "unknown", "platform_response_unavailable",
+        # 私信这条通道本来就没有 HTTP 回执（DM_SEND_URL_MARK 为空），所以"没回执"是常态；
+        # 但如果是被竞态/传输失败打断的，原因必须说清楚 —— 它仍然是 unknown（可能已经发出去了），
+        # 只是把"为什么说不清"写进原因枚举，便于人工核对与事后归因。
+        race = _send_race_reason(send_race)
+        row = gate.finish(send_id, "unknown", race or "platform_response_unavailable",
                           {"httpResponses": len(records), "matchedResponses": len(matched),
                            "platformStatusCodes": statuses[:5], "mechanism": mechanism,
                            "recipientVerification": context_mode,
-                           "composerCleared": cleared, "conversationEcho": bool(echo)})
+                           "composerCleared": cleared, "conversationEcho": bool(echo),
+                           "sendRace": send_race})
         return gate.result(row)
     except Exception as exc:
         return _internal_failure(gate, send_id, started, exc, "send_private")
@@ -1215,7 +1285,9 @@ def send_comment(tab, gate, send_id, target, text, source):
             return gate.result(row)
         gate.mark_started(send_id)
         started = True
-        tab.click_at(button["x"], button["y"])
+        # 最后一步同样盯住竞态：点之前/之后各看一次可见性，点击抛异常也接住。
+        send_race = _final_send_click(tab, lambda: tab.click_at(button["x"], button["y"]),
+                                      label="comment_send_button")
         records = recorder.collect(wait_seconds=8.0)
         mark = getattr(S, "COMMENT_PUBLISH_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
@@ -1236,7 +1308,8 @@ def send_comment(tab, gate, send_id, target, text, source):
         detail = {"httpResponses": len(records), "matchedResponses": len(matched),
                   "boundResponses": len(bound), "boundByCommentId": len(by_id),
                   "platformStatusCodes": statuses[:5],
-                  "networkEnableError": record_error}
+                  "networkEnableError": record_error,
+                  "sendRace": send_race}
         if len(chosen) > 1:
             # 归属于哪一条无法判定：证据不足，按未确定处理，禁止进入私信。
             # 宁可停在 unknown 交人工，也不能挑一条"看起来成功"的回执当结论。
@@ -1245,6 +1318,10 @@ def send_comment(tab, gate, send_id, target, text, source):
             if matched:
                 # 命中发布接口但绑定不到本条评论/正文：证据不足，禁止进入私信。
                 row = gate.finish(send_id, "unknown", "platform_response_unbound", detail)
+            elif _send_race_reason(send_race):
+                # 没有回执、而且最后一步还被竞态/传输失败打断：说清是哪一种（仍然 unknown，
+                # 因为"可能已经发出去了"—— 绝不能猜成 failed 让它自动重试）。
+                row = gate.finish(send_id, "unknown", _send_race_reason(send_race), detail)
             else:
                 row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
         elif statuses[0] == 0:

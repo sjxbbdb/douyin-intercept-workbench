@@ -3343,6 +3343,8 @@ class PrivateSkipTests(unittest.TestCase):
     class Page:
         def __init__(self):
             self.clicks = []
+            self.typed = []
+            self.keys = []
 
         def call(self, *_args, **_kwargs):
             return {}
@@ -3354,8 +3356,17 @@ class PrivateSkipTests(unittest.TestCase):
                 return "https://www.douyin.com/user/" + ("A" * 40)
             return None
 
+        def eval_json(self, _expression):
+            return None
+
         def click_at(self, *args):
             self.clicks.append(args)
+
+        def type_text(self, text):
+            self.typed.append(text)
+
+        def press_key(self, key, code=None, key_code=None):
+            self.keys.append((key, code, key_code))
 
         def close(self):
             pass
@@ -3406,6 +3417,56 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertEqual(result["reason"], "dm_not_available")
         self.assertTrue(result["evidence"]["skipped"])
         self.assertEqual(page.clicks, [], "对方不可私信时一个点击都不许发出去")
+
+    def test_a_page_that_hides_during_the_dm_send_is_unknown_not_failed(self):
+        """私信最后一按可能是回车（真机实测发送键是 SVG，不确定时走回车）。
+
+        按之前/之后各看一次可见性：按完页面就不可见时"可能发出去也可能没有"，
+        必须 unknown + 台账禁止自动重试 —— 绝不猜成 failed 去重发一条私信。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper"})
+        flags = {"sent": False}
+        original_press = page.press_key
+        echo_original = send_actions.douyin.dm_conversation_echo
+
+        class Recorder:
+            def collect(self, wait_seconds=0.0):
+                return []
+
+
+        def press_key(key, code=None, key_code=None):
+            original_press(key, code=code, key_code=key_code)
+            flags["sent"] = True
+
+        page.press_key = press_key
+        send_actions.douyin.make_network_recorder = lambda *_a, **_k: Recorder()
+        send_actions.douyin.dm_conversation_echo = lambda *_a, **_k: False
+        # 真机里编辑器会立刻显示刚输入的内容；这里照做，发送前的 text_verification 才有东西可比。
+        send_actions.douyin.dm_panel_state = lambda _cdp, _name: {
+            "found": True, "headerMatch": True, "x": 795, "y": 860,
+            "text": (page.typed[-1] if page.typed else ""),
+            "panelKey": "componentsEntrywrapper imContainer"}
+        send_actions.douyin.visibility_state = lambda _cdp: ("hidden" if flags["sent"] else "visible")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                gate = SendGate(td, "account-a")
+                result = send_actions.send_private(page, gate, "race-dm",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+                row = gate.lookup("race-dm")
+                again = send_actions.send_private(page, gate, "race-dm-2",
+                                                  {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            send_actions.douyin.dm_conversation_echo = echo_original
+            self._restore(saved)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "page_hidden_during_send")
+        self.assertFalse(result["evidence"]["sendRace"]["visibleAfter"])
+        self.assertEqual(row["status"], "unknown", "未知结果必须落台账")
+        self.assertEqual(again["status"], "blocked", "未知结果不得自动重试")
 
     def test_a_page_that_hides_before_the_click_is_not_reported_as_dm_unavailable(self):
         """真机复现（2026-09-28）：页面 hidden 时点击【不送达渲染进程】，面板就是不开。

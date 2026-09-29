@@ -371,6 +371,64 @@ class SendCommentReceiptTests(unittest.TestCase):
         # 真正要紧的是【发送键 (5,6)】—— 页面不可见时绝不能点它。
         self.assertNotIn((5, 6), self.tab.clicks, "页面不可见时不得点发送键")
 
+    def test_a_page_that_hides_right_after_the_send_click_is_unknown(self):
+        """真机结论的延伸（2026-09-28）：可见性检查 -> 真正点下去之间还有好几次 CDP 往返，
+        页面完全可能在这一瞬间被切到后台。点完就不可见时，"可能送达了也可能没有" ——
+        必须 unknown，不许猜成 failed（那会允许自动重试，等于重复发一条评论）。
+        """
+        sent = {"done": False}
+        original_click = self.tab.click_at
+
+        def click_at(x, y):
+            original_click(x, y)
+            if (x, y) == (5, 6):
+                sent["done"] = True
+
+        self.tab.click_at = click_at
+        send_actions.douyin.visibility_state = lambda _tab: "hidden" if sent["done"] else "visible"
+        result = self._run("race-after-click")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "page_hidden_during_send")
+        self.assertFalse(result["evidence"]["sendRace"]["visibleAfter"])
+        self.assertTrue(result["evidence"]["sendRace"]["clicked"], "点击本身是发出去了的")
+
+    def test_a_transport_failure_on_the_send_click_is_unknown_and_never_retried(self):
+        """点击本身抛异常（CDP 传输失败）：也可能已经送达 —— unknown + 台账禁止自动重试。"""
+        original_click = self.tab.click_at
+
+        def click_at(x, y):
+            if (x, y) == (5, 6):
+                raise RuntimeError("simulated click transport failure")
+            original_click(x, y)
+
+        self.tab.click_at = click_at
+        gate = SendGate(self.tmp.name, "account-a")
+        result = send_actions.send_comment(self.tab, gate, "race-transport", self.target, TEXT, "video")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "send_click_transport_failure")
+        self.assertEqual(result["evidence"]["sendRace"]["error"], "RuntimeError")
+        self.assertEqual(gate.lookup("race-transport")["status"], "unknown")
+        again = send_actions.send_comment(self.tab, gate, "race-transport-2", self.target, TEXT, "video")
+        self.assertEqual(again["status"], "blocked", "未知结果不得自动重试")
+
+    def test_a_receipt_still_wins_over_the_race(self):
+        """有回执就以回执为准：点完页面失焦不该把已经确认成功的回执丢掉。"""
+        sent = {"done": False}
+        original_click = self.tab.click_at
+
+        def click_at(x, y):
+            original_click(x, y)
+            if (x, y) == (5, 6):
+                sent["done"] = True
+
+        self.tab.click_at = click_at
+        send_actions.douyin.visibility_state = lambda _tab: "hidden" if sent["done"] else "visible"
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("race-with-receipt")
+        self.assertEqual(result["reason"], "platform_response")
+        self.assertEqual(result["evidence"]["platformStatusCodes"], [0])
+        self.assertFalse(result["evidence"]["sendRace"]["visibleAfter"])
     def test_the_request_body_is_never_persisted(self):
         """请求体只在内存里用于绑定：不写台账、不进 evidence、不写日志文件。"""
         marker = 'NONCE-abc123'
