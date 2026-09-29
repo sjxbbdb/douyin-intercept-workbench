@@ -798,6 +798,29 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertTrue(douyin.dm_conversation_echo(self.page, text, seconds=0.6, interval=0.2),
                         "会话区真的出现这条才算回显")
 
+    def test_the_dm_entry_skips_a_button_that_is_covered_by_a_search_box(self):
+        """真机（2026-09-28，用户反馈"这个私信也点到了用户上方的搜索框"）：
+
+        面板打开后页面上还会出现别的"私信"形状元素（标签页/面板标题），
+        它们的矩形中心可能正好压在搜索框上 —— 重试时点在搜索框上，面板打不开，
+        还会把搜索框点亮。入口定位必须只认【中心点真的能点到】且【不在私信面板内部】的节点。
+        """
+        import douyin
+        self._load("dm_entry.html")
+        covered = self.page.evaluate(
+            "(function(){var b=document.querySelector('#decoy').getBoundingClientRect();"
+            "var cx=Math.round(b.x+b.width/2),cy=Math.round(b.y+b.height/2);"
+            "var hit=document.elementFromPoint(cx,cy);return hit?hit.id:null;})()")
+        self.assertEqual(covered, "search", "夹具前提：诱饵的中心确实被搜索框盖住")
+        entry = douyin.dm_entry(self.page)
+        self.assertTrue(entry["found"])
+        x, y = int(entry["x"]), int(entry["y"])
+        inside = self.page.evaluate(
+            "(function(){var b=document.querySelector('#real').getBoundingClientRect();"
+            "return " + str(x) + ">=b.x&&" + str(x) + "<=b.x+b.width&&"
+            + str(y) + ">=b.y&&" + str(y) + "<=b.y+b.height;})()")
+        self.assertTrue(inside, "入口必须落在真正能点的那个按钮上")
+
     def test_private_async_target_context_excludes_wrong_history(self):
         import douyin
         self._load("private.html")

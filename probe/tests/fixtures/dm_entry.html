@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- 真机场景（2026-09-28）：页面上还有别的"私信"形状元素，它的矩形中心被【搜索框】盖住。
+     入口定位必须跳过它，返回真正点得到的那个按钮 —— 否则第 2、3 次重试就会点在搜索框上，
+     面板"打不开"，还顺手把搜索框点亮（用户反馈原话："这个私信也点到了用户上方的搜索框"）。 -->
+<style>
+  .box { position: absolute; top: 100px; height: 30px; }
+  #search { left: 100px; width: 200px; z-index: 5; }
+  #decoy { left: 100px; width: 200px; z-index: 1; background: #eee; }
+  #real { left: 400px; width: 80px; }
+</style>
+<input id="search" class="semi-input box" placeholder="搜索">
+<div id="decoy" class="box" role="button">私信</div>
+<button id="real" class="box">私信</button>

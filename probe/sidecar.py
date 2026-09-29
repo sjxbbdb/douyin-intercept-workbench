@@ -24,6 +24,7 @@ import douyin_selectors as S
 import click_guard
 import live
 import live_flow
+import policy_file
 import search_pool
 import winfocus
 from send_actions import (send_comment, send_danmaku_reply,
@@ -426,6 +427,46 @@ def _public_guard(gate, public_send_id):
 BINDING_MISMATCH = "public_send_id_mismatch"
 
 
+def _policy_allowed_states(server_policy):
+    """授权端策略里放行的公开状态集合；没有策略文件就是空集。"""
+    if not server_policy:
+        return set()
+    states = (server_policy.get("content") or {}).get("allowPublicStates") or []
+    return {str(item) for item in states}
+
+
+def _policy_public_echo(server_policy, event, public_send_id):
+    """服务端策略是否放行了本事件那次【只有页面回声】的公屏回复。
+
+    为什么需要它：直播公屏走 WebSocket —— 真机抓包实证（整段只有埋点请求，
+    没有带本次正文的 HTTP 请求），所以平台回执永远拿不到：
+    台账状态只能是 unknown，队列里最多记到 sent_echoed。
+    "只有 sent_confirmed 才允许私信"这条默认口径于是让直播私信永远走不到。
+
+    只有三个条件同时成立才放行（否则维持原口径）：
+      1) 配置了授权端下发的策略文件（CLI 传入，平台侧落盘）；
+      2) 该策略显式把本事件记录的公开状态列进 allowPublicStates；
+      3) 事件里记的 sendId 精确等于传入的 publicSendId —— 绑定关系一点没松。
+    """
+    if not server_policy:
+        return None
+    detail = (event or {}).get("detail") or {}
+    # 公开状态在两处之一：评论区批次写在 detail.recordedState，直播批次写在事件的 state 列。
+    recorded = str(detail.get("recordedState") or (event or {}).get("state") or "")
+    if not recorded or recorded == PUBLIC_CONFIRMED:
+        return None
+    if str(detail.get("sendId") or "").strip() != str(public_send_id or "").strip():
+        return None
+    if recorded not in _policy_allowed_states(server_policy):
+        return None
+    identity = server_policy.get("identity") or {}
+    return {"policySource": "server_file",
+            "policyId": identity.get("policyId"),
+            "policyVersion": identity.get("policyVersion"),
+            "policySha256": server_policy.get("sha256"),
+            "recordedState": recorded}
+
+
 def _comment_public_binding(queue, event_id, public_send_id):
     """③ 对应性：这个 publicSendId 必须是【本事件】那一次公屏回复。
 
@@ -640,7 +681,8 @@ def _navigate(page, url):
 
 
 class Sidecar:
-    def __init__(self, state_dir, profile_dir, port):
+    def __init__(self, state_dir, profile_dir, port, policy_path=None, policy_key_path=None,
+                 auth_session=None, auth_tenant=None):
         self.state_dir = self._external_dir(state_dir, "state-dir")
         self.profile_dir = self._external_dir(profile_dir, "profile-dir")
         self.port = int(port)
@@ -658,6 +700,135 @@ class Sidecar:
         # 搜索结果池：按【账号 + 关键词】落库，候选可以被 videoId 正式引用（交接给评论区）。
         self.video_pool = search_pool.SearchPool(self.state_dir, self.account_scope)
         self.marker_path = os.path.join(self.state_dir, "browser-owner.json")
+        # 🔴 策略内容只能来自【授权端下发的文件】（CLI 传入，平台侧落盘）。
+        #    params 里自带的策略一律拒绝（policy_not_server_issued）：
+        #    最弱的那条路径就是实际生效的那条，这个口子不能开。
+        self.policy_path = policy_path
+        # 授权端预置的【公钥】文件（kid -> RSA JWK）。本侧只验签、不签名：
+        # 私钥留在授权端，客户端拿到的公钥签不出任何东西。
+        self.policy_key_path = policy_key_path
+        # 当前授权会话与租户：由宿主透传，策略必须绑定到它们（评审 2026-09-28）。
+        self.auth_session = auth_session
+        self.auth_tenant = auth_tenant
+        # 服务端台账存在性校验：必须由宿主注册（见 _server_policy）。
+        self.policy_ledger_check = None
+        self._policy_cache = None
+        self._policy_rejection = None
+        self._policy_fingerprint = None
+
+    def _server_policy(self):
+        """读取并校验授权端下发的【非对称签名】策略；没配置就返回 None（= 内置保守默认值）。
+
+        🔴 评审意见（2026-09-28，第二轮）：
+          「未完成前继续只允许 sent_confirmed」+「策略缓存不会感知过期/轮换」
+          +「策略放行前仍缺少服务端台账存在性校验」。这里逐条落实：
+
+          · 非签名（普通 JSON）、共享密钥签名、签名不对、绑定不上本机
+            租户/账号/设备/授权会话、想放开 sent_confirmed 以外的状态 —— 一律【拒绝使用】，
+            退回内置默认（仍然只放行 sent_confirmed），并把拒绝原因挂在响应里；
+          · 缓存带 (路径, mtime, size) 指纹：文件一改（轮换/撤销）立刻重新验签；
+            每次使用都重新检查有效期，过期即失效；
+          · 服务端台账校验：宿主必须注册 policy_ledger_check 回调（确认这份策略在授权端
+            台账里存在且有效）。没注册 -> policy_not_wired_to_ledger，策略一律不放行。
+        """
+        path = getattr(self, "policy_path", None)
+        if not path:
+            self._policy_cache = None
+            self._policy_rejected = None
+            return None
+        try:
+            stamp = os.stat(path)
+            fingerprint = (os.path.abspath(path), int(stamp.st_mtime_ns), int(stamp.st_size))
+        except OSError:
+            fingerprint = None
+        cached = getattr(self, "_policy_cache", None)
+        if cached is not None and getattr(self, "_policy_fingerprint", None) == fingerprint:
+            # 文件没变也要重新看有效期：策略可能刚到点。
+            expires = cached.get("expiresAt")
+            if expires is None or float(expires) > time.time():
+                return cached
+            self._policy_rejection = {"code": "policy_expired", "message": "policy has expired"}
+            self._policy_cache = None
+            self._policy_rejected = True
+            return None
+        if getattr(self, "_policy_rejected", False) and fingerprint is not None \
+                and getattr(self, "_policy_fingerprint", None) == fingerprint:
+            return None
+        try:
+            checker = getattr(self, "policy_ledger_check", None)
+            if checker is None:
+                raise policy_file.PolicyFileError(
+                    "policy_not_wired_to_ledger",
+                    "no server-side ledger check registered; policy release is not wired yet")
+            keys = policy_file.load_keys(getattr(self, "policy_key_path", None))
+            loaded = policy_file.load(path, keys=keys, account_scope=self.account_scope,
+                                      device=policy_file.device_id(self.state_dir),
+                                      tenant=getattr(self, "auth_tenant", None),
+                                      auth_session=getattr(self, "auth_session", None))
+            if not checker(loaded):
+                raise policy_file.PolicyFileError(
+                    "policy_not_in_server_ledger",
+                    "the authorization ledger has no valid entry for this policy")
+        except policy_file.PolicyFileError as exc:
+            # 策略没通过校验：不执行它，但要让宿主知道（不是静默降级）。
+            self._policy_rejection = {"code": exc.code, "message": exc.message}
+            self._policy_cache = None
+            self._policy_fingerprint = fingerprint
+            self._policy_rejected = True
+            return None
+        # 测试替身（__new__ 构造）没有 __init__ 设过的属性，所以这里一律用赋值补上。
+        self._policy_cache = loaded
+        self._policy_fingerprint = fingerprint
+        self._policy_rejection = None
+        self._policy_rejected = True
+        return loaded
+
+    def _issued_policy_ref(self):
+        """把【已验签策略】的身份做成冻结计划里的 policyRef。
+
+        🔴 评审意见（2026-09-28）：「policyRef 没有自动写入冻结计划」—— 这里补上：
+        只要策略真的生效了，批次就必须带上它的身份（含策略引用、租户、设备、授权会话、
+        内容哈希），事后才能回答"这条批次是按哪一版策略跑的"。
+        """
+        policy = self._server_policy()
+        if not policy:
+            return None
+        # ⚠️ policyRef 只允许放【稳定的身份三件套】（normalize_policy_ref 会拒绝未知字段）：
+        #    策略内容不能借"身份"这个口子夹带进来。租户/设备/会话/策略引用/内容哈希
+        #    走 _policy_status() 与台账字段，不塞进 policyRef。
+        try:
+            return live_flow.normalize_policy_ref(dict(policy.get("identity") or {}))
+        except live_flow.LiveFlowError:
+            return None
+
+    def _plan_policy_ref(self, params):
+        """冻结计划用的策略身份：调用方给了就用它（但必须与已签发策略一致），没给就用签发的那份。"""
+        supplied = _policy_ref(params)
+        issued = self._issued_policy_ref()
+        if supplied and issued:
+            for key in ("policyId", "policyVersion", "knowledgeSetVersion"):
+                if str(supplied.get(key)) not in (str(issued.get(key)), "None"):
+                    raise SidecarError(
+                        "policy_ref_mismatch",
+                        "caller policyRef disagrees with the policy issued to this account")
+        return supplied or issued
+
+    def _policy_status(self):
+        """给响应用的策略来源与拒绝原因（宿主据此判断"策略到底生效没有"）。"""
+        if getattr(self, "_policy_rejection", None):
+            return {"policySource": "builtin_default",
+                    "policyRejected": dict(self._policy_rejection)}
+        if getattr(self, "_policy_cache", None):
+            return {"policySource": "server_signed_file",
+                    "policyRejected": None,
+                    "policyKeyId": self._policy_cache.get("keyId"),
+                    "policyTenantId": self._policy_cache.get("tenantId"),
+                    "policyRef": self._policy_cache.get("policyRef"),
+                    "policyDeviceId": self._policy_cache.get("deviceId"),
+                    "policyAuthorizationSession": self._policy_cache.get("authorizationSession"),
+                    "policySha256": self._policy_cache.get("sha256"),
+                    "policyExpiresAt": self._policy_cache.get("expiresAt")}
+        return {"policySource": "builtin_default", "policyRejected": None}
 
     @staticmethod
     def _external_dir(value, label):
@@ -1344,7 +1515,7 @@ class Sidecar:
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
         # 🔴 策略身份在【建批次之前】校验：形状不对就不该产生任何队列副作用。
-        policy_ref = _policy_ref(params)
+        policy_ref = self._plan_policy_ref(params)
         public_text = params.get("publicText")
         private_text = params.get("privateText")
         for value, label in ((public_text, "public_text"), (private_text, "private_text")):
@@ -1382,10 +1553,13 @@ class Sidecar:
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
                     "expired": batch["expired"], "filter": filtered,
                     "batchFilter": summary.get("filter") or {}}
+        server_policy = self._server_policy()
         plan = self.comment_queue.freeze_plan(
             batch["batchId"],
             comment_flow.build_scripts(batch["events"], public_text, private_text),
-            policy_ref=policy_ref)
+            policy=(server_policy or {}).get("content"),
+            policy_ref=policy_ref,
+            policy_source=("server_signed_file" if server_policy else None))
         # 摘要里的 frozen/status 必须是【冻结之后】的事实：take_batch 那一刻还没冻结，
         # 直接回传会让宿主以为计划没冻上。
         summary["frozen"] = True
@@ -1403,7 +1577,9 @@ class Sidecar:
                 "scriptSource": plan.get("scriptSource"),
                 "policy": plan.get("policy"), "policySource": plan.get("policySource"),
                 # 服务端策略身份（与计划一起冻结；私信阶段必须原样带回来）
-                "policyRef": plan.get("policyRef")}
+                "policyRef": plan.get("policyRef"),
+                # 策略到底生效没有：签名没通过 / 未配置时这里会明说（不是静默降级）
+                **self._policy_status()}
 
     def comment_reply(self, params):
         """阶段一：对批次内被接受的条目【逐条公开回复】。
@@ -1748,16 +1924,21 @@ class Sidecar:
             # 关键词未命中或队列为空：都不建立批次，下一次监听到达后会形成新的批次
             return {"status": "empty", "batch": summary, "targets": [], "blocked": [],
                     "expired": batch["expired"], "filter": batch["filter"]}
+        # 策略内容只能来自【授权端下发的文件】；params 里的 policy 仍然被拒（见方法开头）。
+        server_policy = self._server_policy()
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
-                                           params.get("policy"), reply_mode=reply_mode,
-                                           reply_via=reply_via, policy_ref=policy_ref)
+                                           (server_policy or {}).get("content"),
+                                           reply_mode=reply_mode,
+                                           reply_via=reply_via, policy_ref=policy_ref,
+                                           policy_source=("server_signed_file" if server_policy else None))
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
                 "replyMode": plan.get("replyMode"), "replyVia": plan.get("replyVia"),
                 "policy": plan["policy"], "policySource": plan.get("policySource"),
                 # 服务端策略身份（与计划一起冻结；阶段二必须原样带回来）
-                "policyRef": plan.get("policyRef")}
+                "policyRef": plan.get("policyRef"),
+                **self._policy_status()}
 
     def live_reply(self, params):
         """Phase one: public reply for accepted items of a frozen batch.
@@ -1875,14 +2056,15 @@ class Sidecar:
                 results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "public_missing"})
                 continue
+            event = self.live_queue.find_event(item["eventId"]) or {}
             refusal = _public_guard(self.gate, public_send_id)
-            if refusal:
+            by_policy = _policy_public_echo(self._server_policy(), event, public_send_id) if refusal else None
+            if refusal and not by_policy:
                 self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": refusal[0]})
                 results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": refusal[0]})
                 continue
-            event = self.live_queue.find_event(item["eventId"]) or {}
             recorded = str((event.get("detail") or {}).get("sendId") or "")
             # 🔴 缺记录也必须拒绝："没有记录"与"记录对不上"是同一类失败 ——
             #    两者都无法证明这次私信绑定的就是【本事件】那次公屏成功。
@@ -1983,9 +2165,23 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--port", required=True, type=int)
+    # 授权端下发的策略文件：由平台侧落盘、主进程按账号作用域传进来。
+    # 不传 = 内置保守默认值（行为与今天完全一致）；传了但校验不过 = fail-closed 拒绝。
+    parser.add_argument("--policy-file", default=None,
+                        help="server-issued SIGNED policy file (JWS envelope; optional)")
+    parser.add_argument("--policy-key", default=None,
+                        help="authorized PUBLIC key file (kid -> RSA JWK); required for signed policies")
+    parser.add_argument("--auth-session", default=None,
+                        help="current authorization session id (host-provisioned; bound into the policy)")
+    parser.add_argument("--auth-tenant", default=None,
+                        help="tenant id of the current authorization session (bound into the policy)")
     args = parser.parse_args(argv)
     try:
-        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port)
+        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port,
+                          policy_path=args.policy_file,
+                          policy_key_path=args.policy_key,
+                          auth_session=args.auth_session,
+                          auth_tenant=args.auth_tenant)
     except Exception as exc:
         _emit({"id": None, "ok": False, "error": {"code": getattr(exc, "code", "invalid_config"),
                                                       "message": _err_message(getattr(exc, "message", exc))}})

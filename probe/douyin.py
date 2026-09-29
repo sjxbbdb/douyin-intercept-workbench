@@ -498,7 +498,18 @@ _DM_ENTRY_JS = (
     "  if(cs.visibility==='hidden'||cs.display==='none') continue;"
     "  if(n.disabled||n.getAttribute('aria-disabled')==='true')"
     "    return {found:false,blocked:true,reason:'stranger_dm_disabled'};"
-    "  return {found:true,blocked:false,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};"
+    # 🔴 真机（2026-09-28，用户反馈"这个私信也点到了用户上方的搜索框"）：
+    #    私信面板打开后，面板里/页面上还会出现别的"私信"形状元素（标签页、面板标题），
+    #    它们的矩形中心可能正好压在【搜索框】上 —— 于是第 2、3 次重试点在搜索框上，
+    #    面板自然"打不开"，还顺手把搜索框点亮了。
+    #    所以：中心点必须真的能被点到（elementFromPoint 命中它或其子节点），
+    #    并且【排除私信面板内部】的节点 —— 入口只应该来自主页本身。
+    "  var insidePanel=!!n.closest('[class*=\"messageEditor\"],[class*=\"imContainer\"],[class*=\"componentsEntry\"]');"
+    "  if(insidePanel) continue;"
+    "  var cx=Math.round(r.x+r.width/2),cy=Math.round(r.y+r.height/2);"
+    "  var hit=document.elementFromPoint(cx,cy);"
+    "  if(!hit||!(hit===n||n.contains(hit)||hit.contains(n))) continue;"
+    "  return {found:true,blocked:false,x:cx,y:cy};"
     "}"
     "return {found:false,blocked:false,reason:'dm_button_not_found'};"
     "})()"
