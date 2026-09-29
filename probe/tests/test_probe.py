@@ -3780,7 +3780,9 @@ class PrivateSkipTests(unittest.TestCase):
             self._restore(saved)
         self.assertEqual(result["reason"], "dm_panel_unavailable")
         self.assertTrue(result["evidence"]["skipped"])
-        self.assertEqual(len(page.clicks), 3)
+        # 合并后的流程：入口最多点两次（第二次必须先重新导航回主页，见 #52/#54），
+        # 而不是旧版的三次"拿着同一个坐标反复点"。
+        self.assertEqual(len(page.clicks), 2)
 
     def test_a_panel_that_never_opens_is_skipped_not_failed(self):
         import send_actions

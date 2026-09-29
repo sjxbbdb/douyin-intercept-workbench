@@ -535,6 +535,14 @@ def send_private(tab, gate, send_id, target, text):
                     return gate.result(row)
                 if not entry.get("found"):
                     break
+                # 🔴 点击前再确认页面可见（#48）：hidden 时点击不送达渲染进程。
+                #    确认不了就不点 —— 点了也不会生效，只会把结论带偏：
+                #    把"没点着"记成"对方不可私信"会把可触达的人误判成私密用户。
+                if not _click_ready(tab):
+                    entry_click_blocked_hidden = True
+                    probe["pageHiddenBeforeEntryClick"] = True
+                    break
+                clicked_while_ready = True
                 tab.click_at(entry["x"], entry["y"])
                 entry_clicks += 1
                 probe["entryClick"] = entry_clicks
