@@ -574,8 +574,28 @@ def recipient_context(cdp, author_id, author_name="", allow_profile=True):
         return {"verified": False}
 
 
+# 私信面板里同时存在【搜索框】与【发消息输入框】，两者都是可见 editable。
+# 🔴 真机教训（2026-09-28，用户反馈"你点到了私信的搜索界面"）：只要按"第一个可见 editable"
+#    去挑，就可能挑中搜索框 —— 文字打进去只是搜索，消息根本没发出去；
+#    而搜索框/输入框里出现的同一段文字还可能被 echo 判成"会话回显"（假证据）。
+#    所以凡是"挑输入框"或"找回显"的地方，都要显式排除 search 形状的元素。
+_SEARCH_GUARD_JS = (
+    "function searchish(e){"
+    "var ph=String((e.getAttribute&&e.getAttribute('placeholder'))||'');"
+    "if(/搜索|search/i.test(ph))return true;"
+    "var own=String((e.getAttribute&&e.getAttribute('data-e2e'))||'');"
+    "if(/search/i.test(own))return true;"
+    "var n=e;for(var k=0;k<6&&n;k++){"
+    "  if(/search/i.test(String(n.className||'')))return true;"
+    "  var a=String((n.getAttribute&&n.getAttribute('data-e2e'))||'');"
+    "  if(/search/i.test(a))return true;"
+    "  n=n.parentElement;}"
+    "return false;}"
+)
+
+
 _DM_COMPOSER_JS = (
-    "(function(){"
+    "(function(){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&cs.visibility!=='hidden'&&cs.display!=='none';}"
     "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ";"
@@ -585,6 +605,7 @@ _DM_COMPOSER_JS = (
     "  var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
     "  for(var i=0;i<eds.length;i++){var e=eds[i];"
     "    if(!vis(e)) continue;"
+    "    if(searchish(e)) continue;"      # 🔴 面板里的搜索框不是发消息的地方
     "    if(e.disabled||e.getAttribute('aria-disabled')==='true') continue;"
     "    var r=e.getBoundingClientRect();"
     "    return {found:true,scope:scopes[s],"
@@ -600,6 +621,7 @@ _DM_COMPOSER_JS = (
     "var all=Array.from(document.querySelectorAll('[contenteditable=true],textarea,input'));"
     "for(var j=0;j<all.length;j++){var el=all[j];"
     "  if(!vis(el)) continue;"
+    "  if(searchish(el)) continue;"      # 🔴 兜底也不能落在搜索框上
     "  var anc=el.closest('[class*=\"message\"],[class*=\"chat\"],[class*=\"imChat\"],[class*=\"MsgInput\"]');"
     "  if(!anc) continue;"
     "  var r2=el.getBoundingClientRect();"
@@ -617,7 +639,7 @@ def dm_composer(cdp):
 
 
 _DM_COMPOSER_FOR_RECIPIENT_JS = (
-    "(function(expectedId,expectedName){"
+    "(function(expectedId,expectedName){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
     "function pathOk(a){try{return new URL(a.href,location.href).pathname.replace(/\\/$/,'')==='/user/'+expectedId;}"
@@ -633,7 +655,8 @@ _DM_COMPOSER_FOR_RECIPIENT_JS = (
     "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ",hits=[];"
     "for(var s=0;s<scopes.length;s++){var box=document.querySelector(scopes[s]);if(!box)continue;"
     "var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
-    "for(var i=0;i<eds.length;i++){var e=eds[i];if(!vis(e)||e.disabled||e.getAttribute('aria-disabled')==='true')continue;"
+    "for(var i=0;i<eds.length;i++){var e=eds[i];"
+    "if(!vis(e)||searchish(e)||e.disabled||e.getAttribute('aria-disabled')==='true')continue;"
     "var context=ctxOk(e);if(!context)continue;var r=e.getBoundingClientRect();"
     "hits.push({found:true,scope:scopes[s],containerKey:String(context.key).slice(0,160),"
     "x:Math.round(r.x+Math.min(120,Math.max(30,r.width/2))),y:Math.round(r.y+r.height/2),text:(e.innerText||e.value||'')});}}"
@@ -649,7 +672,7 @@ def dm_composer_for_recipient(cdp, author_id, author_name=""):
 
 
 _DM_PANEL_JS = (
-    "(function(expected){"
+    "(function(expected){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
     "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
@@ -657,7 +680,7 @@ _DM_PANEL_JS = (
     "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
     "if(!(box&&vis(box)))return {found:false,reason:'dm_panel_not_open'};"
     "var ed=null,eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
-    "for(var i=0;i<eds.length;i++){if(vis(eds[i])){ed=eds[i];break;}}"
+    "for(var i=0;i<eds.length;i++){if(vis(eds[i])&&!searchish(eds[i])){ed=eds[i];break;}}"
     "if(!ed)return {found:false,reason:'dm_editor_not_found'};"
     "var r=ed.getBoundingClientRect();"
     "var head=document.querySelector(" + json.dumps(S.DM_CHAT_HEADER_TITLE) + ");"
@@ -698,26 +721,58 @@ def dm_panel_state(cdp, author_name=""):
 
 
 _CONVERSATION_ECHO_JS = (
-    "(function(){"
-    "function textOf(el){return String((el&&(el.innerText||el.textContent))||'')"
-    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'').replace(/\\s+/g,'');}"
-    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ",out='';"
-    "for(var i=0;i<scopes.length;i++){var ns=document.querySelectorAll(scopes[i]);"
-    "for(var j=0;j<ns.length;j++){var t=textOf(ns[j]);if(t.length>out.length)out=t;}}"
-    "return out.slice(0,4000);})()"
+    "(function(want){" + _SEARCH_GUARD_JS +
+    "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/\\s+/g,'').trim();}"
+    # 🔴 先把【输入框本身】找出来并在后面排除掉：
+    #    2026-09-28 真机教训 —— 旧实现把会话 scopes 里最长的一段 innerText 拼起来做子串匹配，
+    #    而 [class*="imChat"] 会命中【输入框容器】(messageEditorimChatEditorContainer)，
+    #    于是"刚敲进输入框、还没发出去"的文字也会被判成会话回显（假证据）。
+    "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
+    "var ed=null;"
+    "if(box&&vis(box)){var eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
+    "for(var k=0;k<eds.length;k++){if(vis(eds[k])&&!searchish(eds[k])){ed=eds[k];break;}}}"
+    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ";"
+    "for(var s=0;s<scopes.length;s++){var nodes=document.querySelectorAll(scopes[s]);"
+    "for(var i=0;i<nodes.length;i++){var node=nodes[i];"
+    "var els=[node].concat(Array.prototype.slice.call(node.querySelectorAll('*')));"
+    "for(var j=0;j<els.length;j++){var el=els[j];"
+    # 只看【叶子】全文相等：大容器拼串命中会把"列表里恰好包含这几个字"也算成回显。
+    "if(el.children&&el.children.length>0)continue;"
+    "if(!vis(el))continue;"
+    "if(searchish(el))continue;"
+    "if(ed&&(el===ed||ed.contains(el)))continue;"
+    "if(norm(el.innerText||el.textContent)!==want)continue;"
+    "return JSON.stringify({echo:true,scope:scopes[s],cls:String(el.className||'').slice(0,60)});"
+    "}}}"
+    "return JSON.stringify({echo:false});})"
 )
 
 
 def dm_conversation_echo(cdp, text, seconds=6.0, interval=1.2):
-    """等会话区里出现刚发的那条（诊断证据，不是"送达"判据本身）。"""
+    """等会话区里出现刚发的那条（页面观测证据，不是"送达"判据本身）。
+
+    🔴 2026-09-28 修（用户反馈"点到私信搜索界面"时顺带暴露的假证据）：
+      旧实现把会话 scopes 里最长的一段 innerText 拼起来做【子串】匹配，
+      而 [class*="imChat"] 会命中输入框容器 —— 于是"刚敲进输入框、还没发出去"的文字
+      也会被判成会话回显。现在：只在会话区里找【叶子节点、全文相等】的元素，
+      并显式排除输入框与搜索框子树。返回 bool（调用方按 bool(echo) 记录证据）。
+    """
     want = re.sub(r"\s+", "", str(text or ""))
+    if not want:
+        return False
+    expr = _CONVERSATION_ECHO_JS + "(" + json.dumps(want, ensure_ascii=False) + ")"
     deadline = time.time() + float(seconds)
     while True:
+        detail = {}
         try:
-            body = cdp.evaluate(_CONVERSATION_ECHO_JS) or ""
+            raw = cdp.evaluate(expr) or ""
+            detail = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {}
         except Exception:
-            body = ""
-        if want and want in body:
+            detail = {}
+        if detail.get("echo"):
             return True
         if time.time() >= deadline:
             return False
@@ -764,14 +819,14 @@ def dm_send_button(cdp):
 
 
 _DM_SEND_FOR_RECIPIENT_JS = (
-    "(function(expectedId,expectedName){"
+    "(function(expectedId,expectedName){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
     "function pathOk(a){try{return new URL(a.href,location.href).pathname.replace(/\\/$/,'')==='/user/'+expectedId;}catch(e){return false;}}"
     "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ",hits=[];"
     "for(var s=0;s<scopes.length;s++){var box=document.querySelector(scopes[s]);if(!box)continue;"
     "var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
-    "for(var i=0;i<eds.length;i++){var ed=eds[i];if(!vis(ed))continue;"
+    "for(var i=0;i<eds.length;i++){var ed=eds[i];if(!vis(ed)||searchish(ed))continue;"
     "var root=ed.closest('[data-recipient-id],[data-user-id],[data-author-id],[class*=message],[class*=chat],[class*=imChat],[class*=MsgInput]');"
     "if(!root)continue;var ids=[root.getAttribute('data-recipient-id'),root.getAttribute('data-user-id'),root.getAttribute('data-author-id')];"
     "var explicit=ids.some(function(v){return !!v;});if(explicit&&ids.indexOf(expectedId)<0)continue;"
