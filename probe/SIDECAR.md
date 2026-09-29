@@ -419,40 +419,59 @@ Policy is refused at the boundary until the authorization service signs it:
 The library-level seam (`LiveQueue.freeze_plan(policy=...)`) stays in place for
 the server wiring.
 
-### Signed policy (2026-09-28, review follow-up)
+### Signed policy (2026-09-28, second review round)
 
-A policy file is now only accepted as an **authorized-side signed JWS envelope**
-(`{"protected","payload","signature"}`, `alg=HS256`). The previous shape — a plain
-JSON document that carried its own `policySha256` — is refused with
-`policy_signature_required`: a self-computed hash proves the file was not
-corrupted, not who signed it.
+A policy file is only accepted as an **asymmetric-signed** JWS envelope
+(`{"protected","payload","signature"}`). Two earlier shapes are refused on sight:
+a plain JSON document carrying its own `policySha256`
+(`policy_signature_required` — a self-computed hash proves the file was not
+corrupted, not who signed it), and **shared-secret signatures** such as
+`HS256` (`policy_alg_unsupported` — the reviewer is right that a client holding
+the same secret could forge a policy). Only `RS256` (RSA PKCS#1 v1.5 + SHA-256,
+verified with `pow()` from the standard library) is accepted, and the client is
+provisioned with a **public key only** (`--policy-key`, `kid -> RSA JWK`).
 
-The signature must be **bound to this machine**: the payload has to carry
-`tenantId`, `accountScope`, `deviceId` and `policyRef`, and every one of them is
-compared against the local account scope (profile path digest), the device id
-(`<state-dir>/device.json`, generated once) and the caller-supplied tenant. Any
-mismatch is `policy_binding_mismatch`; an unknown `kid` is `policy_key_unknown`;
-a non-`HS256` header is `policy_alg_unsupported`; a stale envelope is
-`policy_expired`.
+The signature must be **bound to this run**: the payload has to carry
+`tenantId`, `accountScope`, `deviceId`, `policyRef` and `authorizationSession`,
+and each is compared against the local values — account scope (profile path
+digest), device id (`<state-dir>/device.json`), the tenant and the authorization
+session handed in by the host (`--auth-tenant` / `--auth-session`). Any mismatch
+is `policy_binding_mismatch`, a missing local value is `policy_binding_missing`,
+an unknown `kid` is `policy_key_unknown`, a stale envelope is `policy_expired`.
 
-🔴 Until the authorized side actually ships signed (or authenticated-HTTP)
-delivery, `allowPublicStates` may only contain `sent_confirmed` — anything else
-is refused with `policy_state_not_allowed_yet`. So a live-channel private message
-still cannot be unlocked by page echo alone.
+🔴 Until the authorized side actually ships the signed delivery end to end,
+`allowPublicStates` may only contain `sent_confirmed` — anything else is refused
+with `policy_state_not_allowed_yet`. So a live-channel private message still
+cannot be unlocked by page echo alone.
+
+Three more review points are wired in:
+
+* **Server-side ledger check**: the host must register
+  `Sidecar.policy_ledger_check` (a callable that confirms the policy exists and
+  is valid in the authorization ledger). Without it every policy is refused with
+  `policy_not_wired_to_ledger`; when the callback says no, the reason is
+  `policy_not_in_server_ledger`. This is deliberately a seam, not a stub that
+  always returns true — the local entry point alone cannot release anything.
+* **Cache aware of expiry and rotation**: the cache is keyed by
+  `(path, mtime_ns, size)`, so replacing the file takes effect immediately, and
+  expiry is re-checked on every use (`test_the_cache_notices_rotation`,
+  `test_the_cache_notices_expiry`).
+* **`policyRef` written into the frozen plan**: when a policy is in force,
+  `live_plan` / `comment_plan` record its identity automatically, and a
+  caller-supplied `policyRef` that disagrees raises `policy_ref_mismatch`.
+  Note the identity keeps only the stable triple
+  (`policyId` / `policyVersion` / `knowledgeSetVersion`) — the tenant, device,
+  session, policy reference and content hash travel in `policySource` /
+  `policyRejected` style status fields instead, so policy *content* can never
+  ride in through the identity slot.
 
 A rejected policy is **never obeyed**: the sidecar falls back to the built-in
 conservative default and reports `policySource: "builtin_default"` plus
-`policyRejected: {code, message}` in `live_plan` / `comment_plan`, so the host can
-see that the policy did not take effect instead of silently running under it
-(`test_an_unsigned_policy_is_rejected_and_reported_not_obeyed`).
+`policyRejected: {code, message}` in `live_plan` / `comment_plan`.
 
-The verification key is provisioned out of band (`--policy-key`, a `kid -> secret`
-file). This side only verifies — it never signs. `policy_file.sign()` exists for
-the authorized side and for tests to share one JWS rule set.
-
-Still open and deliberately not claimed as done: the authorized-side key
-provisioning and authenticated delivery channel, lifting the
-`sent_confirmed`-only restriction once that ships, credits / feature-switch /
-audit integration (the local `send_gate.py` remains the only local authority),
-and real-platform acceptance for live selectors, author identity, public reply
-delivery and private delivery.
+Still open and deliberately not claimed as done: the authorized side key
+provisioning and authenticated delivery channel, the real server-side ledger
+call behind the seam, lifting the `sent_confirmed`-only restriction once that
+ships, credits / feature-switch / audit integration (the local `send_gate.py`
+remains the only local authority), and real-platform acceptance for live
+selectors, author identity, public reply delivery and private delivery.
