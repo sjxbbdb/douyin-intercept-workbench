@@ -669,7 +669,8 @@ def send_private(tab, gate, send_id, target, text):
         # 🔴 评审要求（2026-09-29）：回显必须绑定【目标收件人 + 本次发送动作】。
         #    所以发送【之前】先取一次"这个会话里和本次话术完全相同的消息有几条"作为基线，
         #    发送后只认【计数增加】—— 历史里本来就有同样文字时不会造成假证据。
-        echo_baseline = douyin.dm_conversation_echo_count(tab, text, author_name)
+        #    多次读、取最大值：会话历史异步渲染，只读一次会把"还没渲出来"当成 0。
+        echo_baseline = douyin.dm_conversation_echo_baseline(tab, text, author_name)
         # The durable started marker is the last operation before the send.
         gate.mark_started(send_id)
         started = True
@@ -718,6 +719,7 @@ def send_private(tab, gate, send_id, target, text):
                            "composerCleared": cleared, "conversationEcho": echo,
                            # 回显的绑定证据：基线（发送前有几条相同文字）、发送后计数、未命中原因。
                            "conversationEchoBaseline": echo_detail.get("baseline"),
+                           "conversationEchoBaselineReads": list(echo_baseline.get("reads") or []),
                            "conversationEchoCount": echo_detail.get("count"),
                            "conversationEchoReason": echo_detail.get("reason"),
                            "conversationListPreview": bool(row_preview.get("containsText")),

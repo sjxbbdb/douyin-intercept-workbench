@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dm echo overlapping scopes and list preview</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; }
+  .messageEditor { display: block; border: 1px solid #333; padding: 8px; width: 300px; }
+  .head { width: 300px; padding: 4px; }
+  .bubble { display: block; padding: 2px 4px; }
+  .row { display: block; width: 300px; }
+</style>
+<body>
+  <!-- 真机事实（2026-09-29）：
+       ① DM_CONVERSATION_SCOPES 里的选择器互相嵌套（messageMessageList 在 MessageBox 里），
+          同一个气泡会被数好几次 —— 实测"一条新消息"被数成 7；
+       ② 面板里【别的会话】与【会话列表那一行的预览】也挂着同样的文字。
+       正确口径：只数【当前这条会话面板】里的气泡，且排除会话列表行。
+       夹具把三层都摆出来：一条真消息 + 一条列表预览 + 嵌套容器。 -->
+  <div class="componentsEntrywrapper imContainer">
+    <div class="conversationConversationListwrapper" id="convList">
+      <div class="conversationConversationItemwrapper" id="row">
+        <span class="TextMessageTextpureText" id="preview">你好</span>
+      </div>
+    </div>
+    <div class="StackLayoutStackChatHeadertitle head" id="head">小明</div>
+    <div class="MessageBox" id="box">
+      <div class="messageMessageList" id="list">
+        <span class="TextMessageTextpureText bubble" id="one">你好</span>
+      </div>
+    </div>
+    <div class="messageEditor" id="panel">
+      <div contenteditable="true" id="editor">你好</div>
+    </div>
+  </div>
+</body>

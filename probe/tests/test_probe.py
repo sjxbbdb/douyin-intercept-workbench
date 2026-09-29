@@ -837,6 +837,44 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertTrue(decoy["found"], "按它自己的完整标题查当然查得到")
         self.assertNotEqual((decoy["x"], decoy["y"]), (row["x"], row["y"]))
 
+    def test_overlapping_conversation_scopes_do_not_double_count_a_bubble(self):
+        """真机（2026-09-29）：会话 scope 互相嵌套，同一气泡被命中多次 —— 实测一条消息数成 7。
+
+        夹具按真机结构把 messageMessageList 套在 MessageBox 里：一条消息必须只算一次。
+        """
+        import douyin
+        self._load("dm_echo_overlap.html")
+        counted = douyin.dm_conversation_echo_count(self.page, "你好", "小明")
+        self.assertTrue(counted["found"], counted)
+        self.assertEqual(counted["count"], 1,
+                         "只数当前会话里的气泡：嵌套 scope 不重复、会话列表预览与输入框都不算")
+        inside_both = self.page.evaluate(
+            "(function(){var el=document.querySelector('#one');"
+            "return !!(el.closest('[class*=\"MessageBox\"]')&&"
+            "el.closest('[class*=\"messageMessageList\"]'));})()")
+        self.assertTrue(inside_both, "前提：这条消息确实同时落在两个 scope 里")
+
+    def test_the_baseline_takes_the_largest_of_several_reads(self):
+        """会话历史是异步渲染的：只读一次会把"还没渲出来"当成 0，于是发完一涨就误判成本次回显。"""
+        import json as jsonmod
+        import douyin
+        scripted = [0, 5, 5]
+
+        class Cdp:
+            def evaluate(self, _expression):
+                value = scripted.pop(0) if scripted else 5
+                return jsonmod.dumps({"found": True, "count": value})
+
+        original_sleep = douyin.time.sleep
+        douyin.time.sleep = lambda _seconds: None
+        try:
+            baseline = douyin.dm_conversation_echo_baseline(Cdp(), "你好", "小明",
+                                                            tries=3, interval=0)
+        finally:
+            douyin.time.sleep = original_sleep
+        self.assertEqual(baseline["count"], 5, "取最大读数，避免把还没渲染当成 0")
+        self.assertEqual(baseline["reads"], [0, 5, 5])
+
     def test_the_echo_counts_only_messages_inside_the_confirmed_recipient(self):
         """真机结构 + 评审要求（2026-09-29）：回显必须绑定【目标收件人 + 本次发送动作】。
 

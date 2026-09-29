@@ -832,18 +832,31 @@ _CONVERSATION_ECHO_COUNT_JS = (
     "var ed=null;"
     "if(box&&vis(box)){var eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
     "for(var k=0;k<eds.length;k++){if(vis(eds[k])&&!searchish(eds[k])){ed=eds[k];break;}}}"
-    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ",wantText=norm(want.text||''),count=0;"
-    "for(var s=0;s<scopes.length;s++){var nodes=document.querySelectorAll(scopes[s]);"
-    "for(var i=0;i<nodes.length;i++){var node=nodes[i];"
-    "var els=[node].concat(Array.prototype.slice.call(node.querySelectorAll('*')));"
+    # 🔴 真机（2026-09-29，两次修正）：只按 scope 列表数是不行的 ——
+    #    ① DM_CONVERSATION_SCOPES 里的选择器互相嵌套，同一个气泡会被数好几次（实测 1 条数成 7）；
+    #    ② 面板会把【别的会话】也挂在 DOM 里，那些会话里的同样文字也会被算进来。
+    #    所以改成：先从头部标题往上找到【当前这条会话的面板】，只在这个子树里数；
+    #    再按节点去重、只保留最外层命中节点。
+    "var panel=head?head.closest('[class*=\"componentsEntrywrapper\"],[class*=\"imContainer\"]'):null;"
+    "if(!panel)return JSON.stringify({found:false,count:0,reason:'conversation_panel_not_found'});"
+    "var wantText=norm(want.text||''),seen=new Set(),matched=[];"
+    "var els=[panel].concat(Array.prototype.slice.call(panel.querySelectorAll('*')));"
     "for(var j=0;j<els.length;j++){var el=els[j];"
     "if(el.children&&el.children.length>0)continue;"
     "if(!vis(el))continue;"
     "if(searchish(el))continue;"
+    # ③ 会话【列表】里那一行的预览也是同样的文字，但它不是"这个会话里的消息" —— 排除掉。
+    "if(el.closest('[class*=\"conversationConversationList\"]'))continue;"
     "if(ed&&(el===ed||ed.contains(el)))continue;"
     "if(norm(el.innerText||el.textContent)!==wantText)continue;"
-    "count++;}}}"
-    "return JSON.stringify({found:true,count:count,headerLen:headText.length});})"
+    "if(seen.has(el))continue;seen.add(el);matched.push(el);}"
+    "var count=0;"
+    "for(var m=0;m<matched.length;m++){var inside=false;"
+    "for(var a=0;a<matched.length;a++){"
+    "if(a!==m&&matched[a].contains(matched[m])){inside=true;break;}}"
+    "if(!inside)count++;}"
+    "return JSON.stringify({found:true,count:count,headerLen:headText.length,"
+    "scopesMatched:matched.length});})"
 )
 
 
@@ -870,6 +883,29 @@ def dm_conversation_echo_count(cdp, text, author_name=""):
     if not detail:
         return {"found": False, "count": 0, "reason": "echo_lookup_failed"}
     return detail
+
+
+def dm_conversation_echo_baseline(cdp, text, author_name, tries=3, interval=1.0):
+    """发送【前】取基线：多次读取取最大值。
+
+    🔴 真机（2026-09-29）：会话历史是**异步渲染**的 —— 面板刚打开时消息列表可能还是空的，
+    只读一次会把"历史还没渲出来"当成 0；等我们发完再读时历史已经渲出来，
+    计数一涨就会被误判成"本次新消息"（实测就踩到了：基线 0、发完 7）。
+    取多次读数的最大值可以把这个坑堵掉。返回值与 dm_conversation_echo_count 同形，
+    另加 reads 便于事后核对。
+    """
+    best = {"found": False, "count": 0}
+    reads = []
+    for index in range(max(1, int(tries))):
+        detail = dm_conversation_echo_count(cdp, text, author_name)
+        reads.append(int(detail.get("count") or 0))
+        if detail.get("found") and int(detail.get("count") or 0) >= int(best.get("count") or 0):
+            best = detail
+        if index + 1 < int(tries):
+            time.sleep(interval)
+    result = dict(best)
+    result["reads"] = reads
+    return result
 
 
 def dm_conversation_echo_after_send(cdp, text, author_name, baseline, seconds=6.0, interval=1.2):
