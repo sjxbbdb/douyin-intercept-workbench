@@ -507,27 +507,85 @@ def _policy_ref_refusal(plan, params):
     return None
 
 
-def _private_binding_mismatch(gate, public_send_id, target):
-    """单发私信的 ③ 对应性校验；不一致时返回说明文字，否则 None。
+DANMAKU_KEY_PREFIXES = ("live-danmaku-native:", "live-danmaku:")
 
-    公屏评论回复的 target_key 形如 source:commentId:authorId（见 send_actions
-    的 gate_key = "%s:%s:%s"），末段就是评论作者。直播弹幕回复的末段是
-    【昵称】而不是 sec_uid（见 send_danmaku_reply），拿它跟私信目标的
-    authorId 比会误杀合法调用 —— 所以这里只对 kind=comment 生效。
+
+def _norm_binding_name(value):
+    """昵称归一化：零宽字符、脱敏星号、空白都不参与比较（与页面侧同一套口径）。"""
+    text = str(value or "")
+    for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        text = text.replace(junk, "")
+    for star in ("*", "＊"):
+        text = text.replace(star, "")
+    return "".join(text.split())
+
+
+def _danmaku_public_binding(row, target):
+    """③ 对应性（弹幕通路）：公屏回复必须【同一事件 + 同一收件人】。
+
+    🔴 评审 2026-09-29：单发私信此前只对 kind=comment 做对应性校验，弹幕通路被整条跳过
+    （旧注释的理由是"弹幕 target_key 的末段是昵称不是 sec_uid"）。后果是：
+    **拿 A 那条已确认的公屏回复，给 B 发私信**，在宿主最常直接调用的 send_private
+    入口上走得通 —— 张冠李戴。
+
+    其实 key 的结构够用：`live-danmaku[-native]:<eventId>:<authorName>`。所以这里要求：
+      · DM 目标必须带上同一个 eventId（`eventId`，兼容 `id`）—— 缺失即拒绝；
+      · 昵称必须与 key 里记的那一个一致（归一化后比较）—— 缺失同样拒绝（无从证明是同一人）。
     """
+    key = str(row.get("target_key") or "")
+    prefix = next((item for item in DANMAKU_KEY_PREFIXES if key.startswith(item)), None)
+    if prefix is None:
+        return None
+    event_id, _, author_name = key[len(prefix):].partition(":")
+    if not event_id:
+        return ("public_event_missing", "the bound danmaku reply carries no event id")
     if not isinstance(target, dict):
+        return None
+    target_event = str(target.get("eventId") or target.get("id") or "").strip()
+    if not target_event:
+        return ("public_event_missing",
+                "a danmaku private message must carry the eventId of the bound public reply")
+    if target_event != event_id:
+        return ("public_event_mismatch",
+                "the bound danmaku reply belongs to another event; a private message may only "
+                "bind the public reply of the same event")
+    expected = _norm_binding_name(author_name)
+    actual = _norm_binding_name(target.get("authorName"))
+    if not actual:
+        return ("public_target_missing",
+                "a danmaku private message must carry the authorName of the bound reply")
+    if expected and expected != actual:
+        return ("public_target_mismatch",
+                "the bound danmaku reply belongs to another recipient; a private message must "
+                "bind the reply of the same recipient")
+    return None
+
+
+def _private_binding_mismatch(gate, public_send_id, target):
+    """单发私信的 ③ 对应性校验；返回 (code, message) 或 None。
+
+    两条公屏通路都要绑（评审 2026-09-29：弹幕通路以前整条没绑）：
+      · comment ：target_key = source:commentId:authorId（末段是评论作者 sec_uid）；
+      · danmaku ：target_key = live-danmaku[-native]:eventId:authorName ——
+                  必须同一事件 + 同一收件人，见 _danmaku_public_binding。
+    """
+    row = gate.lookup(str(public_send_id or "").strip())
+    if not row:
+        return None
+    kind = str(row.get("kind") or "")
+    if kind == "danmaku_reply":
+        return _danmaku_public_binding(row, target)
+    if kind != "comment" or not isinstance(target, dict):
         return None
     author_id = str(target.get("authorId") or "").strip()
     if not author_id:
-        return None
-    row = gate.lookup(str(public_send_id or "").strip())
-    if not row or str(row.get("kind") or "") != "comment":
         return None
     parts = str(row.get("target_key") or "").split(":")
     if len(parts) < 3:
         return None
     if parts[-1] != author_id:
-        return ("the bound public reply belongs to another author; "
+        return (BINDING_MISMATCH,
+                "the bound public reply belongs to another author; "
                 "a private message must bind the reply of the same recipient")
     return None
 
@@ -1591,9 +1649,10 @@ class Sidecar:
         # ③ 对应性：这条公屏回复必须是【收件人本人】那一条。
         #    单发路径此前只有 ①②，于是"拿 A 的公屏成功去给 B 发私信"走得通 ——
         #    而单发恰恰是宿主最常直接调用的入口。仍然在打开浏览器之前判定。
+        #    弹幕通路同样在【打开浏览器之前】判定：同一事件 + 同一收件人，缺一不可。
         mismatch = _private_binding_mismatch(self.gate, params.get("publicSendId"), target)
         if mismatch:
-            raise SidecarError(BINDING_MISMATCH, mismatch)
+            raise SidecarError(mismatch[0], mismatch[1])
         page, _ = self._page()
         try:
             return send_private(page, self.gate, send_id, target, text)

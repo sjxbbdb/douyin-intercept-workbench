@@ -2411,15 +2411,77 @@ class CommentFlowContractTests(unittest.TestCase):
             self.assertIsNone(SendGate(td, "account-b").lookup("reply-account-a"),
                               "B 看不到 A 的台账行")
 
-    def test_missing_public_send_id_is_refused(self):
-        """缺 publicSendId 必须拒绝 —— 它曾经是「可选」的，那等于没有守卫。
-
-        「可选参数」在这个位置的真实含义是：任何调用方只要省略它，
-        就绕过了「公开回复确认成功后才允许私信」这条契约，
-        而偏偏执行发送的就是这条单发路径。批量清单一直强制这一条，
-        两个入口口径不一致时，实际生效的是最弱的那条。
-        （_instance(explode=True) 让 _page 抛异常，顺带证明门禁在开浏览器之前生效。）
+    def test_a_danmaku_public_reply_cannot_unlock_a_message_to_another_event(self):
+        """评审 2026-09-29：单发私信此前【完全没绑弹幕通路】—— 拿 A 那条已确认的公屏回复，
+        可以给 B 发私信（张冠李戴）。现在必须同一事件，且判定发生在打开浏览器之前。
         """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("dm-1", "live-danmaku-native:event-a:小明", "关注我", kind="danmaku_reply")
+            gate.finish("dm-1", "sent_confirmed", "platform_response")
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-x", "publicSendId": "dm-1",
+                                       "target": {"eventId": "event-b", "authorId": "author-b",
+                                                  "authorName": "小红"},
+                                       "text": "你好"})
+        self.assertEqual(raised.exception.code, "public_event_mismatch")
+
+    def test_a_danmaku_public_reply_cannot_unlock_a_message_to_another_recipient(self):
+        """同一事件、换成另一个收件人也不行（昵称必须与公屏那条一致）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("dm-2", "live-danmaku:event-a:小明", "关注我", kind="danmaku_reply")
+            gate.finish("dm-2", "sent_confirmed", "platform_response")
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-y", "publicSendId": "dm-2",
+                                       "target": {"eventId": "event-a", "authorId": "author-b",
+                                                  "authorName": "小红"},
+                                       "text": "你好"})
+        self.assertEqual(raised.exception.code, "public_target_mismatch")
+
+    def test_a_danmaku_private_message_must_carry_the_event_and_the_recipient(self):
+        """缺 eventId / 缺昵称一律拒绝：无从证明是同一事件、同一个人（fail-closed）。"""
+        import sidecar
+        cases = [({"authorId": "author-a", "authorName": "小明"}, "public_event_missing"),
+                 ({"eventId": "event-a", "authorId": "author-a"}, "public_target_missing")]
+        for target, code in cases:
+            with tempfile.TemporaryDirectory() as td:
+                gate = SendGate(td, "account-a")
+                gate.reserve("dm-3", "live-danmaku-native:event-a:小明", "关注我",
+                             kind="danmaku_reply")
+                gate.finish("dm-3", "sent_confirmed", "platform_response")
+                sidecar_mod, instance = self._instance(explode=True)
+                instance.gate = gate
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.send_private({"sendId": "priv-z", "publicSendId": "dm-3",
+                                           "target": target, "text": "你好"})
+            self.assertEqual(raised.exception.code, code, repr(target))
+
+    def test_a_matching_danmaku_binding_still_reaches_the_browser(self):
+        """反向保护：同一事件 + 同一收件人时必须放行（否则上面几条就变成"永远发不出去"）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("dm-4", "live-danmaku-native:event-a:小明", "关注我",
+                         kind="danmaku_reply")
+            gate.finish("dm-4", "sent_confirmed", "platform_response")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            self.assertIsNone(sidecar._private_binding_mismatch(
+                gate, "dm-4", {"eventId": "event-a", "authorId": "author-a",
+                               "authorName": "小明"}))
+            # 脱敏星号在归一化后仍然算同一人。
+            self.assertIsNone(sidecar._private_binding_mismatch(
+                gate, "dm-4", {"eventId": "event-a", "authorId": "author-a",
+                               "authorName": "小*明"}))
+
+    def test_missing_public_send_id_is_refused(self):
         import sidecar
         base = {"sendId": "priv-1", "target": {"authorId": "author-1"}, "text": "你好"}
         with tempfile.TemporaryDirectory() as td:
@@ -4683,15 +4745,29 @@ class PrivateBindingContractTests(unittest.TestCase):
             self.assertIsNone(sidecar._private_binding_mismatch(
                 instance.gate, "pub-a1", {"authorId": "author-1"}))
 
-    def test_danmaku_reply_key_is_not_compared_by_author_id(self):
-        """弹幕回复的 target_key 末段是【昵称】不是 sec_uid，拿它比 authorId 会误杀。"""
+    def test_danmaku_reply_key_is_compared_by_event_and_name_not_by_author_id(self):
+        """弹幕 key 的末段是【昵称】不是 sec_uid：不能拿它比 authorId，但要绑事件与昵称。
+
+        🔴 评审 2026-09-29 修正：以前这条弹幕通路【整条跳过】了对应性校验 ——
+        于是"拿 A 那条已确认的公屏回复给 B 发私信"在单发入口走得通。现在的口径是：
+        authorId 不参与比较（key 里根本没有它），但 eventId 与昵称必须一致。
+        """
         import sidecar
         with tempfile.TemporaryDirectory() as td:
             gate = SendGate(td, "account-a")
             self._confirmed(gate, "pub-dm", "live-danmaku-native:e1:小明",
                             kind="danmaku_reply")
+            # 同一事件 + 同一昵称：authorId 完全不参与比较（key 里没有 sec_uid）。
             self.assertIsNone(sidecar._private_binding_mismatch(
-                gate, "pub-dm", {"authorId": "MS4wLjABAAAAsecuid"}))
+                gate, "pub-dm", {"eventId": "e1", "authorId": "MS4wLjABAAAAsecuid",
+                                 "authorName": "小明"}))
+            # 换事件 / 换人：一律拒绝（且都发生在打开浏览器之前）。
+            self.assertEqual(sidecar._private_binding_mismatch(
+                gate, "pub-dm", {"eventId": "e2", "authorId": "MS4wLjABAAAAsecuid",
+                                 "authorName": "小明"})[0], "public_event_mismatch")
+            self.assertEqual(sidecar._private_binding_mismatch(
+                gate, "pub-dm", {"eventId": "e1", "authorId": "MS4wLjABAAAAsecuid",
+                                 "authorName": "小红"})[0], "public_target_mismatch")
 
     # ---- ③ 对应性：批次路径（清单与执行必须同口径）----
 
