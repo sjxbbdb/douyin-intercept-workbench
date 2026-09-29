@@ -681,7 +681,7 @@ def _navigate(page, url):
 
 
 class Sidecar:
-    def __init__(self, state_dir, profile_dir, port, policy_path=None):
+    def __init__(self, state_dir, profile_dir, port, policy_path=None, policy_key_path=None):
         self.state_dir = self._external_dir(state_dir, "state-dir")
         self.profile_dir = self._external_dir(profile_dir, "profile-dir")
         self.port = int(port)
@@ -703,24 +703,55 @@ class Sidecar:
         #    params 里自带的策略一律拒绝（policy_not_server_issued）：
         #    最弱的那条路径就是实际生效的那条，这个口子不能开。
         self.policy_path = policy_path
+        # 授权端预置的【验签密钥】（kid -> secret）。本侧只验签、不签名。
+        self.policy_key_path = policy_key_path
         self._policy_cache = None
+        self._policy_rejection = None
 
     def _server_policy(self):
-        """读取并校验授权端下发的策略文件；没配置就返回 None（= 内置保守默认值）。
+        """读取并校验授权端下发的【签名】策略；没配置就返回 None（= 内置保守默认值）。
 
-        任何异常（文件缺失 / JSON 坏了 / 哈希对不上 / 过期）都抛 SidecarError：
-        fail-closed —— 宁可拒绝执行，也不用半信半疑的策略去放开红线。
+        🔴 评审意见（2026-09-28）：「未完成前继续只允许 sent_confirmed」。所以：
+          · 非签名（普通 JSON）、签名不对、绑定不上本机租户/账号/设备/policyRef、
+            或者想放开 sent_confirmed 以外的状态 —— 一律【拒绝使用这份策略】，
+            退回内置默认（仍然只放行 sent_confirmed），并把拒绝原因挂在响应里，
+            让宿主看得见"策略没生效"，而不是悄悄按它执行；
+          · 只有签名与四个绑定全部通过的策略才会被采用。
         """
         cached = getattr(self, "_policy_cache", None)
-        if cached is not None:
+        if cached is not None or getattr(self, "_policy_rejected", False):
             return cached
+        path = getattr(self, "policy_path", None)
+        if not path:
+            self._policy_cache = None
+            return None
         try:
-            loaded = policy_file.load(getattr(self, "policy_path", None))
+            keys = policy_file.load_keys(getattr(self, "policy_key_path", None))
+            loaded = policy_file.load(path, keys=keys, account_scope=self.account_scope,
+                                      device=policy_file.device_id(self.state_dir))
         except policy_file.PolicyFileError as exc:
-            raise SidecarError(exc.code, exc.message)
+            # 策略没通过校验：不执行它，但要让宿主知道（不是静默降级）。
+            self._policy_rejection = {"code": exc.code, "message": exc.message}
+            self._policy_cache = None
+            self._policy_rejected = True
+            return None
         # 测试替身（__new__ 构造）没有 __init__ 设过的属性，所以这里一律用赋值补上。
         self._policy_cache = loaded
+        self._policy_rejected = True
         return loaded
+
+    def _policy_status(self):
+        """给响应用的策略来源与拒绝原因（宿主据此判断"策略到底生效没有"）。"""
+        if getattr(self, "_policy_rejection", None):
+            return {"policySource": "builtin_default",
+                    "policyRejected": dict(self._policy_rejection)}
+        if getattr(self, "_policy_cache", None):
+            return {"policySource": "server_signed_file",
+                    "policyRejected": None,
+                    "policyKeyId": self._policy_cache.get("keyId"),
+                    "policyTenantId": self._policy_cache.get("tenantId"),
+                    "policyRef": self._policy_cache.get("policyRef")}
+        return {"policySource": "builtin_default", "policyRejected": None}
 
     @staticmethod
     def _external_dir(value, label):
@@ -1451,7 +1482,7 @@ class Sidecar:
             comment_flow.build_scripts(batch["events"], public_text, private_text),
             policy=(server_policy or {}).get("content"),
             policy_ref=policy_ref,
-            policy_source=("server_file" if server_policy else None))
+            policy_source=("server_signed_file" if server_policy else None))
         # 摘要里的 frozen/status 必须是【冻结之后】的事实：take_batch 那一刻还没冻结，
         # 直接回传会让宿主以为计划没冻上。
         summary["frozen"] = True
@@ -1469,7 +1500,9 @@ class Sidecar:
                 "scriptSource": plan.get("scriptSource"),
                 "policy": plan.get("policy"), "policySource": plan.get("policySource"),
                 # 服务端策略身份（与计划一起冻结；私信阶段必须原样带回来）
-                "policyRef": plan.get("policyRef")}
+                "policyRef": plan.get("policyRef"),
+                # 策略到底生效没有：签名没通过 / 未配置时这里会明说（不是静默降级）
+                **self._policy_status()}
 
     def comment_reply(self, params):
         """阶段一：对批次内被接受的条目【逐条公开回复】。
@@ -1820,14 +1853,15 @@ class Sidecar:
                                            (server_policy or {}).get("content"),
                                            reply_mode=reply_mode,
                                            reply_via=reply_via, policy_ref=policy_ref,
-                                           policy_source=("server_file" if server_policy else None))
+                                           policy_source=("server_signed_file" if server_policy else None))
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
                 "replyMode": plan.get("replyMode"), "replyVia": plan.get("replyVia"),
                 "policy": plan["policy"], "policySource": plan.get("policySource"),
                 # 服务端策略身份（与计划一起冻结；阶段二必须原样带回来）
-                "policyRef": plan.get("policyRef")}
+                "policyRef": plan.get("policyRef"),
+                **self._policy_status()}
 
     def live_reply(self, params):
         """Phase one: public reply for accepted items of a frozen batch.
@@ -2057,11 +2091,14 @@ def main(argv=None):
     # 授权端下发的策略文件：由平台侧落盘、主进程按账号作用域传进来。
     # 不传 = 内置保守默认值（行为与今天完全一致）；传了但校验不过 = fail-closed 拒绝。
     parser.add_argument("--policy-file", default=None,
-                        help="server-issued policy file (optional; hash-checked)")
+                        help="server-issued SIGNED policy file (JWS envelope; optional)")
+    parser.add_argument("--policy-key", default=None,
+                        help="authorized verification key file (kid -> secret); required for signed policies")
     args = parser.parse_args(argv)
     try:
         sidecar = Sidecar(args.state_dir, args.profile_dir, args.port,
-                          policy_path=args.policy_file)
+                          policy_path=args.policy_file,
+                          policy_key_path=args.policy_key)
     except Exception as exc:
         _emit({"id": None, "ok": False, "error": {"code": getattr(exc, "code", "invalid_config"),
                                                       "message": _err_message(getattr(exc, "message", exc))}})

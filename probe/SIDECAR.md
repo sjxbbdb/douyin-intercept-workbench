@@ -419,7 +419,40 @@ Policy is refused at the boundary until the authorization service signs it:
 The library-level seam (`LiveQueue.freeze_plan(policy=...)`) stays in place for
 the server wiring.
 
-Still open and deliberately not claimed as done: server-issued policy,
-credits / feature-switch / audit integration (the local `send_gate.py` remains
-the only local authority), and real-platform acceptance for live selectors,
-author identity, public reply delivery and private delivery.
+### Signed policy (2026-09-28, review follow-up)
+
+A policy file is now only accepted as an **authorized-side signed JWS envelope**
+(`{"protected","payload","signature"}`, `alg=HS256`). The previous shape — a plain
+JSON document that carried its own `policySha256` — is refused with
+`policy_signature_required`: a self-computed hash proves the file was not
+corrupted, not who signed it.
+
+The signature must be **bound to this machine**: the payload has to carry
+`tenantId`, `accountScope`, `deviceId` and `policyRef`, and every one of them is
+compared against the local account scope (profile path digest), the device id
+(`<state-dir>/device.json`, generated once) and the caller-supplied tenant. Any
+mismatch is `policy_binding_mismatch`; an unknown `kid` is `policy_key_unknown`;
+a non-`HS256` header is `policy_alg_unsupported`; a stale envelope is
+`policy_expired`.
+
+🔴 Until the authorized side actually ships signed (or authenticated-HTTP)
+delivery, `allowPublicStates` may only contain `sent_confirmed` — anything else
+is refused with `policy_state_not_allowed_yet`. So a live-channel private message
+still cannot be unlocked by page echo alone.
+
+A rejected policy is **never obeyed**: the sidecar falls back to the built-in
+conservative default and reports `policySource: "builtin_default"` plus
+`policyRejected: {code, message}` in `live_plan` / `comment_plan`, so the host can
+see that the policy did not take effect instead of silently running under it
+(`test_an_unsigned_policy_is_rejected_and_reported_not_obeyed`).
+
+The verification key is provisioned out of band (`--policy-key`, a `kid -> secret`
+file). This side only verifies — it never signs. `policy_file.sign()` exists for
+the authorized side and for tests to share one JWS rule set.
+
+Still open and deliberately not claimed as done: the authorized-side key
+provisioning and authenticated delivery channel, lifting the
+`sent_confirmed`-only restriction once that ships, credits / feature-switch /
+audit integration (the local `send_gate.py` remains the only local authority),
+and real-platform acceptance for live selectors, author identity, public reply
+delivery and private delivery.
