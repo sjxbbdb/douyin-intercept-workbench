@@ -622,6 +622,8 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
         return _gate_result(gate, reservation, send_id)
 
     started = False
+    # 上滚找回旧弹幕会挪动列表位置：这里先占位，保证异常路径也能把它还给最新。
+    scrolled_px = 0
     try:
         requested_room = _canonical_room(room_url)
         current_raw = tab.evaluate("location.href") or ""
@@ -671,7 +673,6 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
         state = None
         refusal = None
         last_mismatch = None
-        scrolled_px = 0
         for attempt in range(3):
             # placed：调用方刚读到的"此刻可见坐标"。第一次点击直接用它 ——
             # 重新定位要多花几百毫秒，高流量房间里那条弹幕已经被顶走了（真机实测）。
@@ -778,6 +779,9 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
                            "roomEchoSource": "page_memory" if echo.get("row") else None})
         return gate.result(row)
     except Exception as exc:
+        # 🔴 异常恢复（2026-09-28）：上滚找旧弹幕可能已经把列表挪走了 —— 异常路径也必须还回去，
+        #    否则下一轮采集看到的还是那批旧弹幕。
+        _restore_chat_bottom(tab, scrolled_px)
         return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
 
 
