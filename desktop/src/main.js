@@ -588,6 +588,26 @@ async function runAgentChat(input) {
   }, { idempotencyKey: requestKey, metadata: { message, platformAccountId: requestedPlatform } });
 }
 
+async function prepareReplyPlan(input) {
+  if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+  if (!api) throw new Error('授权中心尚未连接');
+  const workflowId = text(input?.workflowId, 'workflow id', 100);
+  const version = input?.version === undefined ? '1' : String(input.version);
+  const knowledgeSetId = text(input?.knowledgeSetId, 'knowledge set id', 100);
+  const query = text(input?.query, 'knowledge query', 4000);
+  if (!workflowId || !knowledgeSetId || !query) throw new Error('生成话术前必须指定固定流程、话术库和问题');
+  const request = {
+    workflowId, version, params: input?.params && typeof input.params === 'object' ? input.params : {},
+    knowledgeSetId, knowledgeSetVersion: input?.knowledgeSetVersion, query,
+    topK: input?.topK, targets: Array.isArray(input?.targets) ? input.targets.slice(0, 200) : [],
+    idempotencyKey: safeIdempotencyKey(typeof input?.idempotencyKey === 'string' && input.idempotencyKey.trim() ? input.idempotencyKey : `reply-plan:${workflowId}:${crypto.randomUUID()}`)
+  };
+  const requestEpoch = sessionEpoch; const requestApi = api; const requestToken = authStore.getToken();
+  const result = await requestApi.createReplyPlan(request);
+  if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，话术计划未应用');
+  return result;
+}
+
 
 // 任务面板的结构化流程启动。
 //
@@ -617,10 +637,14 @@ async function runExplicitWorkflow(input) {
   const intent = workflowRequest.buildWorkflowIntent(request);
   const context = workflowRequest.buildWorkflowContext(request);
   return workflowManager.run(accountId, async ({ context: accountContext }) => {
-    const plan = await accountContext.runtime.planFromIntent(intent, context);
-    const check = workflowRequest.planMatchesRequest(plan, request);
-    if (!check.ok) {
-      throw new Error('平台返回的计划与请求不一致（' + check.reason + (check.field ? '/' + check.field : '') + '），已拒绝启动');
+    let plan;
+    if (input?.replyPlan?.status === 'issued' && input.replyPlan.planId && input.replyPlan.params) {
+      plan = { planId: input.replyPlan.planId, workflowId: input.replyPlan.workflowId, version: input.replyPlan.version, params: input.replyPlan.params };
+      if (plan.workflowId !== request.workflowId || String(plan.version) !== String(request.version)) throw new Error('授权中心话术计划与请求流程不一致，已拒绝启动');
+    } else {
+      plan = await accountContext.runtime.planFromIntent(intent, context);
+      const check = workflowRequest.planMatchesRequest(plan, request);
+      if (!check.ok) throw new Error('平台返回的计划与请求不一致（' + check.reason + (check.field ? '/' + check.field : '') + '），已拒绝启动');
     }
     return startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId });
   }, { idempotencyKey: requestKey, metadata: { workflowId: request.workflowId, platformAccountId: requestedPlatform } });
@@ -644,6 +668,7 @@ function registerIpc() {
   ipcMain.handle('platform-accounts:select', wrap((_event, platformId) => switchPlatformAccount(platformId)));
   ipcMain.handle('platform-accounts:create', wrap((_event, input) => createPlatformAccount(input)));
   ipcMain.handle('agent:chat', wrap((_event, input) => runAgentChat(input)));
+  ipcMain.handle('agent:prepare-reply-plan', wrap((_event, input) => prepareReplyPlan(input)));
   ipcMain.handle('agent:start-workflow', wrap((_event, input) => runExplicitWorkflow(input)));
   ipcMain.handle('agent:resume-workflow', wrap(async (_event, input) => {
     const runId = typeof input === 'string' ? input : input?.runId;

@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('agentApi', {
   selectPlatformAccount: (platformId) => invoke('platform-accounts:select', platformId),
   createPlatformAccount: (payload) => invoke('platform-accounts:create', payload),
   chat: (payload) => invoke('agent:chat', payload),
+  prepareReplyPlan: (payload) => invoke('agent:prepare-reply-plan', payload),
   resumeWorkflow: (runId) => invoke('agent:resume-workflow', runId),
   pauseWorkflow: (runId) => invoke('agent:pause-workflow', runId),
   getEndpoint: () => invoke('agent:get-endpoint'),

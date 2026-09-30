@@ -98,6 +98,14 @@ class ApiClient {
     return this.request('POST', '/v1/agent/plan', body, 30000);
   }
 
+  createReplyPlan(body) {
+    return this.request('POST', '/v1/reply-plans', body, 30000);
+  }
+
+  replyPlan(idempotencyKey) {
+    return this.request('GET', `/v1/reply-plans/${encodeURIComponent(idempotencyKey)}`, undefined, 12000);
+  }
+
   workflows() {
     return this.request('GET', '/v1/workflows');
   }
