@@ -43,8 +43,8 @@ function isSendingWorkflow(workflowId: string, contract: RecordValue) {
 
 function assertReadOnlyCompletionEvidence(row: RecordValue, targetState: unknown) {
   const contract = parseJson<RecordValue>(row.contract_json, {});
-  if (!isSendingWorkflow(row.workflow_id, contract)) return;
   if (row.workflow_id !== 'video.search') {
+    if (!isSendingWorkflow(row.workflow_id, contract)) return;
     throw conflict('SEND_EVIDENCE_REQUIRED', '发送流程必须提供服务端认可的平台响应证据；当前发行版保持 fail-closed');
   }
   const state = targetState && typeof targetState === 'object' && !Array.isArray(targetState) ? targetState as RecordValue : {};
