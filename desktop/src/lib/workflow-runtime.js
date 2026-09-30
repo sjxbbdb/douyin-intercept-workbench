@@ -282,6 +282,17 @@ class WorkflowRuntime {
     return clone(run);
   }
 
+  attachRemoteRun(runId, remoteRunId) {
+    const value = requiredText(remoteRunId, 'remoteRunId', 160);
+    const data = this.#readData();
+    const run = this.#findOwned(data, runId);
+    if (run.remoteRunId && run.remoteRunId !== value) throw new Error('workflow remote run binding conflict');
+    run.remoteRunId = value;
+    run.updatedAt = this.clock();
+    this.#writeData(data);
+    return clone(run);
+  }
+
   async run(runId) {
     const value = requiredText(runId, 'runId', 160);
     if (this.running.has(value)) return this.running.get(value);
@@ -609,6 +620,31 @@ class WorkflowRuntime {
   #ensureState() {
     const data = this.store.get();
     if (!Array.isArray(data.workflowRuns)) { data.workflowRuns = []; this.store.set(data); }
+    let changed = false;
+    for (const run of data.workflowRuns) {
+      if (run.accountId !== this.accountId || run.status !== RUN_STATES.RUNNING) continue;
+      // A persisted RUNNING marker means the desktop may have terminated while
+      // an executor was in flight.  A side-effect step must never be retried
+      // blindly; leave it UNKNOWN so resume goes through reconciliation.  Pure
+      // collection/compute work is safe to resume from a PAUSED checkpoint.
+      const step = Array.isArray(run.steps) ? run.steps[run.currentStep] : null;
+      const definition = this.workflows.get(`${run.workflowId}@${run.version}`);
+      const definitionStep = definition?.steps?.[run.currentStep];
+      const sideEffect = step?.sideEffect === true || definitionStep?.sideEffect === true;
+      run.status = sideEffect ? RUN_STATES.UNKNOWN : RUN_STATES.PAUSED;
+      if (step && step.status === 'running') step.status = sideEffect ? 'unknown' : 'paused';
+      run.lastError = {
+        code: sideEffect ? 'DESKTOP_RESTARTED_DURING_SIDE_EFFECT' : 'DESKTOP_RESTARTED_WITH_RUNNING_WORKFLOW',
+        reason: sideEffect ? 'desktop_restarted_during_side_effect' : 'desktop_restarted_with_running_workflow'
+      };
+      run.checkpoint = {
+        ...(run.checkpoint && typeof run.checkpoint === 'object' ? run.checkpoint : {}),
+        code: sideEffect ? 'WORKFLOW_RESTART_REQUIRES_RECONCILIATION' : 'WORKFLOW_RESTART_PAUSED'
+      };
+      run.updatedAt = this.clock();
+      changed = true;
+    }
+    if (changed) this.store.set(data);
   }
 
   #readData() {

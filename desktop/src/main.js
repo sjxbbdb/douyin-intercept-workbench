@@ -71,16 +71,36 @@ function accountDir(userId, platformAccount = currentPlatformAccountId) {
 }
 
 function sidecarPort(userId, platformAccount = currentPlatformAccountId) {
-  return scopedSidecarPort(apiEndpoint, userId || 'guest', platformAccount);
+  const knownAccounts = platformAccounts.map((account) => account?.id).filter(Boolean);
+  return scopedSidecarPort(apiEndpoint, userId || 'guest', platformAccount, knownAccounts);
 }
 
 function runtimeAccountId(userId, platformAccount) {
   return platformScope({ workbenchUserId: userId || 'guest', platformAccountId: platformAccount }).runtimeAccountId;
 }
 
+const WORKFLOW_PAUSE_COLLECTORS = new Set(['open_error', 'error', 'capability_error', 'closed', 'disconnected', 'close_error', 'close_timeout']);
+
+function browserPauseReason(status) {
+  const collector = typeof status?.collector === 'string' ? status.collector : '';
+  if (!WORKFLOW_PAUSE_COLLECTORS.has(collector) && !(status?.connected === false && status?.disconnected === true)) return null;
+  const detail = typeof status?.error === 'string' && status.error.trim() ? `:${status.error.trim().slice(0, 240)}` : '';
+  return `browser_${collector || 'disconnected'}${detail}`;
+}
+
+function pauseWorkflowForBrowserStatus(accountId, runtime, status) {
+  const reason = browserPauseReason(status);
+  if (!reason) return;
+  try { runtime?.invalidate(reason); } catch (error) { console.warn('[workflow] failed to persist browser pause', error.message); }
+  if (accountId) workflowManager?.invalidate(accountId, reason);
+}
+
 function createBrowserInstance(userId, platformAccount = currentPlatformAccountId, callbacks = {}) {
   const common = { onStatus: callbacks.onStatus || (() => {}), onEvents: callbacks.onEvents || (() => {}) };
-  return process.env.DOUYIN_ELECTRON_BRIDGE === '1'
+  // The Electron DOM bridge is an offline development fallback only.  A
+  // packaged build must always use the bundled sidecar, even if an inherited
+  // environment variable happens to enable the fallback.
+  return process.env.DOUYIN_ELECTRON_BRIDGE === '1' && !app.isPackaged
     ? new BrowserBridge({ parentWindow: mainWindow, getPartition: () => browserPartition(apiEndpoint, userId || 'guest', platformAccount), ...common })
     : new ProbeBridge({ accountDir: accountDir(userId, platformAccount), port: sidecarPort(userId, platformAccount), cwd: path.resolve(__dirname, '..', '..'), resourcesPath: process.resourcesPath, packaged: app.isPackaged, ...common });
 }
@@ -90,8 +110,9 @@ async function createBrowser(userId, platformAccount = currentPlatformAccountId)
   browser = null;
   if (previous) await previous.close?.();
   const callbackEpoch = sessionEpoch;
+  const accountId = userId && platformAccount ? runtimeAccountId(userId, platformAccount) : null;
   browser = createBrowserInstance(userId, platformAccount, {
-    onStatus: (status) => { if (callbackEpoch !== sessionEpoch) return; if (status.navigating) engine?.pauseAll('browser_navigation'); if (['captcha', 'login_required', 'unsupported'].includes(status.status)) engine?.pauseAll(`sidecar_${status.status}`); browserState = { ...browserState, ...status }; emitState(); },
+    onStatus: (status) => { if (callbackEpoch !== sessionEpoch) return; pauseWorkflowForBrowserStatus(accountId, workflowRuntime, status); if (status.navigating) engine?.pauseAll('browser_navigation'); if (['captcha', 'login_required', 'unsupported'].includes(status.status)) engine?.pauseAll(`sidecar_${status.status}`); if (browserPauseReason(status)) engine?.pauseAll(browserPauseReason(status)); browserState = { ...browserState, ...status }; emitState(); },
     onEvents: (events) => { if (callbackEpoch !== sessionEpoch) return; void engine?.ingest(events); }
   });
 }
@@ -157,10 +178,20 @@ function switchAccountStore(userId, reason = 'account_switch', isCurrent = () =>
   const transition = accountTransition.then(async () => {
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
     const targetPlatformAccount = userId ? (platformAccount || null) : null;
+    const previousWorkflowAccountId = currentAccountUserId && currentPlatformAccountId
+      ? runtimeAccountId(currentAccountUserId, currentPlatformAccountId)
+      : null;
     browserState = { connected: false, collector: 'closed', matchCount: 0 };
     lastProbe = null;
     engine?.invalidate(reason);
     workflowRuntime?.invalidate(reason);
+    if (previousWorkflowAccountId) {
+      // Invalidate the exact account before closing its browser.  This aborts
+      // queued/running manager jobs and prevents the old account from sending
+      // after the new platform account becomes current.
+      invalidateManagedWorkflows(reason, (accountId) => accountId === previousWorkflowAccountId);
+      await closeInvalidatedWorkflows();
+    }
     const previous = browser;
     if (previous) await previous.close?.();
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
@@ -223,15 +254,15 @@ async function solidifyRemoteWorkflow(remoteRunId, reason) {
 
 function currentProfile() { return dataStore.get().selectorProfile || DEFAULT_SELECTOR_PROFILE; }
 
-function normalizedPlatformAccounts(payload) {
+function normalizedPlatformAccounts(payload, includeDisabled = false) {
   const rows = Array.isArray(payload) ? payload : payload?.accounts;
   if (!Array.isArray(rows)) throw new Error('授权中心返回的平台账号列表无效');
-  return rows.filter((item) => item && typeof item.id === 'string' && item.id.trim() && item.status !== 'disabled').map((item) => ({ ...item, id: normalizePlatformAccountId(item.id) }));
+  return rows.filter((item) => item && typeof item.id === 'string' && item.id.trim() && (includeDisabled || item.status !== 'disabled')).map((item) => ({ ...item, id: normalizePlatformAccountId(item.id) }));
 }
 
-async function fetchPlatformAccounts(requestApi = api, tokenOverride = null) {
+async function fetchPlatformAccounts(requestApi = api, tokenOverride = null, includeDisabled = false) {
   const response = await requestApi.platformAccounts(tokenOverride || authStore.getToken());
-  return normalizedPlatformAccounts(response);
+  return normalizedPlatformAccounts(response, includeDisabled);
 }
 
 function preferredPlatformAccount(userId, accounts) {
@@ -248,6 +279,10 @@ async function switchPlatformAccount(platformAccount) {
   if (!accounts.some((item) => item.id === selected)) throw new Error('平台账号不属于当前工作台或已停用');
   if (selected === currentPlatformAccountId) { platformAccounts = accounts; authStore.setPlatformAccountId(currentAccountUserId, selected); emitState(); return { accounts, platformAccountId: selected }; }
   const license = authStore.getLicense();
+  // Make the complete account set available while constructing the new
+  // browser, so its deterministic allocator can avoid another account's hash
+  // port before either sidecar is launched.
+  platformAccounts = accounts;
   const switched = await switchAccountStore(currentAccountUserId, 'platform_account_switch', () => requestApi === api && authStore.getToken() === requestToken, selected);
   if (!switched) throw new Error('平台账号切换已过期');
   platformAccounts = accounts;
@@ -276,6 +311,12 @@ async function listPlatformAccounts() {
   if (currentPlatformAccountId && !accounts.some((item) => item.id === currentPlatformAccountId)) {
     const selected = preferredPlatformAccount(currentAccountUserId, accounts);
     if (selected) await switchPlatformAccount(selected);
+    else {
+      invalidateManagedWorkflows('platform_account_unavailable');
+      await closeInvalidatedWorkflows();
+      await switchAccountStore(currentAccountUserId, 'platform_account_unavailable', () => Boolean(authStore.getToken()), null);
+      authStore.setPlatformAccountId(currentAccountUserId, null);
+    }
   }
   emitState();
   return { accounts: platformAccounts, platformAccountId: currentPlatformAccountId };
@@ -295,16 +336,26 @@ async function refreshLicense(tokenOverride = null) {
     if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) return { state: 'stale' };
     const safe = publicLicensePayload(me);
     if (!safe.user?.id) throw new Error('授权中心响应缺少用户身份');
-    const accounts = await fetchPlatformAccounts(requestApi, requestToken);
+    const allAccounts = await fetchPlatformAccounts(requestApi, requestToken, true);
+    const accounts = allAccounts.filter((item) => item.status !== 'disabled');
     const selected = preferredPlatformAccount(safe.user.id, accounts);
+    const currentRecord = allAccounts.find((item) => item.id === currentPlatformAccountId);
     const currentStillValid = currentPlatformAccountId && accounts.some((item) => item.id === currentPlatformAccountId);
+    const currentDisabled = Boolean(currentRecord && currentRecord.status === 'disabled');
     const needsAccountSwitch = currentAccountUserId !== safe.user.id
-      || (!currentStillValid && selected !== currentPlatformAccountId && selected != null);
+      || (!currentStillValid && currentPlatformAccountId != null)
+      || (currentPlatformAccountId == null && selected != null);
     if (needsAccountSwitch) {
       if (currentAccountUserId !== safe.user.id) invalidateManagedWorkflows('workbench_account_switch');
+      if (currentDisabled) {
+        invalidateManagedWorkflows('platform_account_disabled');
+        await closeInvalidatedWorkflows();
+      }
+      platformAccounts = accounts;
       const switched = await switchAccountStore(safe.user.id, 'account_switch_from_refresh', () => requestApi === api && authStore.getToken() === requestToken, selected);
       if (!switched) return { state: 'stale' };
       if (selected) authStore.setPlatformAccountId(safe.user.id, selected);
+      else authStore.setPlatformAccountId(safe.user.id, null);
     }
     platformAccounts = accounts;
     engine.setLicense(safe);
@@ -339,6 +390,7 @@ async function handleLogin(_event, input) {
     const selected = preferredPlatformAccount(safe.user.id, accounts);
     invalidateManagedWorkflows('login_account_switch');
     await closeInvalidatedWorkflows();
+    platformAccounts = accounts;
     const switched = await switchAccountStore(safe.user.id, 'login_account_switch', () => attempt === loginAttempt && requestApi === api, selected);
     if (!switched || attempt !== loginAttempt || requestApi !== api) throw new Error('登录会话已切换，请重试');
     platformAccounts = accounts;
@@ -399,6 +451,8 @@ async function handleRedeem(_event, input) {
 
 async function startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage = null }) {
     const runtime = accountContext.runtime;
+    let localRun = null;
+    let remoteRunId = null;
     const catalogResponse = await api.workflows();
     const catalog = Array.isArray(catalogResponse?.workflows) ? catalogResponse.workflows : [];
     const registered = catalog.find((item) => item.workflowId === plan.workflowId && String(item.version) === String(plan.version) && item.status === 'active');
@@ -407,9 +461,57 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
     const contractSteps = canonical?.steps || (Array.isArray(registered.contract?.steps) ? registered.contract.steps : []);
     if (!contractSteps.length) throw new Error('授权中心返回的固定流程没有可执行步骤');
     runtime.registerWorkflow({ workflowId: registered.workflowId, version: String(registered.version), steps: contractSteps });
-    const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: requestedPlatform, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}:${requestedPlatform}`) });
-    const remoteRunId = remote?.run?.id;
-    if (!remoteRunId) throw new Error('授权中心未返回流程实例');
+    // Workflow pricing is authoritative on the server.  Reserve the exact
+    // server-issued amount before creating a run; the server settles it only
+    // after a terminal, verified result decision.  A transport-unknown
+    // reservation is deliberately left to its bounded TTL instead of being
+    // guessed as refundable, preventing duplicate side effects.
+    let creditAction = null;
+    const creditPrice = Number.isSafeInteger(registered.contract?.creditPrice) ? registered.contract.creditPrice : null;
+    if (creditPrice !== null && creditPrice > 0) {
+      const reservation = await api.reserveCreditAction({
+        actionKey: safeIdempotencyKey(`workflow-credit:${plan.planId}:${requestedPlatform}:${registered.workflowId}:${registered.version}`),
+        owner: `workflow:${registered.workflowId}`,
+        amount: creditPrice,
+        metadata: { planId: plan.planId, workflowId: registered.workflowId, version: String(registered.version), platformAccountId: requestedPlatform }
+      });
+      creditAction = reservation?.action || null;
+      if (!creditAction?.id || creditAction.status !== 'reserved') throw new Error('授权中心未返回有效的积分预留');
+      const license = engine.publicLicense();
+      engine.setLicense({ ...license, balance: reservation.balance });
+    }
+    // Persist the frozen local plan before creating the remote mirror.  A
+    // process exit during the HTTP handshake then leaves a resumable local
+    // checkpoint instead of a remote RUNNING record with no local run.
+    try {
+      localRun = runtime.startPlan(plan);
+    } catch (error) {
+      if (creditAction?.id) {
+        try { await api.releaseCreditAction(creditAction.id, { idempotencyKey: safeIdempotencyKey(`workflow-credit-release:${plan.planId}:${requestedPlatform}`) }); } catch (releaseError) { console.warn('[workflow] credit release failed', creditAction.id, releaseError.message); }
+      }
+      throw error;
+    }
+    workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: localRun });
+    emitState();
+    let remote;
+    try {
+      remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: requestedPlatform, creditActionId: creditAction?.id, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}:${requestedPlatform}`) });
+    } catch (error) {
+      runtime.pauseRun(localRun.runId, 'remote_workflow_not_created');
+      // A definite HTTP rejection means no run was accepted by the server;
+      // release the local reservation.  Network/timeout errors remain
+      // indeterminate and are recovered through the action TTL/query path.
+      if (creditAction?.id && Number.isInteger(error?.status) && error.status > 0) {
+        try { await api.releaseCreditAction(creditAction.id, { idempotencyKey: safeIdempotencyKey(`workflow-credit-release:${plan.planId}:${requestedPlatform}`) }); } catch (releaseError) { console.warn('[workflow] credit release failed', creditAction.id, releaseError.message); }
+      }
+      throw error;
+    }
+    remoteRunId = remote?.run?.id;
+    if (!remoteRunId) {
+      runtime.pauseRun(localRun.runId, 'remote_workflow_protocol_error');
+      throw new Error('授权中心未返回流程实例，已暂停本地流程');
+    }
+    accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === localRun.runId ? { ...candidate, remoteRunId } : candidate) }));
     let leaseHeld = false;
     let remoteVersion = Number.isSafeInteger(remote?.run?.checkpointVersion) ? remote.run.checkpointVersion : 0;
     try {
@@ -417,10 +519,9 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
       leaseHeld = true;
       const running = await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: remoteVersion });
       remoteVersion = Number.isSafeInteger(running?.run?.checkpointVersion) ? running.run.checkpointVersion : remoteVersion + 1;
-      const run = runtime.startPlan(plan);
+      const run = localRun;
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: { ...run, status: 'RUNNING' } });
       emitState();
-      accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
       const result = await runtime.run(run.runId);
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
       await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
@@ -456,10 +557,13 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
       emitState();
       return { plan, run: displayRun, nextDecision, decisionApplied };
     } catch (error) {
-      if (leaseHeld) await solidifyRemoteWorkflow(remoteRunId, error.message);
+      if (leaseHeld && remoteRunId) await solidifyRemoteWorkflow(remoteRunId, error.message);
+      if (localRun && !['COMPLETED', 'FAILED', 'STOPPED', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED'].includes(runtime.getRun(localRun.runId).status)) {
+        runtime.pauseRun(localRun.runId, remoteRunId ? 'remote_workflow_interrupted' : 'remote_workflow_not_created');
+      }
       throw error;
     } finally {
-      if (leaseHeld) {
+      if (leaseHeld && remoteRunId) {
         try { await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${accountId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', remoteRunId, error.message); }
       }
     }
@@ -545,6 +649,16 @@ function registerIpc() {
         local = runtime.getRun(normalizedRunId);
       } catch (error) {
         throw new Error(`当前选中的平台账号没有该流程，已拒绝恢复：${error.message}`);
+      }
+      if (!local.remoteRunId) {
+        // A timeout after the server committed the idempotent create can leave
+        // the local checkpoint without the remote id. Reconcile by the
+        // server-issued plan id; never execute an unbound local run.
+        const remoteRows = await api.workflowRuns();
+        const candidate = (Array.isArray(remoteRows?.runs) ? remoteRows.runs : []).find((item) => item.planId === local.plan?.planId && item.platformAccountId === requestedPlatform && !['COMPLETED', 'FAILED', 'STOPPED'].includes(item.status));
+        if (!candidate?.id) throw new Error('该流程缺少授权端运行实例，已拒绝恢复；请重新创建任务');
+        runtime.attachRemoteRun(local.runId, candidate.id);
+        local = runtime.getRun(normalizedRunId);
       }
       let remoteVersion = null;
       let leaseHeld = false;
@@ -664,9 +778,18 @@ async function boot() {
       const platformAccount = options?.platformAccountId;
       if (!userId || !platformAccount || accountId !== runtimeAccountId(userId, platformAccount)) throw new Error('工作流账号上下文范围无效');
       const store = new JsonStore(accountDataPath(userId, platformAccount), defaultData);
-      const accountBrowser = createBrowserInstance(userId, platformAccount);
-      const runtime = createWorkflowRuntimeForStore(store, userId, platformAccount, accountBrowser);
-      return { accountId, store, runtime, close: () => accountBrowser.close() };
+      let runtime;
+      const accountBrowser = createBrowserInstance(userId, platformAccount, {
+        onStatus: (status) => pauseWorkflowForBrowserStatus(accountId, runtime, status)
+      });
+      runtime = createWorkflowRuntimeForStore(store, userId, platformAccount, accountBrowser);
+      return {
+        accountId,
+        store,
+        runtime,
+        invalidate: (reason) => { runtime.invalidate(reason); accountBrowser.stop?.(); },
+        close: () => accountBrowser.close()
+      };
     }
   });
   // Read the encrypted token before clearing the cached display license. This

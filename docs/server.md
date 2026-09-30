@@ -25,6 +25,16 @@ ADMIN_USERNAME=owner ADMIN_PASSWORD='从密码管理器注入' npm run bootstrap
 
 也可省略环境变量后交互输入。CLI 支持管理员生成账号、禁用/续期、积分调整、兑换码发行、流水查询。密码、token、兑换码与 AI key 不写日志。新用户创建时随机密码只在命令输出中显示一次。
 
+固定业务流程目录也由管理员显式登记。首次部署完成 bootstrap 后，在受保护的运维机上执行：
+
+```bash
+node scripts/register-platform-workflows.mjs \
+  --endpoint https://api.example.com \
+  --username owner --password '从密码管理器注入'
+```
+
+脚本从桌面端固定契约读取 `video.search`、`comment.reply_then_private`、`live.reply_then_private` 和 `live.batch`，只创建缺失版本，不覆盖已有定义。`--dry-run` 只打印待登记 payload；流程目录为空、版本被禁用或契约 hash 不一致时，桌面端会拒绝启动，必须由管理员处理后再运行。
+
 生产镜像不含 `tsx`，使用编译后的 CLI：
 
 ```bash
@@ -55,7 +65,7 @@ Fastify 默认不信任 `X-Forwarded-For`，因此不会无条件把客户端提
 
 ## 数据与恢复
 
-积分余额不直接作为可被覆盖的字段使用；每次变化追加 ledger，事务内维护余额快照，余额永不小于零。AI draft 的 hold 带 owner、幂等键、过期时间和状态；每次请求前回收过期 hold。进程在 provider 成功后崩溃时，hold 会在过期后释放，客户端可用同 key 重试，服务端不会再次创建并行扣款。
+积分余额不直接作为可被覆盖的字段使用；每次变化追加 ledger，事务内维护余额快照，余额永不小于零。AI draft 的 hold 带 owner、幂等键、过期时间和状态；每次请求前回收过期 hold。provider 超时或响应未知时，服务端保留 pending 幂等记录和 hold，客户端必须先查询同一操作；过期后释放并审计，不能换 key 自动重发。成功结果和扣费在同一事务提交。
 
 固定流程运行实例使用 `workflow_definitions`、`workflow_runs` 和 `workflow_checkpoints` 保存版本化契约、冻结参数、知识集版本、当前步骤和恢复次数。模型规划只负责选择注册的 `workflowId/version/params`；运行中的步骤由桌面固定执行器上报，服务端拒绝未注册版本、旧 checkpoint 和跨账号知识集。`UNKNOWN`、`WAITING_HUMAN` 和 `PAUSED` 不会被服务端自动改写为成功或触发重发，恢复必须使用原运行实例并通过两次健康检查。
 

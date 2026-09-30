@@ -29,6 +29,12 @@
 
 每次受保护请求在线检查会话、账号状态、有效期和设备撤销状态。
 
+### 平台账号与积分动作
+
+`POST/GET /v1/platform-accounts` 管理当前工作台用户自己的抖音账号标识；`PATCH /v1/platform-accounts/:id` 只允许更新显示名或 `active/disabled` 状态。平台账号停用后，绑定它的固定流程不能继续写 checkpoint、续租或恢复。
+
+`POST /v1/credits/actions/reserve` 只接受服务端登记的 owner 和价格，返回带过期时间的预留动作；`GET /v1/credits/actions/:id` 查询动作状态；`POST /v1/credits/actions/:id/commit` 或 `.../release` 使用幂等键完成结算。过期预留由服务端释放并写审计。客户端不能指定任意 owner、余额或成功状态。
+
 ### `GET /v1/credits/ledger`
 
 返回当前用户 append-only 流水：`{ entries: [{id,delta,balanceAfter,kind,metadata,createdAt}], balance }`。金额是非负整数积分；客户端不可提交余额或余额后的值。
@@ -45,7 +51,7 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 ### 固定流程运行与恢复
 
-管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；服务端保存契约快照和知识集版本。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
+管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
 
 需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。服务端不会因为恢复请求自动重发未知发送动作。
 
@@ -73,7 +79,11 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 ### `POST /v1/agent/draft`
 
-请求：`{ event, businessContext?, targetCustomer?, replyInstructions?, idempotencyKey }`。仅在用户拥有 `draft` entitlement 且服务端配置了 OpenAI-compatible `baseUrl`、`model`、API key 时可用；缺少任一项明确返回 503，不默认为某个模型。服务端从配置读取价格，不接受客户端覆盖。服务端先在事务中创建带 owner 的积分 hold，AI 成功后 capture 并追加收费流水，失败、超时、provider 503 或响应无法解析时 release，不扣积分。模型输出必须解析为 `{matched, intent: "purchase"|"question"|"other", confidence: 0..1, reason, reply}`；不符合结构也视为失败。响应 `{matched,intent,confidence,reason,reply,charged,balance,eventId,actionId}`。并发请求不能突破可用余额，过期 hold 会在请求前回收。评论内容会发送到本授权端配置的 provider，服务端不把原文写入日志或审计。
+请求：`{ event, businessContext?, targetCustomer?, replyInstructions?, idempotencyKey }`。仅在用户拥有 `draft` entitlement 且服务端配置了 OpenAI-compatible `baseUrl`、`model`、API key 时可用；缺少任一项明确返回 503，不默认为某个模型。服务端从配置读取价格，不接受客户端覆盖。服务端先在事务中创建带 owner 的积分 hold，AI 成功后 capture 并追加收费流水。provider 超时、连接中断、响应无法解析或进程在 provider 返回前退出都保留 pending/hold 为 `unknown`，不删除幂等记录，也不换 key 自动重试；使用 `GET /v1/agent/draft/:idempotencyKey` 查询原操作，过期预留由服务端回收。模型输出必须解析为 `{matched, intent: "purchase"|"question"|"other", confidence: 0..1, reason, reply}`；不符合结构也视为不确定。成功响应 `{matched,intent,confidence,reason,reply,charged,balance,eventId,actionId}`。并发请求不能突破可用余额。评论内容会发送到本授权端配置的 provider，服务端不把原文写入日志或审计。
+
+### `GET /v1/agent/draft/:idempotencyKey`
+
+返回草稿操作的 `completed` 或 `unknown` 状态，以及脱敏的 hold 状态和过期时间。`unknown` 只提供核对依据，不会触发 provider 重试或积分扣除。
 
 ## 管理员
 

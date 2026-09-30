@@ -67,7 +67,13 @@ class ProbeBridge {
 
   #reportOpenFailure(error, message = error?.message || '页面打开失败') {
     this.currentUrl = null;
+    this.#stopForTransition();
     this.onStatus?.({ connected: false, collector: 'open_error', url: null, matchCount: 0, error: message });
+  }
+
+  #reportCollectorFailure(error, collector = 'error') {
+    this.#stopForTransition();
+    this.onStatus?.({ connected: false, collector, error: error?.message || String(error || '侧车采集失败') });
   }
 
   async open(url) {
@@ -146,10 +152,15 @@ class ProbeBridge {
     const params = source === 'live'
       ? { url: this.currentUrl || requested, maxItems: Number.isInteger(options.maxItems) ? options.maxItems : 100 }
       : { url: this.currentUrl || requested, maxItems: Number.isInteger(options.maxItems) ? options.maxItems : 100, scrollRounds: Number.isInteger(options.scrollRounds) ? options.scrollRounds : 0 };
-    const result = await this.client.request(method, params, { timeoutMs: 45000 });
-    const events = validEvents(result, source);
-    this.onStatus?.({ connected: true, collector: result.status || 'ready', status: result.status || 'ready', matchCount: events.length, capability: result.capability || this.capability });
-    return { ...result, events };
+    try {
+      const result = await this.client.request(method, params, { timeoutMs: 45000 });
+      const events = validEvents(result, source);
+      this.onStatus?.({ connected: true, collector: result.status || 'ready', status: result.status || 'ready', matchCount: events.length, capability: result.capability || this.capability });
+      return { ...result, events };
+    } catch (error) {
+      this.#reportCollectorFailure(error);
+      throw error;
+    }
   }
 
   isOpenFor(url) {
@@ -179,6 +190,7 @@ class ProbeBridge {
       } catch (error) {
         if (epoch !== this.lifecycleEpoch || generation !== this.cancelGeneration) return;
         this.running = false;
+        this.#reportCollectorFailure(error);
         throw error;
       }
     });
@@ -233,8 +245,8 @@ class ProbeBridge {
     if (!this.running || epoch !== this.collectEpoch) return;
     this.timer = setTimeout(async () => {
       if (!this.running || epoch !== this.collectEpoch) return;
-      try { await this.#collect(epoch); } catch (error) { this.onStatus?.({ collector: 'error', error: error.message }); }
-      this.#scheduleCollect(epoch);
+      try { await this.#collect(epoch); } catch { /* #collect reports and stops on collector failure. */ }
+      if (this.running && epoch === this.collectEpoch) this.#scheduleCollect(epoch);
     }, 2500);
   }
 
@@ -251,6 +263,9 @@ class ProbeBridge {
       if (terminal) this.running = false;
       this.onStatus?.({ connected: true, collector: result.status || 'ready', status: result.status || 'ready', matchCount: events.length, capability: result.capability || this.capability });
       if (events.length) this.onEvents?.(events);
+    } catch (error) {
+      if (epoch === this.collectEpoch && this.running) this.#reportCollectorFailure(error);
+      throw error;
     } finally { this.collectRunning = false; }
   }
 

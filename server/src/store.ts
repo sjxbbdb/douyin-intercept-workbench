@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
   workflow_id TEXT NOT NULL,
   workflow_version TEXT NOT NULL,
   contract_json TEXT NOT NULL,
+  policy_json TEXT NOT NULL DEFAULT '{}',
   params_json TEXT NOT NULL,
   knowledge_set_id TEXT REFERENCES knowledge_sets(id),
   knowledge_set_version INTEGER,
@@ -191,6 +192,7 @@ CREATE TABLE IF NOT EXISTS credit_actions (
   status TEXT NOT NULL CHECK(status IN ('reserved','committed','released')),
   ledger_id TEXT,
   metadata_json TEXT NOT NULL DEFAULT '{}',
+  expires_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(user_id, action_key)
@@ -214,6 +216,14 @@ export class Store {
     if (!columns.some((column) => column.name === 'lease_device_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_device_id TEXT");
     if (!columns.some((column) => column.name === 'lease_expires_at')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN lease_expires_at INTEGER");
     if (!columns.some((column) => column.name === 'credit_action_id')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN credit_action_id TEXT");
+    if (!columns.some((column) => column.name === 'policy_json')) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN policy_json TEXT NOT NULL DEFAULT '{}'");
+    const creditActionColumns = this.all<{ name: string }>('PRAGMA table_info(credit_actions)');
+    if (!creditActionColumns.some((column) => column.name === 'expires_at')) {
+      // Legacy reservations did not have a lifetime. Give them a bounded
+      // grace period so they cannot hold a user's balance forever.
+      this.db.exec("ALTER TABLE credit_actions ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0");
+      this.db.exec('UPDATE credit_actions SET expires_at=updated_at+900000 WHERE expires_at=0');
+    }
   }
   now() { return Date.now(); }
   exec(sql: string) { this.db.exec(sql); }

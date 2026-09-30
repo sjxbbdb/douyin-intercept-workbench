@@ -12,7 +12,7 @@ const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
 const { createWorkflowAdapter } = require('../src/lib/workflow-adapter');
 const { platformWorkflowDefinitions } = require('../src/lib/workflow-contracts');
 const { AuthStore } = require('../src/lib/auth-store');
-const { platformScope, accountDataPath, browserPartition, sidecarPort } = require('../src/lib/platform-account');
+const { platformScope, accountDataPath, browserPartition, sidecarPort, allocateSidecarPorts } = require('../src/lib/platform-account');
 const { AccountRuntimeManager } = require('../src/lib/account-runtime-manager');
 
 let passed = 0;
@@ -111,6 +111,18 @@ test('JsonStore rejects a directory containing only damaged versions', () => { c
 test('JsonStore EXDEV fallback is revision based and reopens latest data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated EFS rename'); error.code = 'EXDEV'; throw error; }; const store = new JsonStore(file, { state: 'initial' }); store.set({ state: 'one' }); store.set({ state: 'two' }); const reopened = new JsonStore(file, {}); assert.equal(reopened.get().state, 'two'); assert.equal(reopened.revision, 2); } finally { fs.renameSync = originalRename; } });
 test('JsonStore does not commit memory when disk write fails', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { state: 'initial' }); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated disk full'); error.code = 'ENOSPC'; throw error; }; assert.throws(() => store.set({ state: 'failed' }), /disk full/); assert.equal(store.get().state, 'initial'); assert.equal(store.revision, 0); } finally { fs.renameSync = originalRename; } });
 test('restarts pause persisted running tasks without an active collector', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [{ id: 'task-running', status: 'running', generation: 2 }], events: [], leads: [], logs: [], pending: [], selectorProfile: {} })); const authStore = { getLicense: () => null, setLicense: () => {} }; new TaskEngine({ store, api: {}, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {} }); const recovered = store.get(); assert.equal(recovered.tasks[0].status, 'paused'); assert.equal(recovered.tasks[0].generation, 3); assert.equal(recovered.logs.at(-1).detail.reason, 'desktop_restarted_without_active_collector'); });
+test('workflow runtime recovers persisted running steps without blindly resending side effects', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-recovery-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [
+    { runId: 'paused-run', accountId: 'account-a', workflowId: 'recovery.fixture', version: '1', plan: { workflowId: 'recovery.fixture', version: '1', params: {} }, status: RUN_STATES.RUNNING, currentStep: 0, steps: [{ stepId: 'collect', sideEffect: false, status: 'running' }], checkpoint: null, lastError: null },
+    { runId: 'unknown-run', accountId: 'account-a', workflowId: 'recovery.fixture', version: '1', plan: { workflowId: 'recovery.fixture', version: '1', params: {} }, status: RUN_STATES.RUNNING, currentStep: 0, steps: [{ stepId: 'send', sideEffect: true, status: 'running' }], checkpoint: null, lastError: null }
+  ] });
+  const runtime = new WorkflowRuntime({ store, accountId: 'account-a', workflows: [{ workflowId: 'recovery.fixture', version: '1', steps: [{ stepId: 'collect', sideEffect: false }, { stepId: 'send', sideEffect: true }] }] });
+  assert.equal(runtime.getRun('paused-run').status, RUN_STATES.PAUSED);
+  assert.equal(runtime.getRun('paused-run').lastError.code, 'DESKTOP_RESTARTED_WITH_RUNNING_WORKFLOW');
+  assert.equal(runtime.getRun('unknown-run').status, RUN_STATES.UNKNOWN);
+  assert.equal(runtime.getRun('unknown-run').lastError.code, 'DESKTOP_RESTARTED_DURING_SIDE_EFFECT');
+});
 
 test('platform account selection is persisted per workbench user and derives isolated runtime/browser scopes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-platform-'));
@@ -127,6 +139,17 @@ test('platform account selection is persisted per workbench user and derives iso
   assert.notEqual(accountDataPath(dir, 'https://license.example', 'workbench-a', 'platform-a'), accountDataPath(dir, 'https://license.example', 'workbench-a', 'platform-b'));
   assert.notEqual(browserPartition('https://license.example', 'workbench-a', 'platform-a'), browserPartition('https://license.example', 'workbench-a', 'platform-b'));
   assert.notEqual(sidecarPort('https://license.example', 'workbench-a', 'platform-a'), sidecarPort('https://license.example', 'workbench-a', 'platform-b'));
+});
+
+test('sidecar port allocation resolves same-user hash collisions deterministically', () => {
+  const accounts = ['acct-104', 'acct-69', 'acct-104'];
+  assert.equal(sidecarPort('https://license.example', 'workbench-a', 'acct-69'), sidecarPort('https://license.example', 'workbench-a', 'acct-104'));
+  const first = allocateSidecarPorts('https://license.example', 'workbench-a', accounts);
+  const second = allocateSidecarPorts('https://license.example', 'workbench-a', [...accounts].reverse());
+  assert.equal(first.get('acct-69') === first.get('acct-104'), false);
+  assert.deepEqual([...first.entries()], [...second.entries()]);
+  assert.equal(sidecarPort('https://license.example', 'workbench-a', 'acct-69', accounts), first.get('acct-69'));
+  assert.equal(sidecarPort('https://license.example', 'workbench-a', 'acct-104', accounts), first.get('acct-104'));
 });
 
 testAsync('workflow runtime isolates two platform accounts under one workbench user', async () => {

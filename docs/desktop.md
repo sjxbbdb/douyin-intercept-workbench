@@ -53,7 +53,10 @@ desktop/
 | GET | `/v1/credits/ledger` | 无 | 积分台账 |
 | POST | `/v1/credits/redeem` | `{ code, idempotencyKey }` | 兑换卡密，必须幂等 |
 | POST | `/v1/agent/evaluate` | `{ event, rule, idempotencyKey }` | 规则筛选与模板回复，服务端重验规则并按 `features.prices.evaluateReplyPrice` 扣积分，响应 `{ matched, intent, confidence, reason, reply, charged, balance, eventId, actionId? }` |
-| POST | `/v1/agent/draft` | `{ event, businessContext, targetCustomer, replyInstructions, idempotencyKey }` | AI 意向判断和回复草稿，只有账号开通 `features.draft` 才可调用，按 `features.prices.draftPrice` 扣积分 |
+| POST | `/v1/agent/draft` | `{ event, businessContext, targetCustomer, replyInstructions, idempotencyKey }` | AI 意向判断和回复草稿，只有账号开通 `features.draft` 才可调用，按 `features.prices.draftPrice` 扣积分；provider 未知时保留原幂等操作 |
+| GET | `/v1/agent/draft/:idempotencyKey` | 无 | 查询草稿操作的 `completed/unknown`，未知状态不得换 key 自动重试 |
+| POST | `/v1/platform-accounts` | `{ platform, accountRef, displayName }` | 登记当前工作台自己的平台账号标识 |
+| PATCH | `/v1/platform-accounts/:id` | `{ displayName?, status? }` | 更新名称或停用/启用账号；停用会阻断绑定流程的继续写入 |
 
 `event.observedAt` 在发送给授权中心前统一为毫秒整数；桌面端把完整请求方法和原始 payload 与事件一起持久化，恢复生成始终复用该方法和幂等键，不随后来修改的任务模式改路由。
 
