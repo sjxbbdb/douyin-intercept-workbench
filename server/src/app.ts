@@ -125,7 +125,18 @@ function getFeatures(row: AnyRecord, providerConfigured: boolean) {
 function recoverExpiredHolds(store: Store) {
   store.transaction(() => {
     const now = store.now();
+    const expired = store.all<{ user_id: string; hold_key: string }>("SELECT user_id,hold_key FROM holds WHERE status='held' AND expires_at<=?", now);
     store.run("UPDATE holds SET status='released' WHERE status='held' AND expires_at<=?", now);
+    // Draft generation is a planning operation and has no platform-side
+    // effect. Once its bounded hold expires, its pending idempotency record
+    // can be safely reclaimed so a caller can explicitly retry the draft.
+    // Platform sends use a separate workflow/credit-action gate and never
+    // enter this table.
+    for (const row of expired) if (row.hold_key.startsWith('draft:')) {
+      const key = row.hold_key.slice(6);
+      store.run("DELETE FROM idempotency WHERE user_id=? AND scope='draft' AND idem_key=? AND status='pending'", row.user_id, key);
+      audit(store, 'system', null, 'agent.draft.expired', row.user_id, { idempotencyKey: key });
+    }
   });
 }
 
@@ -399,9 +410,17 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
       const result = await providerDraft(config, { event, businessContext, targetCustomer, replyInstructions });
       const fresh = userFromRequest(store, request, config); const freshEntitlement = parseJson<AnyRecord>(fresh.features_json ?? '{}', {}); if (freshEntitlement.draft !== true) throw forbidden('FEATURE_DISABLED', '该账号未开通 AI 草稿功能'); if (!providerConfigured) throw new AppError(503, 'PROVIDER_NOT_CONFIGURED', 'AI provider 未配置'); return store.transaction(() => { if (hold) { const current = store.get<AnyRecord>('SELECT * FROM holds WHERE id=? AND status=\'held\' AND expires_at>?', hold, store.now()); if (!current) throw new AppError(503, 'HOLD_EXPIRED', '积分预留已过期，请重试'); store.run("UPDATE holds SET status='captured' WHERE id=? AND status='held'", hold); } const actionId = randomId('action'); const entry = appendLedger(store, user.user_id, -price, 'ai_draft', key, hashPayload(payload), { actionId, eventId }); const response = { ...result, charged: price, balance: entry.balance, eventId, actionId }; idempotentComplete(store, user.user_id, 'draft', key, response); audit(store, 'user', user.user_id, 'agent.draft', user.user_id, { actionId, eventId, charged: price }); return response; });
     } catch (error) {
-      // Provider errors are indeterminate: preserve the pending operation and
-      // its hold until the TTL expires so a caller cannot retry with a new key
-      // and accidentally send twice. The status endpoint is the recovery path.
+      // The provider only returns a reply draft; it cannot send to Douyin.
+      // Release the hold and reclaim the pending key so an explicit caller
+      // retry is safe. Platform-side sends remain fail-closed in workflows.
+      store.transaction(() => {
+        if (hold) store.run("UPDATE holds SET status='released' WHERE id=? AND status='held'", hold);
+        store.run("DELETE FROM idempotency WHERE user_id=? AND scope='draft' AND idem_key=? AND status='pending'", user.user_id, key);
+        audit(store, 'user', user.user_id, 'agent.draft.failed', user.user_id, {
+          idempotencyKey: key,
+          code: error instanceof AppError ? error.code : 'PROVIDER_FAILED',
+        });
+      });
       throw error;
     }
   });
