@@ -534,53 +534,8 @@ def chat_list_tail(cdp, box=None):
     return found if isinstance(found, dict) else {"ok": False, "reason": "tail_lookup_failed"}
 
 
-CHAT_SCROLL_STATE_JS = (
-    "(function(box){"
-    "function inBox(r,b){var t=2;"
-    "return r.x+t>=b[0]&&r.right-t<=b[0]+b[2]&&r.y+t>=b[1]&&r.bottom-t<=b[1]+b[3];}"
-    "var lists=document.querySelectorAll(" + json.dumps(S.LIVE_CHAT_LIST) + ");"
-    "for(var L=0;L<lists.length;L++){var list=lists[L];"
-    "if(!inBox(list.getBoundingClientRect(),box))continue;"
-    "var el=list;"
-    "for(var u=0;u<6&&el;u++){"
-    "  if(el.scrollHeight>el.clientHeight+4){"
-    "    return {ok:true,top:Math.round(el.scrollTop),height:Math.round(el.scrollHeight),"
-    "            client:Math.round(el.clientHeight),"
-    "            atBottom:el.scrollTop+el.clientHeight>=el.scrollHeight-2,"
-    "            cls:String(el.className||'').slice(0,50)};}"
-    "  el=el.parentElement;}"
-    "}"
-    "return {ok:false,reason:'scroll_container_not_found'};})"
-)
-
-
-def chat_scroll_state(cdp, box=None):
-    """读聊天列表【真实】的滚动位置（scrollTop / 可滚动高度 / 是否已经到底）。
-
-    🔴 真机（2026-09-28）：滚轮 delta 不等于实际滚动量 —— 列表可能已经到顶/到底，
-    浏览器还有滚动惯性。拿 delta 当"滚了多少"会让上层重试逻辑自欺欺人，
-    所以每次滚完都要读真实 scrollTop 说话。真正的滚动容器可能是列表本身，
-    也可能是它的某个祖先（真机上两种都遇到过），这里向上找第一个可滚动的元素。
-    """
-    if box is None:
-        picked = main_chat_list(cdp)
-        if not picked.get("found"):
-            return {"ok": False, "reason": picked.get("reason") or "main_chat_list_not_found"}
-        box = picked["box"]
-    try:
-        found = cdp.eval_json("(%s)(%s)" % (CHAT_SCROLL_STATE_JS, json.dumps(list(box))))
-    except Exception as exc:
-        return {"ok": False, "reason": "scroll_state_failed", "error": type(exc).__name__}
-    return found if isinstance(found, dict) else {"ok": False, "reason": "scroll_state_failed"}
-
-
 def scroll_chat_list(cdp, direction="up", amount=420, times=1, box=None):
-    """用【真实滚轮】在主聊天列表上滚动：up = 看更早的弹幕，down = 回到最新。
-
-    返回值里的 moved 是【实测滚到的像素数】（滚前滚后 scrollTop 之差），delta 只是请求值 ——
-    上层按 moved 记账（见 open_reply_menu / resume_chat_bottom）。读不到滚动容器、滚轮事件
-    发不出去都不抛异常：如实记 moved=0 并把 reason 带出去。
-    """
+    """用【真实滚轮】在主聊天列表上滚动：up = 看更早的弹幕，down = 回到最新。"""
     if box is None:
         picked = main_chat_list(cdp)
         if not picked.get("found"):
@@ -588,74 +543,13 @@ def scroll_chat_list(cdp, direction="up", amount=420, times=1, box=None):
         box = picked["box"]
     x, y, w, h = box
     cx, cy = int(x + w / 2), int(y + h / 2)
-    up = str(direction) == "up"
-    delta = -abs(int(amount)) if up else abs(int(amount))
-    moved = 0
-    measured = 0
-    state = {}
+    delta = -abs(int(amount)) if str(direction) == "up" else abs(int(amount))
     for _ in range(max(1, int(times))):
-        before = chat_scroll_state(cdp, box)
-        try:
-            cdp.call("Input.dispatchMouseEvent",
-                     {"type": "mouseWheel", "x": cx, "y": cy, "deltaX": 0, "deltaY": delta},
-                     timeout=10)
-        except Exception as exc:
-            return {"ok": False, "reason": "wheel_failed", "error": type(exc).__name__,
-                    "box": list(box), "delta": delta, "moved": moved}
+        cdp.call("Input.dispatchMouseEvent",
+                 {"type": "mouseWheel", "x": cx, "y": cy, "deltaX": 0, "deltaY": delta},
+                 timeout=10)
         time.sleep(0.25)
-        state = chat_scroll_state(cdp, box)
-        if before.get("ok") and state.get("ok"):
-            measured += 1
-            step = (before["top"] - state["top"]) if up else (state["top"] - before["top"])
-            moved += max(0, int(step))
-    result = {"ok": True, "box": list(box), "delta": delta * max(1, int(times)),
-              "moved": moved, "measured": measured}
-    if state.get("ok"):
-        result["atBottom"] = bool(state.get("atBottom"))
-        result["top"] = state.get("top")
-    else:
-        result["atBottom"] = None
-    return result
-
-
-# 上滚找回「已经滚出可视区」的弹幕：真机量出来的距离（见 open_reply_menu 里的注释）。
-RECOVERY_SCROLL_PX = 1200
-RECOVERY_ATTEMPTS = 5
-
-
-def resume_chat_bottom(cdp, box=None, distance=0, min_steps=3, max_steps=12):
-    """把聊天列表滚回【最新】（best-effort，绝不抛异常）。
-
-    上滚找旧弹幕之后必须回到最新：否则下一次采集看到的还是那批旧弹幕，
-    新弹幕全落在列表可视区下方。
-
-    🔴 真机（2026-09-28）：回滚的判据不是"滚了几次"，而是【真的到底了没有】——
-    每次滚完读一次 scrollTop，atBottom 为真就停；distance 只用来给步数一个上限，
-    免得列表本来就在底部时还空滚十几次。
-    """
-    budget_px = max(int(distance), RECOVERY_SCROLL_PX * int(min_steps))
-    steps = min(int(max_steps),
-                max(int(min_steps), (budget_px + RECOVERY_SCROLL_PX - 1) // RECOVERY_SCROLL_PX))
-    moved = 0
-    scrolled = 0
-    at_bottom = None
-    for _ in range(steps):
-        try:
-            step = scroll_chat_list(cdp, "down", RECOVERY_SCROLL_PX, 1, box)
-        except Exception as exc:
-            return {"ok": False, "reason": "scroll_failed", "error": type(exc).__name__,
-                    "scrolled": scrolled, "moved": moved, "atBottom": at_bottom}
-        if not step.get("ok"):
-            return {"ok": False, "reason": step.get("reason") or "scroll_failed",
-                    "scrolled": scrolled, "moved": moved, "atBottom": at_bottom}
-        scrolled += 1
-        moved += max(0, int(step.get("moved") or 0))
-        at_bottom = step.get("atBottom")
-        if at_bottom:
-            break
-        if step.get("moved") == 0 and at_bottom is None:
-            break
-    return {"ok": True, "scrolled": scrolled, "moved": moved, "atBottom": at_bottom}
+    return {"ok": True, "box": list(box), "delta": delta * max(1, int(times))}
 
 
 def pause_autoscroll(cdp, settle=1.3, box=None):
@@ -670,17 +564,12 @@ def pause_autoscroll(cdp, settle=1.3, box=None):
             return {"ok": False, "reason": picked.get("reason") or "main_chat_list_not_found"}
         box = picked["box"]
     before = chat_list_tail(cdp, box)
-    # 🔴 评审意见（2026-09-28）：这一步的上滚以前【不计入 scrolled_px】——
-    #    如果目标正是在这一步被找到的，列表就不会被恢复到最新位置，下一轮采集会受影响。
-    #    所以把【实测】滚到的像素一并回报，由调用方累计。
-    step = scroll_chat_list(cdp, "up", 420, 1, box)
+    scroll_chat_list(cdp, "up", 420, 1, box)
     time.sleep(settle)
     after = chat_list_tail(cdp, box)
     paused = bool(before.get("ok") and after.get("ok") and before.get("key") == after.get("key"))
     return {"ok": True, "paused": paused, "box": list(box),
-            "before": before.get("key"), "after": after.get("key"),
-            "moved": (int(step.get("moved") or 0) if step.get("ok") else 0),
-            "atBottom": step.get("atBottom")}
+            "before": before.get("key"), "after": after.get("key")}
 
 
 def scroll_to_danmaku(cdp, target, max_steps=4, amount=420):
@@ -1126,39 +1015,11 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
         #    正确做法是 fail-closed：没有主列表矩形就不点。
         return {"ok": False, "reason": "main_chat_list_not_found"}
     last = None
-    scrolled_px = 0
-    stuck_steps = 0
     pending = placed if isinstance(placed, dict) and placed.get("x") is not None else None
-    for index in range(RECOVERY_ATTEMPTS):
+    for index in range(4):
         if index == 1:
             settled = pause_autoscroll(cdp)
             box = settled.get("box") or box
-            # 这一步也真的滚动了列表：把实测像素计进 scrolled_px，
-            # 否则"正好在这一步找到目标"时，列表不会被恢复到最新（评审 2026-09-28）。
-            scrolled_px += max(0, int(settled.get("moved") or 0))
-        elif index >= 2:
-            # 🔴 真机量出来的（2026-09-26，高流量房间 685317364746，公屏每秒好几条）：
-            #    采集后 0s 四条全部能直接定位；15s 时一条都定不到，但【上滚 3600px 找回一半】；
-            #    30s / 60s 之后连上滚 6000px 都找不回来（页面的历史窗口已经过去了）。
-            #    所以上滚距离必须够大 —— 420px 在快房间里只够买一秒。
-            # 🔴 记账按【实测滚到的像素】（2026-09-28 复查）：列表可能已经到顶、还有滚动惯性，
-            #    delta 不等于真的滚了那么多；连续两次滚不动就说明到顶了，别再空转。
-            try:
-                step = scroll_chat_list(cdp, "up", RECOVERY_SCROLL_PX, 1, box)
-            except Exception as exc:
-                step = {"ok": False, "reason": "scroll_failed", "error": type(exc).__name__}
-            if step.get("ok"):
-                scrolled_px += max(0, int(step.get("moved") or 0))
-                stuck_steps = stuck_steps + 1 if not step.get("moved") else 0
-                if stuck_steps >= 2:
-                    last = last or "danmaku_not_found_in_list"
-                    break
-            else:
-                stuck_steps += 1
-                if stuck_steps >= 2:
-                    last = last or step.get("reason") or "scroll_failed"
-                    break
-            time.sleep(0.6)
         if pending is not None:
             # 🔴 真机教训（2026-09-20，高流量房间）：先读"此刻可见的行"拿到坐标，
             #    再重新定位会多花几百毫秒到几秒 —— 期间那条弹幕已经被新弹幕顶走，
@@ -1193,13 +1054,12 @@ def open_reply_menu(cdp, target, wait_seconds=3.0, interval=0.4, placed=None):
             menu = cdp.eval_json(MENU_ITEMS_JS)
             if isinstance(menu, dict) and menu.get("found"):
                 return {"ok": True, "items": menu["items"], "placed": found,
-                        "attempts": index + 1, "scrolledPx": scrolled_px}
+                        "attempts": index + 1}
             if time.time() >= deadline:
                 break
             time.sleep(interval)
         last = "reply_menu_not_opened"
-    return {"ok": False, "reason": last or "reply_menu_not_opened",
-            "scrolledPx": scrolled_px}
+    return {"ok": False, "reason": last or "reply_menu_not_opened"}
 
 
 def choose_reply_menu_item(cdp, menu, labels=NATIVE_REPLY_LABELS):

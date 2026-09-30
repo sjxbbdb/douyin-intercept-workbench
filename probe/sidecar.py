@@ -507,153 +507,27 @@ def _policy_ref_refusal(plan, params):
     return None
 
 
-DANMAKU_KEY_PREFIXES = ("live-danmaku-native:", "live-danmaku:")
-
-
-def _norm_binding_name(value):
-    """昵称归一化：零宽字符、脱敏星号、空白都不参与比较（与页面侧同一套口径）。"""
-    text = str(value or "")
-    for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        text = text.replace(junk, "")
-    for star in ("*", "＊"):
-        text = text.replace(star, "")
-    return "".join(text.split())
-
-
-def _danmaku_public_binding(row, target):
-    """③ 对应性（弹幕通路）：公屏回复必须【同一事件 + 同一收件人】。
-
-    🔴 评审 2026-09-29：单发私信此前只对 kind=comment 做对应性校验，弹幕通路被整条跳过
-    （旧注释的理由是"弹幕 target_key 的末段是昵称不是 sec_uid"）。后果是：
-    **拿 A 那条已确认的公屏回复，给 B 发私信**，在宿主最常直接调用的 send_private
-    入口上走得通 —— 张冠李戴。
-
-    其实 key 的结构够用：`live-danmaku[-native]:<eventId>:<authorName>`。所以这里要求：
-      · DM 目标必须带上同一个 eventId（`eventId`，兼容 `id`）—— 缺失即拒绝；
-      · 昵称必须与 key 里记的那一个一致（归一化后比较）—— 缺失同样拒绝（无从证明是同一人）。
-    """
-    key = str(row.get("target_key") or "")
-    prefix = next((item for item in DANMAKU_KEY_PREFIXES if key.startswith(item)), None)
-    if prefix is None:
-        return None
-    event_id, _, author_name = key[len(prefix):].partition(":")
-    if not event_id:
-        return ("public_event_missing", "the bound danmaku reply carries no event id")
-    if not isinstance(target, dict):
-        return None
-    target_event = str(target.get("eventId") or target.get("id") or "").strip()
-    if not target_event:
-        return ("public_event_missing",
-                "a danmaku private message must carry the eventId of the bound public reply")
-    if target_event != event_id:
-        return ("public_event_mismatch",
-                "the bound danmaku reply belongs to another event; a private message may only "
-                "bind the public reply of the same event")
-    expected = _norm_binding_name(author_name)
-    actual = _norm_binding_name(target.get("authorName"))
-    if not actual:
-        return ("public_target_missing",
-                "a danmaku private message must carry the authorName of the bound reply")
-    if expected and expected != actual:
-        return ("public_target_mismatch",
-                "the bound danmaku reply belongs to another recipient; a private message must "
-                "bind the reply of the same recipient")
-    return None
-
-
-# ---- 通用私信入口的输入预检（评审 2026-09-29）----
-# 参数级错误不该有浏览器成本：以前 target 不是对象 / 缺 authorId / text 空或过长，
-# 会一路走到 send_actions 里才失败 —— 那时浏览器已经开了（还留下"点了一半"的现场）。
-PRIVATE_MAX_TEXT = 2000
-_AUTHOR_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-
-
-def _author_id_shape_ok(value):
-    """与 send_actions.AUTHOR_ID_RE（^[A-Za-z0-9_-]{1,200}$）同一口径。"""
-    text = str(value or "")
-    if not 1 <= len(text) <= 200:
-        return False
-    return all(ch in _AUTHOR_ID_CHARS for ch in text)
-
-
-def _private_input_refusal(params):
-    """通用私信的输入预检；返回 (code, message) 或 None。**必须在打开浏览器之前调用。**
-
-    覆盖：sendId / target 类型 / target.authorId 形状 / text 类型与长度。
-    更细的绑定校验（publicSendId、事件与收件人）在 _private_binding_mismatch 里，
-    同样发生在打开浏览器之前。
-    """
-    if not isinstance(params, dict):
-        return ("invalid_input", "params must be an object")
-    if not str(params.get("sendId") or "").strip():
-        return ("invalid_input", "sendId is required")
-    target = params.get("target")
-    if not isinstance(target, dict):
-        return ("invalid_input", "target must be an object")
-    if not _author_id_shape_ok(target.get("authorId")):
-        return ("invalid_input", "target.authorId is invalid")
-    text = params.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return ("invalid_input", "text must be a non-empty string")
-    if len(text) > PRIVATE_MAX_TEXT:
-        return ("invalid_input", "text must be 1-%d characters" % PRIVATE_MAX_TEXT)
-    return None
-
-
-def _item_plan_membership(queue, plan_ids, event_id):
-    """逐项预判定：这个 eventId 是否【属于本批次】。返回稳定 reason 或 None。
-
-    🔴 评审 2026-09-29：以前是先 mark_private(...) 再发现事件不存在 ——
-    对不存在的 eventId 队列层会抛 unknown_event，而且已经尝试写一次没有意义的私有记录。
-    现在先判归属（纯读，无副作用），再决定要不要落台账：
-      · 事件在队列里根本不存在    -> event_not_in_plan
-      · 事件存在但不属于本批次    -> event_not_in_plan
-    两者对宿主是同一件事：这条不该按"本批次的一条"来处理。
-    """
-    key = str(event_id or "").strip()
-    if not key:
-        return "event_not_in_plan"
-    if queue.find_event(key) is None:
-        return "event_not_in_plan"
-    if key not in plan_ids:
-        return "event_not_in_plan"
-    return None
-
-
-def _item_plan_ids(queue, batch_id):
-    """本批次的 eventId 集合（冻结计划里的目标）。取不到就返回空集合（fail-closed）。"""
-    try:
-        plan = queue.plan(batch_id) or {}
-    except Exception:
-        return set()
-    return {str(target.get("eventId")) for target in (plan.get("targets") or [])}
-
-
 def _private_binding_mismatch(gate, public_send_id, target):
-    """单发私信的 ③ 对应性校验；返回 (code, message) 或 None。
+    """单发私信的 ③ 对应性校验；不一致时返回说明文字，否则 None。
 
-    两条公屏通路都要绑（评审 2026-09-29：弹幕通路以前整条没绑）：
-      · comment ：target_key = source:commentId:authorId（末段是评论作者 sec_uid）；
-      · danmaku ：target_key = live-danmaku[-native]:eventId:authorName ——
-                  必须同一事件 + 同一收件人，见 _danmaku_public_binding。
+    公屏评论回复的 target_key 形如 source:commentId:authorId（见 send_actions
+    的 gate_key = "%s:%s:%s"），末段就是评论作者。直播弹幕回复的末段是
+    【昵称】而不是 sec_uid（见 send_danmaku_reply），拿它跟私信目标的
+    authorId 比会误杀合法调用 —— 所以这里只对 kind=comment 生效。
     """
-    row = gate.lookup(str(public_send_id or "").strip())
-    if not row:
-        return None
-    kind = str(row.get("kind") or "")
-    if kind == "danmaku_reply":
-        return _danmaku_public_binding(row, target)
-    if kind != "comment" or not isinstance(target, dict):
+    if not isinstance(target, dict):
         return None
     author_id = str(target.get("authorId") or "").strip()
     if not author_id:
+        return None
+    row = gate.lookup(str(public_send_id or "").strip())
+    if not row or str(row.get("kind") or "") != "comment":
         return None
     parts = str(row.get("target_key") or "").split(":")
     if len(parts) < 3:
         return None
     if parts[-1] != author_id:
-        return (BINDING_MISMATCH,
-                "the bound public reply belongs to another author; "
+        return ("the bound public reply belongs to another author; "
                 "a private message must bind the reply of the same recipient")
     return None
 
@@ -766,7 +640,7 @@ def _navigate(page, url):
 
 
 class Sidecar:
-    def __init__(self, state_dir, profile_dir, port, gate_limits=None):
+    def __init__(self, state_dir, profile_dir, port):
         self.state_dir = self._external_dir(state_dir, "state-dir")
         self.profile_dir = self._external_dir(profile_dir, "profile-dir")
         self.port = int(port)
@@ -774,10 +648,7 @@ class Sidecar:
             raise SidecarError("invalid_port", "port must be between 1024 and 65535")
         os.makedirs(self.state_dir, exist_ok=True)
         self.account_scope = hashlib.sha256(self.profile_dir.encode("utf-8")).hexdigest()[:32]
-        # 本地安全阀（每目标 1 条 / 每小时 / 每天）。默认值保持不变；
-        # 授信调用方可以显式调高（真机验收、压测等场景）—— 这是【本地】限额，
-        # 不是平台配额，调高它不等于绕过平台风控（见 send_gate 的说明）。
-        self.gate = SendGate(self.state_dir, self.account_scope, limits=gate_limits)
+        self.gate = SendGate(self.state_dir, self.account_scope)
         # 点击审计：每次（含被拒绝的）点击都写一行，便于事后复核落点
         click_guard.set_audit_path(os.path.join(self.state_dir, "click_audit.jsonl"))
         self.live_queue = live_flow.LiveQueue(self.state_dir, self.account_scope)
@@ -1442,45 +1313,6 @@ class Sidecar:
     # 而两阶段契约（只有 sent_confirmed 才允许私信）是无法靠自觉守住的。
     # 这里把直播间已经跑通的同一套机制（队列 -> 批次 -> 冻结计划 -> 两阶段）搬到评论区。
 
-    def _reply_reachable_split(self, url, targets, limit=24):
-        """按【此刻页面上真的能点开「回复」】把候选分堆（只读，不下任何单）。
-
-        🔴 真机结论（2026-09-29）：视频页只渲染【几行】评论，而我们是按评论接口采的
-        （实测接口 179 条 / 命中 49 条，页面只渲染 5 行），两个集合【不重合】——
-        接口里有、页面上没有的评论技术上无法回复，冻结进批次只会让回复阶段成片
-        reply_target_not_rendered。直播间那条早就有 pick_reply_target 做这件事，评论区一直缺。
-
-        判据直接用 comment_row_present 的 replyReady（唯一命中 + 回复按钮可见且在视口内），
-        与发送阶段同源，避免"标注能回、真去点却点不着"。
-
-        返回 (reachable, unreachable, checked)。任何探针异常都返回 checked=False，
-        上层据此退回旧行为 —— 不因为探针坏了就把批次清空。
-        """
-        page = None
-        try:
-            page, _ = self._page()
-            _navigate(page, url)
-            if not _wait_document(page):
-                return list(targets), [], False
-            reachable, unreachable = [], []
-            for index, target in enumerate(targets):
-                if index >= limit:
-                    # 超出检查上限的按"可回复"处理（best-effort，不无限探）。
-                    reachable.extend(targets[index:])
-                    break
-                state = douyin.comment_row_present(
-                    page, {"authorId": target.get("authorId"), "text": target.get("text")})
-                if state.get("replyReady"):
-                    reachable.append(target)
-                else:
-                    unreachable.append(target)
-            return reachable, unreachable, True
-        except Exception:
-            return list(targets), [], False
-        finally:
-            if page is not None:
-                page.close()
-
     def comment_plan(self, params):
         """采集一条视频的评论、按关键词筛选，形成【评论批次】并冻结话术。
 
@@ -1541,23 +1373,8 @@ class Sidecar:
         if not targets:
             return {"status": "empty", "batch": None, "targets": [], "blocked": [],
                     "expired": [], "filter": filtered}
-        # 🔴 真机（2026-09-29）：先按"此刻页面上能不能点开「回复」"筛一遍再冻结。
-        #    接口采到的评论里，页面上没渲染的那些【技术上无法回复】——
-        #    冻进批次只会让回复阶段成片 reply_target_not_rendered（实测 8 条里 6 条）。
-        video_url = collected.get("url") or url
-        reachable, unreachable, checked = self._reply_reachable_split(video_url, targets)
-        filtered = dict(filtered or {})
-        filtered["replyReachable"] = len(reachable)
-        filtered["replyUnreachable"] = len(unreachable)
-        filtered["replyReachabilityChecked"] = checked
-        if checked and not reachable:
-            # 页面上一条都点不开：不冻批次，让宿主换视频/换关键词，
-            # 而不是冻一批注定失败的（宿主据此提前止损，不必等到回复阶段才发现）。
-            return {"status": "empty", "batch": None, "targets": [], "blocked": [],
-                    "expired": [], "filter": filtered,
-                    "reason": "no_replyable_comment"}
-        pool = reachable if checked else targets
-        self.comment_queue.append(pool)
+
+        self.comment_queue.append(targets)
         batch = self.comment_queue.take_batch(max_items=max_items,
                                               window_seconds=window_seconds)
         summary = comment_flow.batch_summary(batch)
@@ -1664,50 +1481,37 @@ class Sidecar:
         allowed, rejected = self.comment_queue.private_candidates(batch_id)
         by_id = {target["eventId"]: target for target in allowed}
         reasons = {row.get("eventId"): row.get("reason") for row in rejected}
-        # 🔴 评审 2026-09-29：先判【这个 eventId 是否属于本批次】（纯读、无副作用），
-        #    再决定要不要落台账。以前是先 mark_private(...) —— 对不存在的 eventId
-        #    队列层会抛 unknown_event，而且已经尝试写了一次没有意义的私有记录。
-        plan_ids = _item_plan_ids(self.comment_queue, batch_id)
         results, sendable = [], []
         for item in items:
-            event_id = str(item.get("eventId") or "").strip()
-            membership = _item_plan_membership(self.comment_queue, plan_ids, event_id)
-            if membership:
-                # 不属于本批次：逐项给稳定结果，绝不落台账、绝不打开浏览器。
-                results.append({"eventId": event_id, "status": "blocked",
-                                "reason": membership})
-                continue
             # 两阶段门禁必须落在每个批次条目上，而不是只依赖
             # private_candidates 的状态筛选：任何调用方都不能拿一个
             # 其它公屏动作，或省略 publicSendId，来绕过本条评论的绑定。
             public_send_id = str(item.get("publicSendId") or "").strip()
             if not public_send_id:
-                self.comment_queue.mark_private(event_id, "blocked", batch_id,
+                self.comment_queue.mark_private(item["eventId"], "blocked", batch_id,
                                                  {"reason": "public_missing"})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "public_missing"})
                 continue
             refusal = _public_guard(self.gate, public_send_id)
             if refusal:
-                self.comment_queue.mark_private(event_id, "blocked", batch_id,
+                self.comment_queue.mark_private(item["eventId"], "blocked", batch_id,
                                                  {"reason": refusal[0]})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": refusal[0]})
                 continue
-            target = by_id.get(event_id)
+            target = by_id.get(item["eventId"])
             if target is None:
-                results.append({"eventId": event_id, "status": "blocked",
-                                "reason": reasons.get(event_id)
+                results.append({"eventId": item["eventId"], "status": "blocked",
+                                "reason": reasons.get(item["eventId"])
                                           or "not_a_private_candidate"})
                 continue
             # ③ 对应性校验，与候选清单共用同一个判定（见 _comment_public_binding）。
             # 两边口径必须一致：清单说 allowed 而这里 blocked，宿主据此建的计划
             # 会当场失败；反过来（清单拦、执行放）则等于清单形同虚设。
-            binding = _comment_public_binding(self.comment_queue, event_id, public_send_id)
+            binding = _comment_public_binding(self.comment_queue, item["eventId"], public_send_id)
             if binding:
-                self.comment_queue.mark_private(event_id, "blocked", batch_id,
-                                                {"reason": binding})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": binding})
                 continue
             text = item.get("text") or target.get("privateText") or ""
@@ -1776,12 +1580,6 @@ class Sidecar:
         缺 publicSendId 一律 public_missing 拒绝 —— 它曾经是「可选」的，
         那等于给整条契约留了一个省略参数就能走的后门。
         """
-        # 🔴 输入预检（评审 2026-09-29）：sendId / target 类型 / authorId 形状 / text
-        #    全部在【打开浏览器之前】判完 —— 参数级错误不该有浏览器成本，
-        #    也不该留下"点了一半"的现场。
-        problem = _private_input_refusal(params)
-        if problem:
-            raise SidecarError(problem[0], problem[1])
         send_id = str(params.get("sendId") or "")
         target = params.get("target")
         text = params.get("text")
@@ -1793,10 +1591,9 @@ class Sidecar:
         # ③ 对应性：这条公屏回复必须是【收件人本人】那一条。
         #    单发路径此前只有 ①②，于是"拿 A 的公屏成功去给 B 发私信"走得通 ——
         #    而单发恰恰是宿主最常直接调用的入口。仍然在打开浏览器之前判定。
-        #    弹幕通路同样在【打开浏览器之前】判定：同一事件 + 同一收件人，缺一不可。
         mismatch = _private_binding_mismatch(self.gate, params.get("publicSendId"), target)
         if mismatch:
-            raise SidecarError(mismatch[0], mismatch[1])
+            raise SidecarError(BINDING_MISMATCH, mismatch)
         page, _ = self._page()
         try:
             return send_private(page, self.gate, send_id, target, text)
@@ -2058,20 +1855,8 @@ class Sidecar:
             raise SidecarError(refusal[0], refusal[1])
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         by_id = {item["eventId"]: item for item in allowed}
-        reason_by_id = {row.get("eventId"): row.get("reason") for row in rejected}
-        # 🔴 评审 2026-09-29：先判【这个 eventId 是否属于本批次】（纯读、无副作用），
-        #    再决定要不要落台账。以前先 mark_private(...) —— 对不存在的 eventId
-        #    队列层会抛 unknown_event，而且已经尝试写了一次没有意义的私有记录。
-        plan_ids = _item_plan_ids(self.live_queue, batch_id)
         results, sendable = [], []
         for item in items:
-            event_id = str(item.get("eventId") or "").strip()
-            membership = _item_plan_membership(self.live_queue, plan_ids, event_id)
-            if membership:
-                # 不属于本批次：逐项给稳定结果，绝不落台账、绝不打开浏览器。
-                results.append({"eventId": event_id, "status": "blocked",
-                                "reason": membership})
-                continue
             # 🔴 审核意见（2026-09-21）：直播私信必须【逐项绑定】那一次已确认成功的公屏回复。
             #    只靠批次候选清单（按事件状态放行）会留下一条绕过路径：
             #    调用方可以不带 publicSendId 直接要私信，公屏成功门禁就形同虚设。
@@ -2085,40 +1870,41 @@ class Sidecar:
             #         且记录的 sendId 精确等于传入的 publicSendId"，缺记录同样拒绝。）
             public_send_id = str(item.get("publicSendId") or "").strip()
             if not public_send_id:
-                self.live_queue.mark_private(event_id, "blocked", batch_id,
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": "public_missing"})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "public_missing"})
                 continue
             refusal = _public_guard(self.gate, public_send_id)
             if refusal:
-                self.live_queue.mark_private(event_id, "blocked", batch_id,
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": refusal[0]})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": refusal[0]})
                 continue
-            event = self.live_queue.find_event(event_id) or {}
+            event = self.live_queue.find_event(item["eventId"]) or {}
             recorded = str((event.get("detail") or {}).get("sendId") or "")
             # 🔴 缺记录也必须拒绝："没有记录"与"记录对不上"是同一类失败 ——
             #    两者都无法证明这次私信绑定的就是【本事件】那次公屏成功。
             if not recorded or recorded != public_send_id:
-                self.live_queue.mark_private(event_id, "blocked", batch_id,
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": "public_send_mismatch"})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "public_send_mismatch"})
                 continue
-            target = by_id.get(event_id)
+            target = by_id.get(item["eventId"])
             if target is None:
-                reason = reason_by_id.get(event_id) or "not_a_private_candidate"
-                self.live_queue.mark_private(event_id, "blocked", batch_id,
+                reason = next((r["reason"] for r in rejected
+                               if r["eventId"] == item["eventId"]), "not_a_private_candidate")
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": reason})
-                results.append({"eventId": event_id, "status": "blocked", "reason": reason})
+                results.append({"eventId": item["eventId"], "status": "blocked", "reason": reason})
                 continue
             text = item.get("text") or target["privateText"]
             if text != target["privateText"]:
-                self.live_queue.mark_private(event_id, "blocked", batch_id,
+                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
                                              {"reason": "script_mismatch"})
-                results.append({"eventId": event_id, "status": "blocked",
+                results.append({"eventId": item["eventId"], "status": "blocked",
                                 "reason": "script_mismatch"})
                 continue
             sendable.append((item, target, text))
@@ -2197,26 +1983,9 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--port", required=True, type=int)
-    # 本地安全阀（可选覆盖）：默认 每目标 1 / 每小时 20 / 每天 50。
-    # 授信调用方可在真机验收或压测时调高 —— 这是【本地】限额，不是平台配额。
-    parser.add_argument("--per-user-limit", type=int, default=None)
-    parser.add_argument("--hourly-limit", type=int, default=None)
-    parser.add_argument("--daily-limit", type=int, default=None)
     args = parser.parse_args(argv)
-    limits = {}
-    for key, value in (("per_user", args.per_user_limit),
-                       ("hourly", args.hourly_limit),
-                       ("daily", args.daily_limit)):
-        if value is not None:
-            if value < 0:
-                _emit({"id": None, "ok": False,
-                       "error": {"code": "invalid_config",
-                                 "message": "%s limit must not be negative" % key}})
-                return 2
-            limits[key] = int(value)
     try:
-        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port,
-                          gate_limits=limits or None)
+        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port)
     except Exception as exc:
         _emit({"id": None, "ok": False, "error": {"code": getattr(exc, "code", "invalid_config"),
                                                       "message": _err_message(getattr(exc, "message", exc))}})
