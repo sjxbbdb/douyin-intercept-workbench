@@ -33,10 +33,16 @@ async function providerServer(mode: 'success' | 'invalid' | 'timeout' | 'delay')
   return { server, baseUrl: `http://127.0.0.1:${address.port}` };
 }
 async function plannerServer() {
-  const server: Server = createServer((_request, response) => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"workflowId":"video.search","version":"1","params":{"source":"fixture"}}' } }] })); }).listen(0, '127.0.0.1');
+  let lastRequest: any = null;
+  const server: Server = createServer((request, response) => {
+    let raw = ''; request.setEncoding('utf8'); request.on('data', (chunk) => { raw += chunk; }); request.on('end', () => {
+      try { lastRequest = raw ? JSON.parse(raw) : null; } catch { lastRequest = null; }
+      response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"workflowId":"video.search","version":"1","params":{"keyword":"暴雨末日","source":"fixture"}}' } }] }));
+    });
+  }).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', () => resolve()));
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('planner did not bind');
-  return { server, baseUrl: `http://127.0.0.1:${address.port}` };
+  return { server, baseUrl: `http://127.0.0.1:${address.port}`, getLastRequest: () => lastRequest };
 }
 async function resultDecisionServer() {
   const server: Server = createServer((_request, response) => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"decision":"complete"}' } }] })); }).listen(0, '127.0.0.1');
@@ -209,6 +215,19 @@ test('agent planner only returns registered fixed workflow and is idempotent', a
   } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
 });
 
+test('agent planner receives tenant-scoped knowledge and freezes its version', async () => {
+  const provider = await plannerServer(); const f = await fixture({ provider: { baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' } }); try {
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'video.search', version: '1', name: '查找视频', contract: { steps: ['search'] } } }); assert.equal(workflow.statusCode, 200, workflow.body);
+    const user = await f.create({ username: 'planner-knowledge' }); const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'pc', deviceName: 'A' } }); const token = login.json().token;
+    const set = await f.app.inject({ method: 'POST', url: '/v1/knowledge-sets', headers: { authorization: `Bearer ${token}` }, payload: { name: '业务话术' } }); assert.equal(set.statusCode, 200, set.body);
+    const knowledgeSetId = set.json().id;
+    const doc = await f.app.inject({ method: 'POST', url: '/v1/knowledge-documents', headers: { authorization: `Bearer ${token}` }, payload: { knowledgeSetId, title: '价格', content: '暴雨末日套餐价格请咨询客服' } }); assert.equal(doc.statusCode, 200, doc.body);
+    const planned = await f.app.inject({ method: 'POST', url: '/v1/agent/plan', headers: { authorization: `Bearer ${token}` }, payload: { intent: '找视频并使用价格话术', context: { knowledgeSetId, knowledgeQuery: '套餐价格' }, idempotencyKey: 'planner-knowledge-001' } }); assert.equal(planned.statusCode, 200, planned.body);
+    assert.equal(planned.json().params.knowledgeSetId, knowledgeSetId); assert.equal(planned.json().params.knowledgeSetVersion, 1);
+    const request = provider.getLastRequest(); assert.equal(request?.messages?.[1]?.content?.includes('暴雨末日套餐价格'), true);
+  } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
+});
+
 test('credit action reserve commit release is idempotent and bounded', async () => {
   const f = await fixture(); try {
     const user = await f.create({ username: 'credit-actions' });
@@ -315,14 +334,15 @@ test('canonical business runs require a platform account and freeze policy', asy
   const f = await fixture(); try {
     const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'video.search', version: 1, name: '视频搜索', contract: { steps: ['search'] } } }); assert.equal(workflow.statusCode, 200, workflow.body);
     const user = await f.create({ username: 'bound-business' }); const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'pc', deviceName: 'A' } }); const token = login.json().token;
-    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'bound-plan-1', user.id, 'video.search', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
-    const missing = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'bound-plan-1', workflowId: 'video.search', version: 1, params: {}, idempotencyKey: 'bound-run-missing-account' } }); assert.equal(missing.statusCode, 409); assert.equal(missing.json().code, 'PLATFORM_ACCOUNT_REQUIRED');
+    const videoParams = JSON.stringify({ keyword: '暴雨末日' });
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'bound-plan-1', user.id, 'video.search', '1', videoParams, 'issued', Date.now(), Date.now() + 60_000);
+    const missing = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'bound-plan-1', workflowId: 'video.search', version: 1, params: { keyword: '暴雨末日' }, idempotencyKey: 'bound-run-missing-account' } }); assert.equal(missing.statusCode, 409); assert.equal(missing.json().code, 'PLATFORM_ACCOUNT_REQUIRED');
     const account = await f.app.inject({ method: 'POST', url: '/v1/platform-accounts', headers: { authorization: `Bearer ${token}` }, payload: { platform: 'douyin', accountRef: 'bound-account', displayName: '主账号' } }); assert.equal(account.statusCode, 200); const platformAccountId = account.json().id;
-    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'bound-plan-2', user.id, 'video.search', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
-    const created = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'bound-plan-2', workflowId: 'video.search', version: 1, params: {}, platformAccountId, idempotencyKey: 'bound-run-with-account' } }); assert.equal(created.statusCode, 200, created.body); assert.equal(created.json().run.policy.platformAccountId, platformAccountId); assert.equal(created.json().run.policy.entitlement, 'videoSearch');
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'bound-plan-2', user.id, 'video.search', '1', videoParams, 'issued', Date.now(), Date.now() + 60_000);
+    const created = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'bound-plan-2', workflowId: 'video.search', version: 1, params: { keyword: '暴雨末日' }, platformAccountId, idempotencyKey: 'bound-run-with-account' } }); assert.equal(created.statusCode, 200, created.body); assert.equal(created.json().run.policy.platformAccountId, platformAccountId); assert.equal(created.json().run.policy.entitlement, 'videoSearch');
     const firstLease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${created.json().run.id}/lease/acquire`, headers: { authorization: `Bearer ${token}` }, payload: { idempotencyKey: 'bound-lease-first' } }); assert.equal(firstLease.statusCode, 200, firstLease.body);
-    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'bound-plan-3', user.id, 'video.search', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
-    const second = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'bound-plan-3', workflowId: 'video.search', version: 1, params: {}, platformAccountId, idempotencyKey: 'bound-run-second' } }); assert.equal(second.statusCode, 200, second.body);
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'bound-plan-3', user.id, 'video.search', '1', videoParams, 'issued', Date.now(), Date.now() + 60_000);
+    const second = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'bound-plan-3', workflowId: 'video.search', version: 1, params: { keyword: '暴雨末日' }, platformAccountId, idempotencyKey: 'bound-run-second' } }); assert.equal(second.statusCode, 200, second.body);
     const busy = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${second.json().run.id}/lease/acquire`, headers: { authorization: `Bearer ${token}` }, payload: { idempotencyKey: 'bound-lease-second' } }); assert.equal(busy.statusCode, 409); assert.equal(busy.json().code, 'PLATFORM_ACCOUNT_BUSY');
   } finally { await f.close(); }
 });

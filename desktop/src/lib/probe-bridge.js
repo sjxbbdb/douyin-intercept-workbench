@@ -320,6 +320,35 @@ class ProbeBridge {
     return this.client.request('comment_private_candidates', params, { timeoutMs: 20000 });
   }
 
+  // Batch comment workflow methods are deliberately explicit. The workflow
+  // adapter owns sequencing and per-target confirmation; this bridge only
+  // forwards the frozen, side-effect-specific request to the bundled sidecar.
+  async commentCollect(params) {
+    await this.#launch();
+    const result = await this.client.request('collect_comments', params, { timeoutMs: 60000 });
+    return { ...result, events: validEvents(result, 'video') };
+  }
+
+  async commentPlan(params) {
+    await this.#launch();
+    return this.client.request('comment_plan', params, { timeoutMs: 60000 });
+  }
+
+  async commentReply(params) {
+    await this.#launch();
+    return this.client.request('comment_reply', params, { timeoutMs: 60000 });
+  }
+
+  async commentPrivate(params) {
+    await this.#launch();
+    return this.client.request('comment_private', params, { timeoutMs: 60000 });
+  }
+
+  async commentResult(params) {
+    await this.#launch();
+    return this.client.request('comment_result', params, { timeoutMs: 20000 });
+  }
+
   async liveListen(params, maxItems = 100) {
     const request = typeof params === 'string' ? { url: params, maxItems } : params;
     await this.#launch();

@@ -149,6 +149,27 @@ class ApiClient {
   updatePlatformAccount(platformAccountId, body, tokenOverride = null) {
     return this.request('PATCH', `/v1/platform-accounts/${encodeURIComponent(platformAccountId)}`, body, 12000, tokenOverride);
   }
+
+  knowledgeSets(tokenOverride = null) {
+    return this.request('GET', '/v1/knowledge-sets', undefined, 12000, tokenOverride);
+  }
+
+  createKnowledgeSet(body, tokenOverride = null) {
+    return this.request('POST', '/v1/knowledge-sets', body, 12000, tokenOverride);
+  }
+
+  knowledgeDocuments(knowledgeSetId, tokenOverride = null) {
+    const query = new URLSearchParams({ knowledgeSetId: String(knowledgeSetId || '') });
+    return this.request('GET', `/v1/knowledge-documents?${query.toString()}`, undefined, 12000, tokenOverride);
+  }
+
+  addKnowledgeDocument(body, tokenOverride = null) {
+    return this.request('POST', '/v1/knowledge-documents', body, 12000, tokenOverride);
+  }
+
+  retrieveKnowledge(body, tokenOverride = null) {
+    return this.request('POST', '/v1/knowledge-retrieve', body, 12000, tokenOverride);
+  }
 }
 
 module.exports = { ApiClient, ApiError };

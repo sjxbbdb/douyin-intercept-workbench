@@ -1,8 +1,15 @@
 # v4 验证记录
 
-更新时间：2026-09-19
-分支：`rewrite/v4-agent`
-记录提交：`ce9214b`
+更新时间：2026-09-30
+分支：`codex/platform-goal-20260930`
+记录提交：当前分支最新平台收口提交
+
+## 平台侧增量验证（2026-09-30）
+
+- `npm run check`、`npm test`：server 25/25，desktop 52/52，Probe protocol PASS；另有 `node desktop/test/comment-batch.js` PASS。
+- 服务端新增可注入 OpenAI-compatible embeddings 后端、向量版本隔离和 Agent 规划知识上下文测试；未配置 embeddings 时只使用确定性本地 token-bag，不能冒充生产语义模型。
+- 工作台新增 Agent、找视频、评论区、直播间、任务/恢复、话术库入口；知识库 IPC 由主进程代持 token。评论批次固定为采集/冻结 → 公屏确认 → 仅对确认成功目标私信 → 报告。
+- Windows portable 构建使用 D 盘缓存，产物为 `desktop/release/截流自动回复 Agent-4.0.3-x64-portable.exe`，SHA-256 `686E200B7270F179B966EEF8A0E73A2B989EF6EF0852CBC6DDCA00D3E0A36EEE`，大小 107,011,381 bytes；`scripts/verify-desktop-release-preflight.mjs` PASS。此次未把构建产物当作真实抖音发送验收。
 
 ## 4.0.3 验证记录
 

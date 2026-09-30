@@ -20,7 +20,8 @@ const WORKFLOWS = new Map([
   ['video.search', '关键词找视频'],
   ['comment.reply_then_private', '评论命中：公屏回复后私信'],
   ['live.reply_then_private', '直播间单条命中：公屏回复后私信'],
-  ['live.batch', '直播间批次：关键词命中后公屏回复与私信']
+  ['live.batch', '直播间批次：关键词命中后公屏回复与私信'],
+  ['comment.batch', '评论区批次：关键词命中后公屏回复与私信']
 ]);
 
 function parseArgs(argv) {

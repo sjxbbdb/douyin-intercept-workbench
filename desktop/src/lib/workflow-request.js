@@ -10,9 +10,10 @@
 //   核对不过就拒绝启动（fail-closed），绝不"跑一个差不多的流程"。
 
 const WORKFLOW_IDS = Object.freeze({
-  'live.batch': Object.freeze({ version: '1', required: ['url', 'keywords'], kind: 'live_batch' }),
-  'live.reply_then_private': Object.freeze({ version: '1', required: ['url'], kind: 'live_reply_then_private' }),
-  'comment.reply_then_private': Object.freeze({ version: '1', required: ['url'], kind: 'comment_reply_then_private' }),
+  'live.batch': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'live_batch' }),
+  'comment.batch': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'comment_batch' }),
+  'live.reply_then_private': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'live_reply_then_private' }),
+  'comment.reply_then_private': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'comment_reply_then_private' }),
   'video.search': Object.freeze({ version: '1', required: ['keyword'], kind: 'video_search' })
 });
 
@@ -48,6 +49,13 @@ function buildWorkflowIntent(request) {
     const via = params.replyVia === 'mention_text' ? '公屏纯文本 @' : '原生「回复 TA」';
     return '在直播间 ' + params.url + ' 监听弹幕，命中关键词「' + keywords + '」的观众：先用' + via
       + '在公屏回复，确认成功后再发私信。批次窗口 ' + window + ' 秒，最多回复 '
+      + (Number.isInteger(params.maxSends) ? params.maxSends : 10) + ' 条。';
+  }
+  if (spec.workflowId === 'comment.batch') {
+    const keywords = (params.keywords || []).join('、');
+    return '在视频 ' + params.url + ' 采集评论，命中关键词「' + keywords
+      + '」的目标先整批公屏回复，逐条确认成功后再私信；最多采集 '
+      + (Number.isInteger(params.maxComments) ? params.maxComments : 20) + ' 条，最多发送 '
       + (Number.isInteger(params.maxSends) ? params.maxSends : 10) + ' 条。';
   }
   if (spec.workflowId === 'video.search') return '搜索视频：' + params.keyword;

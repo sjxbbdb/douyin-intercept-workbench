@@ -53,6 +53,8 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
 
+平台固定目录包括 `video.search`、`comment.reply_then_private`、`comment.batch`、`live.reply_then_private` 和 `live.batch`。`comment.batch` 的批量私信只能使用同一批次里 `sent_confirmed` 的公屏 `sendId`，部分成功可以生成报告，`unknown` 目标不会盲目重发。
+
 需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。服务端不会因为恢复请求自动重发未知发送动作。
 
 同一个运行实例在多设备之间由任务租约保护：`POST /v1/workflow-runs/:id/lease/acquire`、`.../lease/renew`、`.../lease/release` 以当前登录会话的 `deviceId` 作为租约身份，默认 120 秒、允许 5 到 600 秒。持有有效租约的设备才能写入检查点、恢复流程和请求结果决策；其他设备收到 `LEASE_HELD` 或 `LEASE_OWNER_MISMATCH`。客户端异常退出后租约自然过期，其他设备可以接管；租约操作都需要幂等键并写入审计。完整请求和桌面生命周期见 [workflow-lease.md](contracts/workflow-lease.md)。
@@ -62,6 +64,8 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 ### `knowledge-sets`
 
 `POST/GET/PATCH /v1/knowledge-sets` 只管理当前工作台账号的知识集元数据和版本。运行实例可冻结 `knowledgeSetId + knowledgeSetVersion`；任何跨账号访问返回 `KNOWLEDGE_SET_NOT_FOUND`。向量内容和 provider key 不通过桌面端接口暴露。
+
+`POST /v1/agent/plan` 的 `context` 可带 `knowledgeSetId`、可选 `knowledgeSetVersion`、`knowledgeQuery` 和 `knowledgeTopK`。授权端先按租户和版本检索，再把片段作为不可信参考交给规划器；成功计划会把同一知识集 ID/版本写回 `params`，客户端不能替换它。服务端默认使用确定性的 `deterministic-token-bag`，配置 `EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL` 后才启用 OpenAI-compatible `/embeddings`；不同 embedding 版本不会混用向量。
 
 ### `POST /v1/agent/evaluate`
 

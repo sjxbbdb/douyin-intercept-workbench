@@ -13,10 +13,11 @@ interface WorkflowRouteDeps {
   adminFromRequest: AuthFn;
   planner?: (input: RecordValue) => Promise<RecordValue>;
   resultDecider?: (input: RecordValue) => Promise<RecordValue>;
+  knowledgeRetrieve?: (input: { userId: string; knowledgeSetId: string; version?: number; query: string; topK?: number }) => Promise<RecordValue>;
 }
 
 const checkpointStatuses = new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']);
-const accountBoundWorkflowIds = new Set(['video.search', 'comment.reply_then_private', 'live.reply_then_private', 'live.batch']);
+const accountBoundWorkflowIds = new Set(['video.search', 'comment.reply_then_private', 'comment.batch', 'live.reply_then_private', 'live.batch']);
 const transitions: Record<string, Set<string>> = {
   PLANNED: new Set(['RUNNING', 'PAUSED', 'STOPPED']),
   RUNNING: new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']),
@@ -75,6 +76,40 @@ const normalizeStatus = (value: unknown) => {
   return aliases[raw] ?? raw;
 };
 const runParams = (value: unknown) => objectValue(value ?? {}, 'params', 24_000);
+const douyinHosts = new Set(['douyin.com', 'www.douyin.com', 'v.douyin.com', 'live.douyin.com']);
+function workflowUrl(value: unknown, name: string, live = false) {
+  if (typeof value !== 'string' || value.length > 2_048) throw badRequest(`${name} 无效`);
+  let url: URL;
+  try { url = new URL(value); } catch { throw badRequest(`${name} 无效`); }
+  if (url.protocol !== 'https:' || url.username || url.password || !douyinHosts.has(url.hostname)) throw badRequest(`${name} 必须是受支持的 HTTPS 抖音地址`);
+  if (live && url.hostname !== 'live.douyin.com') throw badRequest(`${name} 必须是直播间地址`);
+  if (!live && url.hostname === 'live.douyin.com') throw badRequest(`${name} 不能是直播间地址`);
+  return url.href;
+}
+function workflowKeywords(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 50 || value.some((item) => typeof item !== 'string' || !item.trim() || item.length > 200)) throw badRequest('params.keywords 无效');
+  return value.map((item) => item.trim());
+}
+function validateWorkflowParams(id: string, params: RecordValue) {
+  if (id === 'video.search') {
+    if (typeof params.keyword !== 'string' || !params.keyword.trim() || params.keyword.length > 200) throw badRequest('视频搜索必须提供 keyword');
+    if (params.maxVideos !== undefined && (!Number.isSafeInteger(params.maxVideos) || params.maxVideos < 1 || params.maxVideos > 100)) throw badRequest('params.maxVideos 无效');
+    if (params.scrollRounds !== undefined && (!Number.isSafeInteger(params.scrollRounds) || params.scrollRounds < 0 || params.scrollRounds > 10)) throw badRequest('params.scrollRounds 无效');
+    if (params.minRelevance !== undefined && (!Number.isSafeInteger(params.minRelevance) || params.minRelevance < 0 || params.minRelevance > 100)) throw badRequest('params.minRelevance 无效');
+  }
+  if (id === 'comment.reply_then_private' || id === 'comment.batch') {
+    workflowUrl(params.url, 'params.url');
+    workflowKeywords(params.keywords);
+    for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
+  }
+  if (id === 'live.reply_then_private' || id === 'live.batch') {
+    workflowUrl(params.url, 'params.url', true);
+    workflowKeywords(params.keywords);
+    for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
+  }
+  for (const key of ['reply', 'privateText']) if (params[key] !== undefined && (typeof params[key] !== 'string' || params[key].length > 2_000)) throw badRequest(`params.${key} 无效`);
+  return params;
+}
 const workflowContract = (value: unknown) => {
   const contract = objectValue(value, 'contract', 32_000);
   if (!Array.isArray(contract.steps) || contract.steps.length === 0 || contract.steps.length > 100) throw badRequest('contract.steps 必须是 1-100 个步骤');
@@ -316,8 +351,25 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     if (!deps.planner) throw new AppError(503, 'PLANNER_NOT_CONFIGURED', 'Agent 规划器未配置');
     const catalog = store.all<RecordValue>("SELECT workflow_id,version,name,contract_json FROM workflow_definitions WHERE status='active' ORDER BY workflow_id,version DESC").map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, contract: parseJson(row.contract_json, {}) }));
     if (!catalog.length) throw new AppError(503, 'WORKFLOW_CATALOG_EMPTY', '暂无可用固定流程');
-    const result = await deps.planner({ intent, context, catalog });
-    const id = workflowId(result.workflowId); const version = workflowVersion(result.version); const params = runParams(result.params); ensureWorkflowFeature(actor, id);
+    let plannerContext = context;
+    let knowledgeBinding: { id: string; version: number } | null = null;
+    if (context.knowledgeSetId !== undefined) {
+      const knowledgeSetId = stringValue(context.knowledgeSetId, 'context.knowledgeSetId', 100, true) as string;
+      const knowledgeQuery = context.knowledgeQuery === undefined ? intent : stringValue(context.knowledgeQuery, 'context.knowledgeQuery', 4_000, true) as string;
+      if (!deps.knowledgeRetrieve) throw new AppError(503, 'KNOWLEDGE_RETRIEVER_NOT_CONFIGURED', '话术知识检索未配置');
+      const knowledge = await deps.knowledgeRetrieve({ userId: actor.user_id, knowledgeSetId, version: context.knowledgeSetVersion, query: knowledgeQuery, topK: context.knowledgeTopK });
+      knowledgeBinding = { id: knowledge.knowledgeSetId, version: knowledge.version };
+      // Snippets are untrusted user content. They are input evidence only; the
+      // planner still may return one registered fixed workflow and parameters.
+      plannerContext = { ...context, knowledge: { knowledgeSetId: knowledge.knowledgeSetId, version: knowledge.version, backend: knowledge.backend, results: knowledge.results } };
+    }
+    const result = await deps.planner({ intent, context: plannerContext, catalog });
+    const id = workflowId(result.workflowId); const version = workflowVersion(result.version); const params = runParams(result.params);
+    if (knowledgeBinding) {
+      if (params.knowledgeSetId !== undefined && params.knowledgeSetId !== knowledgeBinding.id) throw new AppError(503, 'PLANNER_KNOWLEDGE_BINDING_INVALID', '规划器返回了不匹配的话术知识集');
+      params.knowledgeSetId = knowledgeBinding.id; params.knowledgeSetVersion = knowledgeBinding.version;
+    }
+    validateWorkflowParams(id, params); ensureWorkflowFeature(actor, id);
     if (!store.get<RecordValue>("SELECT workflow_id FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version)) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
     const issuedAt = store.now(); const expiresAt = issuedAt + 10 * 60 * 1000;
     const response = { planId: randomId('plan'), workflowId: id, version, params, issuedAt, expiresAt };
@@ -413,7 +465,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
 
   app.post('/v1/workflow-runs', async (request) => {
     const actor = user(request); ensureWorkflowFeature(actor); const body = bodyObject(request.body); rejectUnknown(body, ['planId', 'workflowId', 'version', 'params', 'knowledgeSetId', 'platformAccountId', 'creditActionId', 'idempotencyKey']);
-    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const plan = planId(body.planId); const params = runParams(body.params); const key = idempotencyKey(body.idempotencyKey); const account = platformAccount(actor, body.platformAccountId); const creditActionId = body.creditActionId === undefined ? null : stringValue(body.creditActionId, 'creditActionId', 160, true) as string;
+    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const plan = planId(body.planId); const params = runParams(body.params); validateWorkflowParams(id, params); const key = idempotencyKey(body.idempotencyKey); const account = platformAccount(actor, body.platformAccountId); const creditActionId = body.creditActionId === undefined ? null : stringValue(body.creditActionId, 'creditActionId', 160, true) as string;
     ensureWorkflowFeature(actor, id);
     const payload = { planId: plan, workflowId: id, version, params, knowledgeSetId: body.knowledgeSetId ?? null, platformAccountId: account?.id ?? null, creditActionId, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,status,payload_hash FROM idempotency WHERE user_id=? AND scope=\'workflow.run\' AND idem_key=?', actor.user_id, key);

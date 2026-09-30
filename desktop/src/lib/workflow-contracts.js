@@ -100,6 +100,34 @@ const PLATFORM_WORKFLOW_CONTRACTS = Object.freeze([
       },
       { stepId: 'report', action: 'live.result', phase: 'report', sideEffect: false }
     ]
+  },
+  {
+    // 评论区【批次】固定工作流：采集与计划冻结分开记录，随后整批公屏回复，
+    // 只有本批次、本动作确认的公屏结果才能进入私信阶段。
+    workflowId: 'comment.batch',
+    version: '1',
+    kind: 'comment_batch',
+    steps: [
+      { stepId: 'collect', action: 'comment.collect', phase: 'collect', sideEffect: false },
+      { stepId: 'plan', action: 'comment.plan', phase: 'plan', sideEffect: false },
+      {
+        stepId: 'reply_public',
+        action: 'comment.public_reply',
+        phase: 'public',
+        sideEffect: true,
+        resultRequired: true,
+        successStatuses: CONFIRMED_DELIVERY
+      },
+      {
+        stepId: 'private_message',
+        action: 'comment.private_message',
+        phase: 'private',
+        sideEffect: true,
+        resultRequired: true,
+        successStatuses: CONFIRMED_DELIVERY
+      },
+      { stepId: 'report', action: 'comment.result', phase: 'report', sideEffect: false }
+    ]
   }
 ]);
 

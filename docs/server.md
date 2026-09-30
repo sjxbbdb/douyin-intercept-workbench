@@ -33,7 +33,7 @@ node scripts/register-platform-workflows.mjs \
   --username owner --password '从密码管理器注入'
 ```
 
-脚本从桌面端固定契约读取 `video.search`、`comment.reply_then_private`、`live.reply_then_private` 和 `live.batch`，只创建缺失版本，不覆盖已有定义。`--dry-run` 只打印待登记 payload；流程目录为空、版本被禁用或契约 hash 不一致时，桌面端会拒绝启动，必须由管理员处理后再运行。
+脚本从桌面端固定契约读取 `video.search`、`comment.reply_then_private`、`comment.batch`、`live.reply_then_private` 和 `live.batch`，只创建缺失版本，不覆盖已有定义。`--dry-run` 只打印待登记 payload；流程目录为空、版本被禁用或契约 hash 不一致时，桌面端会拒绝启动，必须由管理员处理后再运行。
 
 生产镜像不含 `tsx`，使用编译后的 CLI：
 
@@ -58,6 +58,10 @@ docker compose exec license-server node dist/cli.js ledger --id <user-id>
 | `OPENAI_COMPATIBLE_API_KEY` | AI provider key，不写数据库或日志 |
 | `OPENAI_COMPATIBLE_MODEL` | provider 模型名 |
 | `DRAFT_TIMEOUT_MS` | AI 请求超时，默认 30 秒 |
+| `EMBEDDING_BASE_URL` | 可选 OpenAI-compatible embeddings 地址；未配置 embedding 三项时使用本地确定性 token-bag 兜底 |
+| `EMBEDDING_API_KEY` | embeddings provider key，不写数据库或日志 |
+| `EMBEDDING_MODEL` | embeddings 模型名 |
+| `EMBEDDING_TIMEOUT_MS` | embeddings 请求超时，默认 15 秒 |
 
 生产环境应由 Nginx/Caddy 终止 TLS，并仅将 `/v1` 与 `/healthz` 反代到回环监听的 Node 进程。不要把 HTTP 明文端口暴露到公网。数据库目录必须挂载持久卷并限制权限。应用层已启用请求体限制、输入校验和基于 IP 的 rate limit。
 
@@ -68,6 +72,8 @@ Fastify 默认不信任 `X-Forwarded-For`，因此不会无条件把客户端提
 积分余额不直接作为可被覆盖的字段使用；每次变化追加 ledger，事务内维护余额快照，余额永不小于零。AI draft 的 hold 带 owner、幂等键、过期时间和状态；每次请求前回收过期 hold。provider 超时或响应未知时，服务端保留 pending 幂等记录和 hold，客户端必须先查询同一操作；过期后释放并审计，不能换 key 自动重发。成功结果和扣费在同一事务提交。
 
 固定流程运行实例使用 `workflow_definitions`、`workflow_runs` 和 `workflow_checkpoints` 保存版本化契约、冻结参数、知识集版本、当前步骤和恢复次数。模型规划只负责选择注册的 `workflowId/version/params`；运行中的步骤由桌面固定执行器上报，服务端拒绝未注册版本、旧 checkpoint 和跨账号知识集。`UNKNOWN`、`WAITING_HUMAN` 和 `PAUSED` 不会被服务端自动改写为成功或触发重发，恢复必须使用原运行实例并通过两次健康检查。
+
+当 Agent 规划上下文包含 `knowledgeSetId` 时，授权端先按租户和版本检索知识片段，再把有限结果作为不可信输入交给规划器；成功计划会绑定同一知识集 ID 和版本。embedding provider 不可用时，文档写入和检索失败并保持 fail-closed，不会静默混用另一向量空间。
 
 备份优先在停服后复制数据库文件；需要在线备份时使用 Node `node:sqlite` 的一致性 backup 能力或 SQLite 官方 backup API，不能只复制仍在 WAL 写入的 `.sqlite` 文件。恢复前停止服务、替换整个数据库文件与 WAL/SHM 文件，再启动并检查 `/healthz`。
 

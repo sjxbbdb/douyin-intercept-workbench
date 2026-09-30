@@ -628,6 +628,16 @@ async function runExplicitWorkflow(input) {
 
 function registerIpc() {
   const wrap = (handler) => async (event, payload) => { assertLocalSender(event); return handler(event, payload); };
+  const authorizedApiCall = async (operation) => {
+    if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+    const requestEpoch = sessionEpoch;
+    const requestApi = api;
+    const requestToken = authStore.getToken();
+    if (!requestApi || !requestToken) throw new Error('请先登录并通过授权检查');
+    const result = await operation(requestApi, requestToken);
+    if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，结果未应用');
+    return result;
+  };
   ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, workflowAccounts: [...workflowAccountRuns.values()], platformAccounts, platformAccountId: currentPlatformAccountId })));
   ipcMain.handle('agent:list-workflows', wrap(() => workflowRuntime.listWorkflows()));
   ipcMain.handle('platform-accounts:list', wrap(() => listPlatformAccounts()));
@@ -718,8 +728,13 @@ function registerIpc() {
   ipcMain.handle('reply:retry-draft', wrap((_event, eventKey) => engine.retryDraft(text(eventKey, 'event key', 240))));
   ipcMain.handle('credits:redeem', wrap(handleRedeem));
   ipcMain.handle('credits:ledger', wrap(async () => { if (!authStore.getToken()) throw new Error('请先登录'); const requestEpoch = sessionEpoch; const requestApi = api; const requestToken = authStore.getToken(); const result = await requestApi.ledger(requestToken); if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，台账未应用'); return Array.isArray(result) ? result : result.entries || result.ledger || result.items || []; }));
+  ipcMain.handle('knowledge:list-sets', wrap(() => authorizedApiCall((requestApi, token) => requestApi.knowledgeSets(token))));
+  ipcMain.handle('knowledge:create-set', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.createKnowledgeSet({ name: text(input?.name, 'knowledge set name', 100), description: typeof input?.description === 'string' ? input.description : '' }, token))));
+  ipcMain.handle('knowledge:list-documents', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.knowledgeDocuments(text(input?.knowledgeSetId, 'knowledge set id', 100), token))));
+  ipcMain.handle('knowledge:add-document', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.addKnowledgeDocument({ knowledgeSetId: text(input?.knowledgeSetId, 'knowledge set id', 100), title: text(input?.title, 'document title', 300), content: text(input?.content, 'document content', 200000), metadata: input?.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata) ? input.metadata : {} }, token))));
+  ipcMain.handle('knowledge:retrieve', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.retrieveKnowledge({ knowledgeSetId: text(input?.knowledgeSetId, 'knowledge set id', 100), query: text(input?.query, 'knowledge query', 4000), topK: Number(input?.topK || 5) }, token))));
   ipcMain.handle('browser:open', wrap(async (_event, url) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const requested = targetUrl(url); engine.pauseAll('browser_navigation'); const finalUrl = await requestBrowser.open(requested); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，页面结果已丢弃'); if (finalUrl && finalUrl !== requested) dataStore.update((data) => ({ ...data, tasks: data.tasks.map((task) => task.url === requested ? { ...task, url: finalUrl, updatedAt: new Date().toISOString() } : task) })); return browserState; }));
-  ipcMain.handle('browser:search', wrap(async (_event, input) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const result = await requestBrowser.search({ keyword: text(input?.keyword, 'keyword', 200), maxVideos: Number(input?.maxVideos || 20), scrollRounds: Number(input?.scrollRounds || 2), cursor: input?.cursor || undefined, minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索结果已丢弃'); return result; }));
+  ipcMain.handle('browser:search', wrap(async (_event, input) => { const license = engine.publicLicense(); if (license.state !== 'authorized') throw new Error('请先登录并通过授权检查'); if (license.features?.videoSearch !== true) throw new Error('当前授权未开通找视频功能'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const result = await requestBrowser.search({ keyword: text(input?.keyword, 'keyword', 200), maxVideos: Number(input?.maxVideos || 20), scrollRounds: Number(input?.scrollRounds || 2), cursor: input?.cursor || undefined, minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索结果已丢弃'); return result; }));
   ipcMain.handle('browser:close', wrap(() => browser.close()));
   ipcMain.handle('selectors:probe', wrap(async (_event, profile) => {
     const normalized = normalizeProfile(profile || currentProfile());

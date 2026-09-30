@@ -11,6 +11,7 @@
 - Electron 桌面端的 API client、任务状态机、人工确认队列、可见 DOM/CDP 专用窗口和输入校验；
 - 平台层的版本化固定 workflow、Agent 规划契约、运行实例 checkpoint/人工恢复、账号级锁和 Agent 对话入口；桌面端已把协作者 sidecar 挂到平台适配层，评论/直播固定为“公屏回复确认后再私信”；
 - 服务端测试，以及真实回环 HTTP + desktop `ApiClient` 的授权/积分/幂等/会话隔离验收；TaskEngine 到规则 `/evaluate` 和 AI `/draft` 的 HTTP A–E 集成均已通过，二者请求体按服务端契约分离，时间字段在授权端使用整数毫秒；
+- 平台工作台已拆出 Agent、找视频、评论区、直播间、任务/恢复、话术库、积分与设置入口；话术库按租户和版本隔离，Agent 规划可引用服务端检索片段；评论批次固定为“公屏确认后再私信”，评论/直播未获得真实 `sent_confirmed` 证据时仍保持人工门控；
 - 旧仓库完整 Git 历史和平台能力审计，见 [`docs/reference-audit.md`](docs/reference-audit.md)。桌面端已接入受控 Python sidecar 的 JSONL 主链路；sidecar 以 PyInstaller onedir 随包分发，不能把“本地 capabilities 联通”误读为线上平台能力已验证。
 
 能力开发按证据推进。视频搜索、评论采集与筛选、评论回复、直播互动和私信触达都可以继续开发。能力先在独立探针、专用 Chrome 或 Python sidecar 中取得与具体接入方式相匹配的证据，再决定是否接入桌面端和发行开关；官方 API 路径单独核验 scope/资格，浏览器路径记录页面、账号和操作边界，不凭空要求官方 API 资格。

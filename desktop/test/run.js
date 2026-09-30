@@ -759,7 +759,7 @@ testAsync('live batch private step binds each confirmed public send and records 
 
 testAsync('structured workflow requests are validated and the issued plan is verified', async () => {
   const { requestForWorkflow, buildWorkflowIntent, buildWorkflowContext, planMatchesRequest } = require('../src/lib/workflow-request');
-  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
+  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], publicReply: '欢迎咨询', privateReply: '您好，已私信您', windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
   const spec = requestForWorkflow(request);
   assert.equal(spec.workflowId, 'live.batch');
   assert.equal(spec.version, '1');
