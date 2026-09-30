@@ -259,7 +259,11 @@ def force_page_active(cdp):
 
 
 def ensure_visible(cdp, log=None):
-    """尽力把页面变成 visible。返回是否成功。不改变任何平台侧状态。"""
+    """尽力把页面变成 visible。返回是否成功。不改变任何平台侧状态。
+
+    职责归属：这里只做【页面级】激活（纯 CDP）。【窗口级】恢复（Windows user32）
+    由 Sidecar._page() 独占调用 winfocus 完成，发送路径不碰窗口。
+    """
     if visibility_state(cdp) == "visible":
         return True
     try:
@@ -414,6 +418,27 @@ def comment_item_count(cdp):
     return r.get("items", 0)
 
 
+def _rect_center(rect, w, h):
+    """把 rect 折成可用坐标；形状不完整就返回 None（绝不猜、绝不抛）。
+
+    评论容器是平台 DOM，改版会让 getBoundingClientRect 的字段缺席或变成非数字。
+    这里要求四个键齐全且宽高为正，否则交给调用方走固定坐标兜底。
+    """
+    if not isinstance(rect, dict):
+        return None
+    try:
+        x0 = float(rect["x"])
+        y0 = float(rect["y"])
+        rw = float(rect["width"])
+        rh = float(rect["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if rw <= 0 or rh <= 0:
+        return None
+    return (min(max(int(x0 + rw // 2), 20), int(w) - 20),
+            min(max(int(y0 + rh // 2), 60), int(h) - 60))
+
+
 def scroll_comment_panel(cdp, rounds=4, pause=1.6, dy=2000):
     """把评论容器往下滚一轮。返回最后一次的结果 {ok, scrolled, items, wheel}。
 
@@ -426,21 +451,33 @@ def scroll_comment_panel(cdp, rounds=4, pause=1.6, dy=2000):
       3) 不动 documentElement/body —— 视频页整页下滚可能切到下一个视频，会污染数据
     """
     info = {}
+    fallback_reason = None
     for _ in range(rounds):
-        rect = comment_panel_rect(cdp) or {}
+        rect = comment_panel_rect(cdp)
         vw = cdp.eval_json("(function(){return {w:window.innerWidth,h:window.innerHeight};})()") or {}
-        w, h = int(vw.get("w") or 1680), int(vw.get("h") or 876)
-        if rect:
-            x = min(max(rect["x"] + rect["width"] // 2, 20), w - 20)
-            y = min(max(rect["y"] + rect["height"] // 2, 60), h - 60)
-        else:
+        try:
+            w, h = int(vw.get("w") or 1680), int(vw.get("h") or 876)
+        except (TypeError, ValueError):
+            w, h = 1680, 876
+        # 🔴 不能只看 rect 的真假：rect 非空【不代表】它有 x/y/width/height。
+        #    原来直接 rect["x"]，一旦页面返回的形状不是这四个键（DOM 改版，
+        #    或夹具/替身返回别的结构），就抛 KeyError 冒到调用方；
+        #    而调用方只会把它记成一句 "KeyError"，看不出是评论容器定位失败。
+        center = _rect_center(rect, w, h)
+        if center is None:
             x, y = w - 200, h // 2
+            fallback_reason = "panel_rect_unavailable" if rect else "panel_rect_absent"
+        else:
+            x, y = center
+            fallback_reason = None
         via = scroll_by(cdp, dy=dy, x=x, y=y)
         try:
             info = cdp.eval_json(_COMMENT_SCROLL_JS) or {}
         except Exception:
             info = {}
         info["wheel"] = via
+        if fallback_reason:
+            info["wheelFallback"] = fallback_reason
         time.sleep(pause)
     return info
 
@@ -537,8 +574,28 @@ def recipient_context(cdp, author_id, author_name="", allow_profile=True):
         return {"verified": False}
 
 
+# 私信面板里同时存在【搜索框】与【发消息输入框】，两者都是可见 editable。
+# 🔴 真机教训（2026-09-28，用户反馈"你点到了私信的搜索界面"）：只要按"第一个可见 editable"
+#    去挑，就可能挑中搜索框 —— 文字打进去只是搜索，消息根本没发出去；
+#    而搜索框/输入框里出现的同一段文字还可能被 echo 判成"会话回显"（假证据）。
+#    所以凡是"挑输入框"或"找回显"的地方，都要显式排除 search 形状的元素。
+_SEARCH_GUARD_JS = (
+    "function searchish(e){"
+    "var ph=String((e.getAttribute&&e.getAttribute('placeholder'))||'');"
+    "if(/搜索|search/i.test(ph))return true;"
+    "var own=String((e.getAttribute&&e.getAttribute('data-e2e'))||'');"
+    "if(/search/i.test(own))return true;"
+    "var n=e;for(var k=0;k<6&&n;k++){"
+    "  if(/search/i.test(String(n.className||'')))return true;"
+    "  var a=String((n.getAttribute&&n.getAttribute('data-e2e'))||'');"
+    "  if(/search/i.test(a))return true;"
+    "  n=n.parentElement;}"
+    "return false;}"
+)
+
+
 _DM_COMPOSER_JS = (
-    "(function(){"
+    "(function(){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&cs.visibility!=='hidden'&&cs.display!=='none';}"
     "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ";"
@@ -548,6 +605,7 @@ _DM_COMPOSER_JS = (
     "  var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
     "  for(var i=0;i<eds.length;i++){var e=eds[i];"
     "    if(!vis(e)) continue;"
+    "    if(searchish(e)) continue;"      # 🔴 面板里的搜索框不是发消息的地方
     "    if(e.disabled||e.getAttribute('aria-disabled')==='true') continue;"
     "    var r=e.getBoundingClientRect();"
     "    return {found:true,scope:scopes[s],"
@@ -563,6 +621,7 @@ _DM_COMPOSER_JS = (
     "var all=Array.from(document.querySelectorAll('[contenteditable=true],textarea,input'));"
     "for(var j=0;j<all.length;j++){var el=all[j];"
     "  if(!vis(el)) continue;"
+    "  if(searchish(el)) continue;"      # 🔴 兜底也不能落在搜索框上
     "  var anc=el.closest('[class*=\"message\"],[class*=\"chat\"],[class*=\"imChat\"],[class*=\"MsgInput\"]');"
     "  if(!anc) continue;"
     "  var r2=el.getBoundingClientRect();"
@@ -580,7 +639,7 @@ def dm_composer(cdp):
 
 
 _DM_COMPOSER_FOR_RECIPIENT_JS = (
-    "(function(expectedId,expectedName){"
+    "(function(expectedId,expectedName){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
     "function pathOk(a){try{return new URL(a.href,location.href).pathname.replace(/\\/$/,'')==='/user/'+expectedId;}"
@@ -596,7 +655,8 @@ _DM_COMPOSER_FOR_RECIPIENT_JS = (
     "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ",hits=[];"
     "for(var s=0;s<scopes.length;s++){var box=document.querySelector(scopes[s]);if(!box)continue;"
     "var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
-    "for(var i=0;i<eds.length;i++){var e=eds[i];if(!vis(e)||e.disabled||e.getAttribute('aria-disabled')==='true')continue;"
+    "for(var i=0;i<eds.length;i++){var e=eds[i];"
+    "if(!vis(e)||searchish(e)||e.disabled||e.getAttribute('aria-disabled')==='true')continue;"
     "var context=ctxOk(e);if(!context)continue;var r=e.getBoundingClientRect();"
     "hits.push({found:true,scope:scopes[s],containerKey:String(context.key).slice(0,160),"
     "x:Math.round(r.x+Math.min(120,Math.max(30,r.width/2))),y:Math.round(r.y+r.height/2),text:(e.innerText||e.value||'')});}}"
@@ -612,7 +672,7 @@ def dm_composer_for_recipient(cdp, author_id, author_name=""):
 
 
 _DM_PANEL_JS = (
-    "(function(expected){"
+    "(function(expected){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
     "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
@@ -620,7 +680,7 @@ _DM_PANEL_JS = (
     "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
     "if(!(box&&vis(box)))return {found:false,reason:'dm_panel_not_open'};"
     "var ed=null,eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
-    "for(var i=0;i<eds.length;i++){if(vis(eds[i])){ed=eds[i];break;}}"
+    "for(var i=0;i<eds.length;i++){if(vis(eds[i])&&!searchish(eds[i])){ed=eds[i];break;}}"
     "if(!ed)return {found:false,reason:'dm_editor_not_found'};"
     "var r=ed.getBoundingClientRect();"
     "var head=document.querySelector(" + json.dumps(S.DM_CHAT_HEADER_TITLE) + ");"
@@ -629,8 +689,12 @@ _DM_PANEL_JS = (
     "var panel=box.closest('[class*=imContainer],[class*=componentsEntry]');"
     "return {found:true,x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
     "text:String(ed.innerText||ed.value||'').replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,''),headerFound:!!head,headerLen:headText.length,"
+    # 🔴 用户要求（2026-09-28）：收件人判定改为【严格昵称匹配】——
+    #    前缀命中不再算数（"小明" 不能当成 "小明同学"）。脱敏星号与零宽字符仍然
+    #    在 norm() 里先归一化，所以 "张*三" 与 "张三" 仍然相等；被截断的标题
+    #    则一律不匹配（宁可跳过，也不要把消息发给另一个人）。
     "headerFull:!!(full&&headText===full),headerPrefix:!!(prefix&&headText.indexOf(prefix)===0),"
-    "headerMatch:!!((full&&headText===full)||(prefix&&headText.indexOf(prefix)===0)),"
+    "headerMatch:!!(full&&headText===full),"
     "panelKey:panel?String(panel.className||'').slice(0,60):''};"
     "})"
 )
@@ -651,7 +715,7 @@ def dm_panel_state(cdp, author_name=""):
 
     🔴 真机实测（2026-09-20）：面板里没有 data-recipient-id / data-user-id，也没有指向
     /user/<sec_uid> 的链接，所以严格校验收件人的那套选择器在真机上 count=0。
-    真机可用信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
+    真机可用信号是【会话头部标题 = 对方昵称】（严格等值；脱敏星号与零宽字符先归一化）。
     返回里只给长度与匹配布尔值，昵称原文不出页面。
     """
     expected = {"full": _norm_name(author_name),
@@ -660,27 +724,265 @@ def dm_panel_state(cdp, author_name=""):
     return cdp.eval_json("(%s)(%s)" % (_DM_PANEL_JS, payload)) or {"found": False}
 
 
+_DM_ROWS_FIND_JS = (
+    "function dmRows(expected){"
+    "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/[*＊]/g,'').replace(/\\s+/g,'').trim();}"
+    "var full=norm(expected.full||''),prefix=norm(expected.prefix||'');"
+    "var rows=document.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM) + "),hits=[],seen=0,covered=0;"
+    "for(var i=0;i<rows.length;i++){var row=rows[i];if(!vis(row))continue;seen++;"
+    "var nodes=row.querySelectorAll(" + json.dumps(S.DM_CONVERSATION_ITEM_TITLE) + "),title='';"
+    "for(var j=0;j<nodes.length;j++){var t=norm(nodes[j].innerText||nodes[j].textContent||'');"
+    "if(t){title=t;break;}}"
+    "if(!title)continue;"
+    # 严格昵称匹配（2026-09-28 用户要求）：只有归一化后【完全相等】才算命中，
+    # 前缀命中一律不算 —— 列表里"小明"那一行不是"小明同学"，点错就是发给另一个人。
+    "if(!(full&&title===full))continue;"
+    "var r=row.getBoundingClientRect();"
+    # 🔴 真机（2026-09-26）：会话打开时，整列会话列表仍然挂在 DOM 里、仍然有真实尺寸，
+    #    但【整列被会话内容盖住】—— elementFromPoint 命中的是消息气泡而不是行。
+    #    这时候照坐标点下去就是点进对方的会话里（可能点到消息里的链接），
+    #    所以先做遮挡判定（与私信入口同一套规则），被盖住的行一律不返回。
+    "var cx=Math.round(r.x+r.width/2),cy=Math.round(r.y+r.height/2);"
+    "var hit=document.elementFromPoint(cx,cy);"
+    "if(!(hit&&(hit===row||row.contains(hit)))){covered++;continue;}"
+    "hits.push({titleLen:title.length,titleFull:!!(full&&title===full),"
+    "titlePrefix:!!(prefix&&title.indexOf(prefix)===0),"
+    "body:norm(row.innerText||row.textContent||''),"
+    "x:cx,y:cy,w:Math.round(r.width),h:Math.round(r.height)});}"
+    "return {hits:hits,seen:seen,covered:covered};}"
+)
+
+_DM_ROW_JS = (
+    "(function(expected){"
+    + _DM_ROWS_FIND_JS +
+    "var found=dmRows(expected),hits=found.hits;"
+    "if(hits.length!==1)return {found:false,matched:false,count:hits.length,rowsSeen:found.seen,"
+    "covered:found.covered,"
+    "reason:hits.length?'ambiguous_conversation_row':"
+    "(found.covered?'conversation_row_covered':'conversation_row_not_found')};"
+    "var h=hits[0];"
+    "return {found:true,matched:true,count:1,rowsSeen:found.seen,titleLen:h.titleLen,"
+    "titleFull:h.titleFull,titlePrefix:h.titlePrefix,x:h.x,y:h.y,w:h.w,h:h.h};})(EXPECTED)"
+)
+
+_DM_ROW_PREVIEW_JS = (
+    "(function(expected,want){"
+    + _DM_ROWS_FIND_JS +
+    "var found=dmRows(expected),hits=found.hits;"
+    "if(hits.length!==1)return {found:false,count:hits.length,rowsSeen:found.seen,covered:found.covered};"
+    "var body=hits[0].body,needle=String(want||'');"
+    "return {found:true,count:1,rowsSeen:found.seen,bodyLen:body.length,"
+    "containsText:!!(needle&&body.indexOf(needle)>=0)};})(EXPECTED,WANT)"
+)
+
+
+def _expected_name(author_name):
+    return {"full": _norm_name(author_name),
+            "prefix": _norm_name(str(author_name or "").split("*")[0])}
+
+
+def dm_conversation_row(cdp, author_name):
+    """在消息面板的【会话列表】里定位对方那一行（真机里这一行标题就是对方昵称）。
+
+    🔴 真机（2026-09-26，用户反馈"打开了私信却没有真的发私信"）：点主页上的「私信」
+    之后，面板有时候停在【消息列表】——会话并没有打开，而入口按钮的坐标（约 963,132）
+    正好落在已经打开的面板内部（搜索框/标题栏那一带）。于是在这里像真人一样：
+    在列表里点开对方那一行，再从会话里的编辑器输入。
+    只回报长度与匹配布尔值，昵称原文不出页面；多行同名时返回 not found（不猜）。
+    """
+    expr = _DM_ROW_JS.replace("EXPECTED", json.dumps(_expected_name(author_name), ensure_ascii=False))
+    return cdp.eval_json(expr) or {"found": False}
+
+
+def dm_row_preview_matches(cdp, author_name, text):
+    """会话列表里对方那一行的预览，是不是已经变成刚发出去的那句话。
+
+    这是【页面观察】，不是平台回执：私信走长连接、没有 HTTP 回执（红线 2），
+    所以它只能作为证据，永远不足以宣告 sent_confirmed。
+    真机实测（2026-09-26）：发出去的那条会出现在该行预览里，整页重载后仍在；
+    没发出去的行只显示平台提示语（"对方回复或关注你之前，只能发送一条文字消息"）。
+    """
+    needle = _norm_name(text)[:6]
+    if not needle:
+        return {"found": False, "reason": "empty_text"}
+    expr = _DM_ROW_PREVIEW_JS.replace("EXPECTED", json.dumps(_expected_name(author_name), ensure_ascii=False)) \
+                            .replace("WANT", json.dumps(needle, ensure_ascii=False))
+    return cdp.eval_json(expr) or {"found": False}
+
+
+# 🔴 评审要求（2026-09-29）：「私信回显必须绑定目标收件人和本次发送动作；历史会话中出现相同文字
+#    不能被判定为本次发送成功」。所以回显改成【计数】：调用方在发送前先取一次基线，发送后只有
+#    计数真的增加了，才算"这次看到了新的一条"。历史里已有的同样文字不会造成假证据。
+_CONVERSATION_ECHO_COUNT_JS = (
+    "(function(want){" + _SEARCH_GUARD_JS +
+    "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/\\s+/g,'').trim();}"
+    # 收件人绑定：会话头部标题必须仍然等于目标昵称，否则这份"回显"根本不证明是对的人。
+    "var head=document.querySelector(" + json.dumps(S.DM_CHAT_HEADER_TITLE) + ");"
+    "var expected=norm(want.name||''),headText=head?norm(head.innerText||head.textContent||''):'';"
+    "if(!expected||headText!==expected)return JSON.stringify({found:false,count:0,"
+    "reason:'recipient_not_confirmed'});"
+    # 输入框子树被排除：刚敲进去还没发的文字不是回显。
+    "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
+    "var ed=null;"
+    "if(box&&vis(box)){var eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
+    "for(var k=0;k<eds.length;k++){if(vis(eds[k])&&!searchish(eds[k])){ed=eds[k];break;}}}"
+    # 🔴 真机（2026-09-29，两次修正）：只按 scope 列表数是不行的 ——
+    #    ① DM_CONVERSATION_SCOPES 里的选择器互相嵌套，同一个气泡会被数好几次（实测 1 条数成 7）；
+    #    ② 面板会把【别的会话】也挂在 DOM 里，那些会话里的同样文字也会被算进来。
+    #    所以改成：先从头部标题往上找到【当前这条会话的面板】，只在这个子树里数；
+    #    再按节点去重、只保留最外层命中节点。
+    "var panel=head?head.closest('[class*=\"componentsEntrywrapper\"],[class*=\"imContainer\"]'):null;"
+    "if(!panel)return JSON.stringify({found:false,count:0,reason:'conversation_panel_not_found'});"
+    "var wantText=norm(want.text||''),seen=new Set(),matched=[];"
+    "var els=[panel].concat(Array.prototype.slice.call(panel.querySelectorAll('*')));"
+    "for(var j=0;j<els.length;j++){var el=els[j];"
+    "if(el.children&&el.children.length>0)continue;"
+    "if(!vis(el))continue;"
+    "if(searchish(el))continue;"
+    # ③ 会话【列表】里那一行的预览也是同样的文字，但它不是"这个会话里的消息" —— 排除掉。
+    "if(el.closest('[class*=\"conversationConversationList\"]'))continue;"
+    "if(ed&&(el===ed||ed.contains(el)))continue;"
+    "if(norm(el.innerText||el.textContent)!==wantText)continue;"
+    "if(seen.has(el))continue;seen.add(el);matched.push(el);}"
+    "var count=0;"
+    "for(var m=0;m<matched.length;m++){var inside=false;"
+    "for(var a=0;a<matched.length;a++){"
+    "if(a!==m&&matched[a].contains(matched[m])){inside=true;break;}}"
+    "if(!inside)count++;}"
+    "return JSON.stringify({found:true,count:count,headerLen:headText.length,"
+    "scopesMatched:matched.length});})"
+)
+
+
+def dm_conversation_echo_count(cdp, text, author_name=""):
+    """数一数【当前这个会话里】和本次话术完全相同的消息气泡有几个。
+
+    🔴 绑两件事（评审 2026-09-29）：
+      · 收件人：会话头部标题必须等于目标昵称，否则返回 recipient_not_confirmed ——
+        别人会话里的同样文字不算数；
+      · 本次动作：调用方先取基线计数，发送后只认【计数增加】，历史里已有的那条不算。
+    它仍然是页面观测（不是平台回执），所以调用方只把它写进 evidence。
+    """
+    payload = json.dumps({"text": re.sub(r"\s+", "", str(text or "")),
+                          "name": _norm_name(author_name)}, ensure_ascii=False)
+    try:
+        raw = cdp.evaluate(_CONVERSATION_ECHO_COUNT_JS + "(" + payload + ")") or ""
+    except Exception as exc:
+        return {"found": False, "count": 0, "reason": "echo_lookup_failed",
+                "error": type(exc).__name__}
+    try:
+        detail = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {}
+    except Exception:
+        detail = {}
+    if not detail:
+        return {"found": False, "count": 0, "reason": "echo_lookup_failed"}
+    return detail
+
+
+def dm_conversation_echo_baseline(cdp, text, author_name, tries=3, interval=1.0):
+    """发送【前】取基线：多次读取取最大值。
+
+    🔴 真机（2026-09-29）：会话历史是**异步渲染**的 —— 面板刚打开时消息列表可能还是空的，
+    只读一次会把"历史还没渲出来"当成 0；等我们发完再读时历史已经渲出来，
+    计数一涨就会被误判成"本次新消息"（实测就踩到了：基线 0、发完 7）。
+    取多次读数的最大值可以把这个坑堵掉。返回值与 dm_conversation_echo_count 同形，
+    另加 reads 便于事后核对。
+    """
+    best = {"found": False, "count": 0}
+    reads = []
+    for index in range(max(1, int(tries))):
+        detail = dm_conversation_echo_count(cdp, text, author_name)
+        reads.append(int(detail.get("count") or 0))
+        if detail.get("found") and int(detail.get("count") or 0) >= int(best.get("count") or 0):
+            best = detail
+        if index + 1 < int(tries):
+            time.sleep(interval)
+    result = dict(best)
+    result["reads"] = reads
+    return result
+
+
+def dm_conversation_echo_after_send(cdp, text, author_name, baseline, seconds=6.0, interval=1.2):
+    """发送后等【新的一条】出现：计数必须超过基线。返回 {"echo","baseline","count"}。
+
+    基线取不到的（收件人未确认 / 读取失败）一律 echo=False：宁可漏报，
+    也不把"历史里本来就有这句字"当成这次发送的证据。
+    """
+    base = int((baseline or {}).get("count") or 0)
+    if not (baseline or {}).get("found"):
+        return {"echo": False, "baseline": None, "count": None,
+                "reason": (baseline or {}).get("reason") or "baseline_unavailable"}
+    deadline = time.time() + float(seconds)
+    while True:
+        detail = dm_conversation_echo_count(cdp, text, author_name)
+        if detail.get("found") and int(detail.get("count") or 0) > base:
+            return {"echo": True, "baseline": base, "count": int(detail.get("count") or 0)}
+        if time.time() >= deadline:
+            return {"echo": False, "baseline": base,
+                    "count": (int(detail.get("count")) if detail.get("found") else None),
+                    "reason": detail.get("reason")}
+        time.sleep(interval)
+
+
 _CONVERSATION_ECHO_JS = (
-    "(function(){"
-    "function textOf(el){return String((el&&(el.innerText||el.textContent))||'')"
-    ".replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'').replace(/\\s+/g,'');}"
-    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ",out='';"
-    "for(var i=0;i<scopes.length;i++){var ns=document.querySelectorAll(scopes[i]);"
-    "for(var j=0;j<ns.length;j++){var t=textOf(ns[j]);if(t.length>out.length)out=t;}}"
-    "return out.slice(0,4000);})()"
+    "(function(want){" + _SEARCH_GUARD_JS +
+    "function vis(e){var r=e.getBoundingClientRect(),cs=getComputedStyle(e);"
+    "return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden';}"
+    "function norm(t){return String(t==null?'':t).replace(/[\\u200b\\u200c\\u200d\\ufeff]/g,'')"
+    ".replace(/\\s+/g,'').trim();}"
+    # 🔴 先把【输入框本身】找出来并在后面排除掉：
+    #    2026-09-28 真机教训 —— 旧实现把会话 scopes 里最长的一段 innerText 拼起来做子串匹配，
+    #    而 [class*="imChat"] 会命中【输入框容器】(messageEditorimChatEditorContainer)，
+    #    于是"刚敲进输入框、还没发出去"的文字也会被判成会话回显（假证据）。
+    "var box=document.querySelector(" + json.dumps(S.DM_MESSAGE_EDITOR_SCOPE) + ");"
+    "var ed=null;"
+    "if(box&&vis(box)){var eds=box.querySelectorAll('[contenteditable=true],textarea,input');"
+    "for(var k=0;k<eds.length;k++){if(vis(eds[k])&&!searchish(eds[k])){ed=eds[k];break;}}}"
+    "var scopes=" + json.dumps(S.DM_CONVERSATION_SCOPES) + ";"
+    "for(var s=0;s<scopes.length;s++){var nodes=document.querySelectorAll(scopes[s]);"
+    "for(var i=0;i<nodes.length;i++){var node=nodes[i];"
+    "var els=[node].concat(Array.prototype.slice.call(node.querySelectorAll('*')));"
+    "for(var j=0;j<els.length;j++){var el=els[j];"
+    # 只看【叶子】全文相等：大容器拼串命中会把"列表里恰好包含这几个字"也算成回显。
+    "if(el.children&&el.children.length>0)continue;"
+    "if(!vis(el))continue;"
+    "if(searchish(el))continue;"
+    "if(ed&&(el===ed||ed.contains(el)))continue;"
+    "if(norm(el.innerText||el.textContent)!==want)continue;"
+    "return JSON.stringify({echo:true,scope:scopes[s],cls:String(el.className||'').slice(0,60)});"
+    "}}}"
+    "return JSON.stringify({echo:false});})"
 )
 
 
 def dm_conversation_echo(cdp, text, seconds=6.0, interval=1.2):
-    """等会话区里出现刚发的那条（诊断证据，不是"送达"判据本身）。"""
+    """等会话区里出现刚发的那条（页面观测证据，不是"送达"判据本身）。
+
+    🔴 2026-09-28 修（用户反馈"点到私信搜索界面"时顺带暴露的假证据）：
+      旧实现把会话 scopes 里最长的一段 innerText 拼起来做【子串】匹配，
+      而 [class*="imChat"] 会命中输入框容器 —— 于是"刚敲进输入框、还没发出去"的文字
+      也会被判成会话回显。现在：只在会话区里找【叶子节点、全文相等】的元素，
+      并显式排除输入框与搜索框子树。返回 bool（调用方按 bool(echo) 记录证据）。
+    """
     want = re.sub(r"\s+", "", str(text or ""))
+    if not want:
+        return False
+    expr = _CONVERSATION_ECHO_JS + "(" + json.dumps(want, ensure_ascii=False) + ")"
     deadline = time.time() + float(seconds)
     while True:
+        detail = {}
         try:
-            body = cdp.evaluate(_CONVERSATION_ECHO_JS) or ""
+            raw = cdp.evaluate(expr) or ""
+            detail = json.loads(raw) if isinstance(raw, str) and raw.startswith("{") else {}
         except Exception:
-            body = ""
-        if want and want in body:
+            detail = {}
+        if detail.get("echo"):
             return True
         if time.time() >= deadline:
             return False
@@ -727,14 +1029,14 @@ def dm_send_button(cdp):
 
 
 _DM_SEND_FOR_RECIPIENT_JS = (
-    "(function(expectedId,expectedName){"
+    "(function(expectedId,expectedName){" + _SEARCH_GUARD_JS +
     "function vis(e){var r=e.getBoundingClientRect(),s=getComputedStyle(e);"
     "return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';}"
     "function pathOk(a){try{return new URL(a.href,location.href).pathname.replace(/\\/$/,'')==='/user/'+expectedId;}catch(e){return false;}}"
     "var scopes=" + json.dumps(S.DM_EDITOR_SCOPES) + ",hits=[];"
     "for(var s=0;s<scopes.length;s++){var box=document.querySelector(scopes[s]);if(!box)continue;"
     "var eds=Array.from(box.querySelectorAll('[contenteditable=true],textarea,input'));"
-    "for(var i=0;i<eds.length;i++){var ed=eds[i];if(!vis(ed))continue;"
+    "for(var i=0;i<eds.length;i++){var ed=eds[i];if(!vis(ed)||searchish(ed))continue;"
     "var root=ed.closest('[data-recipient-id],[data-user-id],[data-author-id],[class*=message],[class*=chat],[class*=imChat],[class*=MsgInput]');"
     "if(!root)continue;var ids=[root.getAttribute('data-recipient-id'),root.getAttribute('data-user-id'),root.getAttribute('data-author-id')];"
     "var explicit=ids.some(function(v){return !!v;});if(explicit&&ids.indexOf(expectedId)<0)continue;"
@@ -805,20 +1107,51 @@ def _row_helpers_js():
         # 正文提取：排除作者链接内、时间/地区、纯数字、固定操作文案，取最长候选
         "function bodyText(row){var noise=" + json.dumps(S.COMMENT_NOISE_TEXTS) + ";"
         "var link=row.querySelector('a[href*=\"/user/\"]');var best='';"
+        # 🔴 真机/夹具（2026-09-26）：「更多」菜单里的省略号是个【长文本候选】，
+        #    会把纯数字兜底挡住（best='...' 比 '111' 长）-> 采集里有这条、定位却恒失败。
+        "var more=row.querySelector('[data-e2e=\"video-comment-more\"]');"
+        # 评审要求（2026-09-26）：点赞数 0 与 分享/回复 属于【统计/操作行】，绝不能当正文。
+        #    真机上它们包在 class 含 stats 的容器里（comment-item-stats-container），
+        #    整棵子树排除在正文候选之外 —— 纯数字兜底只会看到真正的正文（例如 111）。
+        "var stats=row.querySelector('[class*=\"stats\"]');"
+        # 🔴 真机（2026-09-21 评审）：过滤纯数字是为了避开时间/计数这类噪声，
+        #    但【整条评论就是数字】的情况真实存在（例如「111」「666」「+1」的场景里用户只发数字）。
+        #    原来一律 continue，于是 best 为空 -> rowMatches 永远匹配不到 ->
+        #    采集里有这条、定位恒失败，看起来像定位器坏了。
+        #    所以留一个纯数字兜底：只有在没有任何其它候选时才用它。
+        "var digits='';"
         "var all=row.querySelectorAll('span,div');"
         "for(var i=0;i<all.length;i++){var e=all[i];"
         "if(e.children&&e.children.length>0)continue;"
         "if(link&&link.contains(e))continue;"
         "var t=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();"
         "if(!t)continue;"
-        "if(/^\\d+$/.test(t))continue;"
+        "if(more&&more.contains(e))continue;"
+        "if(stats&&stats.contains(e))continue;"
+        "if(/^[.。．·…]+$/.test(t))continue;"
+        "if(/^\\d+$/.test(t)){if(!digits)digits=t;continue;}"
         "if(/^\\d+(秒|分钟|小时|天|周|月|年)前/.test(t))continue;"
         "if(t.indexOf('·')>=0&&/\\d/.test(t))continue;"
+        # 🔴 真机（2026-09-21）：行处于「回复中」时会多出一个「回复@某人」元素，
+        #    它比评论正文长，会被下面「取最长候选」选中 -> bodyText 变成「回复@xxx」
+        #    -> rowMatches 的正文比对失败 -> 报 reply_row_mismatch，
+        #    看起来像「编辑器认不出属于哪一行」，实际是正文提取被污染。
+        #    实测该行 innerText：...求带学PR剪辑 / 回复中 / 回复@风卷残叶飘
+        "if(/^回复@/.test(t))continue;"
         "if(noise.indexOf(t)>=0)continue;"
         "if(t.length>best.length)best=t;}"
-        "return best;}"
+        "return best||digits;}"
         # 目标匹配：正文必须一致；id 命中即可，否则要求作者链接一致
-        "function rowMatches(row,t){"
+        # 评审要求（2026-09-26）：定位以【评论 ID】为首要依据 ——
+        #   ① 目标带稳定 ID：先用 ID 找行；找到就以 ID 为准，但【仍做一次正文一致性校验】，
+        #      正文不符即 0 条命中（绝不因为 ID 对了就凑合发）；
+        #   ② 目标不带 ID（或行上没有稳定 ID）时，才回落到正文 + 作者匹配。
+        #   两遍共用同一个行集合，避免标注与发送各自挑到不同的行。
+        "function matchRows(rs,t){" +
+        "if(t.id){var byId=rs.filter(function(r){var rid=r.id||r.getAttribute('data-comment-id')||'';return rid&&rid===t.id;});" +
+        "if(byId.length)return byId.filter(function(r){return rowTextMatches(r,t);});}" +
+        "return rs.filter(function(r){return rowTextMatches(r,t);});}"
+        "function rowTextMatches(row,t){"
         "if(t.text&&bodyText(row)!==t.text)return false;"
         "if(t.id&&(row.id===t.id||row.getAttribute('data-comment-id')===t.id))return true;"
         "if(!t.text)return false;"
@@ -845,20 +1178,33 @@ def _target_json(target):
 
 
 # --- 1) 「回复」按钮：先滚入视口，再读坐标 ---
-_REPLY_BUTTON_JS = (
-    "(function(t){" + _row_helpers_js() +
-    "var rs=rows();"
-    "var hits=rs.filter(function(r){return rowMatches(r,t);});"
-    "if(hits.length!==1)return {found:false,count:hits.length,"
-    "reason:hits.length?'ambiguous_comment':'comment_not_found'};"
-    "var row=hits[0];"
+#
+# 🔴 判定口径必须只有一处（2026-09-21 评审）：采集阶段标注"这条能不能回"、
+#    发送阶段决定"能不能点"，如果各写一套匹配逻辑，就会出现
+#    "标注说可以回、发送却必被拒（或反过来）"的不一致 —— 宿主据此挑的目标全是废的。
+#    所以下面把【行匹配 + 按钮查找】抽成共用片段，两处结论都从同一份判定里来：
+#      matches      命中几条（>1 就是 ambiguous_comment，绝不能随便挑一条）
+#      replyReady   唯一命中 且 回复按钮存在、可见、已在视口内
+#      reason       与发送阶段的拒绝原因【同一个枚举】
+_REPLY_BUTTON_LOOKUP_JS = (
+    "function replyButtonIn(row){"
     "var all=row.querySelectorAll('span,div,button,[role=button]');"
-    "var btn=null;"
     "for(var i=0;i<all.length;i++){var e=all[i];"
     "if(e.children&&e.children.length>0)continue;"
     "var s=(e.innerText||e.textContent||'').replace(/\\s+/g,'').trim();"
     "if(s!==" + json.dumps(S.COMMENT_REPLY_BUTTON_TEXT) + ")continue;"
-    "if(!vis(e))continue;btn=e;break;}"
+    "if(!vis(e))continue;return e;}"
+    "return null;}"
+)
+
+_REPLY_BUTTON_JS = (
+    "(function(t){" + _row_helpers_js() + _REPLY_BUTTON_LOOKUP_JS +
+    "var rs=rows();"
+    "var hits=matchRows(rs,t);"
+    "if(hits.length!==1)return {found:false,count:hits.length,"
+    "reason:hits.length?'ambiguous_comment':'comment_not_found'};"
+    "var row=hits[0];"
+    "var btn=replyButtonIn(row);"
     "if(!btn)return {found:false,count:1,reason:'reply_button_not_found'};"
     "if(!inView(btn)){row.scrollIntoView({block:'center'});"
     "return {found:false,count:1,reason:'scrolled_into_view'};}"
@@ -893,7 +1239,7 @@ _REPLY_COMPOSER_JS = (
     "if(open.length!==1)return {found:false,count:open.length,"
     "reason:open.length?'ambiguous_reply_open':'reply_not_open'};"
     "var row=open[0];"
-    "if(!rowMatches(row,t))return {found:false,count:1,reason:'reply_row_mismatch'};"
+    "if(matchRows([row],t).length!==1)return {found:false,count:1,reason:'reply_row_mismatch'};"
     "var eds=Array.from(row.querySelectorAll(" + json.dumps(S.COMMENT_REPLY_EDITOR_SELECTOR) + ")).filter(vis);"
     "if(eds.length!==1)return {found:false,count:eds.length,"
     "reason:eds.length?'ambiguous_reply_editor':'reply_editor_not_found'};"
@@ -902,6 +1248,58 @@ _REPLY_COMPOSER_JS = (
     "x:Math.round(r.x+Math.min(80,Math.max(20,r.width/2))),y:Math.round(r.y+r.height/2),"
     "text:(e.innerText||'').replace(/\\u200b/g,'')};})(TARGET)"
 )
+
+
+# 目标行【此刻】的回复可用性：只读、不滚动、不点击。
+# 分类与 comment_reply_button 完全一致（同一个 reason 枚举），所以"标注"与"发送"不会互相打脸：
+#   present       行是否命中（唯一或歧义都算命中）
+#   matches       命中条数
+#   replyReady    唯一命中 且 回复按钮存在、可见、已在视口内 -> 发送阶段可以直接点
+#   reason        '' | comment_not_found | ambiguous_comment | reply_button_not_found | scrolled_into_view
+_ROW_PRESENT_JS = (
+    "(function(t){" + _row_helpers_js() + _REPLY_BUTTON_LOOKUP_JS +
+    "var rs=rows();"
+    "var hits=matchRows(rs,t);"
+    "if(hits.length===0)return {present:false,matches:0,total:rs.length,replyReady:false,"
+    "reason:'comment_not_found'};"
+    "if(hits.length>1)return {present:true,matches:hits.length,total:rs.length,replyReady:false,"
+    "reason:'ambiguous_comment'};"
+    "var row=hits[0];"
+    "var btn=replyButtonIn(row);"
+    "if(!btn)return {present:true,matches:1,total:rs.length,replyReady:false,"
+    "reason:'reply_button_not_found'};"
+    "if(!inView(btn))return {present:true,matches:1,total:rs.length,replyReady:false,"
+    "reason:'scrolled_into_view'};"
+    "return {present:true,matches:1,total:rs.length,replyReady:true,reason:''};})(TARGET)"
+)
+
+
+def comment_row_present(cdp, target):
+    """目标行【此刻】的回复可用性分类（采集标注与发送判定共用这一份结论）。
+
+    返回：{present, matches, total, replyReady, reason}
+      present      行是否命中（唯一或歧义都算命中）
+      matches      命中条数（>1 = 歧义，绝不能随便挑一条去点）
+      replyReady   唯一命中 且 回复按钮存在、可见、已在视口内 —— 发送阶段可直接点击
+      reason       与 comment_reply_button 同一枚举：
+                   '' | comment_not_found | ambiguous_comment | reply_button_not_found | scrolled_into_view
+
+    🔴 为什么必须同源（2026-09-21 评审）：采集走接口、回复走 DOM，两个集合本来就不重合；
+       如果"标注能不能回"和"实际能不能点"各写一套判断，就会出现
+       "标注 visible=true、发送却必被拒"（例如目标行有两条相同内容 -> 歧义），
+       宿主据此挑出来的候选全是废的。现在两边共用 replyButtonIn + 同一套 reason。
+
+    🔴 为什么采集阶段就需要它（真机 2026-09-21）：
+       采集走接口（/aweme/v1/web/comment/list/），一次能拿 100~200 条；
+       回复走 DOM，页面只渲染几十条。两个集合【不重合】。
+       采集到的目标很可能压根不在页面上，回复时必然失败 ——
+       而失败发生在「点不到」这一步，看起来像定位器坏了，其实是目标够不到。
+       所以采集时就标出哪些【当前可见】，让宿主只挑可见的，
+       而不是先选一个再反复重试。
+    只读、不滚动、不点击，因此可以安全地对多条候选调用。
+    """
+    return cdp.eval_json(_ROW_PRESENT_JS.replace("TARGET", _target_json(target))) \
+        or {"present": False}
 
 
 def comment_reply_composer(cdp, target):
@@ -916,7 +1314,7 @@ _REPLY_SEND_JS = (
     "if(open.length!==1)return {found:false,count:open.length,"
     "reason:open.length?'ambiguous_reply_open':'reply_not_open'};"
     "var row=open[0];"
-    "if(!rowMatches(row,t))return {found:false,count:1,reason:'reply_row_mismatch'};"
+    "if(matchRows([row],t).length!==1)return {found:false,count:1,reason:'reply_row_mismatch'};"
     "var ct=row.querySelector(" + json.dumps(S.COMMENT_INPUT_RIGHT_CT) + ");"
     "if(!ct)return {found:false,count:0,reason:'comment_input_right_not_found'};"
     "var cands=Array.from(ct.querySelectorAll('span,div,svg'));"
@@ -972,8 +1370,9 @@ def wait_comment_panel(cdp, timeout=25):
     return False
 
 
-def make_network_recorder(cdp, url_mark):
+def make_network_recorder(cdp, url_mark, capture_post_data=False):
     if callable(url_mark):
-        return NetworkRecorder(cdp, url_mark)
+        return NetworkRecorder(cdp, url_mark, capture_post_data=capture_post_data)
     mark = str(url_mark or "")
-    return NetworkRecorder(cdp, lambda u: bool(mark) and mark in (u or ""))
+    return NetworkRecorder(cdp, lambda u: bool(mark) and mark in (u or ""),
+        capture_post_data=capture_post_data)

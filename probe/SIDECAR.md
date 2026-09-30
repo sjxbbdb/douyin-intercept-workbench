@@ -37,9 +37,18 @@ first page; the response carries `cursor`, `hasMore`, `page`, `poolSize`, and
 scrolling the same owned tab instead of reloading the first page, and any video
 already in the cursor pool is filtered out. The cursor is opaque to the host —
 the host only stores and returns it — but it is still validated on the
-boundary: a cursor issued for another keyword, an unsupported version, or a
-pool beyond the cap is rejected with `invalid_input`. `hasMore` is false when a
-page yields no new video, which is the host signal to stop paging.
+boundary: a cursor issued for another keyword or account, an unsupported
+version, or a pool beyond the cap is rejected with `invalid_input`. A cursor is
+also bound to the **normalized search filters** it was issued for
+(`dateFrom` / `dateTo` as epoch bounds, `minRelevance` as an integer):
+continuing a search with different filters is refused with
+`cursor_filter_mismatch` instead of silently mixing two filter sets into one
+result. When the caller has an account scope, the cursor must **prove** it
+belongs to that account (`a` present and equal): a cursor without the account
+field is refused with `cursor_account_mismatch` rather than accepted.
+Non-numeric page sizes or filter values are rejected with `invalid_input`;
+they never surface as a bare `ValueError`. `hasMore` is false when a page
+yields no new video, which is the host signal to stop paging.
 `platformHasMore` / `platformCursor` mirror what the platform response body
 reported; they are read-only telemetry and are never replayed against the API.
 
@@ -198,6 +207,84 @@ same `unknown` semantics as the other send paths.
 
 ## 分页 / 验证码 / 两阶段契约（2026-09-20 协作修复）
 
+* **页面不可见时点击不送达渲染进程（2026-09-28 真机复现）**：Chrome 窗口被遮挡/最小化时
+  `document.visibilityState === "hidden"`，`Input.dispatchMouseEvent` 的点击【不生效】——
+  现象正是"私信按钮坐标是对的、点上去、面板就是不开"（人工点同一个页面却正常）。
+  实测同一次点击：hidden 时面板 12 秒都不开；`Page.bringToFront` 之后同一个坐标立刻打开
+  （会话头部匹配、输入框出现、输入后清空、会话里出现回声）。
+  * 发送路径现在在【每次点击之前】再确认一次可见性（`_click_ready`），不可见先尝试恢复、
+    仍不可见就【不点】；
+  * 归因分开：一次都没能在可见状态下点下去 -> `blocked/page_not_visible`
+    （`skipped: false`、`manualAction: true`，人工把窗口切到前台再试）；
+    只有【页面可见但面板确实打不开】才是 `blocked/dm_panel_unavailable`
+    （`skipped: true`，对方未互关/私密/关闭了陌生人私信）—— 这两件事混在一起会把
+    可触达的用户误判成私密用户。
+  回归：`test_probe.PrivateSkipTests`（新增 2 个）+ `test_comment_publish_binding`（新增 1 个）。
+* **服务端签发策略的「身份」冻结（2026-09-26 评审收尾）**：本侧**不接收策略内容**
+  （`policy` 对象继续以 `policy_not_server_issued` 拒绝），但支持把策略**身份**冻结进计划：
+  `policyId` + `policyVersion`（+ 可选 `knowledgeSetVersion`），
+  或直接把计划回显的 `policyRef` 对象原样带回来。
+  * 形状不对 -> `invalid_policy_ref`，且**在建批次之前**拒绝（不产生队列副作用）；
+  * 冻结之后，执行阶段（`live_reply` / `live_private` / `comment_reply` / `comment_private`）
+    必须把同一身份带回来：缺 -> `policy_ref_missing`，不一致 -> `policy_ref_mismatch`；
+  * 完全不带身份时保持既有行为（授权端还没接线），这条是加法能力。
+  授权端签发、策略存储与积分扣除都在平台侧，本侧只做身份冻结与一致性校验。
+  回归：`test_policy_ref`（形状 4 个用例 + 直播 7 个 + 评论 4 个）。
+* **发布回执结构化绑定（2026-09-26 评审收尾）**：评论公开回复的回执不再用「原始串包含」判定，
+  而是先**解析请求体**（form URL 编码 / JSON / 值里再套一层 JSON / 转义中文），再按字段比对：
+  ① **白名单 id 字段**（reply_id / reply_comment_id / comment_id / cid / commentid /
+     replyid / reply_cid）**精确等于**目标评论 id（结论性依据，短正文与编码差异都影响不到它）；
+  ② **白名单正文字段**（text / content / comment / reply_text / replytext / comment_text /
+     content_text）等于或包含本次正文（平台可能在正文里插入 @昵称 之类的内容）。
+  🔴 字段名必须**精确命中白名单**：video_id / aweme_id / item_id / user_id / content_type
+     这类无关字段即使值碰巧相同也不参与绑定（2026-09-27 评审：子串匹配会误绑定）。
+  状态码按**数字形态**收：整数、整数值的 float、数字字符串（"0"）都算，
+  于是平台用字符串回 0 时同样落成确认成功；缺失 / null / bool / 非数字串仍是读不出。
+  请求体拿不到或解析不出字段 -> `unknown/platform_response_unbound`；
+  **归属不明**（多条回执都能绑定、且没有唯一的 id 绑定）-> `unknown/platform_response_ambiguous` ——
+  宁可停在 unknown 交人工，也不挑一条「看起来成功」的回执当结论。
+  🔴 请求体只在内存里用于这一次绑定：`detail` / `evidence` / 台账 / 日志里都不出现 `postData`。
+  回归：`test_comment_publish_binding`（解析层 10 个用例 + 决策层 6 个用例）。
+* **评论去重按身份优先级，绝不合并不同用户（2026-09-26 评审收尾）**：抓取期的键与
+  `dedupe_comments` 都改成 **评论 ID -> (作者标识 + 正文) -> (昵称 + 正文) -> 各自保留**。
+  原来按 `(sec_uid or "", 正文)` 分组：没有 `sec_uid` 的评论全部落进同一个【空身份】桶，
+  两个不同用户发同一句话（「求带」）会被判成同一条并丢掉其中一条 —— 下游是按人去私信的，
+  丢错人就是给错人发消息。昵称那一档只是为了认出「DOM 兜底重读的同一行」，
+  什么身份都没有时**各自保留**：宁可多留一条，也不合并两个用户。
+  🔴 **两个不同的非空评论 ID 永远是两条记录**（2026-09-27 评审）：身份兜底只允许把
+     "没有评论 ID 的那一份"（接口副本 / DOM 副本）并进另一条，绝不允许把两个有 ID 的
+     评论并成一条 —— 否则下游会少一条目标，处理账也对不上。
+  回归：`test_comment_dedupe_identity`（11 个身份用例 + 4 个抓取键用例 + 3 个 DOM 兜底集成用例）。
+* **游标绑定规范化后的筛选条件（2026-09-26 评审收尾）**：`cursor` 里新增 `f`，
+  装的是**解析后**的 `dateFrom` / `dateTo`（epoch 秒）与 `minRelevance`。
+  此前游标只绑定关键词与账号，于是宿主可以带着 `minRelevance=60` 采完第一页、
+  第二页把条件改掉继续用同一个游标 —— 两页条件不同，却被当成「同一次搜索」，
+  而「这批是按 6–9 月、相关度 60 以上采的」正是宿主决定给谁发消息的依据。
+  条件一变就以 `cursor_filter_mismatch` 拒绝（**在打开浏览器之前**），
+  让宿主重新发起一次搜索；**语义等价**的写法（`2026-06` 与 `2026-06-01`）解析后相同，
+  不算变化。缺 `f`、`f` 不是对象、`f` 缺键，一律按不一致拒绝。
+  协议版本随之升到 `cursorVersion: 2`：v1 游标里没有条件信息，无法判断它是怎么采的，
+  继续接受等于把这条缺陷留在协议里，所以直接拒绝（`invalid_input`），
+  宿主重新从第一页开始即可 —— 游标是不透明的临时状态，不是持久资产。
+  响应 `filter` 新增 `cursorFilters`，把这组规范化条件回显给宿主对账。
+  🔴 两处收紧（2026-09-27 评审）：
+    · 带账号作用域时游标必须**证明**自己属于该账号 —— 缺 `a` 与 `a` 不符一样以
+      `cursor_account_mismatch` 拒绝（原来 `payload.get("a") and ...` 会在缺字段时直接放行，
+      于是不带账号信息的游标可以被任何账号拿去当已见集合）；
+    · 参数与游标里的筛选值一律走**严格整数解析**：非数字给 `invalid_input`（请求参数）
+      或 `cursor_filter_mismatch`（游标里的 `f`），绝不冒裸 `ValueError`，
+      也不把非数字静默当成 0（那会让"条件变了"被判成"条件没变"）。
+  回归：`test_search_cursor_filters.CursorFilterBindingTests` 与
+  `SearchPaginationFilterTests`。
+* **搜索池持久化发布时间（2026-09-26 评审收尾）**：`search_videos` 新增 `create_time` 与
+  `published_at`，`search_pool` 返回的每条候选都带 `createTime` / `publishedAt`
+  （取不到就是 `null`，**不拿采集时刻冒充发布日期**）。此前池子只存链接与相关度，
+  宿主重启后「这个视频什么时候发的」就丢了 —— 而发布时间恰恰是「按 6–9 月筛」的依据。
+  老库由 `SearchPool._migrate` **原地补列**（`ALTER TABLE`），已有的历史行留 NULL，
+  由 `stats.unknownDate` 计数；重新采集时用 `COALESCE` 保留已知值
+  （新一页没拿到发布时间，不该把已经知道的值擦掉）。
+  `videoId -> 评论区` 的正式交接（`SearchPool.get`）语义不变。
+  回归：`test_search_pool_persistence.SearchPoolPersistenceTests`。
 * **游标池 = 本页见过的全部视频**：`search` 的 cursor 里装的池子包含被 `minRelevance` 筛掉的、
   以及超出 `maxVideos` 未返回的视频。原实现只把"保留下来的"放进池里 —— 被筛掉的视频不在池中，
   续页时数据源（或平台滚动重渲染）再把它们摆出来就会被当成新视频重复处理，相关度阈值越高越明显。
@@ -230,7 +317,69 @@ same `unknown` semantics as the other send paths.
   `public_send_mismatch`。
   只按批次候选清单放行会留下绕过路径（调用方不带 `publicSendId` 直接要私信），
   所以绑定检查必须落在**每个 item** 上；`_live_batch_items` 也不再丢弃该字段。
-  回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 正确绑定四条路径）。
+  回归：`LivePrivateBindingTests`（缺 sendId / 未确认 / 张冠李戴 / 缺队列绑定 / 正确绑定五条路径）。
+  🔴 **事件自身必须存在绑定记录**（2026-09-26 收紧）：原来是
+  `if recorded and recorded != public_send_id` —— 事件上没有记录时直接放行，
+  等于说「任何一条已确认的公屏回复都能拿给一个从未公屏回复过的事件去发私信」。
+  现在要求 **记录的 sendId 精确等于传入的 publicSendId**：缺记录与记录对不上
+  同样以 `public_send_mismatch` 拒绝（两者都无法证明这次私信绑定的是本事件那次成功）。
+  回归补充：`test_an_event_without_a_recorded_send_id_is_refused`、
+  `test_a_record_without_the_send_id_key_is_refused_too`。
+* **直播监听的恢复语义（2026-09-26 评审收尾）**：监听是持续动作，宿主会重启、会换房间、
+  平台会重发旧事件、批次会超窗。这些情况下：
+  ① 队列与未冻结的批次都还在，`take_batch` **复用同一个 batchId**（不会凭空多出批次）；
+  ② 平台重发同一条事件只计 `duplicates`，不会变成新事件；
+  ③ 已经出过结果的事件（`sent_confirmed` / `unknown` / `failed` / `blocked`）
+  **不会回到队列**，也不会被后来的批次再发一次；
+  ④ `unknown` 的公屏结果永远不进私信候选（红线：未知不得自动重试）；
+  ⑤ 每个目标各自绑自己的房间：换房间不会把旧房间的事件当成新房间的，
+  同一个人在另一个房间说同一句话也不算同一条事件；
+  ⑥ 超窗批次在 `ensure_active` 处以 `batch_expired` 拒绝，计划中的事件一并作废、不重发；
+  ⑦ checkpoint（`phase` / `pendingEvents` / `frozenAt` / `planTargets`）重启后照常可读。
+  回归：`test_live_recovery`（8 个队列用例 + 1 个 sidecar 入口用例，全部离线）。
+
+* **分页记录：页面版本与分页终止态（2026-09-21，评审要求固化）**：`search` 的每次响应都带
+  * `cursorVersion`：产出该 `cursor` 的**协议版本**（当前 `2`；v2 起游标同时绑定筛选条件）。宿主重启后据此判断手里的游标
+    是不是自己能解析的那一版；不是就重新从第一页开始，而不是拿着解析不了的游标继续请求。
+  * `pageOutcome`：**分页终止态**，取值固定为
+
+    | 取值 | 含义 | 宿主该做什么 |
+    |---|---|---|
+    | `more` | 本页有结果、游标可用 | 可以继续申请下一页 |
+    | `exhausted` | 本页没有新视频（池子到头） | 停止翻页 |
+    | `captcha` | 命中验证码 | **停止**，人工处理后再继续（`cursor=null`、`hasMore=false`） |
+    | `login_required` | 登录失效 | **停止**，人工登录（同样不给游标） |
+
+  ⚠️ `pageOutcome` 与 `platformHasMore` **不是一回事**：前者说的是"我们这边还翻不翻"，
+  后者是平台响应体的观测值（"平台那边还有没有"）。混用会让宿主在平台明明还有结果时提前收工，
+  或者反过来对着验证码继续翻。
+  ⚠️ **桌面端当前没有完整透传这两个字段**（`desktop/` 侧只取 `videos` / `cursor` / `hasMore`）；
+  透传由平台侧补齐，本侧只保证字段名与取值稳定。
+  回归：`SearchPagingRelevanceTests.test_page_record_carries_version_and_paging_outcome`、
+  `test_paging_outcome_is_not_confused_with_the_platform_signal`。
+* **私信面板里"挑输入框"和"判回显"都不许被搜索框骗（2026-09-28 真机反馈）**：私信面板左上是
+  【搜索】框，和发消息输入框一样是可见 editable；面板里还有会话列表。
+  * 挑输入框：`searchish()` 守卫（placeholder / 自身或祖先 class / data-e2e 含 search）已加进
+    `dm_composer` / `dm_composer_for_recipient` / `dm_panel_state` / `dm_send_button_for_recipient`，
+    保证"发消息的输入框"永远唯一命中 —— 否则文字会打进搜索框，消息根本没发出去；
+  * 判回显：旧实现把会话 scopes 里最长的一段 innerText 拼起来做【子串】匹配，
+    而 `[class*="imChat"]` 会命中输入框容器 `messageEditorimChatEditorContainer`
+    （真机实测 `editorInsideConversationScope: true`）——"刚敲进输入框、还没发出去"的文字
+    也会被判成会话回显（假证据）。现在只在会话区找【叶子节点、全文相等】的元素，
+    并显式排除输入框与搜索框子树。
+  真机验证：把标记词打进输入框（不发送）-> `dm_conversation_echo` 返回 `False`；
+  会话里真的存在的那条 -> 返回 `True`。
+  回归：`test_probe.ChromiumFixtureTests` 新增 2 个用例（夹具里补了搜索框与会话列表）。
+* **两个 mismatch 枚举不要混用（同义不同名，刻意的）**：公屏回复与私信的绑定校验在两条通道上
+  各有自己的枚举 ——
+  * 评论区：`public_send_id_mismatch`（`comment_private`）；
+  * 直播间：`public_send_mismatch`（`live_private`）。
+
+  两者含义相同（拿别人那次的公屏成功来给这个事件发私信），但**名字不同是有意的**：
+  宿主只看枚举就能知道是哪条通道拒的。写文档、写测试、写桌面端映射时都必须用**准确的那个**，
+  不要把两个名字相互替换。
+  回归：`CommentBatchFlowTests.test_private_refuses_a_public_send_id_that_belongs_to_another_target`、
+  `LivePrivateBindingTests`。
 
 ### 采集数据源与「回复弹幕」（2026-09-20 真机）
 

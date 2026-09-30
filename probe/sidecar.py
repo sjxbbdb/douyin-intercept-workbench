@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import cdp as cdpmod
 import comment_flow
@@ -54,6 +54,36 @@ def _iso(ts=None):
     return datetime.fromtimestamp(ts or time.time(), timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+_DURABLE_SEND_STATES = {"failed", "blocked", "unknown", "sent_confirmed"}
+_PUBLIC_QUEUE_STATES = _DURABLE_SEND_STATES | {"sent_echoed"}
+
+
+def _durable_send_state(gate, send_id, outcome):
+    """Return the raw ledger state used by phase-two gating.
+
+    ``SendGate.result`` intentionally projects ``sent_confirmed`` to the
+    public ``unknown`` status.  That projection is safe for callers, but it
+    cannot be used to decide whether a private follow-up is allowed.  Batch
+    queues therefore read the durable ledger row and fall back to the public
+    outcome only when no row exists (for validation failures before reserve).
+    """
+    fallback = str((outcome or {}).get("status") or "unknown")
+    # Only the conservative public ``unknown`` projection may be resolved from
+    # the ledger.  A failed/blocked outcome (for example an idempotency
+    # conflict) must never inherit an older sent_confirmed row under the same
+    # sendId and unlock a private follow-up for a new attempt.
+    if fallback != "unknown":
+        return fallback if fallback in _PUBLIC_QUEUE_STATES else "unknown"
+    try:
+        raw = gate.lookup(send_id)
+        state = str((raw or {}).get("status") or "")
+    except Exception:
+        state = ""
+    if state in _DURABLE_SEND_STATES:
+        return state
+    return fallback if fallback in _DURABLE_SEND_STATES else "unknown"
+
+
 # ---------- 搜索游标（架构依据 images/10-video-search-flow）----------
 #
 # 图 10 要求：「读取一页结果 -> 按固定条件筛选并去重 -> 保存视频池与搜索游标
@@ -67,11 +97,85 @@ def _iso(ts=None):
 #    去重由 crawl.search_videos(seen_ids=...) 负责。平台自己的 has_more / cursor
 #    只作为观测信号一起返回，供宿主记录，不作为翻页依据。
 
-CURSOR_VERSION = 1
+# 游标版本 2：payload 增加 "f"（规范化后的筛选条件绑定）。
+# 🔴 版本必须升：老版本游标里【没有】筛选条件，无法判断它是在什么条件下采的，
+#    继续接受就等于把"条件变了也能接着翻"这条缺陷留在协议里。老游标一律拒绝，
+#    宿主重新发起一次搜索即可 —— 游标本来就是不透明的临时状态，不是持久资产。
+CURSOR_VERSION = 2
+# 筛选条件绑定失败（评审 2026-09-26）：
+#   游标此前只绑定【关键词 + 账号】。于是宿主可以带着 minRelevance=60 采完第一页，
+#   第二页把 minRelevance 调成 0 继续用同一个游标 —— 两页条件不同，却被当成
+#   "同一次搜索"，"这批是按 6–9 月、相关度 60 以上采的"这句话就不成立了，
+#   而宿主会据此决定给谁发消息。所以条件一变就必须拒绝旧游标，让它重新开始。
+CURSOR_FILTER_MISMATCH = "cursor_filter_mismatch"
+# 游标 "f" 里必须【三个键齐全】：少一个就说明它不是本版本产出的（或被人改过），
+# 按不一致拒绝 —— 不能拿"缺省值恰好相等"当通过，那是猜。
+CURSOR_FILTER_KEYS = ("dateFrom", "dateTo", "minRelevance")
+# 分页终止态的显式记录（images/10 第 3 步「保存视频池与搜索游标」）。
+# 只有 cursor/hasMore 时，宿主重启后分不清"到底了"和"被验证码/登录打断了"。
+PAGE_OUTCOME_MORE = "more"
+PAGE_OUTCOME_EXHAUSTED = "exhausted"
+PAGE_OUTCOME_CAPTCHA = "captcha"
+PAGE_OUTCOME_LOGIN = "login_required"
 CURSOR_MAX_SEEN = 20000
 
 
-def _encode_cursor(keyword, seen, page_no, account_scope=None):
+# "没有默认值" 的哨兵：不能用 None —— None 本身是【合法默认值】
+# （dateFrom/dateTo 为空就表示"这一侧不设边界"）。
+_NO_DEFAULT = object()
+
+
+def _int_value(value, label, default=_NO_DEFAULT):
+    """外部参数 -> int。非数字一律 invalid_input —— 绝不让裸 ValueError 冒到协议层。
+
+    收的形状：整数、以及"就是整数"的字符串（宿主常常原样透传字符串）；
+    空值（None / 空串）-> default。
+    🔴 不收 bool：True 是 int 的子类，但语义上不是数量；
+       也不收小数与其它类型 —— 悄悄取整会让人以为筛选条件生效了。
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if default is _NO_DEFAULT:
+            raise SidecarError("invalid_input", "%s must be an integer" % label)
+        return default
+    if isinstance(value, bool):
+        raise SidecarError("invalid_input", "%s must be an integer" % label)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("+-").isdigit():
+            return int(text)
+    raise SidecarError("invalid_input", "%s must be an integer" % label)
+
+
+def _filter_binding(date_from=None, date_to=None, min_relevance=0):
+    """把筛选条件规范化成游标里存的那三个值。
+
+    存的是【解析后的区间边界（epoch 秒）】而不是宿主给的原始字符串：
+    "2026-06" 与 "2026-06-01" 指向同一个区间，语义相同，不该被判成"条件变了"；
+    反过来 "2026-06" 与 "2026-07" 语义不同，必须被判出来。
+    minRelevance 是整数，直接存。
+    """
+
+    return {"dateFrom": _int_value(date_from, "dateFrom", default=None),
+            "dateTo": _int_value(date_to, "dateTo", default=None),
+            "minRelevance": _int_value(min_relevance, "minRelevance", default=0)}
+
+
+def _normalize_binding(filters):
+    """把筛选绑定收敛成规范三元组；缺省 = 不设任何筛选。
+
+    游标里的 "f" 来自外部（宿主可能原样转存过别人给它的串），
+    所以这里不信任它的形状：不是对象就当成"没有条件"，
+    由 decode 决定这算不算不一致（按不一致拒绝）。
+    """
+    if not isinstance(filters, dict):
+        return _filter_binding()
+    return _filter_binding(filters.get("dateFrom"), filters.get("dateTo"),
+                           filters.get("minRelevance"))
+
+
+def _encode_cursor(keyword, seen, page_no, account_scope=None, filters=None):
     """游标 = 不透明字符串。带 account_scope 之后，跨账号复用会被拒绝。
 
     为什么必须带：游标里的 seen 是"已经见过哪些视频"的池子。
@@ -79,18 +183,22 @@ def _encode_cursor(keyword, seen, page_no, account_scope=None):
     （多账号并行时这是静默的数据错误，不是权限问题）。
     """
     payload = {"v": CURSOR_VERSION, "k": keyword, "n": int(page_no),
-               "seen": sorted(str(x) for x in seen)}
+               "seen": sorted(str(x) for x in seen),
+               # 筛选条件一起绑定：条件变了，这个游标就不再代表"同一次搜索"。
+               "f": _normalize_binding(filters)}
     if account_scope:
         payload["a"] = str(account_scope)
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _decode_cursor(value, keyword, account_scope=None):
+def _decode_cursor(value, keyword, account_scope=None, filters=None):
     """返回 (已见视频集合, 页码)。空游标 = 第一页。任何不合法都直接拒绝。
 
-    account_scope 给定时，游标里带账号的必须与它一致（老游标不带账号字段，
-    仍然接受 —— 否则宿主手里尚未过期的那一个会被突然判死）。
+    account_scope 给定时，游标必须**证明**自己属于这个账号：带账号字段且一致。
+    🔴 缺账号字段与账号不符一样拒绝 —— 原来的 `payload.get("a") and ...` 会在
+       缺字段时直接放行，于是一个不带账号信息的游标可以被任何账号拿去当已见集合
+       （多账号并行下这是静默的数据错误）。
     """
     if value in (None, ""):
         return set(), 1
@@ -104,9 +212,27 @@ def _decode_cursor(value, keyword, account_scope=None):
         raise SidecarError("invalid_input", "cursor version is not supported")
     if payload.get("k") != keyword:
         raise SidecarError("invalid_input", "cursor does not belong to this keyword")
-    if account_scope and payload.get("a") and str(payload["a"]) != str(account_scope):
+    if account_scope and str(payload.get("a") or "") != str(account_scope):
         raise SidecarError("cursor_account_mismatch",
                            "cursor belongs to another account scope")
+    # 🔴 筛选条件必须与游标里记的一致。
+    #    默认（filters=None）= "我期望一个不带筛选的游标"，这是 fail-closed 的方向：
+    #    忘了传 filters 的调用方只会被拒绝，不会悄悄放行。
+    #    形状不对的 "f" 同样按不一致处理 —— 本版本产出的游标一定带完整三元组。
+    recorded = payload.get("f")
+    if not isinstance(recorded, dict) or set(recorded) != set(CURSOR_FILTER_KEYS):
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor was issued for other search filters; start a new search")
+    try:
+        recorded_binding = _normalize_binding(recorded)
+    except SidecarError:
+        # "f" 里塞了非数字（"abc" / [] / {}）：这不是本版本产出的游标，
+        # 按【不一致】拒绝，绝不把裸 ValueError/TypeError 冒到协议层。
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor filter bindings are malformed; start a new search")
+    if recorded_binding != _normalize_binding(filters):
+        raise SidecarError(CURSOR_FILTER_MISMATCH,
+                           "cursor was issued for other search filters; start a new search")
     seen = payload.get("seen")
     if not isinstance(seen, list) or len(seen) > CURSOR_MAX_SEEN:
         raise SidecarError("invalid_input", "cursor pool is invalid")
@@ -157,6 +283,74 @@ def _filter_text(value, label, limit=400):
     if len(value) > limit:
         raise SidecarError("invalid_input", "%s is too long" % label)
     return value
+
+
+# 搜索的发布时间区间：口径写死在【北京时间】，与商家/宿主嘴里的"6–9 月"一致。
+# create_time 是 epoch 秒；不约定时区的话，月初/月末那几条会跨月，
+# 表现成"选了 6 月却少一条"，而且没人看得出为什么。
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def _iso_cn(ts):
+    """epoch 秒 -> 北京时间 ISO 串（给 UI 直接显示用）。"""
+    if not ts:
+        return None
+    return datetime.fromtimestamp(int(ts), tz=_CN_TZ).isoformat(timespec="seconds")
+
+
+def _date_bound_epoch(value, label, end=False):
+    """把 YYYY-MM 或 YYYY-MM-DD 解析成 epoch 秒；空值 = 该边界不设。
+
+    只收这两种形状：宿主（以及后面的 UI 日期选择器）给的就是月或日，
+    收窄输入面比兼容一堆格式更安全。end=True 时取该月/该日的【最后一秒】，
+    这样 "2026-06 ~ 2026-09" 天然包含 6 月初到 9 月末。
+    """
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise SidecarError("invalid_input", "%s must be a string" % label)
+    parts = value.strip().split("-")
+    try:
+        if len(parts) == 2:
+            year, month = int(parts[0]), int(parts[1])
+            if not 1 <= month <= 12:
+                raise ValueError("month")
+            if end:
+                nxt = datetime(year + month // 12, month % 12 + 1, 1, tzinfo=_CN_TZ)
+                return int(nxt.timestamp()) - 1
+            return int(datetime(year, month, 1, tzinfo=_CN_TZ).timestamp())
+        if len(parts) == 3:
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            start = datetime(year, month, day, tzinfo=_CN_TZ)
+            return int(start.timestamp()) + (86400 - 1 if end else 0)
+    except (TypeError, ValueError):
+        pass
+    raise SidecarError("invalid_input", "%s must be YYYY-MM or YYYY-MM-DD" % label)
+
+
+def _apply_date_range(rows, date_from, date_to):
+    """按 createTime 过区间。返回 (保留行, 被区间筛掉数, 取不到发布时间数)。
+
+    🔴 拿不到发布时间的【不算通过】：宁可少给一条，也不要交给宿主一条
+       无法证明其发布时间的视频 —— 否则"这批是按 6–9 月采的"这句话就不成立，
+       而宿主会据此去发消息。
+    """
+    if date_from is None and date_to is None:
+        return list(rows), 0, 0
+    kept, dropped, unknown = [], 0, 0
+    for row in rows:
+        ts = row.get("createTime")
+        if not ts:
+            unknown += 1
+            continue
+        if date_from is not None and ts < date_from:
+            dropped += 1
+            continue
+        if date_to is not None and ts > date_to:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped, unknown
 
 
 def _dedupe_by_author(rows):
@@ -226,6 +420,241 @@ def _public_guard(gate, public_send_id):
         return ("public_" + status,
                 "public reply is %s; only %s allows a private message"
                 % (status, PUBLIC_CONFIRMED))
+    return None
+
+
+BINDING_MISMATCH = "public_send_id_mismatch"
+
+
+def _comment_public_binding(queue, event_id, public_send_id):
+    """③ 对应性：这个 publicSendId 必须是【本事件】那一次公屏回复。
+
+    只做 ①② 会留下一条绕过路径：拿 A 的公屏成功去给 B 发私信（张冠李戴）。
+    直播路径早就补了这一道（见 live_private 的 public_send_mismatch），
+    评论区此前【只有执行时校验、候选清单不校验】—— 于是清单说 allowed、
+    执行却 blocked，宿主据此建出来的计划会当场失败。这里让两处用同一个判定。
+
+    找不到本事件的公屏记录时按 fail-closed 拒绝：能走到这里说明该 sendId
+    确实是一次已确认的公屏回复，那就必然是【别的】事件的 —— 不是本条的。
+    """
+    event = queue.find_event(event_id) or {}
+    recorded = str(((event.get("detail") or {}).get("sendId")) or "")
+    if public_send_id != recorded:
+        return BINDING_MISMATCH
+    return None
+
+
+# ---- 服务端签发策略的【身份】校验（评审 2026-09-26）----
+#
+# 策略内容（放行哪些公开状态、条数上限……）由授权服务端签发并校验，本侧不接收、
+# 也不执行调用方自带的策略（见各处的 policy_not_server_issued）。这里做的是
+# 【身份】层面的两件事：冻结时记下"这次执行用的是哪一版策略"、执行时要求带回来且一致。
+POLICY_REF_MISSING = "policy_ref_missing"
+POLICY_REF_MISMATCH = "policy_ref_mismatch"
+
+
+def _policy_ref(params):
+    """从调用参数里取策略身份；全部缺省返回 None（= 宿主还没接授权端）。
+
+    两种传法都接受，但不许互相矛盾：
+      · 平铺：policyId / policyVersion / knowledgeSetVersion（平台侧命名的字段）；
+      · 嵌套：policyRef 对象 —— 宿主把冻结计划里回显的那个对象原样带回来即可。
+    形状问题一律 invalid_policy_ref：这里只收"稳定的身份标识"，
+    不是随便一个字符串，也不允许借这个口子夹带策略内容。
+    """
+    flat = {key: params.get(key) for key in live_flow.POLICY_REF_FIELDS}
+    nested = params.get("policyRef")
+    has_flat = any(value not in (None, "") for value in flat.values())
+    try:
+        if not has_flat and nested in (None, ""):
+            return None
+        if has_flat and nested not in (None, ""):
+            if not isinstance(nested, dict):
+                raise SidecarError("invalid_policy_ref", "policyRef must be an object")
+            merged = dict(nested)
+            for key, value in flat.items():
+                if value in (None, ""):
+                    continue
+                if str(merged.get(key)) not in (str(value), "None"):
+                    raise SidecarError("invalid_policy_ref",
+                                       "policyRef and the flat policy fields disagree")
+                merged[key] = value
+            return live_flow.normalize_policy_ref(merged)
+        if nested not in (None, ""):
+            return live_flow.normalize_policy_ref(nested)
+        return live_flow.normalize_policy_ref(flat)
+    except live_flow.LiveFlowError as exc:
+        raise SidecarError(exc.code, exc.message)
+
+
+def _policy_ref_refusal(plan, params):
+    """执行阶段：身份必须与冻结计划一致。返回 (code, message) 或 None。
+
+    计划里没记身份（宿主还没接授权端）时不额外要求，保持既有行为；
+    记了身份就必须带回来、而且必须一致 —— 否则"这条批次是按哪一版策略跑的"
+    在计划与执行之间就断了，换一版策略继续发同一条冻结计划，事后无法解释。
+    """
+    frozen = (plan or {}).get("policyRef") or {}
+    if not str(frozen.get("policyId") or ""):
+        return None
+    supplied = _policy_ref(params)
+    if supplied is None:
+        return (POLICY_REF_MISSING,
+                "this batch was frozen under a server-issued policy; send its identity back")
+    if live_flow.normalize_policy_ref(frozen) != supplied:
+        return (POLICY_REF_MISMATCH,
+                "the supplied policy identity is not the one this plan was frozen under")
+    return None
+
+
+DANMAKU_KEY_PREFIXES = ("live-danmaku-native:", "live-danmaku:")
+
+
+def _norm_binding_name(value):
+    """昵称归一化：零宽字符、脱敏星号、空白都不参与比较（与页面侧同一套口径）。"""
+    text = str(value or "")
+    for junk in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        text = text.replace(junk, "")
+    for star in ("*", "＊"):
+        text = text.replace(star, "")
+    return "".join(text.split())
+
+
+def _danmaku_public_binding(row, target):
+    """③ 对应性（弹幕通路）：公屏回复必须【同一事件 + 同一收件人】。
+
+    🔴 评审 2026-09-29：单发私信此前只对 kind=comment 做对应性校验，弹幕通路被整条跳过
+    （旧注释的理由是"弹幕 target_key 的末段是昵称不是 sec_uid"）。后果是：
+    **拿 A 那条已确认的公屏回复，给 B 发私信**，在宿主最常直接调用的 send_private
+    入口上走得通 —— 张冠李戴。
+
+    其实 key 的结构够用：`live-danmaku[-native]:<eventId>:<authorName>`。所以这里要求：
+      · DM 目标必须带上同一个 eventId（`eventId`，兼容 `id`）—— 缺失即拒绝；
+      · 昵称必须与 key 里记的那一个一致（归一化后比较）—— 缺失同样拒绝（无从证明是同一人）。
+    """
+    key = str(row.get("target_key") or "")
+    prefix = next((item for item in DANMAKU_KEY_PREFIXES if key.startswith(item)), None)
+    if prefix is None:
+        return None
+    event_id, _, author_name = key[len(prefix):].partition(":")
+    if not event_id:
+        return ("public_event_missing", "the bound danmaku reply carries no event id")
+    if not isinstance(target, dict):
+        return None
+    target_event = str(target.get("eventId") or target.get("id") or "").strip()
+    if not target_event:
+        return ("public_event_missing",
+                "a danmaku private message must carry the eventId of the bound public reply")
+    if target_event != event_id:
+        return ("public_event_mismatch",
+                "the bound danmaku reply belongs to another event; a private message may only "
+                "bind the public reply of the same event")
+    expected = _norm_binding_name(author_name)
+    actual = _norm_binding_name(target.get("authorName"))
+    if not actual:
+        return ("public_target_missing",
+                "a danmaku private message must carry the authorName of the bound reply")
+    if expected and expected != actual:
+        return ("public_target_mismatch",
+                "the bound danmaku reply belongs to another recipient; a private message must "
+                "bind the reply of the same recipient")
+    return None
+
+
+# ---- 通用私信入口的输入预检（评审 2026-09-29）----
+# 参数级错误不该有浏览器成本：以前 target 不是对象 / 缺 authorId / text 空或过长，
+# 会一路走到 send_actions 里才失败 —— 那时浏览器已经开了（还留下"点了一半"的现场）。
+PRIVATE_MAX_TEXT = 2000
+_AUTHOR_ID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+
+def _author_id_shape_ok(value):
+    """与 send_actions.AUTHOR_ID_RE（^[A-Za-z0-9_-]{1,200}$）同一口径。"""
+    text = str(value or "")
+    if not 1 <= len(text) <= 200:
+        return False
+    return all(ch in _AUTHOR_ID_CHARS for ch in text)
+
+
+def _private_input_refusal(params):
+    """通用私信的输入预检；返回 (code, message) 或 None。**必须在打开浏览器之前调用。**
+
+    覆盖：sendId / target 类型 / target.authorId 形状 / text 类型与长度。
+    更细的绑定校验（publicSendId、事件与收件人）在 _private_binding_mismatch 里，
+    同样发生在打开浏览器之前。
+    """
+    if not isinstance(params, dict):
+        return ("invalid_input", "params must be an object")
+    if not str(params.get("sendId") or "").strip():
+        return ("invalid_input", "sendId is required")
+    target = params.get("target")
+    if not isinstance(target, dict):
+        return ("invalid_input", "target must be an object")
+    if not _author_id_shape_ok(target.get("authorId")):
+        return ("invalid_input", "target.authorId is invalid")
+    text = params.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return ("invalid_input", "text must be a non-empty string")
+    if len(text) > PRIVATE_MAX_TEXT:
+        return ("invalid_input", "text must be 1-%d characters" % PRIVATE_MAX_TEXT)
+    return None
+
+
+def _item_plan_membership(queue, plan_ids, event_id):
+    """逐项预判定：这个 eventId 是否【属于本批次】。返回稳定 reason 或 None。
+
+    🔴 评审 2026-09-29：以前是先 mark_private(...) 再发现事件不存在 ——
+    对不存在的 eventId 队列层会抛 unknown_event，而且已经尝试写一次没有意义的私有记录。
+    现在先判归属（纯读，无副作用），再决定要不要落台账：
+      · 事件在队列里根本不存在    -> event_not_in_plan
+      · 事件存在但不属于本批次    -> event_not_in_plan
+    两者对宿主是同一件事：这条不该按"本批次的一条"来处理。
+    """
+    key = str(event_id or "").strip()
+    if not key:
+        return "event_not_in_plan"
+    if queue.find_event(key) is None:
+        return "event_not_in_plan"
+    if key not in plan_ids:
+        return "event_not_in_plan"
+    return None
+
+
+def _item_plan_ids(queue, batch_id):
+    """本批次的 eventId 集合（冻结计划里的目标）。取不到就返回空集合（fail-closed）。"""
+    try:
+        plan = queue.plan(batch_id) or {}
+    except Exception:
+        return set()
+    return {str(target.get("eventId")) for target in (plan.get("targets") or [])}
+
+
+def _private_binding_mismatch(gate, public_send_id, target):
+    """单发私信的 ③ 对应性校验；返回 (code, message) 或 None。
+
+    两条公屏通路都要绑（评审 2026-09-29：弹幕通路以前整条没绑）：
+      · comment ：target_key = source:commentId:authorId（末段是评论作者 sec_uid）；
+      · danmaku ：target_key = live-danmaku[-native]:eventId:authorName ——
+                  必须同一事件 + 同一收件人，见 _danmaku_public_binding。
+    """
+    row = gate.lookup(str(public_send_id or "").strip())
+    if not row:
+        return None
+    kind = str(row.get("kind") or "")
+    if kind == "danmaku_reply":
+        return _danmaku_public_binding(row, target)
+    if kind != "comment" or not isinstance(target, dict):
+        return None
+    author_id = str(target.get("authorId") or "").strip()
+    if not author_id:
+        return None
+    parts = str(row.get("target_key") or "").split(":")
+    if len(parts) < 3:
+        return None
+    if parts[-1] != author_id:
+        return (BINDING_MISMATCH,
+                "the bound public reply belongs to another author; "
+                "a private message must bind the reply of the same recipient")
     return None
 
 
@@ -337,7 +766,7 @@ def _navigate(page, url):
 
 
 class Sidecar:
-    def __init__(self, state_dir, profile_dir, port):
+    def __init__(self, state_dir, profile_dir, port, gate_limits=None):
         self.state_dir = self._external_dir(state_dir, "state-dir")
         self.profile_dir = self._external_dir(profile_dir, "profile-dir")
         self.port = int(port)
@@ -345,7 +774,10 @@ class Sidecar:
             raise SidecarError("invalid_port", "port must be between 1024 and 65535")
         os.makedirs(self.state_dir, exist_ok=True)
         self.account_scope = hashlib.sha256(self.profile_dir.encode("utf-8")).hexdigest()[:32]
-        self.gate = SendGate(self.state_dir, self.account_scope)
+        # 本地安全阀（每目标 1 条 / 每小时 / 每天）。默认值保持不变；
+        # 授信调用方可以显式调高（真机验收、压测等场景）—— 这是【本地】限额，
+        # 不是平台配额，调高它不等于绕过平台风控（见 send_gate 的说明）。
+        self.gate = SendGate(self.state_dir, self.account_scope, limits=gate_limits)
         # 点击审计：每次（含被拒绝的）点击都写一行，便于事后复核落点
         click_guard.set_audit_path(os.path.join(self.state_dir, "click_audit.jsonl"))
         self.live_queue = live_flow.LiveQueue(self.state_dir, self.account_scope)
@@ -392,15 +824,34 @@ class Sidecar:
         if not tab:
             raise SidecarError("target_not_found", "owned browser target is unavailable")
         page = cdpmod.CDP(tab["webSocketDebuggerUrl"], port=self.port, timeout=30)
-        if douyin.visibility_state(page) != "visible":
+        state = douyin.visibility_state(page)
+        if state == "hidden":
+            # 只有明确 hidden 才尝试恢复；没有可靠 PID 时 fail-closed，
+            # 绝不遍历系统上的 Chrome 窗口（会抢走其它账号的前台状态）。
+            # 先校验 PID：非法值直接 fail-closed，绝不去猜窗口、也不枚举所有 Chrome
+            pid = winfocus.coerce_pid(marker.get("pid"))
+            if pid is None:
+                page.close()
+                raise SidecarError("browser_not_visible",
+                                   "owned browser pid is missing or invalid; bring the window to front manually")
             try:
                 page.call("Page.bringToFront", {}, timeout=5)
             except Exception:
                 pass
-            winfocus.bring_process_front(marker.get("pid"), log=lambda msg: print(msg, file=sys.stderr))
+            winfocus.bring_process_front(pid, log=lambda msg: print(msg, file=sys.stderr))
             time.sleep(0.4)
-        if douyin.visibility_state(page) != "visible":
+            state = douyin.visibility_state(page)
+        elif state == "unknown":
+            # unknown 不等于 hidden：判定不了就交给人工，不猜、不重试。
             page.close()
+            raise SidecarError("page_visibility_unknown",
+                               "cannot determine page visibility; manual check required")
+        if state != "visible":
+            page.close()
+            if state == "unknown":
+                # 判定不了 ≠ 明确不可见：分开上报，避免上层按「窗口不可见」去自动重试
+                raise SidecarError("page_visibility_unknown",
+                                   "cannot determine page visibility after focus recovery; manual check required")
             raise SidecarError("browser_not_visible", "owned browser window must be visible")
         return page, marker
 
@@ -510,7 +961,8 @@ class Sidecar:
                                                                    "public_unknown",
                                                                    "public_failed",
                                                                    "public_blocked",
-                                                                   "missing_author_id"]}},
+                                                                   "missing_author_id",
+                                                                   BINDING_MISMATCH]}},
                 # 批量私信候选清单（只读，不碰浏览器）：替宿主守住"公屏确认成功才允许私信"这条契约。
                 # 它不是发送动作，所以不参与 autoEligible 发送闸门；但仍然标 autoEligible=false，
                 # 避免任何调用方把它误当成"可以自动发私信"的开关。
@@ -525,7 +977,8 @@ class Sidecar:
                                                                                  "public_unknown",
                                                                                  "public_failed",
                                                                                  "public_blocked",
-                                                                                 "missing_author_id"]}},
+                                                                                 "missing_author_id",
+                                                                                 BINDING_MISMATCH]}},
                 # 采集数据源：优先读页面内存里的弹幕数据模型（带 sec_uid），DOM 文本兜底。
                 "live_capture_source": {"implemented": True, "autoEligible": False,
                                          "validation": {"status": "page_memory_verified_2026_09_19",
@@ -667,19 +1120,31 @@ class Sidecar:
         if not isinstance(keyword, str) or not keyword.strip() or len(keyword) > MAX_KEYWORD:
             raise SidecarError("invalid_input", "keyword is required")
         keyword = keyword.strip()
-        max_videos = int(params.get("maxVideos", 50))
-        rounds = int(params.get("scrollRounds", 6))
+        # 🔴 参数解析必须给出【稳定错误码】：原来直接 int(...)，宿主给 "abc" / [] 时
+        #    会抛出裸 ValueError（协议层只能看到一个没有码的内部错误）。
+        max_videos = _int_value(params.get("maxVideos", 50), "maxVideos", default=50)
+        rounds = _int_value(params.get("scrollRounds", 6), "scrollRounds", default=6)
         if not 1 <= max_videos <= 200 or not 0 <= rounds <= 40:
             raise SidecarError("invalid_input", "search bounds are invalid")
         cursor_in = params.get("cursor")
         # account_scope 用 getattr 取：测试替身（__new__ 构造）没有这个属性，
         # 而游标绑定属于【加法能力】，不该让既有的搜索契约整体失败。
         scope = getattr(self, "account_scope", None)
-        seen, page_no = _decode_cursor(cursor_in, keyword, scope)
+        # 发布时间区间：可配置（宿主/后续 UI 给 "YYYY-MM" 或 "YYYY-MM-DD"）。
+        # 为什么不由平台筛选面板决定：面板只给"一天内/一周内/半年内"这类预设，
+        # 表达不了"2026 年 6–9 月"这种自选区间，所以区间判定放在本侧。
+        date_from = _date_bound_epoch(params.get("dateFrom"), "dateFrom")
+        date_to = _date_bound_epoch(params.get("dateTo"), "dateTo", end=True)
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise SidecarError("invalid_input", "dateFrom must not be after dateTo")
 
-        min_relevance = int(params.get("minRelevance", 0) or 0)
+        min_relevance = _int_value(params.get("minRelevance", 0), "minRelevance", default=0)
         if not 0 <= min_relevance <= 100:
             raise SidecarError("invalid_input", "minRelevance must be between 0 and 100")
+        # 🔴 游标必须在【筛选条件校验之后】才解码：它现在绑定的是解析后的
+        #    dateFrom/dateTo/minRelevance 三元组，先解码就没得比。
+        binding = _filter_binding(date_from, date_to, min_relevance)
+        seen, page_no = _decode_cursor(cursor_in, keyword, scope, binding)
         page, _ = self._page()
         try:
             if douyin.login_state(page) == "required":
@@ -687,6 +1152,8 @@ class Sidecar:
                 # 否则上层会自动接着请求，等于对着一个已失效的登录态继续打平台。
                 return {"status": "login_required", "videos": [], "cursor": None,
                         "hasMore": False, "stoppedReason": "login_required",
+                        "pageOutcome": PAGE_OUTCOME_LOGIN,
+                        "cursorVersion": CURSOR_VERSION,
                         "page": page_no, "poolSize": len(seen)}
             # 只有【第一页】或【已经不在搜索页上】才重新导航；
             # 否则保持页面原状、继续往下滚 —— 这才是"读取下一页"。
@@ -710,15 +1177,23 @@ class Sidecar:
                 video_id = str(video.get("aweme_id") or "")
                 if not video_id:
                     continue
+                # create_time 本来就在 crawl.parse_search_item 里解析好了，
+                # 只是此前没有透传给宿主 —— 于是"按发布时间筛"根本无从下手。
+                create_ts = int(video.get("create_time") or 0) or None
                 rows.append({"id": video_id,
                              "url": safe_url(video.get("url"), "video.url"),
                              "title": str(video.get("desc") or "")[:200],
                              "author": str(video.get("author") or "")[:120],
                              "authorId": str(video.get("author_sec_uid") or "")[:200],
+                             "createTime": create_ts,
+                             "publishedAt": _iso_cn(create_ts),
                              "relevance": crawlmod.video_relevance(video.get("desc"), keyword)})
-            out = [row for row in rows if row["relevance"]["score"] >= min_relevance][:max_videos]
-            filtered = len(rows) - len([row for row in rows
-                                        if row["relevance"]["score"] >= min_relevance])
+            passed = [row for row in rows if row["relevance"]["score"] >= min_relevance]
+            filtered = len(rows) - len(passed)
+            # 顺序：相关度 -> 发布时间 -> 截断。截断放最后，否则
+            # maxVideos 会先把候选砍掉、再被日期筛空，看起来像"这个月没视频"。
+            out, filtered_by_date, unknown_date = _apply_date_range(passed, date_from, date_to)
+            out = out[:max_videos]
             # 搜索结果保存：候选落库（按 账号 + 关键词），videoId 从此可以被正式引用。
             pool_saved = None
             store = self._pool()
@@ -736,7 +1211,14 @@ class Sidecar:
                                 if v.get("aweme_id")}
             page_filter = {"collected": len(videos), "returned": len(out),
                            "filteredByRelevance": filtered,
-                           "minRelevance": min_relevance}
+                           "filteredByDate": filtered_by_date,
+                           "unknownDate": unknown_date,
+                           "dateFrom": params.get("dateFrom") or None,
+                           "dateTo": params.get("dateTo") or None,
+                           "minRelevance": min_relevance,
+                           # 游标里绑定的规范化筛选条件（epoch 秒）。宿主可据此核对
+                           # "这个游标属于哪一组条件"，不必自己解析游标。
+                           "cursorFilters": dict(binding)}
             if meta.get("stopped_reason") == "captcha":
                 # 🔴 验证码是【终止状态】，不是"这一页到头了"。
                 #    继续返回 cursor / hasMore=true，上层就会自动接着翻页 ——
@@ -750,6 +1232,8 @@ class Sidecar:
                         "cursor": None,
                         "hasMore": False,
                         "stoppedReason": "captcha",
+                        "pageOutcome": PAGE_OUTCOME_CAPTCHA,
+                        "cursorVersion": CURSOR_VERSION,
                         "page": page_no,
                         "poolSize": len(pool),
                         "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
@@ -758,12 +1242,43 @@ class Sidecar:
                         "platformCursor": meta.get("platform_cursor"),
                         "poolSaved": pool_saved,
                         "filter": page_filter}
-            # 本页一条新视频都没有 -> 池子到头了，宿主可以停止翻页。
+            # 🔴 判"还有没有下一页"必须看 videos（本页采到的新视频），不能看 out。
+            #    out 是【相关度筛过】的列表：minRelevance>0 时本页可能条条被筛掉，
+            #    但那不代表没有下一页。原来 hasMore 取 bool(out)，于是相关度一调高，
+            #    翻页就会在还有下一页的时候提前停住，宿主以为找完了。
+            if not videos:
+                # 本页一条新视频都没有 -> 池子到头了。终止态与验证码/登录同一套收敛：
+                # 不能一边说 hasMore=false，一边又把 cursor 交出去 —— 否则按
+                # 「有 cursor 就继续翻」实现的宿主会一直翻下去。
+                #    poolIds 仍然是【数据】不是翻页指令，照常返回，方便宿主保存去重账。
+                return {"status": "ok",
+                        "videos": out,
+                        "cursor": None,
+                        "hasMore": False,
+                        "stoppedReason": "pool_exhausted",
+                        "pageOutcome": PAGE_OUTCOME_EXHAUSTED,
+                        "cursorVersion": CURSOR_VERSION,
+                        "page": page_no,
+                        "poolSize": len(pool),
+                        "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
+                        "skippedSeen": int(meta.get("skipped_seen") or 0),
+                        "platformHasMore": meta.get("platform_has_more"),
+                        "platformCursor": meta.get("platform_cursor"),
+                        "poolSaved": pool_saved,
+                        "filter": page_filter}
             return {"status": "ok",
                     "videos": out,
-                    "cursor": _encode_cursor(keyword, pool, page_no + 1, scope),
-                    "hasMore": bool(out),
+                    "cursor": _encode_cursor(keyword, pool, page_no + 1, scope, binding),
+                    "hasMore": True,
                     "stoppedReason": None,
+                    # 分页记录：宿主重启后要能复现"这一页为什么停"，也认得出游标是哪一版产出的。
+                    # more / exhausted 与 captcha / login_required 是两类不同的停：
+                    # 前两个是"平台这边就这样了"，后两个是"我们这边被拦住了"。
+                    # 🔴 这里【必然】是 more：能走到这一行就意味着本页采到了新视频。
+                    #    不能写成 MORE if out else EXHAUSTED —— out 是相关度筛过的列表，
+                    #    本页条条被筛掉时会给出 hasMore=true 却又说 exhausted，自相矛盾。
+                    "pageOutcome": PAGE_OUTCOME_MORE,
+                    "cursorVersion": CURSOR_VERSION,
                     "page": page_no,
                     "poolSize": len(pool),
                     "poolIds": sorted(pool)[:CURSOR_MAX_SEEN],
@@ -874,6 +1389,26 @@ class Sidecar:
                 item["matchedKeyword"] = str(row.get("matched_keyword") or "")
                 item["digg"] = int(row.get("digg") or 0)
                 targets.append(item)
+            # 只读探测，不滚动不点击：给每个目标标出【此刻能不能回】。
+            #
+            # 🔴 口径必须与发送阶段一致（2026-09-21 评审）：这里用的是与
+            #    douyin.comment_reply_button 同一份判定（共用 replyButtonIn + 同一套 reason），
+            #    所以 visible=true 蕴含"发送阶段能直接点到回复按钮"，
+            #    不会出现"标注说能回、点下去却必被拒"的不一致。
+            #    探测本身失败记为 None —— 不能把"没探到"当成"不可见"，那是两件事。
+            for item in targets:
+                try:
+                    state = douyin.comment_row_present(page, item)
+                    item["rowPresent"] = bool(state.get("present"))
+                    item["rowMatches"] = int(state.get("matches") or 0)
+                    # visible 是【强语义】：唯一命中 + 回复按钮存在可见且在视口内
+                    item["visible"] = bool(state.get("replyReady"))
+                    item["visibilityReason"] = str(state.get("reason") or "")
+                except Exception:
+                    item["visible"] = None
+                    item["rowPresent"] = None
+                    item["visibilityReason"] = None
+            visible_count = sum(1 for it in targets if it.get("visible"))
             filtered = {
                 "collected": len(rows),
                 "matched": int(fstats.get("matched") or 0),
@@ -886,6 +1421,12 @@ class Sidecar:
                 "keywords": list(fstats.get("keywords") or []),
                 "excludeKeywords": list(fstats.get("exclude_keywords") or []),
                 "modeCounts": dict(fstats.get("modes") or {}),
+                # 🔴 可见性是回复能否成功的前提（真机 2026-09-21）：
+                #    采集走接口能拿 100~200 条，回复走 DOM 只渲染几十条，两个集合不重合。
+                #    这里如实告诉宿主哪些目标【此刻在页面上】，让它只挑可见的；
+                #    否则宿主会选到一个够不到的目标，反复重试后才发现是白费。
+                "visibleCount": visible_count,
+                "invisibleCount": len(targets) - visible_count,
             }
             return {"status": status, "events": events, "targets": targets, "filter": filtered,
                     "capability": {"verified": bool(events), "source": "api_or_dom",
@@ -900,6 +1441,45 @@ class Sidecar:
     # 「关键词匹配评论 -> 逐条公开回复 -> 确认后私信」这条固定流程只能靠宿主自觉，
     # 而两阶段契约（只有 sent_confirmed 才允许私信）是无法靠自觉守住的。
     # 这里把直播间已经跑通的同一套机制（队列 -> 批次 -> 冻结计划 -> 两阶段）搬到评论区。
+
+    def _reply_reachable_split(self, url, targets, limit=24):
+        """按【此刻页面上真的能点开「回复」】把候选分堆（只读，不下任何单）。
+
+        🔴 真机结论（2026-09-29）：视频页只渲染【几行】评论，而我们是按评论接口采的
+        （实测接口 179 条 / 命中 49 条，页面只渲染 5 行），两个集合【不重合】——
+        接口里有、页面上没有的评论技术上无法回复，冻结进批次只会让回复阶段成片
+        reply_target_not_rendered。直播间那条早就有 pick_reply_target 做这件事，评论区一直缺。
+
+        判据直接用 comment_row_present 的 replyReady（唯一命中 + 回复按钮可见且在视口内），
+        与发送阶段同源，避免"标注能回、真去点却点不着"。
+
+        返回 (reachable, unreachable, checked)。任何探针异常都返回 checked=False，
+        上层据此退回旧行为 —— 不因为探针坏了就把批次清空。
+        """
+        page = None
+        try:
+            page, _ = self._page()
+            _navigate(page, url)
+            if not _wait_document(page):
+                return list(targets), [], False
+            reachable, unreachable = [], []
+            for index, target in enumerate(targets):
+                if index >= limit:
+                    # 超出检查上限的按"可回复"处理（best-effort，不无限探）。
+                    reachable.extend(targets[index:])
+                    break
+                state = douyin.comment_row_present(
+                    page, {"authorId": target.get("authorId"), "text": target.get("text")})
+                if state.get("replyReady"):
+                    reachable.append(target)
+                else:
+                    unreachable.append(target)
+            return reachable, unreachable, True
+        except Exception:
+            return list(targets), [], False
+        finally:
+            if page is not None:
+                page.close()
 
     def comment_plan(self, params):
         """采集一条视频的评论、按关键词筛选，形成【评论批次】并冻结话术。
@@ -931,6 +1511,8 @@ class Sidecar:
             # 在这个接线完成之前，边界一律拒绝调用方自带策略。
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
+        # 🔴 策略身份在【建批次之前】校验：形状不对就不该产生任何队列副作用。
+        policy_ref = _policy_ref(params)
         public_text = params.get("publicText")
         private_text = params.get("privateText")
         for value, label in ((public_text, "public_text"), (private_text, "private_text")):
@@ -959,8 +1541,23 @@ class Sidecar:
         if not targets:
             return {"status": "empty", "batch": None, "targets": [], "blocked": [],
                     "expired": [], "filter": filtered}
-
-        self.comment_queue.append(targets)
+        # 🔴 真机（2026-09-29）：先按"此刻页面上能不能点开「回复」"筛一遍再冻结。
+        #    接口采到的评论里，页面上没渲染的那些【技术上无法回复】——
+        #    冻进批次只会让回复阶段成片 reply_target_not_rendered（实测 8 条里 6 条）。
+        video_url = collected.get("url") or url
+        reachable, unreachable, checked = self._reply_reachable_split(video_url, targets)
+        filtered = dict(filtered or {})
+        filtered["replyReachable"] = len(reachable)
+        filtered["replyUnreachable"] = len(unreachable)
+        filtered["replyReachabilityChecked"] = checked
+        if checked and not reachable:
+            # 页面上一条都点不开：不冻批次，让宿主换视频/换关键词，
+            # 而不是冻一批注定失败的（宿主据此提前止损，不必等到回复阶段才发现）。
+            return {"status": "empty", "batch": None, "targets": [], "blocked": [],
+                    "expired": [], "filter": filtered,
+                    "reason": "no_replyable_comment"}
+        pool = reachable if checked else targets
+        self.comment_queue.append(pool)
         batch = self.comment_queue.take_batch(max_items=max_items,
                                               window_seconds=window_seconds)
         summary = comment_flow.batch_summary(batch)
@@ -970,7 +1567,8 @@ class Sidecar:
                     "batchFilter": summary.get("filter") or {}}
         plan = self.comment_queue.freeze_plan(
             batch["batchId"],
-            comment_flow.build_scripts(batch["events"], public_text, private_text))
+            comment_flow.build_scripts(batch["events"], public_text, private_text),
+            policy_ref=policy_ref)
         # 摘要里的 frozen/status 必须是【冻结之后】的事实：take_batch 那一刻还没冻结，
         # 直接回传会让宿主以为计划没冻上。
         summary["frozen"] = True
@@ -986,7 +1584,9 @@ class Sidecar:
                 "publicTextSha256": (plan["targets"][0]["publicTextSha256"]
                                      if plan["targets"] else None),
                 "scriptSource": plan.get("scriptSource"),
-                "policy": plan.get("policy"), "policySource": plan.get("policySource")}
+                "policy": plan.get("policy"), "policySource": plan.get("policySource"),
+                # 服务端策略身份（与计划一起冻结；私信阶段必须原样带回来）
+                "policyRef": plan.get("policyRef")}
 
     def comment_reply(self, params):
         """阶段一：对批次内被接受的条目【逐条公开回复】。
@@ -999,6 +1599,11 @@ class Sidecar:
         plan = self.comment_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        # 🔴 策略身份必须与冻结计划一致（评审 2026-09-26）：换一版策略继续发同一条
+        #    冻结计划，事后无法解释。校验在打开浏览器之前完成。
+        refusal = _policy_ref_refusal(plan, params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         results, sendable = [], []
         for item in items:
             target = self.comment_queue.target(batch_id, item["eventId"])
@@ -1023,10 +1628,12 @@ class Sidecar:
                                       "authorName": target["authorName"], "text": target["text"]}
                     outcome = send_comment(page, self.gate, item["sendId"], comment_target,
                                             text, "video")
+                    recorded_state = _durable_send_state(self.gate, item["sendId"], outcome)
                     self.comment_queue.mark(item["eventId"],
-                                            str(outcome.get("status") or "unknown"), batch_id,
+                                            recorded_state, batch_id,
                                             {"sendId": item["sendId"],
-                                             "reason": outcome.get("reason")})
+                                             "reason": outcome.get("reason"),
+                                             "recordedState": recorded_state})
                     results.append(dict(outcome, eventId=item["eventId"]))
             finally:
                 page.close()
@@ -1051,42 +1658,57 @@ class Sidecar:
         """
         batch_id, items = _comment_batch_items(params)
         self.comment_queue.ensure_active(batch_id)
+        refusal = _policy_ref_refusal(self.comment_queue.plan(batch_id), params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         allowed, rejected = self.comment_queue.private_candidates(batch_id)
         by_id = {target["eventId"]: target for target in allowed}
         reasons = {row.get("eventId"): row.get("reason") for row in rejected}
+        # 🔴 评审 2026-09-29：先判【这个 eventId 是否属于本批次】（纯读、无副作用），
+        #    再决定要不要落台账。以前是先 mark_private(...) —— 对不存在的 eventId
+        #    队列层会抛 unknown_event，而且已经尝试写了一次没有意义的私有记录。
+        plan_ids = _item_plan_ids(self.comment_queue, batch_id)
         results, sendable = [], []
         for item in items:
+            event_id = str(item.get("eventId") or "").strip()
+            membership = _item_plan_membership(self.comment_queue, plan_ids, event_id)
+            if membership:
+                # 不属于本批次：逐项给稳定结果，绝不落台账、绝不打开浏览器。
+                results.append({"eventId": event_id, "status": "blocked",
+                                "reason": membership})
+                continue
             # 两阶段门禁必须落在每个批次条目上，而不是只依赖
             # private_candidates 的状态筛选：任何调用方都不能拿一个
             # 其它公屏动作，或省略 publicSendId，来绕过本条评论的绑定。
             public_send_id = str(item.get("publicSendId") or "").strip()
             if not public_send_id:
-                self.comment_queue.mark_private(item["eventId"], "blocked", batch_id,
+                self.comment_queue.mark_private(event_id, "blocked", batch_id,
                                                  {"reason": "public_missing"})
-                results.append({"eventId": item["eventId"], "status": "blocked",
+                results.append({"eventId": event_id, "status": "blocked",
                                 "reason": "public_missing"})
                 continue
             refusal = _public_guard(self.gate, public_send_id)
             if refusal:
-                self.comment_queue.mark_private(item["eventId"], "blocked", batch_id,
+                self.comment_queue.mark_private(event_id, "blocked", batch_id,
                                                  {"reason": refusal[0]})
-                results.append({"eventId": item["eventId"], "status": "blocked",
+                results.append({"eventId": event_id, "status": "blocked",
                                 "reason": refusal[0]})
                 continue
-            target = by_id.get(item["eventId"])
+            target = by_id.get(event_id)
             if target is None:
-                results.append({"eventId": item["eventId"], "status": "blocked",
-                                "reason": reasons.get(item["eventId"])
+                results.append({"eventId": event_id, "status": "blocked",
+                                "reason": reasons.get(event_id)
                                           or "not_a_private_candidate"})
                 continue
-            # 防御性校验：宿主给的 publicSendId 必须与【本批次为该事件记录的公屏 sendId】一致。
-            # 队列的 private_candidates 已经按状态守住了闸门，这里再对一次绑定，
-            # 避免"用 A 的公屏成功去给 B 发私信"这种张冠李戴。
-            recorded = str(((self.comment_queue.find_event(item["eventId"]) or {})
-                            .get("detail") or {}).get("sendId") or "")
-            if recorded and public_send_id != recorded:
-                results.append({"eventId": item["eventId"], "status": "blocked",
-                                "reason": "public_send_id_mismatch"})
+            # ③ 对应性校验，与候选清单共用同一个判定（见 _comment_public_binding）。
+            # 两边口径必须一致：清单说 allowed 而这里 blocked，宿主据此建的计划
+            # 会当场失败；反过来（清单拦、执行放）则等于清单形同虚设。
+            binding = _comment_public_binding(self.comment_queue, event_id, public_send_id)
+            if binding:
+                self.comment_queue.mark_private(event_id, "blocked", batch_id,
+                                                {"reason": binding})
+                results.append({"eventId": event_id, "status": "blocked",
+                                "reason": binding})
                 continue
             text = item.get("text") or target.get("privateText") or ""
             if text != (target.get("privateText") or ""):
@@ -1154,6 +1776,12 @@ class Sidecar:
         缺 publicSendId 一律 public_missing 拒绝 —— 它曾经是「可选」的，
         那等于给整条契约留了一个省略参数就能走的后门。
         """
+        # 🔴 输入预检（评审 2026-09-29）：sendId / target 类型 / authorId 形状 / text
+        #    全部在【打开浏览器之前】判完 —— 参数级错误不该有浏览器成本，
+        #    也不该留下"点了一半"的现场。
+        problem = _private_input_refusal(params)
+        if problem:
+            raise SidecarError(problem[0], problem[1])
         send_id = str(params.get("sendId") or "")
         target = params.get("target")
         text = params.get("text")
@@ -1162,6 +1790,13 @@ class Sidecar:
         refusal = _public_guard(self.gate, params.get("publicSendId"))
         if refusal:
             raise SidecarError(refusal[0], refusal[1])
+        # ③ 对应性：这条公屏回复必须是【收件人本人】那一条。
+        #    单发路径此前只有 ①②，于是"拿 A 的公屏成功去给 B 发私信"走得通 ——
+        #    而单发恰恰是宿主最常直接调用的入口。仍然在打开浏览器之前判定。
+        #    弹幕通路同样在【打开浏览器之前】判定：同一事件 + 同一收件人，缺一不可。
+        mismatch = _private_binding_mismatch(self.gate, params.get("publicSendId"), target)
+        if mismatch:
+            raise SidecarError(mismatch[0], mismatch[1])
         page, _ = self._page()
         try:
             return send_private(page, self.gate, send_id, target, text)
@@ -1199,6 +1834,16 @@ class Sidecar:
             if not author_id:
                 rejected.append({"eventId": event_id, "reason": "missing_author_id"})
                 continue
+            # ③ 对应性。清单和执行必须同口径：此前 comment_private 检查绑定、
+            #    清单不检查，于是清单说 allowed 而执行当场 blocked。
+            #    queue 用 getattr 取：测试替身（__new__ 构造）没有 comment_queue，
+            #    而绑定校验属于【加法能力】，不该让只在台账上跑用例的调用方失败。
+            queue = getattr(self, "comment_queue", None)
+            if queue is not None:
+                binding = _comment_public_binding(queue, event_id, public_send_id)
+                if binding:
+                    rejected.append({"eventId": event_id, "reason": binding})
+                    continue
             allowed.append({"eventId": event_id, "authorId": author_id,
                             "authorName": str(item.get("authorName") or "")[:120],
                             "publicSendId": public_send_id})
@@ -1282,6 +1927,8 @@ class Sidecar:
             # 在这个接线完成之前，边界一律拒绝调用方自带策略，改用内置的保守默认值。
             raise SidecarError("policy_not_server_issued",
                                "policy must be issued by the authorization service, not by the caller")
+        # 🔴 策略身份在【建批次之前】校验：形状不对就不该产生任何队列副作用。
+        policy_ref = _policy_ref(params)
         reply_via = str(params.get("replyVia") or "native")
         if reply_via not in live_flow.REPLY_VIAS:
             raise SidecarError("invalid_input",
@@ -1306,12 +1953,14 @@ class Sidecar:
                     "expired": batch["expired"], "filter": batch["filter"]}
         plan = self.live_queue.freeze_plan(batch["batchId"], params.get("scripts"),
                                            params.get("policy"), reply_mode=reply_mode,
-                                           reply_via=reply_via)
+                                           reply_via=reply_via, policy_ref=policy_ref)
         return {"status": "ok" if plan["targets"] else "blocked", "batch": summary,
                 "targets": plan["targets"], "blocked": plan["blocked"],
                 "expired": batch["expired"], "filter": batch["filter"],
                 "replyMode": plan.get("replyMode"), "replyVia": plan.get("replyVia"),
-                "policy": plan["policy"], "policySource": plan.get("policySource")}
+                "policy": plan["policy"], "policySource": plan.get("policySource"),
+                # 服务端策略身份（与计划一起冻结；阶段二必须原样带回来）
+                "policyRef": plan.get("policyRef")}
 
     def live_reply(self, params):
         """Phase one: public reply for accepted items of a frozen batch.
@@ -1325,6 +1974,11 @@ class Sidecar:
         plan = self.live_queue.plan(batch_id)
         if not plan.get("targets"):
             raise SidecarError("plan_not_frozen", "freeze the batch plan before replying")
+        # 🔴 策略身份必须与冻结计划一致（评审 2026-09-26）：换一版策略继续发同一条
+        #    冻结计划，事后无法解释。校验在打开浏览器之前完成。
+        refusal = _policy_ref_refusal(plan, params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         mode = str(plan.get("replyMode") or "composer")
         reply_via = str(plan.get("replyVia") or "native")
         requested = params.get("mode")
@@ -1366,7 +2020,7 @@ class Sidecar:
                     else:
                         outcome = send_comment(page, self.gate, item["sendId"], comment_target,
                                                text, "live")
-                    status = str(outcome.get("status") or "unknown")
+                    status = _durable_send_state(self.gate, item["sendId"], outcome)
                     evidence = outcome.get("evidence") or {}
                     if mode == "danmaku" and evidence.get("roomEcho"):
                         # 房间消息流里出现了自己刚发的那条：本通道目前能拿到的最强证据（真机实测）。
@@ -1399,10 +2053,25 @@ class Sidecar:
         """
         batch_id, items = _live_batch_items(params)
         self.live_queue.ensure_active(batch_id)
+        refusal = _policy_ref_refusal(self.live_queue.plan(batch_id), params)
+        if refusal:
+            raise SidecarError(refusal[0], refusal[1])
         allowed, rejected = self.live_queue.private_candidates(batch_id)
         by_id = {item["eventId"]: item for item in allowed}
+        reason_by_id = {row.get("eventId"): row.get("reason") for row in rejected}
+        # 🔴 评审 2026-09-29：先判【这个 eventId 是否属于本批次】（纯读、无副作用），
+        #    再决定要不要落台账。以前先 mark_private(...) —— 对不存在的 eventId
+        #    队列层会抛 unknown_event，而且已经尝试写了一次没有意义的私有记录。
+        plan_ids = _item_plan_ids(self.live_queue, batch_id)
         results, sendable = [], []
         for item in items:
+            event_id = str(item.get("eventId") or "").strip()
+            membership = _item_plan_membership(self.live_queue, plan_ids, event_id)
+            if membership:
+                # 不属于本批次：逐项给稳定结果，绝不落台账、绝不打开浏览器。
+                results.append({"eventId": event_id, "status": "blocked",
+                                "reason": membership})
+                continue
             # 🔴 审核意见（2026-09-21）：直播私信必须【逐项绑定】那一次已确认成功的公屏回复。
             #    只靠批次候选清单（按事件状态放行）会留下一条绕过路径：
             #    调用方可以不带 publicSendId 直接要私信，公屏成功门禁就形同虚设。
@@ -1410,41 +2079,46 @@ class Sidecar:
             #      ① public_missing      没给 publicSendId
             #      ② public_*            台账里该 sendId 不是"已确认成功的公屏回复"（复用 _public_guard）
             #      ③ public_send_mismatch 给的 sendId 不是这个事件自己那次公屏回复
+            #        （2026-09-26 收紧：原来是 `if recorded and recorded != public_send_id`，
+            #         事件上【没有记录】时会直接放行 —— 等于说任何一条已确认的公屏回复
+            #         都能拿给一个从未公屏回复过的事件去发私信。现在要求"事件自身有记录，
+            #         且记录的 sendId 精确等于传入的 publicSendId"，缺记录同样拒绝。）
             public_send_id = str(item.get("publicSendId") or "").strip()
             if not public_send_id:
-                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                self.live_queue.mark_private(event_id, "blocked", batch_id,
                                              {"reason": "public_missing"})
-                results.append({"eventId": item["eventId"], "status": "blocked",
+                results.append({"eventId": event_id, "status": "blocked",
                                 "reason": "public_missing"})
                 continue
             refusal = _public_guard(self.gate, public_send_id)
             if refusal:
-                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                self.live_queue.mark_private(event_id, "blocked", batch_id,
                                              {"reason": refusal[0]})
-                results.append({"eventId": item["eventId"], "status": "blocked",
+                results.append({"eventId": event_id, "status": "blocked",
                                 "reason": refusal[0]})
                 continue
-            event = self.live_queue.find_event(item["eventId"]) or {}
+            event = self.live_queue.find_event(event_id) or {}
             recorded = str((event.get("detail") or {}).get("sendId") or "")
-            if recorded and recorded != public_send_id:
-                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+            # 🔴 缺记录也必须拒绝："没有记录"与"记录对不上"是同一类失败 ——
+            #    两者都无法证明这次私信绑定的就是【本事件】那次公屏成功。
+            if not recorded or recorded != public_send_id:
+                self.live_queue.mark_private(event_id, "blocked", batch_id,
                                              {"reason": "public_send_mismatch"})
-                results.append({"eventId": item["eventId"], "status": "blocked",
+                results.append({"eventId": event_id, "status": "blocked",
                                 "reason": "public_send_mismatch"})
                 continue
-            target = by_id.get(item["eventId"])
+            target = by_id.get(event_id)
             if target is None:
-                reason = next((r["reason"] for r in rejected
-                               if r["eventId"] == item["eventId"]), "not_a_private_candidate")
-                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                reason = reason_by_id.get(event_id) or "not_a_private_candidate"
+                self.live_queue.mark_private(event_id, "blocked", batch_id,
                                              {"reason": reason})
-                results.append({"eventId": item["eventId"], "status": "blocked", "reason": reason})
+                results.append({"eventId": event_id, "status": "blocked", "reason": reason})
                 continue
             text = item.get("text") or target["privateText"]
             if text != target["privateText"]:
-                self.live_queue.mark_private(item["eventId"], "blocked", batch_id,
+                self.live_queue.mark_private(event_id, "blocked", batch_id,
                                              {"reason": "script_mismatch"})
-                results.append({"eventId": item["eventId"], "status": "blocked",
+                results.append({"eventId": event_id, "status": "blocked",
                                 "reason": "script_mismatch"})
                 continue
             sendable.append((item, target, text))
@@ -1523,9 +2197,26 @@ def main(argv=None):
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--profile-dir", required=True)
     parser.add_argument("--port", required=True, type=int)
+    # 本地安全阀（可选覆盖）：默认 每目标 1 / 每小时 20 / 每天 50。
+    # 授信调用方可在真机验收或压测时调高 —— 这是【本地】限额，不是平台配额。
+    parser.add_argument("--per-user-limit", type=int, default=None)
+    parser.add_argument("--hourly-limit", type=int, default=None)
+    parser.add_argument("--daily-limit", type=int, default=None)
     args = parser.parse_args(argv)
+    limits = {}
+    for key, value in (("per_user", args.per_user_limit),
+                       ("hourly", args.hourly_limit),
+                       ("daily", args.daily_limit)):
+        if value is not None:
+            if value < 0:
+                _emit({"id": None, "ok": False,
+                       "error": {"code": "invalid_config",
+                                 "message": "%s limit must not be negative" % key}})
+                return 2
+            limits[key] = int(value)
     try:
-        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port)
+        sidecar = Sidecar(args.state_dir, args.profile_dir, args.port,
+                          gate_limits=limits or None)
     except Exception as exc:
         _emit({"id": None, "ok": False, "error": {"code": getattr(exc, "code", "invalid_config"),
                                                       "message": _err_message(getattr(exc, "message", exc))}})

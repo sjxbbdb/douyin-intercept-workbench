@@ -6,7 +6,7 @@ platform response is recorded as ``unknown`` and blocks a later retry.
 import json
 import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import click_guard
 import douyin
@@ -34,6 +34,23 @@ def _gate_result(gate, reservation, send_id):
     if row and row.get("send_id") != send_id:
         evidence = {"priorSendId": row.get("send_id")}
     return _bad_result(send_id, "blocked", reservation.get("reason", "send_blocked"), evidence)
+
+
+def _internal_failure(gate, send_id, started, exc, stage):
+    """内部异常也必须有【稳定枚举】的原因，异常类型放进 evidence 供排查。
+
+    原来这里直接把 type(exc).__name__ 当 reason，于是宿主的失败归因表里
+    会冒出任意 Python 类名（KeyError / TypeError / ...）。后果有两层：
+      1) reason 不再是可枚举的契约，宿主无法据此决定重试还是放弃；
+      2) 排查方向被带偏 —— 真机取证时看到 "KeyError" 只会以为是平台或契约问题，
+         而它其实指向代码里一个未守卫的下标。
+    未开始点击时按 failed（什么都没发出去），已点击则按 unknown（红线 3：
+    未知结果不得自动重试）。真实异常类型与信息留在 evidence 里，不丢证据。
+    """
+    row = gate.finish(send_id, "unknown" if started else "failed", "internal_error",
+                      {"stage": stage, "exception": type(exc).__name__,
+                       "exceptionMessage": str(exc)[:200]})
+    return gate.result(row)
 
 
 def _clean_draft(value):
@@ -192,11 +209,231 @@ def _canonical_room(url):
 
 
 def _response_status(record):
+    """平台响应里的 status_code，**规范化成 int**；读不出数字返回 None。
+
+    评审 2026-09-27：平台有时把状态码给成字符串（`"status_code": "0"`），
+    原来直接拿原值去比 `== 0`，字符串 "0" 不等于 0 —— 明明成功却落成
+    "读不出状态码 -> unknown"，白丢一次确认。这里把"数字形态"统一收成 int：
+      · int（含 0）-> 原样；
+      · 整数值的 float -> 转 int（平台偶尔给 0.0）；
+      · 数字字符串（允许前后空白与正负号）-> 转 int；
+      · 其余（缺失 / null / bool / 非数字字符串）-> None = 读不出状态码。
+    """
     parsed = record.get("parsed") or {}
     if not isinstance(parsed, dict):
         return None
     data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-    return data.get("status_code", parsed.get("status_code"))
+    value = data.get("status_code", parsed.get("status_code"))
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("+-").isdigit():
+            return int(text)
+    return None
+
+
+def _visibility_gate(tab, gate, send_id):
+    """页面可见性守卫。返回 None 表示可继续；否则返回已落账的结果。
+
+    职责归属（避免两套可见性恢复机制）：
+      · 本守卫只做【页面级】激活：douyin.ensure_visible（纯 CDP，不碰 Windows 窗口）；
+      · 【窗口级】恢复由 Sidecar._page() 独占（winfocus + marker PID），发送路径不参与。
+
+    🔴 口径（平台侧要求 2026-09-26）：
+      · visibilityState == "unknown" 【不等于 hidden】—— 判定不了就交给人工，
+        不得当成"需要置前"，更不得自动重试发送（重试会造成重复触达）；
+      · 只有明确 hidden 才尝试恢复可见性；恢复失败同样交给人工。
+    """
+    state = douyin.visibility_state(tab)
+    if state == "unknown":
+        row = gate.finish(send_id, "blocked", "page_visibility_unknown",
+                          {"skipped": True, "manualAction": True})
+        return gate.result(row)
+    if state != "visible":
+        douyin.ensure_visible(tab)
+        if douyin.visibility_state(tab) != "visible":
+            row = gate.finish(send_id, "blocked", "browser_not_visible",
+                              {"skipped": True, "manualAction": True})
+            return gate.result(row)
+    return None
+
+
+def _page_state(tab):
+    """当前页面可见性三态（visible / hidden / unknown）。
+
+    读不到就按 unknown —— **不是** hidden（平台侧 2026-09-26 的要求：unknown 只交人工，
+    不许拿它去恢复、去点击）。所有"临时再确认一次"的地方都走这里，
+    免得散落的 raw 判断把 unknown 当成可恢复状态。
+    """
+    try:
+        return douyin.visibility_state(tab)
+    except Exception:
+        return "unknown"
+
+
+def _click_ready(tab):
+    """点击【之前】再确认一次页面可见。
+
+    返回三态：`"visible"` / `"hidden"` / `"unknown"` —— 调用方据此决定点、修、还是交人工。
+
+    🔴 真机复现（2026-09-28）：
+      Chrome 窗口被遮挡/最小化时 document.visibilityState == "hidden"，
+      Input.dispatchMouseEvent 的点击【不送达渲染进程】—— 表现就是
+      "私信按钮坐标是对的、点上去、面板就是不开"（人工点同一个页面却正常）。
+      实测同一个坐标：hidden 时面板不开；Page.bringToFront 之后立刻打开、
+      会话头部匹配、输入框清空、会话里出现回声。
+
+    🔴 评审意见（2026-09-28）：「_click_ready() 把 unknown 当成可恢复状态」——确实如此，
+    这里修掉：**unknown 不等于 hidden**（平台侧 2026-09-26 已明确），只有 hidden 才尝试
+    恢复（那是"被遮挡/最小化"这种真的能救回来的情况）；unknown 一律【不恢复、不点】，
+    直接交给人工 —— 读不到状态还去点，等于在"不知道页面是什么状态"的时候动手。
+    """
+    state = _page_state(tab)
+    if state == "visible":
+        return "visible"
+    if state != "hidden":
+        return "unknown"
+    # 只有 hidden 才尝试恢复；恢复后仍然读一次真实状态（可能变 unknown）。
+    douyin.ensure_visible(tab)
+    after = _page_state(tab)
+    if after == "visible":
+        return "visible"
+    return "hidden" if after == "hidden" else "unknown"
+
+
+def _visibility_refusal(send_id, state, extra=None, skipped=False):
+    """点击前可见性不给过时的统一收口：一律 blocked + 手工处置，绝不记成目标不可触达。
+
+    两种状态都交人工，但原因分开，便于排查到底是"窗口被挡"还是"读不到状态"：
+      hidden  -> page_not_visible
+      unknown -> page_visibility_unknown
+    """
+    evidence = {"skipped": bool(skipped), "manualAction": True,
+                "blockedBy": "page_hidden_while_clicking" if state == "hidden"
+                            else "page_visibility_unknown_while_clicking"}
+    if extra:
+        evidence.update(extra)
+    return {"status": "blocked",
+            "reason": "page_not_visible" if state == "hidden" else "page_visibility_unknown",
+            "sendId": str(send_id), "evidence": evidence}
+
+
+def _final_send_click(tab, act, label="send"):
+    """执行【最后一步】发送点击，并如实回报"点击前后页面是否可见 / 点击本身有没有抛异常"。
+
+    🔴 真机（2026-09-28）：页面 hidden 时 Input 事件【不送达渲染进程】，表现就是
+    "发送键点了没反应"。而"可见性检查 -> 真正点下去"之间还有好几次 CDP 往返（取坐标、
+    点输入框、读回显、点发送键），几百毫秒里页面完全可能被切到后台（用户切窗口 / 锁屏 /
+    最小化）。竞态窗口消不掉，但可以把话说到位：
+
+      · 点之前再确认一次可见（调用方用 _click_ready）：不满足 -> blocked，什么都没发出去；
+      · 点之后【立刻】再确认一次：不满足就说明"这一下可能送达了、也可能没有" ——
+        这正是红线 3 的未知结果，只能记 unknown 并禁止自动重试；
+      · 点击本身抛异常（CDP 传输失败）同理：也可能已经送达，绝不能猜成 failed。
+
+    返回 {"clicked","visibleBefore","visibleAfter","error","label"}；本函数自己不抛异常。
+    """
+    info = {"clicked": False, "visibleBefore": False, "visibleAfter": False,
+            "error": None, "label": str(label)}
+    try:
+        info["visibleBefore"] = douyin.visibility_state(tab) == "visible"
+    except Exception as exc:
+        info["error"] = type(exc).__name__
+    try:
+        act()
+        info["clicked"] = True
+    except Exception as exc:
+        info["error"] = info["error"] or type(exc).__name__
+    try:
+        info["visibleAfter"] = douyin.visibility_state(tab) == "visible"
+    except Exception:
+        info["visibleAfter"] = False
+    return info
+
+
+def _send_race_reason(info):
+    """最后一步发送踩到竞态或传输失败时的原因枚举。
+
+    只在【拿不到平台回执】时用它 —— 有回执就该以回执为准（回执是平台自己的话）。
+    三种情况都属于"可能发出去了、也可能没有"，一律 unknown + 禁止自动重试：
+      send_click_transport_failure  点击本身没发出去（CDP 传输失败 / 抛异常）
+      page_hidden_during_send       点完那一刻页面已经不可见
+      page_hidden_while_sending     点之前那一瞬间页面就已经不可见
+    """
+    if not info.get("clicked"):
+        return "send_click_transport_failure"
+    if not info.get("visibleAfter"):
+        return "page_hidden_during_send"
+    if not info.get("visibleBefore"):
+        return "page_hidden_while_sending"
+    return None
+
+def _panel_as_composer(panel):
+    """把「会话头部匹配的私信面板」当成编辑器来用（真机可用的收件人信号）。"""
+    return {"found": True, "x": panel["x"], "y": panel["y"],
+            "text": panel.get("text") or "",
+            "containerKey": panel.get("panelKey") or "messageEditor"}
+
+
+def _await_dm_panel(tab, author_name, tries=16):
+    """等私信面板出现（编辑器可见）。返回最后看到的面板状态，不做任何点击。
+
+    探测本身出异常时按「没看到面板」处理，并把异常名带回 evidence —— 面板等待只是探针；
+    探测失败绝不能被当成「面板开着」（那会让下一步点到面板内部的搜索框上）。
+    """
+    panel = {"found": False}
+    for _ in range(int(tries)):
+        try:
+            panel = douyin.dm_panel_state(tab, author_name) or {"found": False}
+        except Exception as exc:
+            panel = {"found": False, "probeError": type(exc).__name__}
+        if panel.get("found"):
+            return panel
+        time.sleep(0.5)
+    return panel
+
+
+def _await_row_preview(tab, author_name, text, tries=3, interval=2.0):
+    """看会话列表那一行的预览是不是已经变成刚发的话术 —— 平台是异步更新，所以有界重试。
+
+    🔴 真机（2026-09-26）：刚回车就立刻读，平台常常还没把预览换过来 —— 实测「八月」
+    「宽容」「世内高人」都是"当时读到 false，整页重载后消息确实在"。所以隔 2 秒再看，最多 3 次。
+    它仍然只是【页面观察】：读到 false 不等于没发出去（可能只是平台还没更新），
+    读到 true 也证明不了送达 —— 私信没有 HTTP 回执，状态一律 unknown。
+    """
+    preview = {"found": False, "tries": 0}
+    for index in range(max(1, int(tries))):
+        preview = dict(douyin.dm_row_preview_matches(tab, author_name, text) or {})
+        preview["tries"] = index + 1
+        if preview.get("containsText"):
+            return preview
+        if index + 1 < int(tries):
+            time.sleep(interval)
+    return preview
+
+
+def _reopen_profile(tab, author_id):
+    """重新导航回目标主页。
+
+    🔴 真机（2026-09-26）：第一次点「私信」可能真的点空（页面还在渲染）。要重试就
+    【重新导航】，让坐标与面板状态都回到干净状态 —— 绝不拿着旧坐标在可能已经打开的面板上
+    再点一次（那里是面板内部的搜索框）。
+    """
+    try:
+        tab.call("Page.navigate", {"url": douyin.profile_url(author_id)}, timeout=25)
+    except Exception:
+        return False
+    if not _wait_ready(tab):
+        return False
+    try:
+        return bool(_exact_profile_url(tab.evaluate("location.href") or "", author_id))
+    except Exception:
+        return False
 
 
 def send_private(tab, gate, send_id, target, text):
@@ -232,9 +469,10 @@ def send_private(tab, gate, send_id, target, text):
             return gate.result(row)
         # 🔴 真机教训（工作日志第 7 条）：页面 visibilityState=hidden 时点击不送达渲染进程，
         #    表现就是"私信按钮点上去、面板死活不开"（人工点却正常）。先拉活页面。
-        visibility_before = douyin.visibility_state(tab)
-        if visibility_before != "visible":
-            douyin.ensure_visible(tab)
+        # 🔴 unknown 不等于 hidden：交给人工，不自动重试（平台侧要求 2026-09-26）。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
@@ -260,54 +498,119 @@ def send_private(tab, gate, send_id, target, text):
         if not context.get("verified"):
             row = gate.finish(send_id, "failed", "target_context_not_confirmed")
             return gate.result(row)
-        # 🔴 真机教训（2026-09-20）：主页从直播间跳过来时头部还在渲染，按旧坐标点一次
-        #    「私信」经常点空（面板根本没打开）。所以这里改成【重新取入口 -> 点 -> 校验面板】
-        #    的循环，最多 3 轮；每一轮都用当下最新的按钮坐标，避免用过期坐标点击。
+        # 🔴 真机教训（2026-09-26，用户反馈"打开了私信却没有真的去发私信"）：
+        #    点「私信」之后，入口按钮的坐标（约 963,132）就落在【已经打开的消息面板内部】
+        #    （搜索框/标题栏那一带）。所以"面板没开就再点一次入口"这套重试是有害的：
+        #    第 1 次点击把面板打开，第 2、3 次却点在面板里，把面板切到「消息列表」，
+        #    最后判定 panel_not_opened —— 我们一条消息都没输入就跳过了这个目标。
+        #    真机实测（2026-09-26）：面板 1.5s 就开了；面板停在会话列表时，列表里
+        #    对方那一行的标题就是对方昵称，点它就能进入会话。
+        #    新流程分三步，任何一步不成立都停在原地、绝不猜：
+        #      1) 面板已经开着且会话头部 = 对方 -> 直接用；
+        #      2) 面板没开 -> 点一次入口（坐标现取），等面板出现；
+        #      3) 面板开着但停在会话列表 -> 点开对方那一行，再等会话头部匹配。
         composer = {"found": False}
         context_mode = "recipient_scoped"
+        clicked_while_ready = False
+        entry_blocked_state = None
+        panel_probe = []
+        entry_clicks = 0
+        panel = {"found": False}
         for attempt in range(3):
-            entry = douyin.dm_entry(tab)
-            if entry.get("blocked"):
-                row = gate.finish(send_id, "blocked", "target_dm_not_available")
-                return gate.result(row)
-            if not entry.get("found"):
+            probe = {"attempt": attempt + 1, "panelOpen": bool(panel.get("found")),
+                     "headerMatch": bool(panel.get("headerMatch"))}
+            panel_probe.append(probe)
+            if panel.get("found") and panel.get("headerMatch"):
+                composer = _panel_as_composer(panel)
+                context_mode = "live_panel_header"
                 break
-            tab.click_at(entry["x"], entry["y"])
-            # 面板是异步挂载的：同时等「收件人作用域内的输入框」和「会话头部标题」，
-            # 两者都指向同一个收件人才算打开成功。
-            for _ in range(10):
-                time.sleep(0.5)
-                composer = douyin.dm_composer_for_recipient(tab, author_id, author_name)
-                if composer.get("found"):
+            # 入口只在【面板是关着的】时候点，而且最多两次：
+            #   第 2 次必须先重新导航回主页（坐标与面板状态都回到干净状态）。
+            #   面板一旦开着，入口坐标就落在面板内部，再点等于去按面板里的搜索框。
+            if not panel.get("found") and (entry_clicks == 0 or
+                                           (entry_clicks == 1 and _reopen_profile(tab, author_id))):
+                entry = douyin.dm_entry(tab)
+                if entry.get("blocked"):
+                    row = gate.finish(send_id, "blocked", "target_dm_not_available")
+                    return gate.result(row)
+                if not entry.get("found"):
                     break
-                panel = douyin.dm_panel_state(tab, author_name)
-                if panel.get("found") and panel.get("headerMatch"):
-                    context_mode = "live_panel_header"
-                    composer = {"found": True, "x": panel["x"], "y": panel["y"],
-                                "text": panel.get("text") or "",
-                                "containerKey": panel.get("panelKey") or "messageEditor"}
+                # 🔴 点击前再确认页面可见（#48）：hidden 时点击不送达渲染进程；
+                #    unknown 更不许碰（读不到状态就别动手）。两种情况都不点，
+                #    也不把"没点着"记成"对方不可私信"。
+                ready = _click_ready(tab)
+                if ready != "visible":
+                    entry_blocked_state = ready
+                    probe["pageStateBeforeEntryClick"] = ready
                     break
-            if composer.get("found"):
+                clicked_while_ready = True
+                tab.click_at(entry["x"], entry["y"])
+                entry_clicks += 1
+                probe["entryClick"] = entry_clicks
+                # 面板是异步挂载的：等它出现（真机实测 1.5-4s）。
+                panel = _await_dm_panel(tab, author_name)
+                probe["panelOpenAfterClick"] = bool(panel.get("found"))
+                probe["headerMatchAfterClick"] = bool(panel.get("headerMatch"))
+            # 严格收件人作用域的输入框（真机上永远 0 命中，离线夹具里能命中）：
+            # 它一旦命中就是最强的收件人证据，优先采用。
+            strict = douyin.dm_composer_for_recipient(tab, author_id, author_name)
+            probe["strictComposer"] = bool(strict.get("found"))
+            if strict.get("found"):
+                composer = strict
+                context_mode = "recipient_scoped"
                 break
+            if panel.get("found") and panel.get("headerMatch"):
+                composer = _panel_as_composer(panel)
+                context_mode = "live_panel_header"
+                break
+            if not panel.get("found"):
+                continue
+            # 面板开着，但会话不是对方（真机上常见：停在「消息列表」）。
+            # 真机事实：面板里没有 data-recipient-id / 指向 /user/<sec_uid> 的链接
+            # （实测 count=0），能用的收件人信号是【会话头部标题 = 对方昵称】；
+            # 会话列表里那一行的标题也是对方昵称，所以点它就能进对会话。
+            conv_row = douyin.dm_conversation_row(tab, author_name)
+            probe["conversationRowFound"] = bool(conv_row.get("found"))
+            probe["conversationRowMatched"] = bool(conv_row.get("matched"))
+            probe["conversationRowsSeen"] = conv_row.get("rowsSeen")
+            if not (conv_row.get("found") and conv_row.get("matched")):
+                break
+            tab.click_at(conv_row["x"], conv_row["y"])
+            panel = _await_dm_panel(tab, author_name)
+            probe["headerMatchAfterRowClick"] = bool(panel.get("headerMatch"))
         if not composer.get("found"):
-            # 🔴 真机回退（2026-09-20，真实主页实测）：真机私信面板里【没有】data-recipient-id /
-            #    data-user-id，也没有指向 /user/<sec_uid> 的链接（实测 count=0），所以上面那套
-            #    严格校验在真机上永远匹配不到，私信会一直停在 composer_not_found。
-            #    真机可用的收件人信号是【会话头部标题 = 对方昵称】（脱敏昵称按可见前缀比较）。
-            panel = douyin.dm_panel_state(tab, author_name)
-            if not (panel.get("found") and panel.get("headerMatch")):
-                # 🔴 真机与用户反馈（2026-09-21）：有的目标私信入口点得动、面板却始终不开
-                #    （对方未互关 / 私密账号 / 关闭了陌生人私信）。这时我们一条消息都没发，
-                #    应当【跳过并换下一个目标】，而不是把它记成"发送失败"。
-                #    注意：这里只影响"能否触达"的判定，不影响任何发送门槛。
-                row = gate.finish(send_id, "blocked", "dm_panel_unavailable",
-                                  {"skipped": True, "blockedBy": "panel_not_opened",
-                                   "entryClicks": 3})
+            # 🔴 归因四分（#48 的边界 + #54 的新流程）：
+            #   ① 点击前就不给点（hidden / unknown）-> 转人工（不猜目标不可私信）；
+            #   ② 点了，但点完之后页面已经不可见（点击很可能没送达渲染进程）-> 同样转人工，
+            #      【绝不】记成 dm_panel_unavailable（评审 2026-09-28 第 2 条）；
+            #   ③ 面板压根没开、页面全程可见 -> dm_panel_unavailable（跳过，换下一个目标）；
+            #   ④ 面板开了但停在列表、且列表里没有对方那一行 -> dm_conversation_unavailable（跳过）。
+            # ⚠️ 页面顶部那句「对方回复或关注你之前，只能发送一条文字消息」【不是】拒绝：
+            #    平台允许发一条，遇到它必须照常发出去（用户 2026-09-26 明确）。
+            if entry_blocked_state:
+                refusal = _visibility_refusal(send_id, entry_blocked_state,
+                                              {"entryClicks": entry_clicks,
+                                               "pageStateAtEntryClick": entry_blocked_state,
+                                               "attempts": panel_probe})
+                row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                                  refusal["evidence"])
                 return gate.result(row)
-            context_mode = "live_panel_header"
-            composer = {"found": True, "x": panel["x"], "y": panel["y"],
-                        "text": panel.get("text") or "",
-                        "containerKey": panel.get("panelKey") or "messageEditor"}
+            late = _page_state(tab) if clicked_while_ready else "visible"
+            if late != "visible":
+                refusal = _visibility_refusal(
+                    send_id, "hidden" if late == "hidden" else "unknown",
+                    {"entryClicks": entry_clicks, "attempts": panel_probe,
+                     "blockedByLate": "page_lost_after_entry_click"})
+                row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                                  refusal["evidence"])
+                return gate.result(row)
+            ever_open = any(p.get("panelOpen") or p.get("panelOpenAfterClick") for p in panel_probe)
+            reason = "dm_conversation_unavailable" if ever_open else "dm_panel_unavailable"
+            row = gate.finish(send_id, "blocked", reason,
+                              {"skipped": True,
+                               "blockedBy": "conversation_not_opened" if ever_open else "panel_not_opened",
+                               "entryClicks": entry_clicks, "attempts": panel_probe})
+            return gate.result(row)
         existing_text = _clean_draft(composer.get("text"))
         if existing_text and existing_text != _clean_draft(text):
             row = gate.finish(send_id, "failed", "composer_has_different_draft")
@@ -353,6 +656,21 @@ def send_private(tab, gate, send_id, target, text):
                 row = gate.finish(send_id, "failed", "target_session_changed")
                 return gate.result(row)
 
+        # 🔴 与评论路径同一条真机结论（2026-09-28）：hidden 时 Input 事件不送达渲染进程。
+        #    私信面板能开、字也能打进去，但最后一按等于没按 —— 必须在【落 started 之前】
+        #    再确认一次；确认不了就什么都没发出去（blocked + manualAction），
+        #    绝不把"没按着"记成平台拒绝。
+        ready = _click_ready(tab)
+        if ready != "visible":
+            refusal = _visibility_refusal(send_id, ready, {"mechanism": mechanism})
+            row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                              refusal["evidence"])
+            return gate.result(row)
+        # 🔴 评审要求（2026-09-29）：回显必须绑定【目标收件人 + 本次发送动作】。
+        #    所以发送【之前】先取一次"这个会话里和本次话术完全相同的消息有几条"作为基线，
+        #    发送后只认【计数增加】—— 历史里本来就有同样文字时不会造成假证据。
+        #    多次读、取最大值：会话历史异步渲染，只读一次会把"还没渲出来"当成 0。
+        echo_baseline = douyin.dm_conversation_echo_baseline(tab, text, author_name)
         # The durable started marker is the last operation before the send.
         gate.mark_started(send_id)
         started = True
@@ -361,15 +679,21 @@ def send_private(tab, gate, send_id, target, text):
             tab.call("Network.enable", {}, timeout=10)
         except Exception:
             pass
+        # 最后一步同样要盯住竞态：点之前/之后各看一次可见性，点击抛异常也接住。
         if mechanism == "button":
-            tab.click_at(button["x"], button["y"])
+            send_race = _final_send_click(tab, lambda: tab.click_at(button["x"], button["y"]),
+                                          label="dm_send_button")
         else:
-            tab.press_key("Enter", code="Enter", key_code=13)
+            send_race = _final_send_click(
+                tab, lambda: tab.press_key("Enter", code="Enter", key_code=13),
+                label="dm_enter")
         records = recorder.collect(wait_seconds=8.0)
         mark = getattr(S, "DM_SEND_URL_MARK", "")
         matched = [r for r in records if mark and mark in (r.get("url") or "")]
         statuses = [_response_status(r) for r in matched]
-        echo = douyin.dm_conversation_echo(tab, text)
+        # 回显：必须比基线多出一条，才说明"这次真的看到了新消息"（仍然是页面观测）。
+        echo_detail = douyin.dm_conversation_echo_after_send(tab, text, author_name, echo_baseline)
+        echo = bool(echo_detail.get("echo"))
         cleared = None
         try:
             state = douyin.dm_panel_state(tab, author_name)
@@ -377,18 +701,33 @@ def send_private(tab, gate, send_id, target, text):
                 cleared = not str(state.get("text") or "").strip()
         except Exception:
             cleared = None
-        row = gate.finish(send_id, "unknown", "platform_response_unavailable",
+        # 页面观察（不是回执）：会话列表里对方那一行的预览，是不是已经变成刚发的这句话。
+        # 真机实测（2026-09-26）：真发出去的那条会出现在该行预览里，整页重载后仍在；
+        # 没能发出去的行只显示平台提示语。它是有力旁证，但私信没有 HTTP 回执（红线 2），
+        # 所以状态仍然是 unknown，绝不因为这一条就宣告 sent_confirmed。
+        try:
+            row_preview = _await_row_preview(tab, author_name, text)
+        except Exception:
+            row_preview = {"found": False, "tries": 0}
+        # 私信这条通道本来就没有 HTTP 回执，所以"没回执"是常态；被竞态/传输失败打断时，
+        # 原因必须说清楚 —— 仍然是 unknown（可能已经发出去了），只是便于人工归因。
+        race = _send_race_reason(send_race)
+        row = gate.finish(send_id, "unknown", race or "platform_response_unavailable",
                           {"httpResponses": len(records), "matchedResponses": len(matched),
                            "platformStatusCodes": statuses[:5], "mechanism": mechanism,
                            "recipientVerification": context_mode,
-                           "composerCleared": cleared, "conversationEcho": bool(echo)})
+                           "composerCleared": cleared, "conversationEcho": echo,
+                           # 回显的绑定证据：基线（发送前有几条相同文字）、发送后计数、未命中原因。
+                           "conversationEchoBaseline": echo_detail.get("baseline"),
+                           "conversationEchoBaselineReads": list(echo_baseline.get("reads") or []),
+                           "conversationEchoCount": echo_detail.get("count"),
+                           "conversationEchoReason": echo_detail.get("reason"),
+                           "conversationListPreview": bool(row_preview.get("containsText")),
+                           "conversationListPreviewTries": int(row_preview.get("tries") or 0),
+                           "sendRace": send_race})
         return gate.result(row)
     except Exception as exc:
-        if started:
-            row = gate.finish(send_id, "unknown", type(exc).__name__)
-        else:
-            row = gate.finish(send_id, "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "send_private")
 
 
 def _validate_comment(target, text, source):
@@ -525,6 +864,16 @@ def _mention_matches(composer_text, author_name):
     return bool(want) and want in norm(composer_text)
 
 
+def _restore_chat_bottom(tab, scrolled_px):
+    """上滚找过旧弹幕之后把列表滚回最新（best-effort，失败不影响发送结论）。"""
+    if not scrolled_px:
+        return
+    try:
+        live.resume_chat_bottom(tab, distance=scrolled_px)
+    except Exception:
+        pass
+
+
 def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
     """原生「回复 TA」：点弹幕 → 菜单 →「回复 TA」→ 平台插入 @昵称 → 打字 → 回车。
 
@@ -551,6 +900,8 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
         return _gate_result(gate, reservation, send_id)
 
     started = False
+    # 上滚找回旧弹幕会挪动列表位置：这里先占位，保证异常路径也能把它还给最新。
+    scrolled_px = 0
     try:
         requested_room = _canonical_room(room_url)
         current_raw = tab.evaluate("location.href") or ""
@@ -565,9 +916,11 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
                 (requested_room and requested_room[0] == "live.douyin.com" and
                  resolved_room != requested_room)):
             return gate.result(gate.finish(send_id, "failed", "target_live_room_mismatch"))
-        # 页面被遮挡时点击不送达渲染进程（真机踩过），先拉活
-        if douyin.visibility_state(tab) != "visible":
-            douyin.ensure_visible(tab)
+        # 🔴 unknown 不等于 hidden：交给人工，不自动重试（平台侧要求 2026-09-26）。
+        #    直播间原生「回复 TA」是主要公屏路径，口径必须与私信路径一致。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             return gate.result(gate.finish(send_id, "blocked", "captcha_requires_manual_action"))
         login = _await_login(tab)
@@ -603,6 +956,8 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
             # 重新定位要多花几百毫秒，高流量房间里那条弹幕已经被顶走了（真机实测）。
             menu = live.open_reply_menu(tab, {"authorName": author_name, "text": danmaku_text},
                                         placed=placed if attempt == 0 else None)
+            # 为了找到这条已经滚走的弹幕，定位器可能上滚了几千像素：记下来，最后把列表滚回最新。
+            scrolled_px = max(scrolled_px, int(menu.get("scrolledPx") or 0))
             if not menu.get("ok"):
                 refusal = menu.get("reason") or "reply_menu_not_opened"
                 continue
@@ -676,8 +1031,13 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
             refusal = None
             break
         if state is None:
+            # 上滚找过旧弹幕就把列表滚回最新（否则下一轮采集看到的还是那批旧弹幕）。
+            _restore_chat_bottom(tab, scrolled_px)
+            evidence = {"scrolledPx": scrolled_px}
+            if last_mismatch:
+                evidence["mismatch"] = last_mismatch
             return gate.result(gate.finish(send_id, "failed", refusal or "reply_menu_not_opened",
-                                           {"mismatch": last_mismatch} if last_mismatch else None))
+                                           evidence))
         control = live.find_send_control(tab)
         mechanism = str(control.get("mechanism") or "enter")
         gate.mark_started(send_id)
@@ -687,16 +1047,20 @@ def send_danmaku_reply_native(tab, gate, send_id, target, text, placed=None):
         else:
             tab.press_key("Enter", code="Enter", key_code=13)
         echo = live.wait_room_echo(tab, text)
+        _restore_chat_bottom(tab, scrolled_px)
         row = gate.finish(send_id, "unknown", "platform_response_unavailable",
                           {"mechanism": mechanism, "via": "native_reply_ta",
                            "mentionInserted": True, "danmakuLocated": True,
+                           "scrolledPx": scrolled_px,
                            "composerCleared": echo.get("composerCleared"),
                            "roomEcho": bool(echo.get("row")),
                            "roomEchoSource": "page_memory" if echo.get("row") else None})
         return gate.result(row)
     except Exception as exc:
-        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
-        return gate.result(row)
+        # 🔴 异常恢复（2026-09-28）：上滚找旧弹幕可能已经把列表挪走了 —— 异常路径也必须还回去，
+        #    否则下一轮采集看到的还是那批旧弹幕。
+        _restore_chat_bottom(tab, scrolled_px)
+        return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
 
 
 def send_danmaku_reply(tab, gate, send_id, target, text):
@@ -749,9 +1113,10 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
             return gate.result(gate.finish(send_id, "failed", "target_live_room_mismatch"))
         # 🔴 真机教训（工作日志第 7 条）：页面被遮挡时 visibilityState=hidden，点击【不送达渲染进程】。
         #    私信面板"成片打不开"、弹幕定位后点不动，根因都是这个；先把页面拉活再继续。
-        visibility_before = douyin.visibility_state(tab)
-        if visibility_before != "visible":
-            douyin.ensure_visible(tab)
+        # 🔴 unknown 不等于 hidden：交给人工，不自动重试（平台侧要求 2026-09-26）。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             return gate.result(gate.finish(send_id, "blocked", "captcha_requires_manual_action"))
         login = _await_login(tab)
@@ -799,8 +1164,130 @@ def send_danmaku_reply(tab, gate, send_id, target, text):
                            "roomEchoSource": "page_memory" if echo.get("row") else None})
         return gate.result(row)
     except Exception as exc:
-        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "danmaku_reply")
+
+
+# ---- 发布回执的结构化绑定（评审 2026-09-26）----
+#
+# 原来只做【原始串包含】：请求体里出现正文或评论 id 就算绑定。两个坑：
+#   1) JSON 请求体里的中文会被转义成 \uXXXX，用原文比对永远不命中 ——
+#      "发出去了、平台也回了 200，却因为编码不同被判成绑定不上"；
+#   2) 短正文（"111"、"0"）会撞上 id、时间戳等别的字段，
+#      把【别人的】回执算成本次的 -> 过度宣称成功。
+# 所以先解析请求体（form URL 编码 / JSON / 值里再套一层 JSON），再按【字段】比对。
+#
+# 🔴 请求体只在内存里用于这一次绑定：不写日志、不写台账、不进 evidence。
+# 🔴 只按【白名单字段名】判定（评审 2026-09-27）。
+#    原来用 `"id" in name` / `"text" in name or "content" in name` 做子串匹配，
+#    于是 video_id / aweme_id / user_id / item_id / content_type 这类无关字段
+#    也会被当成"评论 id 字段 / 正文字段"，一旦值碰巧相等就把别人的回执算成本次的。
+#    白名单外的字段名一律【不参与绑定】—— 宁可落成 unknown 交人工，
+#    也不要靠猜字段名去宣称成功。要加名字必须附真机请求体证据。
+_REQUEST_ID_FIELDS = ("reply_id", "reply_comment_id", "comment_id", "cid",
+                      "commentid", "replyid", "reply_cid", "reply_cid_list")
+_REQUEST_TEXT_FIELDS = ("text", "content", "comment", "reply_text", "replytext",
+                        "comment_text", "content_text")
+
+
+def _leaf_value(value):
+    """非字符串的叶子值也转成字符串：平台的 id 常常是 JSON 数字。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return ""
+
+
+def _json_pairs(value, depth=0):
+    """JSON 对象/数组 -> [(小写字段名, 字符串值)]；认不得的结构返回 []。"""
+    pairs = []
+    if depth > 2:
+        return pairs
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = str(key).lower()
+            if isinstance(item, str):
+                pairs.append((name, item))
+            elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                pairs.append((name, _leaf_value(item)))
+            elif isinstance(item, (dict, list)):
+                pairs.extend(_json_pairs(item, depth + 1))
+        return pairs
+    if isinstance(value, list):
+        for item in value:
+            pairs.extend(_json_pairs(item, depth + 1))
+    return pairs
+
+
+def _request_pairs(record):
+    """把回执请求体解析成 [(字段名, 值)]；解析不出来就是 []（= 绑定不上，按 unknown）。
+
+    认三种形状：form URL 编码（会解百分号与 + 号）、JSON、以及 form 值里再套一层 JSON。
+    """
+    payload = (record or {}).get("postData")
+    if not isinstance(payload, str) or not payload.strip():
+        return []
+    text = payload.strip()
+    pairs = []
+    if text[:1] in ("{", "["):
+        try:
+            pairs = _json_pairs(json.loads(text))
+        except ValueError:
+            pairs = []
+        if pairs:
+            return pairs
+    try:
+        form = parse_qs(text, keep_blank_values=True)
+    except Exception:
+        form = {}
+    for name, values in form.items():
+        for value in values:
+            pairs.append((str(name).lower(), str(value)))
+            nested = str(value).strip()
+            if nested[:1] in ("{", "["):
+                try:
+                    pairs.extend(_json_pairs(json.loads(nested)))
+                except ValueError:
+                    pass
+    return pairs
+
+
+def _publish_binding(record, text, comment_id):
+    """这条回执属于【本次】这条评论吗？返回 (是否绑定, 依据)。
+
+    优先级：
+      1) 请求体里【白名单里的 id 字段】精确等于目标评论 id -> ("comment_id")
+         —— 字段名与值都要对得上，短正文、编码差异都影响不到它；
+      2) 请求体里【白名单里的正文字段】等于或包含本次正文 -> ("text")
+         —— 平台可能在正文前后插入 @昵称 之类的内容，所以用包含判定，
+            但只在白名单正文字段里判，不在整串、也不在其它字段里判。
+
+    字段名【精确匹配白名单】：video_id / aweme_id / user_id / content_type 这类
+    无关字段即使值碰巧相同也不会被当成绑定依据。
+
+    请求体拿不到、或解析不出任何字段 -> (False, None)：证据不足，
+    由调用方按 unknown 处理 —— 绝不"看到发布接口就当自己成功"。
+    """
+    pairs = _request_pairs(record)
+    if not pairs:
+        return False, None
+    wanted_id = str(comment_id or "").strip()
+    if wanted_id:
+        for name, value in pairs:
+            if name in _REQUEST_ID_FIELDS and value.strip() == wanted_id:
+                return True, "comment_id"
+    wanted_text = str(text or "").strip()
+    if wanted_text:
+        for name, value in pairs:
+            if name in _REQUEST_TEXT_FIELDS:
+                if value.strip() == wanted_text or wanted_text in value:
+                    return True, "text"
+    return False, None
+
+
+def _publish_record_matches(record, text, comment_id):
+    """兼容旧调用点的薄封装：只要绑定依据。新代码请用 _publish_binding。"""
+    return _publish_binding(record, text, comment_id)[0]
 
 
 def send_comment(tab, gate, send_id, target, text, source):
@@ -828,7 +1315,21 @@ def send_comment(tab, gate, send_id, target, text, source):
 
     started = False
     try:
-        tab.call("Page.navigate", {"url": room_url}, timeout=25)
+        # 🔴 真机（2026-09-28）：评论回复此前【无条件重新导航】，于是采集阶段滚动加载出来的
+        #    那些评论行在发送前被整页刷新清空，只剩首屏那几行 —— 定位器于是报
+        #    comment_not_found，最终归成 reply_target_not_rendered；
+        #    而同一刻 comment_row_present（探测）明明说 present / scrolled_into_view。
+        #    所以：已经在目标页上就【不重新导航】，保留已经渲染出来的评论列表。
+        #    不在目标页上（或 URL 读不到）仍然照旧导航 —— 后面的目标页校验一行都没少。
+        already_here = False
+        try:
+            here = _resolved_room_url(tab.evaluate("location.href") or "")
+            wanted = _canonical_room(room_url)
+            already_here = bool(here) and bool(wanted) and _canonical_room(here) == wanted
+        except Exception:
+            already_here = False
+        if not already_here:
+            tab.call("Page.navigate", {"url": room_url}, timeout=25)
         if not _wait_ready(tab):
             row = gate.finish(send_id, "failed", "page_not_ready")
             return gate.result(row)
@@ -848,10 +1349,22 @@ def send_comment(tab, gate, send_id, target, text, source):
         ):
             row = gate.finish(send_id, "failed", "target_live_room_mismatch")
             return gate.result(row)
+        # 评审要求（2026-09-26）：评论（视频/直播公屏）发送路径也必须复用统一的可见性门禁 ——
+        # unknown 不等于 hidden：判定不了就交人工，不自动重试。
+        gated = _visibility_gate(tab, gate, send_id)
+        if gated is not None:
+            return gated
         if douyin.check_captcha(tab):
             row = gate.finish(send_id, "blocked", "captcha_requires_manual_action")
             return gate.result(row)
-        login = douyin.login_state(tab)
+        # 🔴 必须走 _await_login，不能用裸的 login_state。
+        #    主页是 SPA，账号元素是【异步挂载】的：导航后立刻查会得到 unknown，
+        #    于是"明明登录着"却被判成未登录，而且判成 failed —— 这条目标再也进不了私信。
+        #    真机实测：医生(doctor)在页面稳定后判 verified，同一次导航后立刻判却是 unknown。
+        #    私信 / 直播公屏 / 直播私信三条路径早就用了 _await_login，唯独评论回复漏了，
+        #    后果就是评论公开回复在真机上【从未走通过】—— video_reply 至今没有送达证据，
+        #    根因就在这里，不在定位器。
+        login = _await_login(tab)
         if login != "verified":
             row = gate.finish(send_id, "failed", "login_required" if login == "required" else "login_state_unknown")
             return gate.result(row)
@@ -868,12 +1381,70 @@ def send_comment(tab, gate, send_id, target, text, source):
             # 新定位器还会先 scrollIntoView 再重读坐标（虚拟列表里出视口的行坐标是负的）。
             found = douyin.comment_reply_button(tab, target)
             if not found.get("found"):
-                row = gate.finish(send_id, "failed",
-                                  "reply_" + str(found.get("reason") or "not_found"))
+                # 轻量尝试：滚几轮，看目标行是否只是还没进视口。
+                #
+                # 🔴 滚动本身失败【不能改写归因】：定位器返回的 reason 才是事实，
+                #    而 scroll_comment_panel 在页面不可见、面板结构变化或测试替身下
+                #    都可能直接抛错。之前没有这层保护，异常会一路冒到函数末尾的
+                #    except，把结果写成 reason='KeyError' —— 一条准确的
+                #    reply_ambiguous_comment 被替换成了毫无信息量的异常类名
+                #    （CI: BoundaryTests.test_video_comment_ambiguous_target_never_clicks）。
+                for _ in range(3):
+                    try:
+                        douyin.scroll_comment_panel(tab, rounds=1, pause=1.4, dy=2000)
+                    except Exception:
+                        break
+                    found = douyin.comment_reply_button(tab, target)
+                    if found.get("found"):
+                        break
+            if not found.get("found"):
+                # 🔴 真机实测（2026-09-21）—— 这里必须报【准确的原因】，不能一律说 not_found：
+                #
+                #   采集走接口（/aweme/v1/web/comment/list/），回复走 DOM。
+                #   同一个视频：接口给 43 条，DOM 只渲染 17 条，两个集合不重合。
+                #   采集到的第 18~43 条【在页面上根本不存在】，技术上无法回复。
+                #
+                #   试过并证伪的加载手段（都是正常用户行为，未越界）：
+                #     · 逐步滚 scrollTop += 600，20 次 -> scrollHeight 始终 3546，节点恒为 17
+                #     · 跳到底 scrollTop = scrollHeight     -> 同上
+                #     · 真实滚轮 Input.dispatchMouseEvent -> 页面 hidden 时直接读超时
+                #   scrollHeight 不增长是关键：懒加载追加内容时它必然变大。
+                #
+                #   所以「找不到」有两种含义，混在一起会误导排查方向：
+                #     comment_not_found      -> 定位器有问题（需要修代码）
+                #     target_not_rendered    -> 目标不在渲染层（需要换目标，不是修代码）
+                #   另外加滚轮不可用时也要如实标注，否则会被当成定位器缺陷。
+                reason = str(found.get("reason") or "not_found")
+                if reason == "comment_not_found":
+                    # 目标不在渲染层：定位器再怎么改也找不到它，这是【换目标】的事，
+                    # 不是重试代码的事 —— 归 blocked，并给一个能自查的原因。
+                    row = gate.finish(send_id, "blocked", "reply_target_not_rendered")
+                else:
+                    # 定位器自身的问题（多行歧义 / 找不到「回复」按钮）仍然是 failed：
+                    # 这是代码缺陷，基线契约（BoundaryTests）就是按 failed 断言的，
+                    # 一律改成 blocked 会把"我们没点下去"和"我们点不了"混为一谈。
+                    #
+                    # 原因枚举与采集阶段的 visibilityReason 对齐（同名、不叠前缀）：
+                    # 否则会出现 reply_reply_button_not_found 这种叠词，
+                    # 宿主也没法把"标注原因"和"拒绝原因"对上。
+                    refusal = {
+                        "ambiguous_comment": "reply_ambiguous_comment",
+                        "reply_button_not_found": "reply_button_not_found",
+                        "scrolled_into_view": "reply_button_not_rendered",
+                    }.get(reason, "reply_" + reason)
+                    row = gate.finish(send_id, "failed", refusal)
                 return gate.result(row)
             tab.click_at(found["x"], found["y"])
-            time.sleep(0.6)
-            composer = douyin.comment_reply_composer(tab, target)
+            # 🔴 真机（2026-09-21）：点「回复」之后编辑器不是立刻挂载的 ——
+            #    行要先切成「回复中」，Draft.js 编辑器才挂出来。
+            #    原来只等 0.6 秒查一次，查不到就判 comment_composer_not_found，
+            #    实测这一步就是过不去。改成有界轮询，拿到编辑器就走。
+            composer = {"found": False}
+            for _ in range(12):
+                time.sleep(0.5)
+                composer = douyin.comment_reply_composer(tab, target)
+                if composer.get("found"):
+                    break
         if not composer.get("found"):
             row = gate.finish(send_id, "failed", "comment_composer_not_found")
             return gate.result(row)
@@ -897,11 +1468,85 @@ def send_comment(tab, gate, send_id, target, text, source):
         if (after.get("text") or "") != text:
             row = gate.finish(send_id, "failed", "text_verification_failed")
             return gate.result(row)
+        # 🔴 录制器必须在点击【之前】挂上，否则 responseReceived 已经过去了。
+        #
+        #    这里原本是「点一下，然后直接写死 unknown」—— 评论公开回复路径
+        #    从来没有接过录制器（COMMENT_PUBLISH_URL_MARK 在 douyin_selectors 里
+        #    定义了却无人使用），所以 sent_confirmed 在这条路径上【永远不可能出现】，
+        #    两阶段契约的第二段也就永远进不去。
+        #    真机对照：手动点发送 -> POST /aweme/v1/web/comment/publish http=200，
+        #    body 里 status_code=0 —— 响应是可观测的，只是从来没去读。
+        #    私信路径早就这么做了（DM_SEND_URL_MARK），评论路径漏了。
+        recorder = douyin.make_network_recorder(
+            tab, getattr(S, "COMMENT_PUBLISH_URL_MARK", ""),
+            capture_post_data=True)  # 回执要绑定到具体评论正文，必须留档请求体
+        record_error = None
+        try:
+            tab.call("Network.enable", {}, timeout=10)
+        except Exception as exc:
+            # 不能静默吞掉：否则「没抓到响应」无法区分是「没发出去」
+            # 还是「录制器根本没开」，排查方向会整个跑偏。
+            record_error = type(exc).__name__
+        # 🔴 同一条真机结论（2026-09-28）：页面不可见时点击不送达渲染进程，
+        #    表现是"发送键点了没反应"。这里在【落 started 之前】再确认一次：
+        #    确认不了按可重试的 page_not_visible 拒绝，不要记成定位器/选择器问题。
+        ready = _click_ready(tab)
+        if ready != "visible":
+            # hidden 与 unknown 都交人工（unknown 不当作可恢复状态，见 _click_ready）。
+            refusal = _visibility_refusal(send_id, ready, skipped=True)
+            row = gate.finish(send_id, refusal["status"], refusal["reason"],
+                              refusal["evidence"])
+            return gate.result(row)
         gate.mark_started(send_id)
         started = True
-        tab.click_at(button["x"], button["y"])
-        row = gate.finish(send_id, "unknown", "platform_response_unavailable")
+        # 最后一步同样盯住竞态：点之前/之后各看一次可见性，点击抛异常也接住。
+        send_race = _final_send_click(tab, lambda: tab.click_at(button["x"], button["y"]),
+                                      label="comment_send_button")
+        records = recorder.collect(wait_seconds=8.0)
+        mark = getattr(S, "COMMENT_PUBLISH_URL_MARK", "")
+        matched = [r for r in records if mark and mark in (r.get("url") or "")]
+        # 🔴 评审要求（2026-09-26）：回执必须绑定到【这一条评论】。
+        #    只按 URL 匹配时，同一页面里任何一次发布请求都会被算成本次动作的回执
+        #    （并发/重试下张冠李戴）。绑定依据见 _publish_record_matches。
+        bound = []
+        for record in matched:
+            ok, basis = _publish_binding(record, text, target_id)
+            if ok:
+                bound.append((record, basis))
+        # 🔴 按评论 ID 绑定的那一条是【结论性】的：它精确到值，优先采信；
+        #    只有正文绑定时，多条回执就无法区分归属（并发、双击、页面重试）。
+        by_id = [item for item in bound if item[1] == "comment_id"]
+        chosen = by_id if by_id else bound
+        statuses = [_response_status(record) for record, _ in chosen]
+        # ⚠️ detail 里只放计数与状态码：请求体（postData）本身【不进台账、不进日志】。
+        detail = {"httpResponses": len(records), "matchedResponses": len(matched),
+                  "boundResponses": len(bound), "boundByCommentId": len(by_id),
+                  "platformStatusCodes": statuses[:5],
+                  "networkEnableError": record_error,
+                  "sendRace": send_race}
+        if len(chosen) > 1:
+            # 归属于哪一条无法判定：证据不足，按未确定处理，禁止进入私信。
+            # 宁可停在 unknown 交人工，也不能挑一条"看起来成功"的回执当结论。
+            row = gate.finish(send_id, "unknown", "platform_response_ambiguous", detail)
+        elif not chosen:
+            if matched:
+                # 命中发布接口但绑定不到本条评论/正文：证据不足，禁止进入私信。
+                row = gate.finish(send_id, "unknown", "platform_response_unbound", detail)
+            elif _send_race_reason(send_race):
+                # 没有回执、而且最后一步还被竞态/传输失败打断：说清是哪一种（仍然 unknown，
+                # 因为"可能已经发出去了"—— 绝不能猜成 failed 让它自动重试）。
+                row = gate.finish(send_id, "unknown", _send_race_reason(send_race), detail)
+            else:
+                row = gate.finish(send_id, "unknown", "platform_response_unavailable", detail)
+        elif statuses[0] == 0:
+            # 只有平台明确回 status_code=0 才算【确认成功】——
+            # 这是唯一允许进入私信阶段的状态（图 11 固定流程二）。
+            row = gate.finish(send_id, "sent_confirmed", "platform_response", detail)
+        elif statuses[0] is not None:
+            row = gate.finish(send_id, "failed", "platform_rejected", detail)
+        else:
+            # 命中接口但读不出状态码：证据不足，按未确定处理，禁止进入私信。
+            row = gate.finish(send_id, "unknown", "platform_response_unreadable", detail)
         return gate.result(row)
     except Exception as exc:
-        row = gate.finish(send_id, "unknown" if started else "failed", type(exc).__name__)
-        return gate.result(row)
+        return _internal_failure(gate, send_id, started, exc, "send_comment")

@@ -17,7 +17,6 @@ import uuid
 
 import douyin
 import scripts as st
-import winfocus
 import douyin_selectors as S
 from send_actions import send_private
 from send_gate import SendGate
@@ -333,10 +332,9 @@ def prepare_and_maybe_send(cdp, tab_id, target, text, allow_send, ledger, quota)
                     tab.call("Page.bringToFront", {}, timeout=5)
                 except Exception:
                     pass
-                # CDP 的置前改不了 Windows 的遮挡判定 —— 真机日志里出现过
-                # visibility 仍是 hidden 的情况，只能真的把窗口激活一次。
-                if douyin.visibility_state(tab) != "visible":
-                    winfocus.bring_chrome_front()
+                # ⚠️ 诊断工具定位：本入口没有 sidecar marker PID，因此【不做窗口级恢复】。
+                #    窗口级恢复的唯一入口是 Sidecar._page()（带 marker PID）；
+                #    这里只做页面级激活，随后如实记录 visibility（unknown 不等于 hidden）。
                 time.sleep(0.8)
             result["visibility"] = douyin.visibility_state(tab)
             # ⚠️ 每次重试都【重新读取】按钮坐标：页面可能位移，

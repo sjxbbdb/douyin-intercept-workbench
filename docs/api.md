@@ -65,7 +65,7 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 `POST/GET/PATCH /v1/knowledge-sets` 只管理当前工作台账号的知识集元数据和版本。运行实例可冻结 `knowledgeSetId + knowledgeSetVersion`；任何跨账号访问返回 `KNOWLEDGE_SET_NOT_FOUND`。向量内容和 provider key 不通过桌面端接口暴露。
 
-`POST /v1/agent/plan` 的 `context` 可带 `knowledgeSetId`、可选 `knowledgeSetVersion`、`knowledgeQuery` 和 `knowledgeTopK`。授权端先按租户和版本检索，再把片段作为不可信参考交给规划器；成功计划会把同一知识集 ID/版本写回 `params`，客户端不能替换它。服务端默认使用确定性的 `deterministic-token-bag`，配置 `EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL` 后才启用 OpenAI-compatible `/embeddings`；不同 embedding 版本不会混用向量。
+`POST /v1/agent/plan` 的 `context` 可带 `knowledgeSetId`、可选 `knowledgeSetVersion`、`knowledgeQuery` 和 `knowledgeTopK`。授权端先按租户和版本检索，再把片段作为不可信参考交给规划器；成功计划会把同一知识集 ID/版本写回 `params`，客户端不能替换它。每个计划还会写入服务端生成的 `params.policyRef`（策略 ID、策略版本和可选知识集版本）；桌面端和 sidecar 必须在计划、公开回复、私信三个阶段原样回传，缺失或不一致直接暂停人工。服务端默认使用确定性的 `deterministic-token-bag`，配置 `EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL` 后才启用 OpenAI-compatible `/embeddings`；不同 embedding 版本不会混用向量。
 
 ### `POST /v1/agent/evaluate`
 

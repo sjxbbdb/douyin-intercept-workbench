@@ -22,6 +22,27 @@ from send_gate import SendGate  # noqa: E402
 from url_policy import URLPolicyError, safe_url  # noqa: E402
 
 
+_saved_visibility_state = None
+
+
+def setUpModule():
+    # 本文件的用例关注草稿/行/点击等语义，不关注页面可见性。
+    # 页面可见性口径由 probe/tests/test_winfocus.py 覆盖；这里显式声明 visible，
+    # 避免 unknown 被当成 hidden（平台侧要求 2026-09-26：unknown 不等于 hidden，
+    # 且 unknown 不得自动重试发送）。
+    global _saved_visibility_state
+    import send_actions
+    _saved_visibility_state = send_actions.douyin.visibility_state
+    send_actions.douyin.visibility_state = lambda _cdp: 'visible'
+
+
+def tearDownModule():
+    import send_actions
+    if _saved_visibility_state is not None:
+        send_actions.douyin.visibility_state = _saved_visibility_state
+
+
+
 class Events:
     def __init__(self):
         self.handlers = {}
@@ -74,6 +95,21 @@ class SendGateTests(unittest.TestCase):
                 self.assertEqual(process.exitcode, 0)
             self.assertEqual(kinds.count("reserved"), 1)
             self.assertEqual(kinds.count("blocked"), 1)
+
+    def test_gate_limits_default_unchanged_and_can_be_raised_explicitly(self):
+        """本地安全阀：默认值不动，授信调用方可以显式调高（真机验收时需要）。
+
+        这是【本地】限额，不是平台配额；调高它不改变任何发送门禁语义
+        （两阶段契约、unknown 不重试、幂等键都还在）。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            default = sidecar.Sidecar(os.path.join(td, "s1"), os.path.join(td, "p1"), 19291)
+            raised = sidecar.Sidecar(os.path.join(td, "s2"), os.path.join(td, "p2"), 19292,
+                                     gate_limits={"hourly": 60, "daily": 200})
+        self.assertEqual(default.gate.limits, {"per_user": 1, "hourly": 20, "daily": 50},
+                         "默认本地安全阀保持不变")
+        self.assertEqual(raised.gate.limits, {"per_user": 1, "hourly": 60, "daily": 200})
 
     def test_account_scopes_are_isolated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -542,6 +578,26 @@ class ChromiumFixtureTests(unittest.TestCase):
             __import__("time").sleep(0.1)
         self.fail("fixture did not load")
 
+    def test_numeric_only_comment_body_still_locates(self):
+        """正文就是纯数字的评论必须仍能定位（评审要求：把纯数字兜底补回）。
+
+        旧实现把纯数字一律当噪声过滤 -> bodyText 为空 -> rowMatches 永远匹配不到，
+        表现是"采集里有这条、定位恒失败"，看起来像定位器坏了。
+        夹具里 comment-num 的正文就是 111，同行的 0（点赞数）与时间都必须【不是】正文。
+        """
+        import douyin
+        self._load("comments.html")
+        target = {"authorId": "author-num", "text": "111"}
+        state = douyin.comment_row_present(self.page, target)
+        self.assertTrue(state.get("present"), state)
+        self.assertEqual(state.get("matches"), 1, "纯数字正文必须唯一命中")
+        self.assertTrue(state.get("replyReady"), state)
+        found = douyin.comment_reply_button(self.page, target, attempts=1, settle=0)
+        self.assertTrue(found.get("found"), found)
+        # 噪声仍然要挡：点赞数 0 不能被当成正文
+        self.assertFalse(douyin.comment_row_present(
+            self.page, {"authorId": "author-num", "text": "0"}).get("present"))
+
     def test_live_capture_and_single_public_click(self):
         import live
         self._load("live.html")
@@ -682,6 +738,81 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertEqual(douyin.comment_reply_composer(self.page, other)["reason"], "reply_row_mismatch")
 
 
+    def test_the_dm_composer_never_picks_the_search_box(self):
+        """面板里同时有【搜索框】与【发消息输入框】：只能挑后者（2026-09-28 用户反馈）。
+
+        真机现象：文字打进了私信面板的搜索框，消息根本没发出去；
+        而搜索框里出现同一段文字还可能把"会话回显"判真（假证据）。
+        """
+        import douyin
+        self._load("private.html")
+        opener = self.page.eval_json(
+            "(function(){var e=document.querySelector('#open-dm');var r=e.getBoundingClientRect();"
+            "return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};})()")
+        self.page.click_at(opener["x"], opener["y"])
+        found = {"found": False}
+        for _ in range(20):
+            found = douyin.dm_composer(self.page)
+            if found.get("found"):
+                break
+            __import__("time").sleep(0.1)
+        self.assertTrue(found["found"], "面板出现后必须找得到输入框")
+        self.assertNotIn("search", str(found.get("cls") or "").lower(),
+                         "挑中的不能是搜索框")
+        # 收件人作用域的那一套必须【唯一命中】输入框：搜索框在同一个面板里，
+        # 如果它也算候选，就会退化成 ambiguous_recipient_composer（真机上正是这样踩的坑）。
+        scoped = {"found": False}
+        for _ in range(20):
+            scoped = douyin.dm_composer_for_recipient(self.page, "target-user", "Target User")
+            if scoped.get("found"):
+                break
+            __import__("time").sleep(0.1)
+        self.assertTrue(scoped["found"], "收件人作用域的输入框必须唯一命中：%r" % (scoped,))
+        self.assertEqual(scoped.get("containerKey"), "target-panel")
+        x, y = int(scoped["x"]), int(scoped["y"])
+        inside = self.page.evaluate(
+            "(function(){var ed=document.querySelector('#target-panel [contenteditable=true]');"
+            "var r=ed.getBoundingClientRect();"
+            "return " + str(x) + ">=r.x&&" + str(x) + "<=r.x+r.width&&"
+            + str(y) + ">=r.y&&" + str(y) + "<=r.y+r.height;})()")
+        self.assertTrue(inside, "点击坐标必须落在发消息的输入框里")
+        on_search = self.page.evaluate(
+            "(function(){var s=document.querySelector('.searchSearchInputsearch_header input');"
+            "var r=s.getBoundingClientRect();"
+            "return " + str(x) + ">=r.x&&" + str(x) + "<=r.x+r.width&&"
+            + str(y) + ">=r.y&&" + str(y) + "<=r.y+r.height;})()")
+        self.assertFalse(on_search, "点击坐标绝不能落在搜索框上")
+
+    def test_the_conversation_echo_ignores_text_that_is_only_in_the_composer(self):
+        """输入框里的文字不是"会话回显"：没发出去就不许当成功证据。
+
+        旧实现按"会话 scopes 里最长的 innerText"做子串匹配，而 [class*="imChat"]
+        会命中输入框容器 —— 于是刚敲进去的文字被判成回显（2026-09-28 修的假证据）。
+        """
+        import douyin
+        import json as jsonmod
+        self._load("private.html")
+        opener = self.page.eval_json(
+            "(function(){var e=document.querySelector('#open-dm');var r=e.getBoundingClientRect();"
+            "return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};})()")
+        self.page.click_at(opener["x"], opener["y"])
+        text = "你好"
+        for _ in range(20):
+            if self.page.evaluate("document.querySelector('#target-panel').style.display") == "block":
+                break
+            __import__("time").sleep(0.1)
+        self.page.evaluate(
+            "(function(){var ed=document.querySelector('#target-panel [contenteditable=true]');"
+            "ed.innerText=" + jsonmod.dumps(text) + ";return true;})()")
+        self.assertFalse(douyin.dm_conversation_echo(self.page, text, seconds=0.6, interval=0.2),
+                         "只在输入框里的文字不能算会话回显")
+        self.page.evaluate(
+            "(function(){var d=document.createElement('div');d.className='TextMessageTextpureText';"
+            "d.innerText=" + jsonmod.dumps(text) + ";"
+            "document.querySelector('.messageMessageList').appendChild(d);return true;})()")
+        self.assertTrue(douyin.dm_conversation_echo(self.page, text, seconds=0.6, interval=0.2),
+                        "会话区真的出现这条才算回显")
+
     def test_private_async_target_context_excludes_wrong_history(self):
         import douyin
         self._load("private.html")
@@ -701,6 +832,168 @@ class ChromiumFixtureTests(unittest.TestCase):
         self.assertTrue(send["found"])
         self.assertEqual(send["containerKey"], "target-panel")
 
+
+    def test_the_conversation_row_match_is_strict_not_prefix(self):
+        """用户要求（2026-09-28）：严格昵称匹配 —— 前缀不算同一个人。
+
+        夹具里有一行标题是 "Target"（正好是 "Target User" 的前缀）：如果还按前缀匹配，
+        查询 "Target User" 会同时命中两行 -> ambiguous -> 什么都点不了；
+        严格等值必须只命中标题完全相等的那一行。
+        """
+        import douyin
+        self._load("dm_list.html")
+        row = douyin.dm_conversation_row(self.page, "Target User")
+        self.assertTrue(row["found"], row)
+        self.assertEqual(row["count"], 1, "前缀诱饵行不许参与命中")
+        box = self.page.eval_json("(function(){var b=document.querySelector('#row-target').getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height};})()")
+        self.assertGreaterEqual(row["x"], box["x"])
+        self.assertLessEqual(row["y"], box["y"] + box["h"])
+        decoy = douyin.dm_conversation_row(self.page, "Target")
+        self.assertTrue(decoy["found"], "按它自己的完整标题查当然查得到")
+        self.assertNotEqual((decoy["x"], decoy["y"]), (row["x"], row["y"]))
+
+    def test_overlapping_conversation_scopes_do_not_double_count_a_bubble(self):
+        """真机（2026-09-29）：会话 scope 互相嵌套，同一气泡被命中多次 —— 实测一条消息数成 7。
+
+        夹具按真机结构把 messageMessageList 套在 MessageBox 里：一条消息必须只算一次。
+        """
+        import douyin
+        self._load("dm_echo_overlap.html")
+        counted = douyin.dm_conversation_echo_count(self.page, "你好", "小明")
+        self.assertTrue(counted["found"], counted)
+        self.assertEqual(counted["count"], 1,
+                         "只数当前会话里的气泡：嵌套 scope 不重复、会话列表预览与输入框都不算")
+        inside_both = self.page.evaluate(
+            "(function(){var el=document.querySelector('#one');"
+            "return !!(el.closest('[class*=\"MessageBox\"]')&&"
+            "el.closest('[class*=\"messageMessageList\"]'));})()")
+        self.assertTrue(inside_both, "前提：这条消息确实同时落在两个 scope 里")
+
+    def test_the_baseline_takes_the_largest_of_several_reads(self):
+        """会话历史是异步渲染的：只读一次会把"还没渲出来"当成 0，于是发完一涨就误判成本次回显。"""
+        import json as jsonmod
+        import douyin
+        scripted = [0, 5, 5]
+
+        class Cdp:
+            def evaluate(self, _expression):
+                value = scripted.pop(0) if scripted else 5
+                return jsonmod.dumps({"found": True, "count": value})
+
+        original_sleep = douyin.time.sleep
+        douyin.time.sleep = lambda _seconds: None
+        try:
+            baseline = douyin.dm_conversation_echo_baseline(Cdp(), "你好", "小明",
+                                                            tries=3, interval=0)
+        finally:
+            douyin.time.sleep = original_sleep
+        self.assertEqual(baseline["count"], 5, "取最大读数，避免把还没渲染当成 0")
+        self.assertEqual(baseline["reads"], [0, 5, 5])
+
+    def test_the_echo_counts_only_messages_inside_the_confirmed_recipient(self):
+        """真机结构 + 评审要求（2026-09-29）：回显必须绑定【目标收件人 + 本次发送动作】。
+
+        夹具里会话头部 = 目标昵称，消息列表里已经有一条历史消息「你好」，输入框里也有「你好」：
+        计数只能数消息列表里的那一条（输入框里的不算），头部不一致时直接拒答。
+        """
+        import douyin
+        self._load("dm_echo.html")
+        counted = douyin.dm_conversation_echo_count(self.page, "你好", "小明")
+        self.assertTrue(counted["found"], counted)
+        self.assertEqual(counted["count"], 1, "只数消息列表里的气泡，输入框里的不算")
+        wrong = douyin.dm_conversation_echo_count(self.page, "你好", "小红")
+        self.assertFalse(wrong["found"], "头部不是这个收件人 -> 不算数")
+        self.assertEqual(wrong["reason"], "recipient_not_confirmed")
+
+    def test_the_echo_after_send_requires_the_count_to_grow(self):
+        """历史里本来就有同样文字时，发送后计数没涨 —— 绝不能算成这次发送的证据。"""
+        import douyin
+        self._load("dm_echo.html")
+        baseline = douyin.dm_conversation_echo_count(self.page, "你好", "小明")
+        unchanged = douyin.dm_conversation_echo_after_send(self.page, "你好", "小明", baseline,
+                                                           seconds=0.05, interval=0.01)
+        self.assertFalse(unchanged["echo"], "计数没涨就不算回显")
+        self.assertEqual(unchanged["baseline"], 1)
+        self.page.evaluate("(function(){var s=document.createElement('span');"
+                           "s.className='TextMessageTextpureText bubble';s.innerText='你好';"
+                           "document.querySelector('#list').appendChild(s);})()")
+        grown = douyin.dm_conversation_echo_after_send(self.page, "你好", "小明", baseline,
+                                                       seconds=0.5, interval=0.05)
+        self.assertTrue(grown["echo"], grown)
+        self.assertEqual((grown["baseline"], grown["count"]), (1, 2))
+
+    def test_the_panel_header_match_is_strict_not_prefix(self):
+        """面板头部标题只做严格等值：标题是"小明"时，不能当成"小明同学"那一条会话。
+
+        脱敏星号与零宽字符仍然先归一化（"Star*User" == "StarUser"），否则脱敏昵称永远发不出去。
+        """
+        import douyin
+        self._load("dm_headers.html")
+        exact = douyin.dm_panel_state(self.page, "小明")
+        self.assertTrue(exact["found"], exact)
+        self.assertTrue(exact["headerMatch"], "完全相等必须命中")
+        prefixed = douyin.dm_panel_state(self.page, "小明同学")
+        self.assertFalse(prefixed["headerMatch"], "标题只是前缀 -> 不是同一个人，必须拒绝")
+        self.assertFalse(prefixed["headerFull"])
+        # 脱敏昵称（星号）归一化之后仍然必须严格相等，否则脱敏用户永远发不出去。
+        self.page.evaluate("document.querySelector('[class*=ChatHeadertitle]').innerText='Star*User'")
+        masked = douyin.dm_panel_state(self.page, "StarUser")
+        self.assertTrue(masked["headerMatch"], "脱敏星号归一化之后仍然严格相等")
+        self.assertFalse(douyin.dm_panel_state(self.page, "StarUserX")["headerMatch"],
+                         "多一个字就不是同一个人")
+
+    def test_dm_conversation_rows_covered_by_the_open_chat_are_not_clickable(self):
+        """真机（2026-09-26）：会话打开时，整列会话列表仍在 DOM 里且有真实尺寸，
+        但整列被会话内容盖住 —— 照坐标点下去就是点进对方的会话（可能点到消息里的链接）。
+        """
+        import douyin
+        self._load("dm_list_covered.html")
+        row = douyin.dm_conversation_row(self.page, "Target User")
+        self.assertFalse(row["found"], "被盖住的行绝不许返回可点坐标")
+        self.assertEqual(row["reason"], "conversation_row_covered")
+        self.assertGreaterEqual(row["covered"], 1)
+        self.assertLessEqual(row["covered"], row["rowsSeen"])
+        self.assertFalse(douyin.dm_row_preview_matches(self.page, "Target User", "你好，看到你")["found"])
+
+    def test_dm_conversation_row_picks_the_target_row_only(self):
+        """真机（2026-09-26）：面板停在消息列表时，要在列表里点开对方那一行。
+
+        夹具里故意放了同名的隐藏行（display:none）、两行同名（Twin User）和一个带星号的
+        脱敏昵称：隐藏行不参与、同名多行返回 not found（不猜）、星号按同一套口径归一化。
+        """
+        import douyin
+        self._load("dm_list.html")
+        row = douyin.dm_conversation_row(self.page, "Target User")
+        self.assertTrue(row["found"], row)
+        self.assertTrue(row["matched"])
+        self.assertEqual(row["rowsSeen"], 6, "隐藏行不算：可见行 6 个（含一个前缀诱饵行）")
+        box = self.page.eval_json("(function(){var b=document.querySelector('#row-target').getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height};})()")
+        self.assertGreaterEqual(row["x"], box["x"])
+        self.assertLessEqual(row["x"], box["x"] + box["w"])
+        self.assertGreaterEqual(row["y"], box["y"])
+        self.assertLessEqual(row["y"], box["y"] + box["h"])
+        self.assertFalse(douyin.dm_conversation_row(self.page, "Nobody Here")["found"])
+        twin = douyin.dm_conversation_row(self.page, "Twin User")
+        self.assertFalse(twin["found"], "两行同名时不许猜")
+        self.assertEqual(twin["reason"], "ambiguous_conversation_row")
+        self.assertTrue(douyin.dm_conversation_row(self.page, "Star User")["found"],
+                        "脱敏星号不参与比较")
+
+    def test_dm_row_preview_reports_the_sent_text_as_page_observation(self):
+        """行预览是页面观察：发出去的那条会出现在该行预览里，没发出去的行只有平台提示语。
+
+        它是有力旁证，但私信没有 HTTP 回执（红线 2），所以只进 evidence，不改状态。
+        """
+        import douyin
+        self._load("dm_list.html")
+        ours = "你好，看到你在直播间的提问，我整理了一份入门步骤"
+        hit = douyin.dm_row_preview_matches(self.page, "Target User", ours)
+        self.assertTrue(hit["found"], hit)
+        self.assertTrue(hit["containsText"], "对方那一行的预览里就是刚发的话术")
+        miss = douyin.dm_row_preview_matches(self.page, "Other Person", ours)
+        self.assertTrue(miss["found"], miss)
+        self.assertFalse(miss["containsText"], "只有平台提示语的行不算发出去")
+        self.assertFalse(douyin.dm_row_preview_matches(self.page, "Target User", "")["found"])
 
 class LiveFlowTests(unittest.TestCase):
     """Offline coverage for the live batch flow (images/12) and its two
@@ -855,6 +1148,43 @@ class LiveFlowTests(unittest.TestCase):
             self.assertEqual(report["privateCandidates"], 1)
             self.assertEqual(report["checkpoint"]["planTargets"], 1)
             self.assertEqual(report["checkpoint"]["phase"], "private")
+
+    def test_live_reply_uses_raw_ledger_state_for_private_candidates(self):
+        """对外结果可保持 unknown，但已落账的 sent_confirmed 必须进入二阶段。"""
+        import sidecar
+
+        class Page:
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19228)
+            instance.live_queue.append([self._event("e1")])
+            planned = instance.dispatch("live_plan", {
+                "maxItems": 5, "windowSeconds": 600, "replyMode": "composer",
+                "scripts": self._scripts(["e1"])})
+            batch_id = planned["batch"]["batchId"]
+            instance._page = lambda: (Page(), {"pid": 1})
+            original = sidecar.send_comment
+
+            def confirmed_but_projected_unknown(_page, gate, send_id, target, text, source):
+                gate.reserve(send_id, target["authorId"], text, kind="comment")
+                gate.mark_started(send_id)
+                row = gate.finish(send_id, "sent_confirmed", "platform_response")
+                return gate.result(row)
+
+            sidecar.send_comment = confirmed_but_projected_unknown
+            try:
+                reply = instance.dispatch("live_reply", {
+                    "batchId": batch_id, "items": [{"eventId": "e1", "sendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+
+        self.assertEqual(reply["results"][0]["status"], "unknown")
+        self.assertEqual(reply["results"][0]["recordedState"], "sent_confirmed")
+        self.assertEqual(reply["privateCandidates"][0]["eventId"], "e1")
+
 
     def test_live_listen_enqueues_deduped_events(self):
         import sidecar
@@ -1838,7 +2168,11 @@ class SearchRelevanceTests(unittest.TestCase):
         self.assertEqual(result["videos"][0]["relevance"]["reason"], "exact_phrase")
         self.assertEqual(result["videos"][2]["relevance"]["reason"], "no_match")
         self.assertEqual(result["filter"], {"collected": 3, "returned": 3,
-                                            "filteredByRelevance": 0, "minRelevance": 0})
+                                            "filteredByRelevance": 0, "minRelevance": 0,
+                                            "filteredByDate": 0, "unknownDate": 0,
+                                            "dateFrom": None, "dateTo": None,
+                                            "cursorFilters": {"dateFrom": None, "dateTo": None,
+                                                              "minRelevance": 0}})
         # 边界：只发现与筛选，不产生任何发送动作
         for key in ("sent", "sendId", "private", "reply"):
             self.assertNotIn(key, result)
@@ -1847,7 +2181,12 @@ class SearchRelevanceTests(unittest.TestCase):
         result = self._run({"keyword": "宝宝辅食", "minRelevance": 60})
         self.assertEqual([v["id"] for v in result["videos"]], ["1"])
         self.assertEqual(result["filter"], {"collected": 3, "returned": 1,
-                                            "filteredByRelevance": 2, "minRelevance": 60})
+                                            "filteredByRelevance": 2, "minRelevance": 60,
+                                            "filteredByDate": 0, "unknownDate": 0,
+                                            "dateFrom": None, "dateTo": None,
+                                            # 游标里绑定的规范化条件：筛选参数一起进游标
+                                            "cursorFilters": {"dateFrom": None, "dateTo": None,
+                                                              "minRelevance": 60}})
 
     def test_min_relevance_is_validated(self):
         import sidecar
@@ -1917,7 +2256,10 @@ class SearchPagingRelevanceTests(unittest.TestCase):
         self.assertEqual(first["poolSize"], 3)
         self.assertEqual(first["poolIds"], ["1", "2", "3"])
 
-        second, calls = self._run({"keyword": "宝宝辅食", "cursor": first["cursor"]})
+        # 续页必须带【同一组筛选条件】：游标现在绑定 minRelevance，
+        # 少写一个就会被拒绝 —— 这正是该报错的地方（两页条件不同却当成同一次搜索）。
+        second, calls = self._run({"keyword": "宝宝辅食", "minRelevance": 60,
+                                   "cursor": first["cursor"]})
         self.assertEqual(second["page"], 2)
         # 续页时池子里必须已经有那两条被筛掉的视频，否则它们会被重新采集一遍
         self.assertEqual(calls[0]["seen_ids"], {"1", "2", "3"})
@@ -1958,6 +2300,80 @@ class SearchPagingRelevanceTests(unittest.TestCase):
         self.assertIsNone(result["stoppedReason"])
         self.assertEqual(result["poolSize"], 3)
         self.assertEqual(calls[0]["navigate"], True)
+
+    def test_page_record_carries_version_and_paging_outcome(self):
+        """分页记录：页面版本 + 分页终止态（more / exhausted / captcha / login_required）。
+
+        评审意见：找视频要记录「当前页面版本、分页终止态、登录/验证码/空结果」。
+        只有 cursor/hasMore 时，宿主重启后分不清"到底了"和"被验证码打断了"，
+        也认不出手里的游标是哪一版协议产出的 —— 这两件事的处置完全不同：
+        前者停止翻页，后者要人工处理验证码再继续。
+        """
+        import sidecar
+        normal, _ = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(normal["cursorVersion"], sidecar.CURSOR_VERSION)
+        self.assertEqual(normal["pageOutcome"], sidecar.PAGE_OUTCOME_MORE)
+        self.assertEqual(normal["page"], 1)
+
+        captcha, _ = self._run({"keyword": "宝宝辅食"}, stopped="captcha")
+        self.assertEqual(captcha["pageOutcome"], sidecar.PAGE_OUTCOME_CAPTCHA)
+        self.assertEqual(captcha["stoppedReason"], "captcha")
+        self.assertIsNone(captcha["cursor"])
+        self.assertFalse(captcha["hasMore"])
+        self.assertEqual(captcha["cursorVersion"], sidecar.CURSOR_VERSION)
+
+        sidecar_mod, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        try:
+            sidecar.douyin.login_state = lambda page: "required"
+            login = instance.search({"keyword": "宝宝辅食"})
+            sidecar.douyin.login_state = lambda page: "ok"
+            sidecar.crawlmod.search_videos = lambda *args, **kwargs: []
+            empty = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(login["pageOutcome"], sidecar.PAGE_OUTCOME_LOGIN)
+        self.assertIsNone(login["cursor"])
+        self.assertFalse(login["hasMore"])
+        self.assertEqual(empty["pageOutcome"], sidecar.PAGE_OUTCOME_EXHAUSTED)
+        self.assertFalse(empty["hasMore"])
+        self.assertEqual(empty["cursorVersion"], sidecar.CURSOR_VERSION)
+
+    def test_paging_outcome_is_not_confused_with_the_platform_signal(self):
+        """more/exhausted 说的是"我们这边还翻不翻"，platformHasMore 说的是"平台那边还有没有"。
+
+        两者混用会让宿主在平台明明还有结果时提前收工，或者反过来对着验证码继续翻。
+        """
+        import sidecar
+        more, _ = self._run({"keyword": "宝宝辅食"})
+        self.assertEqual(more["pageOutcome"], sidecar.PAGE_OUTCOME_MORE)
+        self.assertEqual(more["platformHasMore"], 1)
+        # 本页一条新视频都没有，但平台那边【明明还有】（platform_has_more=1）：
+        # 我们这边停，是因为这一页没有新东西，不是因为平台没有更多结果。
+        sidecar_mod, instance = self._instance()
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+
+        def empty_search(page, keyword, **kwargs):
+            meta = kwargs.get("meta")
+            if isinstance(meta, dict):
+                meta["skipped_seen"] = 0
+                meta["platform_has_more"] = 1
+                meta["platform_cursor"] = "pc-1"
+            return []
+
+        try:
+            sidecar.douyin.login_state = lambda p: "ok"
+            sidecar.crawlmod.search_videos = empty_search
+            exhausted = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(exhausted["pageOutcome"], sidecar.PAGE_OUTCOME_EXHAUSTED)
+        self.assertEqual(exhausted["platformHasMore"], 1,
+                         "我们这边没有新候选，不等于平台没有更多结果")
 
 
 class CommentFlowContractTests(unittest.TestCase):
@@ -2018,15 +2434,107 @@ class CommentFlowContractTests(unittest.TestCase):
                                        "target": {"authorId": "author-1"}, "text": "你好"})
             return raised.exception.code
 
-    def test_missing_public_send_id_is_refused(self):
-        """缺 publicSendId 必须拒绝 —— 它曾经是「可选」的，那等于没有守卫。
+    def test_comment_evidence_does_not_cross_accounts_on_the_same_video(self):
+        """评审 2026-09-29：「同 URL 切换账号」必须隔离 —— A 的评论证据不能被 B 拿去用。
 
-        「可选参数」在这个位置的真实含义是：任何调用方只要省略它，
-        就绕过了「公开回复确认成功后才允许私信」这条契约，
-        而偏偏执行发送的就是这条单发路径。批量清单一直强制这一条，
-        两个入口口径不一致时，实际生效的是最弱的那条。
-        （_instance(explode=True) 让 _page 抛异常，顺带证明门禁在开浏览器之前生效。）
+        同一个视频、同一段话术，A 账号的公开回复确认成功；B 账号（同一份 state-dir）
+        绝不能因为"文件里有一条 sent_confirmed"就放行私信：证据按账号作用域隔离。
         """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate_a = SendGate(td, "account-a")
+            public_id = self._public_reply(gate_a, "shared-reply", "sent_confirmed")
+            gate_b = SendGate(td, "account-b")
+            self.assertIsNone(sidecar._public_guard(gate_a, public_id))
+            refusal = sidecar._public_guard(gate_b, public_id)
+            self.assertIsNotNone(refusal, "另一个账号不能继承这条评论证据")
+            self.assertEqual(refusal[0], "public_not_found",
+                             "B 的台账里根本没有这条 sendId")
+
+    def test_the_same_video_url_still_records_sends_under_each_account(self):
+        """同一 URL 下两个账号各自记账：互不覆盖，也互不可见。"""
+        with tempfile.TemporaryDirectory() as td:
+            for scope in ("account-a", "account-b"):
+                gate = SendGate(td, scope)
+                self._public_reply(gate, "reply-%s" % scope, "sent_confirmed")
+            rows_a = SendGate(td, "account-a").lookup("reply-account-a")
+            rows_b = SendGate(td, "account-b").lookup("reply-account-b")
+            self.assertEqual(rows_a["status"], "sent_confirmed")
+            self.assertEqual(rows_b["status"], "sent_confirmed")
+            self.assertIsNone(SendGate(td, "account-b").lookup("reply-account-a"),
+                              "B 看不到 A 的台账行")
+
+    def test_a_danmaku_public_reply_cannot_unlock_a_message_to_another_event(self):
+        """评审 2026-09-29：单发私信此前【完全没绑弹幕通路】—— 拿 A 那条已确认的公屏回复，
+        可以给 B 发私信（张冠李戴）。现在必须同一事件，且判定发生在打开浏览器之前。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("dm-1", "live-danmaku-native:event-a:小明", "关注我", kind="danmaku_reply")
+            gate.finish("dm-1", "sent_confirmed", "platform_response")
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-x", "publicSendId": "dm-1",
+                                       "target": {"eventId": "event-b", "authorId": "author-b",
+                                                  "authorName": "小红"},
+                                       "text": "你好"})
+        self.assertEqual(raised.exception.code, "public_event_mismatch")
+
+    def test_a_danmaku_public_reply_cannot_unlock_a_message_to_another_recipient(self):
+        """同一事件、换成另一个收件人也不行（昵称必须与公屏那条一致）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("dm-2", "live-danmaku:event-a:小明", "关注我", kind="danmaku_reply")
+            gate.finish("dm-2", "sent_confirmed", "platform_response")
+            sidecar_mod, instance = self._instance(explode=True)
+            instance.gate = gate
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-y", "publicSendId": "dm-2",
+                                       "target": {"eventId": "event-a", "authorId": "author-b",
+                                                  "authorName": "小红"},
+                                       "text": "你好"})
+        self.assertEqual(raised.exception.code, "public_target_mismatch")
+
+    def test_a_danmaku_private_message_must_carry_the_event_and_the_recipient(self):
+        """缺 eventId / 缺昵称一律拒绝：无从证明是同一事件、同一个人（fail-closed）。"""
+        import sidecar
+        cases = [({"authorId": "author-a", "authorName": "小明"}, "public_event_missing"),
+                 ({"eventId": "event-a", "authorId": "author-a"}, "public_target_missing")]
+        for target, code in cases:
+            with tempfile.TemporaryDirectory() as td:
+                gate = SendGate(td, "account-a")
+                gate.reserve("dm-3", "live-danmaku-native:event-a:小明", "关注我",
+                             kind="danmaku_reply")
+                gate.finish("dm-3", "sent_confirmed", "platform_response")
+                sidecar_mod, instance = self._instance(explode=True)
+                instance.gate = gate
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.send_private({"sendId": "priv-z", "publicSendId": "dm-3",
+                                           "target": target, "text": "你好"})
+            self.assertEqual(raised.exception.code, code, repr(target))
+
+    def test_a_matching_danmaku_binding_still_reaches_the_browser(self):
+        """反向保护：同一事件 + 同一收件人时必须放行（否则上面几条就变成"永远发不出去"）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("dm-4", "live-danmaku-native:event-a:小明", "关注我",
+                         kind="danmaku_reply")
+            gate.finish("dm-4", "sent_confirmed", "platform_response")
+            sidecar_mod, instance = self._instance()
+            instance.gate = gate
+            self.assertIsNone(sidecar._private_binding_mismatch(
+                gate, "dm-4", {"eventId": "event-a", "authorId": "author-a",
+                               "authorName": "小明"}))
+            # 脱敏星号在归一化后仍然算同一人。
+            self.assertIsNone(sidecar._private_binding_mismatch(
+                gate, "dm-4", {"eventId": "event-a", "authorId": "author-a",
+                               "authorName": "小*明"}))
+
+    def test_missing_public_send_id_is_refused(self):
         import sidecar
         base = {"sendId": "priv-1", "target": {"authorId": "author-1"}, "text": "你好"}
         with tempfile.TemporaryDirectory() as td:
@@ -2366,6 +2874,179 @@ class CommentBatchFlowTests(unittest.TestCase):
         params.update(overrides)
         return params
 
+    class _ReachPage:
+        """带 URL 的假页面：让 _reply_reachable_split 能走到真正的探针调用。"""
+
+        def __init__(self, url):
+            self.url = url
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return self.url
+            return None
+
+        def close(self):
+            pass
+
+    def _reachable_instance(self, td, collected, reachable_authors):
+        """把"页面上此刻能不能点开回复"替换成按作者判定；返回 (sidecar, instance)。"""
+        import sidecar
+        sidecar_mod, instance = self._instance(td, collected)
+        instance._page = lambda: (self._ReachPage(self.VIDEO), {"pid": 1})
+        original = sidecar.douyin.comment_row_present
+
+        def probe(_page, target, **kwargs):
+            hit = str(target.get("authorId") or "") in reachable_authors
+            return {"present": hit, "matches": 1 if hit else 0, "replyReady": hit,
+                    "reason": "" if hit else "comment_not_found"}
+
+        sidecar.douyin.comment_row_present = probe
+        instance._restore_comment_row_present = lambda: setattr(
+            sidecar.douyin, "comment_row_present", original)
+        return sidecar_mod, instance
+
+    def test_only_comments_replyable_right_now_are_frozen(self):
+        """评审 2026-09-29 真机结论：接口采到的评论里，页面上没渲染的无法回复。
+
+        计划阶段就按 replyReady 筛一遍：只冻结此刻真的能点开「回复」的那些，
+        并把 reachable/unreachable 计数写进 filter，宿主提前止损。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._reachable_instance(
+                td, self._collected(self._targets(2)), {"author-1"})
+            try:
+                planned = instance.comment_plan(self._plan_params())
+            finally:
+                instance._restore_comment_row_present()
+        self.assertEqual(planned["status"], "ok", planned)
+        self.assertEqual(len(planned["targets"]), 1, "只有 author-1 那条能点开回复")
+        self.assertEqual(planned["targets"][0]["authorId"], "author-1")
+        self.assertTrue(planned["filter"]["replyReachabilityChecked"])
+        self.assertEqual(planned["filter"]["replyReachable"], 1)
+        self.assertEqual(planned["filter"]["replyUnreachable"], 1,
+                         "另一条在页面上点不开 —— 不冻进批次，宿主提前止损")
+
+    def test_when_nothing_can_be_replied_to_no_batch_is_frozen(self):
+        """页面上一条都点不开「回复」：返回 empty + 稳定原因，不冻一批注定失败的批次。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._reachable_instance(
+                td, self._collected(self._targets(2)), set())
+            try:
+                planned = instance.comment_plan(self._plan_params())
+            finally:
+                instance._restore_comment_row_present()
+        self.assertEqual(planned["status"], "empty", planned)
+        self.assertEqual(planned["reason"], "no_replyable_comment")
+        self.assertIsNone(planned["batch"], "不冻结批次")
+        self.assertEqual(planned["filter"]["replyReachable"], 0)
+        self.assertEqual(planned["filter"]["replyUnreachable"], 2)
+
+    def test_a_broken_probe_falls_back_to_the_previous_behaviour(self):
+        """探针本身坏了不许把批次清空：checked=False，退回"按接口候选冻结"。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(2)))
+            instance._page = lambda: (self._ReachPage(self.VIDEO), {"pid": 1})
+            original = sidecar.douyin.comment_row_present
+
+            def boom(*_args, **_kwargs):
+                raise RuntimeError("probe broken")
+
+            sidecar.douyin.comment_row_present = boom
+            try:
+                planned = instance.comment_plan(self._plan_params())
+            finally:
+                sidecar.douyin.comment_row_present = original
+        self.assertEqual(planned["status"], "ok", planned)
+        self.assertEqual(len(planned["targets"]), 2, "探针坏了按旧行为冻结，不清空")
+        self.assertFalse(planned["filter"]["replyReachabilityChecked"])
+
+    def test_an_unknown_event_id_never_touches_the_queue_or_the_browser(self):
+        """评审 2026-09-29：不存在的 eventId 不许先 mark_private 再抛 unknown_event。
+
+        现在先判归属（纯读、无副作用）-> 稳定返回 blocked/event_not_in_plan；
+        既不起浏览器，也不给队列写任何私有记录。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            planned = instance.comment_plan(self._plan_params())
+            batch_id = planned["batch"]["batchId"]
+            calls = []
+            original = instance.comment_queue.mark_private
+            instance.comment_queue.mark_private = (
+                lambda *args, **kwargs: calls.append(args) or original(*args, **kwargs))
+            result = instance.comment_private({"batchId": batch_id, "items": [
+                {"eventId": "ghost-event", "sendId": "priv-1", "publicSendId": "pub-1"}]})
+        item = result["results"][0]
+        self.assertEqual(item["status"], "blocked")
+        self.assertEqual(item["reason"], "event_not_in_plan")
+        self.assertEqual(calls, [], "不属于本批次的事件不许落私有台账")
+
+    def test_an_event_that_exists_but_is_not_in_this_batch_is_not_in_plan(self):
+        """事件在队列里、但不在本批次：同样 event_not_in_plan（不猜、不落台账）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(2)),
+                                                   explode=True)
+            planned = instance.comment_plan(self._plan_params(maxItems=1))
+            batch_id = planned["batch"]["batchId"]
+            planned_ids = [target["eventId"] for target in planned["targets"]]
+            outside = next((name for name in ("e1", "e2") if name not in planned_ids), None)
+            self.assertIsNotNone(outside, "夹具应当有一个落在批次外的事件")
+            self.assertIsNotNone(instance.comment_queue.find_event(outside),
+                                 "这个事件在队列里确实存在")
+            result = instance.comment_private({"batchId": batch_id, "items": [
+                {"eventId": outside, "sendId": "priv-2", "publicSendId": "pub-1"}]})
+        self.assertEqual(result["results"][0]["reason"], "event_not_in_plan")
+
+    def test_a_batch_item_without_the_public_send_id_is_refused_before_the_browser(self):
+        """逐项结果必须稳定：缺 publicSendId -> blocked/public_missing，且不开浏览器。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            planned = instance.comment_plan(self._plan_params())
+            batch_id = planned["batch"]["batchId"]
+            event_id = planned["targets"][0]["eventId"]
+            result = instance.comment_private({"batchId": batch_id, "items": [
+                {"eventId": event_id, "sendId": "priv-3"}]})
+        self.assertEqual(result["results"][0]["status"], "blocked")
+        self.assertEqual(result["results"][0]["reason"], "public_missing")
+
+    def test_private_input_is_validated_before_the_browser_opens(self):
+        """评审 2026-09-29：通用私信入口的输入预检必须在打开浏览器之前完成。
+
+        参数级错误（sendId / target 类型 / authorId 形状 / text）以前会一路走到
+        send_actions 才失败 —— 那时浏览器已经开了。_instance(explode=True) 的 _page
+        会抛异常，等于证明这些拒绝都发生在开浏览器之前。
+        """
+        import sidecar
+        cases = [
+            ({"target": {"authorId": "author-1"}, "text": "你好"}, "sendId"),
+            ({"sendId": "s1", "target": "not-an-object", "text": "你好"}, "target"),
+            ({"sendId": "s1", "target": {}, "text": "你好"}, "authorId"),
+            ({"sendId": "s1", "target": {"authorId": "bad id!"}, "text": "你好"}, "authorId"),
+            ({"sendId": "s1", "target": {"authorId": "author-1"}, "text": ""}, "text"),
+            ({"sendId": "s1", "target": {"authorId": "author-1"}, "text": "x" * 2001}, "text"),
+        ]
+        for params, field in cases:
+            with tempfile.TemporaryDirectory() as td:
+                sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                       explode=True)
+                with self.assertRaises(sidecar.SidecarError) as raised:
+                    instance.send_private(params)
+            self.assertEqual(raised.exception.code, "invalid_input", (field, params))
+            self.assertIn(field, str(raised.exception.message), field)
+
     def test_plan_refuses_missing_scripts_before_any_browser_action(self):
         """话术不完整就不建批次 —— fail-closed，连浏览器都不开。"""
         import sidecar
@@ -2474,6 +3155,53 @@ class CommentBatchFlowTests(unittest.TestCase):
         self.assertEqual(reply["privateRejected"][0]["reason"], "public_unknown")
         self.assertEqual(private["status"], "blocked")
         self.assertEqual(private["results"][0]["reason"], "public_unknown")
+
+    def test_projected_unknown_keeps_raw_confirmed_public_candidate(self):
+        """SendGate 对外把 sent_confirmed 映射为 unknown，队列仍须读原始台账。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            original = sidecar.send_comment
+
+            def confirmed_but_projected_unknown(_page, gate, send_id, target, text, source):
+                gate.reserve(send_id, target["authorId"], text, kind="comment")
+                gate.mark_started(send_id)
+                row = gate.finish(send_id, "sent_confirmed", "platform_response")
+                return gate.result(row)
+
+            sidecar.send_comment = confirmed_but_projected_unknown
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                reply = instance.comment_reply({
+                    "batchId": plan["batch"]["batchId"],
+                    "items": [{"eventId": "e1", "sendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(reply["results"][0]["status"], "unknown")
+        self.assertEqual(reply["privateCandidates"][0]["eventId"], "e1")
+        self.assertEqual(reply["privateCandidates"][0]["publicSendId"], "pub-e1")
+
+    def test_failed_outcome_cannot_inherit_stale_confirmed_ledger_row(self):
+        """sendId 冲突时不能拿旧的 sent_confirmed 解锁新的私信阶段。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)))
+            instance.gate.reserve("pub-e1", "video:e1:author-1", self.PUBLIC, kind="comment")
+            instance.gate.mark_started("pub-e1")
+            instance.gate.finish("pub-e1", "sent_confirmed", "old_attempt_confirmed")
+            original = sidecar.send_comment
+            sidecar.send_comment = lambda *_args, **_kwargs: {
+                "status": "failed", "reason": "idempotency_conflict", "sendId": "pub-e1"}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                reply = instance.comment_reply({
+                    "batchId": plan["batch"]["batchId"],
+                    "items": [{"eventId": "e1", "sendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(reply["results"][0]["status"], "failed")
+        self.assertEqual(reply["privateCandidates"], [])
+        self.assertEqual(reply["privateRejected"][0]["reason"], "public_failed")
 
     def test_confirmed_public_reply_opens_the_private_phase(self):
         """只有 sent_confirmed 放行私信；放行后私信阶段的 sendId 绑定要留痕。"""
@@ -2584,6 +3312,59 @@ class CommentBatchFlowTests(unittest.TestCase):
                 sidecar.send_comment = original_comment
         self.assertEqual(out["status"], "blocked")
         self.assertEqual(out["results"][0]["reason"], "public_not_found")
+
+    def test_private_refuses_a_public_send_id_that_belongs_to_another_target(self):
+        """错误绑定：拿 B 的公屏成功去给 A 发私信，必须拒绝而不是发送。
+
+        评审意见：确认每条私信都必须绑定【对应的】publicSendId。
+        只校验"存在一个已确认的公屏回复"是不够的 —— 张冠李戴同样会触达错人。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(2)))
+            original_comment = sidecar.send_comment
+            original_private = sidecar.send_private
+            sent = []
+            # 基线的私信门禁会先在【本地台账】里查这个 publicSendId，
+            # 所以这里要真的把两次公屏回复登记成 confirmed，否则会先撞上 public_not_found，
+            # 覆盖不到"绑定张冠李戴"这条。
+            for public_id in ("pub-e1", "pub-e2"):
+                instance.gate.reserve(public_id, "comment:%s:author" % public_id,
+                                      "public text", kind="comment")
+                instance.gate.mark_started(public_id)
+                instance.gate.finish(public_id, "sent_confirmed", "platform_response_recorded")
+            sidecar.send_comment = lambda *args, **kwargs: {
+                "status": "sent_confirmed", "reason": "platform_response_recorded",
+                "sendId": args[2]}
+            sidecar.send_private = lambda *args, **kwargs: sent.append(args) or {
+                "status": "unknown", "reason": "platform_response_unavailable"}
+            try:
+                plan = instance.comment_plan(self._plan_params())
+                batch_id = plan["batch"]["batchId"]
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"},
+                    {"eventId": "e2", "sendId": "pub-e2"}]})
+                wrong = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-e2"}]})
+                right = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1b", "publicSendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original_comment
+                sidecar.send_private = original_private
+        self.assertEqual(wrong["results"][0]["reason"], "public_send_id_mismatch")
+        self.assertEqual(len(sent), 1, "只有绑定正确的那一次才允许真的发出去")
+        self.assertEqual(right["results"][0]["status"], "unknown")
+
+    def test_private_without_a_public_send_id_is_refused_by_the_batch_view(self):
+        """缺失绑定：批量清单里没有 publicSendId 的条目一律 public_missing。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._instance(td, self._collected(self._targets(1)),
+                                                   explode=True)
+            listing = instance.dispatch("comment_private_candidates", {"items": [
+                {"eventId": "e1", "authorId": "author-1", "authorName": "用户1"}]})
+        self.assertEqual(listing["allowed"], [])
+        self.assertEqual(listing["rejected"][0]["reason"], "public_missing")
 
     def test_expired_events_are_not_replayed_into_a_batch(self):
         """批次窗口：过期的候选不会重新进批次（评论区窗口远长于弹幕，但语义一致）。"""
@@ -2745,6 +3526,372 @@ class ChatScrollTests(unittest.TestCase):
             live.main_chat_list, live.chat_list_tail, live.scroll_chat_list = original
         self.assertFalse(moving["paused"], "列表仍在动时必须如实报告，不能假装停住了")
 
+
+    def test_a_live_private_item_for_an_unknown_event_is_blocked_without_side_effects(self):
+        """评审 2026-09-29：live_private 遇到不存在的 eventId 时，不许先 mark_private 再抛
+        unknown_event —— 先判归属，统一返回 blocked/event_not_in_plan，且不开浏览器。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19279)
+            instance.live_queue.append([sidecar._event("live", "room-1", {
+                "id": "u1", "authorId": "author-1", "authorName": "小明", "text": "怎么做"})])
+            planned = instance.live_plan({"maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                                          "replyVia": "native",
+                                          "scripts": {"u1": {"publicText": "关注我",
+                                                             "privateText": "你好"}}})
+            batch_id = planned["batch"]["batchId"]
+            calls = []
+            original = instance.live_queue.mark_private
+            instance.live_queue.mark_private = (
+                lambda *args, **kwargs: calls.append(args) or original(*args, **kwargs))
+            opened = []
+            instance._page = lambda: opened.append(1) or (None, {"pid": 1})
+            result = instance.live_private({"batchId": batch_id, "items": [
+                {"eventId": "ghost-event", "sendId": "priv-9", "publicSendId": "pub-9"}]})
+        item = result["results"][0]
+        self.assertEqual(item["status"], "blocked")
+        self.assertEqual(item["reason"], "event_not_in_plan")
+        self.assertEqual(calls, [], "不存在的事件不许落私有台账")
+        self.assertEqual(opened, [], "没有可发送项时不许打开浏览器")
+
+    def test_an_unknown_live_public_state_never_unlocks_the_private_message(self):
+        """评审 2026-09-29：公屏状态是 unknown 时不得自动解锁私信。
+
+        直播公屏没有平台回执是常态，所以这条路径必须【按 unknown 处理】：
+        live_private 逐项绑定 publicSendId，且台账里那条不是 confirmed 就不放行。
+        """
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19277)
+            instance.live_queue.append([sidecar._event("live", "room-1", {
+                "id": "u1", "authorId": "author-1", "authorName": "小明", "text": "怎么做"})])
+            planned = instance.live_plan({"maxItems": 5, "windowSeconds": 600, "replyMode": "danmaku",
+                                          "replyVia": "native",
+                                          "scripts": {"u1": {"publicText": "关注我",
+                                                             "privateText": "你好"}}})
+            batch_id = planned["batch"]["batchId"]
+            # 公屏只走到 unknown（本通道常态），台账与队列都照实记。
+            instance.gate.reserve("pub-1", "live-danmaku-native:u1:小明", "关注我",
+                                  kind="danmaku_reply")
+            instance.gate.mark_started("pub-1")
+            instance.gate.finish("pub-1", "unknown", "platform_response_unavailable")
+            instance.live_queue.mark("u1", live_flow.UNKNOWN, batch_id, {"sendId": "pub-1"})
+            result = instance.live_private({"batchId": batch_id, "items": [
+                {"eventId": "u1", "sendId": "priv-1", "publicSendId": "pub-1"}]})
+        item = result["results"][0]
+        self.assertEqual(item["status"], "blocked", item)
+        self.assertIn(item["reason"],
+                      ("public_unknown", "public_pending", "event_not_private_candidate",
+                       "public_send_mismatch"),
+                      "unknown 的公屏结果绝不能解锁私信")
+
+    def test_a_stuck_scroller_stops_instead_of_guessing(self):
+        """评审 2026-09-29：滚动找回失败时要转人工/跳过，不能猜坐标。"""
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"clicks": 0}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked)
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = lambda *_a, **_k: {"ok": False,
+                                                       "reason": "danmaku_not_found_in_list"}
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": False, "box": list(box),
+                                                   "moved": 0, "atBottom": True}
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": True, "moved": 0, "atBottom": True}
+
+        def click(*_a, **_k):
+            calls["clicks"] += 1
+            return {"ok": True}
+
+        live.click_guard.click_checked = click
+        try:
+            menu = live.open_reply_menu(object(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked) = original
+        self.assertFalse(menu["ok"])
+        self.assertEqual(menu["reason"], "danmaku_not_found_in_list")
+        self.assertEqual(calls["clicks"], 0, "找不到那条弹幕时一个点击都不发")
+        self.assertEqual(menu["scrolledPx"], 0, "列表滚不动就如实记 0，不虚报距离")
+
+    def test_the_pause_scroll_is_counted_so_the_list_can_be_restored(self):
+        """评审 2026-09-28：pause_autoscroll() 的第一次上滚以前不计入 scrolled_px。
+
+        如果目标正是在那一步被找到的，列表就不会被恢复到最新位置，下一轮采集看到的
+        还是那批旧弹幕。这里钉住：那一次【实测】滚动的像素必须计进 scrolledPx。
+        """
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"find": 0}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked, live.time.sleep)
+
+        class Cdp:
+            def eval_json(self, expression):
+                if expression == live.MENU_ITEMS_JS:
+                    return {"found": True, "items": [{"label": "回复 TA", "text": "回复 TA",
+                                                     "x": 1100, "y": 400}]}
+                return None
+
+        def find(_cdp, _target, box=None):
+            calls["find"] += 1
+            if calls["find"] < 2:
+                return {"ok": False, "reason": "danmaku_not_found_in_list", "box": box}
+            return {"ok": True, "x": 1100, "y": 400, "box": box}
+
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = find
+        # 停滚这一步真的滚了 360 像素（并且列表停住了）。
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": True, "box": list(box),
+                                                   "moved": 360, "atBottom": False}
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": True, "moved": 0, "atBottom": False}
+        live.click_guard.click_checked = lambda *_a, **_k: {"ok": True}
+        live.time.sleep = lambda _s: None
+        try:
+            menu = live.open_reply_menu(Cdp(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked, live.time.sleep) = original
+        self.assertTrue(menu["ok"], menu)
+        self.assertEqual(menu["scrolledPx"], 360,
+                         "停滚那一次的实测位移必须计入，否则列表回不到最新")
+
+    def test_open_reply_menu_scrolls_up_when_the_row_rolled_away(self):
+        """真机（2026-09-26，高流量房间）：从采集到回复只要几秒，那条弹幕就已经被新弹幕顶出
+        可视区（DOM 只渲染十几行，被顶走的那条连节点都没了）—— 对外表现就是
+        danmaku_not_found_in_list 成片出现。定位器要像真人一样往上滚去找，找到才点。
+        """
+        import live
+        box = [1000, 236, 500, 620]
+        calls = {"find": 0, "scroll": [], "clicks": []}
+        original = (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+                    live.scroll_chat_list, live.click_guard.click_checked)
+
+        class Cdp:
+            def eval_json(self, expression):
+                if expression == live.MENU_ITEMS_JS:
+                    return {"found": True, "items": [{"label": "回复 TA", "text": "回复 TA",
+                                                     "x": 1100, "y": 400}]}
+                return None
+
+        def find(_cdp, _target, box=None):
+            calls["find"] += 1
+            if calls["find"] < 3:
+                return {"ok": False, "reason": "danmaku_not_found_in_list", "box": box}
+            return {"ok": True, "x": 1100, "y": 400, "box": box}
+
+        live.main_list_box = lambda *_a, **_k: list(box)
+        live.find_danmaku_in_list = find
+        live.pause_autoscroll = lambda *_a, **_k: {"ok": True, "paused": True, "box": list(box)}
+
+        def scroll(_cdp, direction="up", amount=420, times=1, box=None):
+            calls["scroll"].append(direction)
+            # 现在是【实测】距离记账：假列表每滚一次就真的动了 RECOVERY_SCROLL_PX 像素。
+            return {"ok": True, "box": list(box or []), "moved": live.RECOVERY_SCROLL_PX,
+                    "atBottom": False}
+
+        live.scroll_chat_list = scroll
+
+        def click(_cdp, x, y, **_kwargs):
+            calls["clicks"].append((x, y))
+            return {"ok": True}
+
+        live.click_guard.click_checked = click
+        old_sleep = live.time.sleep
+        live.time.sleep = lambda _seconds: None
+        try:
+            menu = live.open_reply_menu(Cdp(), {"authorName": "N", "text": "怎么做"})
+        finally:
+            live.time.sleep = old_sleep
+            (live.main_list_box, live.find_danmaku_in_list, live.pause_autoscroll,
+             live.scroll_chat_list, live.click_guard.click_checked) = original
+        self.assertTrue(menu["ok"], menu)
+        self.assertGreaterEqual(menu["scrolledPx"], live.RECOVERY_SCROLL_PX,
+                                "必须真的上滚去找过那条弹幕（420px 在快房间里只够买一秒）")
+        self.assertIn("up", calls["scroll"])
+        self.assertEqual(calls["clicks"], [(1100, 400)], "找到之后点的是定位到的那条")
+
+    def test_resume_chat_bottom_stops_when_the_list_is_really_at_the_bottom(self):
+        """回滚判据是【真的到底了没有】，不是"滚了几次"（2026-09-28 复查）。
+
+        每次滚完读一次 scrollTop：atBottom 为真就停；距离只用来给步数一个上限。
+        """
+        import live
+        original = live.scroll_chat_list
+        seen = []
+        scripted = [{"ok": True, "moved": 400, "atBottom": False},
+                    {"ok": True, "moved": 400, "atBottom": False},
+                    {"ok": True, "moved": 120, "atBottom": True}]
+
+        def scroll(_cdp, direction="up", amount=420, times=1, box=None):
+            seen.append(direction)
+            return scripted.pop(0) if scripted else {"ok": True, "moved": 0, "atBottom": True}
+
+        live.scroll_chat_list = scroll
+        try:
+            result = live.resume_chat_bottom(object(), distance=3 * live.RECOVERY_SCROLL_PX)
+        finally:
+            live.scroll_chat_list = original
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, ["down", "down", "down"])
+        self.assertTrue(result["atBottom"], "到底了才算回滚成功")
+        self.assertEqual(result["moved"], 920)
+
+    def test_resume_chat_bottom_survives_a_failing_scroll(self):
+        """滚轮发不出去/读不到滚动容器时不许抛异常：如实回报，调用方照常收尾。"""
+        import live
+        original = live.scroll_chat_list
+        live.scroll_chat_list = lambda *_a, **_k: {"ok": False, "reason": "wheel_failed"}
+        try:
+            result = live.resume_chat_bottom(object(), distance=2400)
+        finally:
+            live.scroll_chat_list = original
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "wheel_failed")
+
+    def test_scroll_chat_list_reports_the_measured_distance_not_the_delta(self):
+        """滚轮 delta 不等于实际滚动量：delta 请求 420，列表只动了 300 就得记 300。"""
+        import live
+        original = (live.main_chat_list, live.chat_scroll_state)
+        tops = [1000, 700]
+
+        class Cdp:
+            def call(self, *_a, **_k):
+                return {}
+
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        live.chat_scroll_state = lambda _cdp, box=None: {"ok": True, "top": tops.pop(0),
+                                                         "height": 4000, "client": 600,
+                                                         "atBottom": False}
+        try:
+            result = live.scroll_chat_list(Cdp(), "up", amount=420)
+        finally:
+            live.main_chat_list, live.chat_scroll_state = original
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["delta"], -420, "请求值照旧回报")
+        self.assertEqual(result["moved"], 300, "记的是实测滚到的像素")
+        self.assertEqual(result["measured"], 1)
+        self.assertFalse(result["atBottom"])
+
+    def test_scroll_chat_list_without_a_scroller_does_not_raise(self):
+        """读不到滚动容器（scroll_container_not_found）时 moved 记 0，不抛异常。"""
+        import live
+        original = (live.main_chat_list, live.chat_scroll_state)
+
+        class Cdp:
+            def call(self, *_a, **_k):
+                return {}
+
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        live.chat_scroll_state = lambda _cdp, box=None: {"ok": False,
+                                                         "reason": "scroll_container_not_found"}
+        try:
+            result = live.scroll_chat_list(Cdp(), "up", amount=420)
+        finally:
+            live.main_chat_list, live.chat_scroll_state = original
+        self.assertTrue(result["ok"], "滚轮发出去了就算 ok，读不到容器只是记 0")
+        self.assertEqual(result["moved"], 0)
+        self.assertEqual(result["measured"], 0)
+        self.assertIsNone(result["atBottom"])
+
+    def test_scroll_chat_list_reports_a_wheel_failure_instead_of_raising(self):
+        """滚轮事件本身发不出去（CDP 传输失败）时也不许抛：如实记 wheel_failed。"""
+        import live
+        original = live.main_chat_list
+
+        class Cdp:
+            def call(self, *_a, **_k):
+                raise RuntimeError("simulated wheel transport failure")
+
+        live.main_chat_list = lambda _cdp: {"found": True, "box": [0, 0, 320, 500]}
+        try:
+            result = live.scroll_chat_list(Cdp(), "up", amount=420)
+        finally:
+            live.main_chat_list = original
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "wheel_failed")
+        self.assertEqual(result["error"], "RuntimeError")
+
+    def test_the_chat_list_is_restored_when_the_reply_raises_after_scrolling(self):
+        """异常恢复（2026-09-28）：上滚找旧弹幕之后流程炸了，也必须把列表还给最新。
+
+        否则下一轮采集看到的还是那批旧弹幕 —— 这条通道的坑就是这么埋下的。
+        """
+        import live
+        import send_actions
+        restored = []
+        original = (live.clear_composer, live.dismiss_confirm_modal, live.open_reply_menu,
+                    live.choose_reply_menu_item, live.composer_mention, live.find_composer,
+                    live.find_send_control, live.resume_chat_bottom,
+                    send_actions._visibility_gate, send_actions._await_login,
+                    send_actions.douyin.check_captcha, send_actions.click_guard.click_checked,
+                    send_actions.time.sleep)
+
+        class Page:
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                return "https://live.douyin.com/123456"
+
+            def call(self, *_a, **_k):
+                return {}
+
+            def click_at(self, *_a):
+                pass
+
+            def type_text(self, *_a):
+                pass
+
+        def boom(*_a, **_k):
+            raise RuntimeError("simulated failure after scrolling")
+
+        send_actions._visibility_gate = lambda *_a, **_k: None
+        send_actions._await_login = lambda *_a, **_k: "verified"
+        send_actions.douyin.check_captcha = lambda *_a, **_k: False
+        send_actions.click_guard.click_checked = lambda *_a, **_k: {"ok": True}
+        send_actions.time.sleep = lambda _seconds: None
+        live.clear_composer = lambda *_a, **_k: {"ok": True}
+        live.dismiss_confirm_modal = lambda *_a, **_k: {"handled": False}
+        live.open_reply_menu = lambda *_a, **_k: {
+            "ok": True, "items": [{"label": "回复 TA", "x": 1, "y": 2}], "scrolledPx": 3600}
+        live.choose_reply_menu_item = lambda *_a, **_k: {"ok": True}
+        live.composer_mention = lambda *_a, **_k: {"found": True, "startsAt": True,
+                                                  "text": "@小明 你好"}
+        live.find_composer = lambda *_a, **_k: {"found": True, "x": 5, "y": 6, "text": "关注我"}
+        live.find_send_control = boom
+        live.resume_chat_bottom = lambda _cdp, **kwargs: restored.append(kwargs) or {"ok": True}
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_danmaku_reply_native(
+                    Page(), SendGate(td, "account-a"), "restore-1",
+                    {"id": "e1", "roomId": "https://live.douyin.com/123456",
+                     "authorId": "u1", "authorName": "小明", "text": "怎么做"}, "关注我")
+        finally:
+            (live.clear_composer, live.dismiss_confirm_modal, live.open_reply_menu,
+             live.choose_reply_menu_item, live.composer_mention, live.find_composer,
+             live.find_send_control, live.resume_chat_bottom,
+             send_actions._visibility_gate, send_actions._await_login,
+             send_actions.douyin.check_captcha, send_actions.click_guard.click_checked,
+             send_actions.time.sleep) = original
+        self.assertEqual(result["reason"], "internal_error")
+        self.assertEqual(restored, [{"distance": 3600}],
+                         "异常路径也必须按实测上滚距离把列表滚回最新")
+
+    def test_restore_chat_bottom_is_a_no_op_when_nothing_was_scrolled(self):
+        """没上滚过就不要空滚（避免每一条成功的回复都白滚几次）。"""
+        import live
+        import send_actions
+        calls = []
+        original = live.resume_chat_bottom
+        live.resume_chat_bottom = lambda *_a, **_k: calls.append(1) or {"ok": True}
+        try:
+            send_actions._restore_chat_bottom(object(), 0)
+            send_actions._restore_chat_bottom(object(), 2400)
+        finally:
+            live.resume_chat_bottom = original
+        self.assertEqual(len(calls), 1, "0 像素不滚，>0 才滚")
 
 class RoomUrlTests(unittest.TestCase):
     """真机回归（2026-09-20）：抖音直播广场点进来的房间，房间号在【查询串】里。
@@ -3079,6 +4226,8 @@ class PrivateSkipTests(unittest.TestCase):
     class Page:
         def __init__(self):
             self.clicks = []
+            self.typed = []
+            self.keys = []
 
         def call(self, *_args, **_kwargs):
             return {}
@@ -3090,37 +4239,81 @@ class PrivateSkipTests(unittest.TestCase):
                 return "https://www.douyin.com/user/" + ("A" * 40)
             return None
 
+        def eval_json(self, _expression):
+            return None
+
         def click_at(self, *args):
             self.clicks.append(args)
+
+        def type_text(self, text):
+            self.typed.append(text)
+
+        def press_key(self, key, code=None, key_code=None):
+            self.keys.append((key, code, key_code))
 
         def close(self):
             pass
 
-    def _patched(self, entry, panel=None, clicks_expected=0):
+    def _patched(self, entry, panel=None, clicks_expected=0, row=None, preview=None, states=None):
+        """Patch the browser-facing pieces of the DM path.
+
+        states is an optional list of panel states consumed one per call, so a test
+        can act out: panel closed -> click entry -> panel opens on the message list
+        -> click the conversation row -> the panel now shows the chat header.
+        """
         import douyin
         import send_actions
         page = self.Page()
         saved = (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
-                 send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+                 send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible,
+                 send_actions.douyin.dm_entry,
                  send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+                 send_actions.douyin.dm_conversation_row, send_actions.douyin.dm_row_preview_matches,
+                 send_actions.douyin.dm_conversation_echo,
                  send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
                  send_actions.douyin.make_network_recorder, send_actions.time.sleep)
+        queue = list(states) if states else None
+        # 队列用尽后停在上一次看到的状态（真机上面板不会自己变回去）。
+        fallback = dict(panel) if panel else (dict(states[-1]) if states else {"found": False})
+
+        def panel_state(_cdp, _name):
+            state = dict(queue.pop(0)) if queue else dict(fallback)
+            if page.typed and state.get("found"):
+                # 真机里编辑器会立刻显示刚输入的内容；假页面照做，
+                # 这样发送前的 text_verification 才有东西可比。
+                state["text"] = page.typed[-1]
+            return state
+
         send_actions.douyin.login_state = lambda _cdp: "verified"
         send_actions.douyin.check_captcha = lambda _cdp: False
         send_actions.douyin.visibility_state = lambda _cdp: "visible"
+        send_actions.douyin.ensure_visible = lambda *_a, **_k: True
         send_actions.douyin.dm_entry = lambda _cdp: dict(entry)
-        send_actions.douyin.dm_panel_state = lambda _cdp, _name: dict(panel or {"found": False})
+        send_actions.douyin.dm_panel_state = panel_state
         send_actions.douyin.dm_composer_for_recipient = lambda *_a, **_k: {"found": False}
+        send_actions.douyin.dm_conversation_row = lambda *_a, **_k: dict(row or {"found": False})
+        send_actions.douyin.dm_row_preview_matches = lambda *_a, **_k: dict(preview or {"found": False})
+        send_actions.douyin.dm_conversation_echo = lambda *_a, **_k: False
         send_actions.douyin.recipient_context = lambda *_a, **_k: {"verified": True}
         send_actions.douyin.profile_error_page = lambda _cdp: False
+        send_actions.douyin.make_network_recorder = lambda *_a, **_k: self.Recorder()
         send_actions.time.sleep = lambda _seconds: None
         return page, saved
+
+    class Recorder:
+        """No platform response is captured, exactly like the live DM path."""
+
+        def collect(self, wait_seconds=0.0):
+            return []
 
     def _restore(self, saved):
         import send_actions
         (send_actions.douyin.login_state, send_actions.douyin.check_captcha,
-         send_actions.douyin.visibility_state, send_actions.douyin.dm_entry,
+         send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible,
+         send_actions.douyin.dm_entry,
          send_actions.douyin.dm_panel_state, send_actions.douyin.dm_composer_for_recipient,
+         send_actions.douyin.dm_conversation_row, send_actions.douyin.dm_row_preview_matches,
+         send_actions.douyin.dm_conversation_echo,
          send_actions.douyin.recipient_context, send_actions.douyin.profile_error_page,
          send_actions.douyin.make_network_recorder, send_actions.time.sleep) = saved
 
@@ -3140,6 +4333,173 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertTrue(result["evidence"]["skipped"])
         self.assertEqual(page.clicks, [], "对方不可私信时一个点击都不许发出去")
 
+    def test_a_page_that_hides_during_the_dm_send_is_unknown_not_failed(self):
+        """私信最后一按可能是回车（真机实测发送键是 SVG，不确定时走回车）。
+
+        按之前/之后各看一次可见性：按完页面就不可见时"可能发出去也可能没有"，
+        必须 unknown + 台账禁止自动重试 —— 绝不猜成 failed 去重发一条私信。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper"})
+        flags = {"sent": False}
+        original_press = page.press_key
+        echo_original = send_actions.douyin.dm_conversation_echo
+
+        class Recorder:
+            def collect(self, wait_seconds=0.0):
+                return []
+
+
+        def press_key(key, code=None, key_code=None):
+            original_press(key, code=code, key_code=key_code)
+            flags["sent"] = True
+
+        page.press_key = press_key
+        send_actions.douyin.make_network_recorder = lambda *_a, **_k: Recorder()
+        send_actions.douyin.dm_conversation_echo = lambda *_a, **_k: False
+        # 真机里编辑器会立刻显示刚输入的内容；这里照做，发送前的 text_verification 才有东西可比。
+        send_actions.douyin.dm_panel_state = lambda _cdp, _name: {
+            "found": True, "headerMatch": True, "x": 795, "y": 860,
+            "text": (page.typed[-1] if page.typed else ""),
+            "panelKey": "componentsEntrywrapper imContainer"}
+        send_actions.douyin.visibility_state = lambda _cdp: ("hidden" if flags["sent"] else "visible")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                gate = SendGate(td, "account-a")
+                result = send_actions.send_private(page, gate, "race-dm",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+                row = gate.lookup("race-dm")
+                again = send_actions.send_private(page, gate, "race-dm-2",
+                                                  {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            send_actions.douyin.dm_conversation_echo = echo_original
+            self._restore(saved)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "page_hidden_during_send")
+        self.assertFalse(result["evidence"]["sendRace"]["visibleAfter"])
+        self.assertEqual(row["status"], "unknown", "未知结果必须落台账")
+        self.assertEqual(again["status"], "blocked", "未知结果不得自动重试")
+
+    def test_a_page_that_hides_before_the_click_is_not_reported_as_dm_unavailable(self):
+        """真机复现（2026-09-28）：页面 hidden 时点击【不送达渲染进程】，面板就是不开。
+
+        归因必须是可重试的 page_not_visible（人工把窗口切到前台即可），
+        不能记成 dm_panel_unavailable/skipped —— 那等于把可触达的人误判成私密用户。
+        做法：入口守卫那一刻还 visible，到点击前变 hidden。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        states = ["visible"] + ["hidden"] * 4
+        send_actions.douyin.visibility_state = lambda _cdp: (states.pop(0) if states else "hidden")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "vis-late",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_not_visible")
+        self.assertFalse(result["evidence"]["skipped"], "不可见不等于对方不可私信")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertEqual(page.clicks, [], "看不见的时候一个点击都不发出去")
+
+    def test_unknown_visibility_is_never_treated_as_recoverable(self):
+        """评审 2026-09-28 第 1 条：_click_ready() 曾把 unknown 当成可恢复状态。
+
+        unknown 不等于 hidden：只有 hidden 才尝试恢复（被遮挡/最小化真的能救回来），
+        unknown 一律【不恢复、不点】，直接交人工。
+        """
+        import send_actions
+        calls = {"ensure": 0}
+        saved = (send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible)
+        send_actions.douyin.visibility_state = lambda _cdp: "unknown"
+        ensure = lambda *_a, **_k: calls.__setitem__("ensure", calls["ensure"] + 1) or True
+        send_actions.douyin.ensure_visible = ensure
+        try:
+            decided = send_actions._click_ready(object())
+        finally:
+            send_actions.douyin.visibility_state, send_actions.douyin.ensure_visible = saved
+        self.assertEqual(decided, "unknown")
+        self.assertEqual(calls["ensure"], 0, "unknown 不许拿去恢复")
+
+    def test_a_page_that_is_unknown_at_the_entry_click_goes_to_manual(self):
+        """unknown 出现在入口点击那一刻：不点、不恢复，落 blocked + manualAction 交人工。"""
+        import send_actions
+        author = "A" * 40
+        calls = {"ensure": 0}
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        states = ["visible"] + ["unknown"] * 6
+        send_actions.douyin.visibility_state = lambda _cdp: (states.pop(0) if states else "unknown")
+        ensure = lambda *_a, **_k: calls.__setitem__("ensure", calls["ensure"] + 1) or True
+        send_actions.douyin.ensure_visible = ensure
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "unk-entry",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_visibility_unknown")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertFalse(result["evidence"]["skipped"], "读不到状态不等于对方不可私信")
+        self.assertEqual(calls["ensure"], 0, "unknown 不许拿去恢复")
+        self.assertEqual(page.clicks, [], "读不到状态时一个点击都不发")
+
+    def test_a_page_that_hides_right_after_the_entry_click_is_not_reported_as_dm_unavailable(self):
+        """评审 2026-09-28 第 2 条：入口点击时可见、点完之后页面隐藏。
+
+        这一下很可能根本没送达渲染进程 —— 必须转人工（page_not_visible），
+        绝不能记成 dm_panel_unavailable：那等于把可触达的人判成「不可私信」。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        flags = {"clicked": False}
+        original_click = page.click_at
+
+        def click_at(*args):
+            original_click(*args)
+            flags["clicked"] = True
+
+        page.click_at = click_at
+        send_actions.douyin.visibility_state = lambda _cdp: ("hidden" if flags["clicked"] else "visible")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "late-hide",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_not_visible")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertFalse(result["evidence"]["skipped"], "页面不可见不等于对方不可私信")
+        self.assertEqual(page.typed, [], "没进到会话里，一个字都没输入")
+
+    def test_a_panel_that_never_opens_on_a_visible_page_is_still_skipped(self):
+        """反向保护：页面一直可见、面板确实打不开 -> 仍然是 skipped（对方不可私信）。"""
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 10, "y": 20},
+                                    panel={"found": False})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "vis-ok",
+                                                   {"authorId": author, "authorName": "小明"}, "你好")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["reason"], "dm_panel_unavailable")
+        self.assertTrue(result["evidence"]["skipped"])
+        # 合并后的流程：入口最多点两次（第二次必须先重新导航回主页，见 #52/#54），
+        # 而不是旧版的三次"拿着同一个坐标反复点"。
+        self.assertEqual(len(page.clicks), 2)
+
     def test_a_panel_that_never_opens_is_skipped_not_failed(self):
         import send_actions
         author = "A" * 40
@@ -3154,8 +4514,145 @@ class PrivateSkipTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reason"], "dm_panel_unavailable")
         self.assertTrue(result["evidence"]["skipped"])
-        self.assertEqual(len(page.clicks), 3, "面板打不开时按入口重试次数上报，且不发消息")
+        self.assertEqual(result["evidence"]["blockedBy"], "panel_not_opened")
+        self.assertEqual(len(page.clicks), 2, "面板打不开时按入口重试次数上报，且不发消息")
+        self.assertEqual(page.clicks[0], page.clicks[1], "重试仍然用当下重新取到的入口坐标")
 
+    def test_the_row_preview_is_reread_because_the_platform_updates_it_late(self):
+        """真机（2026-09-26）：刚回车就立刻读会话列表预览，平台常常还没换过来 ——
+        「八月」「宽容」「世内高人」都是"当时读到 false、整页重载后消息确实在"。
+        所以要有界重试；它仍然只是页面观察，读到 false 也不改状态（状态永远是 unknown）。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper"})
+        seen = []
+        original = send_actions.douyin.dm_row_preview_matches
+
+        def preview(_tab, _name, _text):
+            seen.append(1)
+            if len(seen) < 3:
+                return {"found": True, "containsText": False}
+            return {"found": True, "containsText": True}
+
+        send_actions.douyin.dm_row_preview_matches = preview
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "late-1",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            send_actions.douyin.dm_row_preview_matches = original
+            self._restore(saved)
+        self.assertEqual(len(seen), 3, "前两次读到 false 时必须再看一次，不能就此下结论")
+        self.assertTrue(result["evidence"]["conversationListPreview"])
+        self.assertEqual(result["evidence"]["conversationListPreviewTries"], 3)
+        self.assertEqual(result["status"], "unknown", "预览只进 evidence，永远不改状态")
+
+    def test_a_preview_that_never_updates_is_recorded_as_false(self):
+        """预览始终读不到我们的话术：照实记 false（只说明"当时没看到"，不等于没发出去）。"""
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper"},
+                                    preview={"found": True, "containsText": False})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "late-2",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            self._restore(saved)
+        self.assertFalse(result["evidence"]["conversationListPreview"])
+        self.assertEqual(result["evidence"]["conversationListPreviewTries"], 3)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(page.typed, ["你好呀"], "预览读数不影响发出去这个动作本身")
+
+    def test_a_panel_showing_the_one_message_notice_still_sends(self):
+        """用户 2026-09-26 明确：页面顶部那句「对方回复或关注你之前，只能发送一条文字消息」
+        不是拒绝 —— 平台允许发一条，遇到它必须照常发出去。
+
+        真机实测（2026-09-26）：面板 1.5s 就开，会话头部标题 = 对方昵称，回车即可发出。
+        这条路径就是直播私信最常见的那一种：面板打开了、会话里只有那句提示语。
+        """
+        import send_actions
+        author = "A" * 40
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    panel={"found": True, "headerMatch": True, "x": 795, "y": 860,
+                                           "text": "", "panelKey": "componentsEntrywrapper imContainer"},
+                                    preview={"found": True, "containsText": True})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(
+                    page, SendGate(td, "account-a"), "notice-1",
+                    {"authorId": author, "authorName": "小明"}, "你好，看到你在直播间的提问")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "platform_response_unavailable")
+        self.assertEqual(result["evidence"]["mechanism"], "enter")
+        self.assertTrue(result["evidence"]["conversationListPreview"])
+        self.assertEqual(page.clicks, [(963, 132), (795, 860)],
+                         "点一次入口 + 点一次编辑器；入口坐标绝不会被点第二次（那是面板内部）")
+        self.assertEqual(page.typed, ["你好，看到你在直播间的提问"])
+        self.assertEqual(page.keys, [("Enter", "Enter", 13)])
+
+    def test_a_panel_stuck_on_the_message_list_opens_the_target_row(self):
+        """真机（2026-09-26）：点完「私信」面板有时停在消息列表。旧代码会在同一个坐标上
+        再点两次 —— 那里其实是面板内部的搜索框 —— 最后判 panel_not_opened，一条消息都没发。
+        现在改成：在会话列表里点开对方那一行（真机里行标题 = 对方昵称）。
+        """
+        import send_actions
+        author = "A" * 40
+        chat = {"found": True, "headerMatch": True, "x": 795, "y": 860, "text": "",
+                "panelKey": "componentsEntrywrapper imContainer"}
+        states = [{"found": False},                      # 点入口之前：面板没开
+                  {"found": True, "headerMatch": False},  # 点完入口：停在消息列表
+                  dict(chat),                            # 点开对方那一行之后
+                  dict(chat)]                            # 输入之后复核
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    states=states,
+                                    row={"found": True, "matched": True, "x": 800, "y": 300,
+                                         "rowsSeen": 4})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "list-1",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(page.clicks[0], (963, 132), "第一次点私信入口")
+        self.assertEqual(page.clicks[1], (800, 300),
+                         "第二次必须落在会话列表那一行上，而不是已经打开的面板内部（入口坐标）")
+        self.assertEqual(page.clicks[2], (795, 860), "第三次点会话里的编辑器")
+        self.assertEqual(len(page.clicks), 3, "一个动作都不许多余")
+        self.assertEqual(page.typed, ["你好呀"])
+        self.assertEqual(page.keys, [("Enter", "Enter", 13)])
+
+    def test_a_message_list_without_the_target_row_is_skipped(self):
+        """面板开了、但列表里没有对方那一行：跳过，不发任何东西，也不误报成通道故障。"""
+        import send_actions
+        author = "A" * 40
+        states = [{"found": False},
+                  {"found": True, "headerMatch": False}]
+        page, saved = self._patched({"found": True, "blocked": False, "x": 963, "y": 132},
+                                    states=states,
+                                    row={"found": False, "matched": False, "rowsSeen": 4,
+                                         "reason": "conversation_row_not_found"})
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                result = send_actions.send_private(page, SendGate(td, "account-a"), "list-2",
+                                                   {"authorId": author, "authorName": "小明"}, "你好呀")
+        finally:
+            self._restore(saved)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "dm_conversation_unavailable")
+        self.assertEqual(result["evidence"]["blockedBy"], "conversation_not_opened")
+        self.assertTrue(result["evidence"]["skipped"])
+        self.assertEqual(result["evidence"]["entryClicks"], 1)
+        self.assertEqual(page.typed, [], "没进到对方会话时一个字都不许输入")
+        self.assertEqual(page.keys, [], "更不许按回车")
     def test_sidecar_returns_the_skipped_list_separately(self):
         import live_flow
         import send_actions
@@ -3257,6 +4754,38 @@ class LivePrivateBindingTests(unittest.TestCase):
                 {"eventId": "e1", "sendId": "p-3", "publicSendId": "pub-other"}]})
             self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
 
+    def test_an_event_without_a_recorded_send_id_is_refused(self):
+        """事件自身没有公屏绑定记录：即使台账里有【别的】已确认公屏回复，也必须拒绝。
+
+        评审 2026-09-26：原来是 `if recorded and recorded != public_send_id` ——
+        事件上没有记录时直接放行，等于说"任何一条已确认的公屏回复都能拿给一个
+        从未公屏回复过的事件去发私信"。缺记录与记录对不上是同一类失败。
+
+        _setup 把 _page 设成 explode：门禁没拦住就会在这里炸出来。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="")
+            self._confirmed_public(instance.gate, "pub-elsewhere")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-5", "publicSendId": "pub-elsewhere"}]})
+            self.assertEqual(reply["results"][0]["status"], "blocked")
+            self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
+            self.assertEqual(instance.live_queue.find_event("e1")["private"]["reason"],
+                             "public_send_mismatch")
+
+    def test_a_record_without_the_send_id_key_is_refused_too(self):
+        """记录里根本没有 sendId 这个字段（旧版本写入 / 别的路径写入）同样拒绝。"""
+        import live_flow
+        with tempfile.TemporaryDirectory() as td:
+            sidecar, instance, batch_id = self._setup(td, recorded_send_id="pub-1")
+            instance.live_queue.mark("e1", live_flow.SENT_CONFIRMED, batch_id,
+                                     {"reason": "platform_response_recorded"})
+            self._confirmed_public(instance.gate, "pub-1")
+            reply = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                {"eventId": "e1", "sendId": "p-6", "publicSendId": "pub-1"}]})
+            self.assertEqual(reply["results"][0]["status"], "blocked")
+            self.assertEqual(reply["results"][0]["reason"], "public_send_mismatch")
+
     def test_the_bound_public_send_lets_the_private_phase_reach_the_page(self):
         """绑定正确时确实进入浏览器阶段（用假页面验证走通了门禁，而不是被别的规则拦下）。"""
         with tempfile.TemporaryDirectory() as td:
@@ -3284,13 +4813,753 @@ class LivePrivateBindingTests(unittest.TestCase):
                                        os.path.join(td, "profile"), 19232)
             caps = instance.dispatch("capabilities", {})
             capability = caps["capability"]
-            for name in ("private_reply", "video_reply", "live_reply", "live_batch",
-                         "live_danmaku_reply", "live_private_reply", "comment_flow",
-                         "comment_private_candidates"):
+            # 🔴 评审明确的四个必须保持 fail-closed 的发送/批次能力：
+            #    私信(private_reply)、视频公开回复(video_reply)、评论批次(comment_batch)、
+            #    直播间批次(live_batch)。在拿到真实平台响应与送达证据之前，
+            #    谁都不许把它们翻成 true —— 更不能对外声称"真实抖音自动发送可用"。
+            for name in ("private_reply", "video_reply", "comment_batch", "live_batch",
+                         "live_reply", "live_danmaku_reply", "live_private_reply",
+                         "comment_flow", "comment_private_candidates"):
                 self.assertIn(name, capability, name)
                 self.assertFalse(capability[name]["autoEligible"],
                                  "%s 未验证却标记为可自动发送" % name)
             self.assertIn("comment_private_candidates", caps["methods"])
+
+class LivePrivateLedgerGatingTests(unittest.TestCase):
+    """真实台账上的【逐条】门禁：同一批次里只有公屏确认成功的那条才允许私信。
+
+    与 LivePrivateBindingTests 的分工：那边每条绕过路径单独验一个事件；这里把
+    【同一批次里的两条弹幕】放进一次真实调用，证明门禁是逐条的、不是整批放行：
+
+      * 两条事件的批次状态都是 sent_confirmed（候选清单允许两条）——
+        所以本用例单独钉的是"逐项台账绑定"，而不是候选清单；
+      * 真实台账里只有一条公屏回复是 sent_confirmed，另一条停在 unknown（真机常态）；
+      * 结果：确认的那条进入浏览器阶段，unknown 的那条在【打开浏览器之前】被拒绝。
+
+    另外钉住一条容易搞错的细节：契约判定读的是 SendGate.lookup() 的【原始状态】，
+    而不是 result() 映射后的对外状态 —— 后者会把 sent_confirmed 映射成 unknown，
+    照它判定就永远进不了私信。
+    """
+
+    class _Page:
+        def close(self):
+            pass
+
+    @staticmethod
+    def _public_reply(gate, send_id, status):
+        gate.reserve(send_id, "live-danmaku-native:%s" % send_id, "谢谢支持", kind="danmaku_reply")
+        if status in ("unknown", "sent_confirmed"):
+            gate.mark_started(send_id)
+        gate.finish(send_id, status, "platform_response_unavailable")
+        return send_id
+
+    def test_only_the_confirmed_item_reaches_the_private_phase(self):
+        import live_flow
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"), os.path.join(td, "profile"), 19233)
+
+            # 注意：混合批次里"有一条可发"就会打开浏览器 —— 那是正确的。
+            # 这里要钉的是【逐条】：未确认的那条绝不能进到发送路径里。
+            instance._page = lambda: (self._Page(), {"pid": 1})
+            instance.live_queue.append([
+                sidecar._event("live", "room-1", {"id": "e-ok", "authorId": "A" * 40,
+                                                  "authorName": "观众甲", "text": "多少钱"}),
+                sidecar._event("live", "room-1", {"id": "e-unknown", "authorId": "B" * 40,
+                                                  "authorName": "观众乙", "text": "多少钱"}),
+            ])
+            scripts = {"e-ok": {"publicText": "谢谢支持", "privateText": "私信话术"},
+                       "e-unknown": {"publicText": "谢谢支持", "privateText": "私信话术"}}
+            planned = instance.dispatch("live_plan", {"maxItems": 5, "windowSeconds": 600,
+                                                      "replyMode": "danmaku", "scripts": scripts})
+            batch_id = planned["batch"]["batchId"]
+            self.assertEqual(sorted(item["eventId"] for item in planned["targets"]),
+                             ["e-ok", "e-unknown"])
+
+            self._public_reply(instance.gate, "pub-ok", "sent_confirmed")
+            self._public_reply(instance.gate, "pub-unknown", "unknown")
+            for event_id, send_id in (("e-ok", "pub-ok"), ("e-unknown", "pub-unknown")):
+                instance.live_queue.mark(event_id, live_flow.SENT_CONFIRMED, batch_id,
+                                         {"sendId": send_id})
+            candidates, _rejected = instance.live_queue.private_candidates(batch_id)
+            self.assertEqual(len(candidates), 2, "本用例验的是逐项台账门禁，不是候选清单")
+
+            raw = instance.gate.lookup("pub-ok")
+            self.assertEqual(raw["status"], "sent_confirmed")
+            self.assertEqual(instance.gate.result(raw)["status"], "unknown",
+                             "对外 result() 会把 sent_confirmed 映射成 unknown")
+
+            sent = []
+            original = sidecar.send_private
+            sidecar.send_private = lambda _page, _gate, send_id, target, text: (
+                sent.append((send_id, target["authorId"], text)) or
+                {"status": "unknown", "reason": "platform_response_unavailable",
+                 "evidence": {"conversationEcho": True}})
+            try:
+                result = instance.dispatch("live_private", {"batchId": batch_id, "items": [
+                    {"eventId": "e-ok", "sendId": "d-ok", "publicSendId": "pub-ok"},
+                    {"eventId": "e-unknown", "sendId": "d-unknown",
+                     "publicSendId": "pub-unknown"}]})
+            finally:
+                sidecar.send_private = original
+
+            by_event = {item["eventId"]: item for item in result["results"]}
+            self.assertEqual(by_event["e-unknown"]["status"], "blocked")
+            self.assertEqual(by_event["e-unknown"]["reason"], "public_unknown")
+            self.assertEqual(by_event["e-ok"]["status"], "unknown")
+            self.assertEqual([item[1] for item in sent], ["A" * 40], "只有确认过的那条进入浏览器阶段")
+            self.assertEqual(sent[0][0], "d-ok")
+            # 拒绝要留痕：台账里能查到原因，不是静默跳过
+            self.assertEqual(instance.live_queue.find_event("e-unknown")["private"]["reason"],
+                             "public_unknown")
+            self.assertEqual(instance.live_queue.find_event("e-ok")["private"]["status"], "unknown")
+            self.assertEqual(result["skipped"], [], "被门禁拒绝不等于对方不可私信，不能计成跳过")
+
+
+# ============================================================================
+# 模块契约回归（2026-09-21 评审意见）
+#
+# 对应四个模块的验收项：评论区私信绑定、找视频分页终止态、评论选择器/发行开关、
+# 以及"未拿到真实平台送达证据前一律 fail-closed"。
+# 全部离线，不碰浏览器；需要浏览器的部分用假页面 + explode 证明"门禁在开浏览器之前"。
+# ============================================================================
+
+
+class PrivateBindingContractTests(unittest.TestCase):
+    """每条私信都必须绑定【对应】那一次公屏回复。
+
+    两阶段契约分三步，缺一步就有一条绕过路径：
+      ① public_missing          没给 publicSendId
+      ② public_*                给的 sendId 不是"已确认成功的公屏回复"
+      ③ public_send_id_mismatch 是公屏成功，但【不是这一条的】
+
+    ③ 在直播路径早就有（live_private），评论区此前只有执行时校验、
+    候选清单不校验 —— 清单说 allowed、执行当场 blocked，宿主据此建的计划必然失败。
+    """
+
+    VIDEO = "https://www.douyin.com/video/7501633234145447202"
+
+    class _Page:
+        def __init__(self, url="https://www.douyin.com/user/other"):
+            self.url = url
+
+        def call(self, *_args, **_kwargs):
+            return {}
+
+        def evaluate(self, expression):
+            if expression == "document.readyState":
+                return "complete"
+            if expression == "location.href":
+                return self.url
+            return None
+
+        def close(self):
+            pass
+
+    @staticmethod
+    def _confirmed(gate, send_id, target_key, kind="comment"):
+        gate.reserve(send_id, target_key, "public text", kind=kind)
+        gate.mark_started(send_id)
+        gate.finish(send_id, "sent_confirmed", "platform_response")
+        return send_id
+
+    def _single(self, td, explode=True):
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance.state_dir = td
+        instance.account_scope = "account-a"
+        instance.gate = SendGate(td, "account-a")
+        if explode:
+            def boom():
+                raise AssertionError("契约不通过时不得打开浏览器")
+            instance._page = boom
+        else:
+            instance._page = lambda: (self._Page(), {"pid": 1})
+        return sidecar, instance
+
+    # ---- ③ 对应性：单发路径 ----
+
+    def test_single_private_refuses_a_reply_of_another_author(self):
+        """公屏回复是 author-1 的，就不许拿去给 author-2 发私信（张冠李戴）。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._single(td, explode=True)
+            self._confirmed(instance.gate, "pub-a1", "video:c1:author-1")
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                instance.send_private({"sendId": "priv-1", "publicSendId": "pub-a1",
+                                       "target": {"authorId": "author-2"}, "text": "你好"})
+            self.assertEqual(raised.exception.code, "public_send_id_mismatch")
+
+    def test_single_private_accepts_the_matching_author(self):
+        """反向保护：同一个人必须放行，否则契约变成"永远发不出去"。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._single(td)
+            self._confirmed(instance.gate, "pub-a1", "video:c1:author-1")
+            self.assertIsNone(sidecar._private_binding_mismatch(
+                instance.gate, "pub-a1", {"authorId": "author-1"}))
+
+    def test_danmaku_reply_key_is_compared_by_event_and_name_not_by_author_id(self):
+        """弹幕 key 的末段是【昵称】不是 sec_uid：不能拿它比 authorId，但要绑事件与昵称。
+
+        🔴 评审 2026-09-29 修正：以前这条弹幕通路【整条跳过】了对应性校验 ——
+        于是"拿 A 那条已确认的公屏回复给 B 发私信"在单发入口走得通。现在的口径是：
+        authorId 不参与比较（key 里根本没有它），但 eventId 与昵称必须一致。
+        """
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            self._confirmed(gate, "pub-dm", "live-danmaku-native:e1:小明",
+                            kind="danmaku_reply")
+            # 同一事件 + 同一昵称：authorId 完全不参与比较（key 里没有 sec_uid）。
+            self.assertIsNone(sidecar._private_binding_mismatch(
+                gate, "pub-dm", {"eventId": "e1", "authorId": "MS4wLjABAAAAsecuid",
+                                 "authorName": "小明"}))
+            # 换事件 / 换人：一律拒绝（且都发生在打开浏览器之前）。
+            self.assertEqual(sidecar._private_binding_mismatch(
+                gate, "pub-dm", {"eventId": "e2", "authorId": "MS4wLjABAAAAsecuid",
+                                 "authorName": "小明"})[0], "public_event_mismatch")
+            self.assertEqual(sidecar._private_binding_mismatch(
+                gate, "pub-dm", {"eventId": "e1", "authorId": "MS4wLjABAAAAsecuid",
+                                 "authorName": "小红"})[0], "public_target_mismatch")
+
+    # ---- ③ 对应性：批次路径（清单与执行必须同口径）----
+
+    def _targets(self):
+        return [{"id": "e1", "source": "video", "roomId": self.VIDEO, "authorId": "author-1",
+                 "authorName": "用户1", "text": "求带搞钱，在线等！", "matchedKeyword": "求带",
+                 "fingerprint": "fp1", "digg": 3},
+                {"id": "e2", "source": "video", "roomId": self.VIDEO, "authorId": "author-2",
+                 "authorName": "用户2", "text": "求带搞钱，在线等！", "matchedKeyword": "求带",
+                 "fingerprint": "fp2", "digg": 3}]
+
+    def _batch(self, td):
+        import comment_flow
+        import sidecar
+        targets = self._targets()
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance.state_dir = td
+        instance.account_scope = "account-a"
+        instance.gate = SendGate(td, "account-a")
+        instance.comment_queue = comment_flow.CommentQueue(td, "account-a")
+        instance.collect_comments = lambda params: {
+            "status": "ok", "events": targets, "targets": targets,
+            "filter": {"collected": 40, "matched": 2, "targetCount": 2,
+                       "matchMode": "phrase", "keywords": ["求带"],
+                       "modeCounts": {"phrase": 2}}}
+        instance._page = lambda: (self._Page(), {"pid": 1})
+        return sidecar, instance
+
+    def _planned_batch(self, instance):
+        plan = instance.comment_plan({"url": self.VIDEO, "publicText": "需要的话看我主页",
+                                      "privateText": "你好，看到你在评论区留言了",
+                                      "commentKeywords": "求带", "matchMode": "phrase"})
+        return plan["batch"]["batchId"]
+
+    def test_listing_and_execution_agree_on_a_cross_event_binding(self):
+        """拿 e2 的公屏成功给 e1 发私信：候选清单和执行都要拦，且用同一个原因。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._batch(td)
+            original = sidecar.send_comment
+
+            def confirmed(*args, **kwargs):
+                send_id, target = args[2], args[3]
+                instance.gate.reserve(send_id, target["authorId"], args[4], kind="comment")
+                instance.gate.mark_started(send_id)
+                instance.gate.finish(send_id, "sent_confirmed", "platform_response")
+                return {"status": "sent_confirmed", "reason": "platform_response",
+                        "sendId": send_id}
+
+            sidecar.send_comment = confirmed
+            try:
+                batch_id = self._planned_batch(instance)
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"},
+                    {"eventId": "e2", "sendId": "pub-e2"}]})
+                listing = instance.comment_private_candidates({"items": [
+                    {"eventId": "e1", "authorId": "author-1", "authorName": "用户1",
+                     "publicSendId": "pub-e2"}]})
+                executed = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-e2"}]})
+            finally:
+                sidecar.send_comment = original
+        self.assertEqual(listing["allowed"], [], "清单不得放行别人的公屏成功")
+        self.assertEqual([item["reason"] for item in listing["rejected"]],
+                         ["public_send_id_mismatch"])
+        self.assertEqual(executed["results"][0]["reason"], "public_send_id_mismatch")
+
+    def test_the_events_own_public_send_still_passes_the_binding_check(self):
+        """反向保护：本事件自己那一次公屏成功必须通过，否则批次永远发不出私信。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            sidecar_mod, instance = self._batch(td)
+            original_comment = sidecar.send_comment
+            original_private = sidecar.send_private
+
+            def confirmed(*args, **kwargs):
+                send_id, target = args[2], args[3]
+                instance.gate.reserve(send_id, target["authorId"], args[4], kind="comment")
+                instance.gate.mark_started(send_id)
+                instance.gate.finish(send_id, "sent_confirmed", "platform_response")
+                return {"status": "sent_confirmed", "reason": "platform_response",
+                        "sendId": send_id}
+
+            sent = []
+            sidecar.send_comment = confirmed
+            sidecar.send_private = lambda *args, **kwargs: (
+                sent.append(args[3]) or {"status": "unknown",
+                                         "reason": "platform_response_unavailable"})
+            try:
+                batch_id = self._planned_batch(instance)
+                instance.comment_reply({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "pub-e1"}]})
+                listing = instance.comment_private_candidates({"items": [
+                    {"eventId": "e1", "authorId": "author-1", "authorName": "用户1",
+                     "publicSendId": "pub-e1"}]})
+                executed = instance.comment_private({"batchId": batch_id, "items": [
+                    {"eventId": "e1", "sendId": "priv-e1", "publicSendId": "pub-e1"}]})
+            finally:
+                sidecar.send_comment = original_comment
+                sidecar.send_private = original_private
+        self.assertEqual([item["eventId"] for item in listing["allowed"]], ["e1"])
+        self.assertEqual(len(sent), 1, "绑定正确时应当真的进到私信发送")
+        self.assertEqual(executed["results"][0]["status"], "unknown")
+
+    def test_the_mismatch_reason_is_declared_in_the_capability_matrix(self):
+        """拒绝原因是契约的一部分：必须出现在能力的 rejectReasons 里，宿主才能据此决策。"""
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19241)
+            caps = instance.dispatch("capabilities", {})["capability"]
+        for name in ("comment_flow", "comment_private_candidates"):
+            self.assertIn("public_send_id_mismatch",
+                          caps[name]["validation"]["rejectReasons"], name)
+
+
+class SearchTerminalStateTests(unittest.TestCase):
+    """找视频：分页终止态与空结果的收敛（登录 / 验证码已有回归，这里补空结果与提前终止）。"""
+
+    VIDEO = "https://www.douyin.com/video/1"
+
+    def _run(self, params, videos, stopped=None):
+        import sidecar
+        page = FakeSearchPage()
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        calls = []
+
+        def fake(_page, _keyword, **kwargs):
+            calls.append(kwargs)
+            meta = kwargs.get("meta")
+            if isinstance(meta, dict):
+                meta["skipped_seen"] = 0
+                meta["platform_cursor"] = "pc-1"
+                meta["platform_has_more"] = 1
+                if stopped:
+                    meta["stopped_reason"] = stopped
+            return list(videos)
+
+        sidecar.douyin.login_state = lambda _page: "ok"
+        sidecar.crawlmod.search_videos = fake
+        try:
+            return instance.search(params), calls
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    @staticmethod
+    def _videos():
+        # 两条都与关键词「宝宝辅食」无重叠，保证 minRelevance=100 时条条被筛掉
+        return [{"aweme_id": "1", "url": "https://www.douyin.com/video/1",
+                 "desc": "今天天气不错", "author": "A", "author_sec_uid": "S1"},
+                {"aweme_id": "2", "url": "https://www.douyin.com/video/2",
+                 "desc": "随便聊聊别的", "author": "B", "author_sec_uid": "S2"}]
+
+    def test_an_empty_page_is_terminal_and_hands_back_no_cursor(self):
+        """本页一条新视频都没有 = 池子到头：不能一边说 hasMore=false 一边又交出 cursor。
+
+        否则按"有 cursor 就继续翻"实现的宿主会一直翻下去 —— 终止语义必须自洽，
+        与验证码 / 登录失效同一套收敛规则。
+        """
+        result, _ = self._run({"keyword": "宝宝辅食"}, [])
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["hasMore"])
+        self.assertIsNone(result["cursor"])
+        self.assertEqual(result["stoppedReason"], "pool_exhausted")
+        # pageOutcome 是宿主重启后唯一能复现"为什么停"的字段，必须跟着一起收敛
+        self.assertEqual(result["pageOutcome"], "exhausted")
+        self.assertEqual(result["cursorVersion"], 2)
+
+    def test_relevance_filter_does_not_fake_a_terminal_page(self):
+        """本页确实采到了视频、只是都被相关度筛掉，这不算"没有下一页"。
+
+        原来的 hasMore 取的是【筛过之后】的列表长度，于是 minRelevance 一调高，
+        翻页就会在还有下一页的时候提前停住。
+        """
+        result, _ = self._run({"keyword": "宝宝辅食", "minRelevance": 100}, self._videos())
+        self.assertEqual(result["videos"], [])
+        self.assertEqual(result["filter"]["filteredByRelevance"], 2)
+        self.assertTrue(result["hasMore"], "筛掉不等于没有下一页")
+        self.assertIsNotNone(result["cursor"])
+        # 这条最关键：hasMore=true 时 pageOutcome 不能说 exhausted（自相矛盾）。
+        # 本页确实采到了视频，只是都被相关度筛掉 —— 那是 more，不是到头。
+        self.assertEqual(result["pageOutcome"], "more")
+        self.assertEqual(result["cursorVersion"], 2)
+
+
+class InternalFailureReasonTests(unittest.TestCase):
+    """内部异常必须落成【稳定枚举】的原因，且评论容器定位失败不得抛 KeyError。"""
+
+    def test_scroll_panel_recovers_from_an_unusable_rect(self):
+        """评论容器返回的形状里没有 x/y/width/height 时必须兜底，而不是抛 KeyError。
+
+        真机上 DOM 改版会让 getBoundingClientRect 的字段缺席；
+        离线夹具/替身返回别的结构也会走到这里。原来直接 rect["x"]，
+        抛出的 KeyError 一路冒到 send_comment 的兜底，被记成一句 "KeyError" ——
+        排查方向整个跑偏（看起来像契约问题，其实是未守卫的下标）。
+        """
+        import douyin
+
+        class Cdp:
+            def __init__(self):
+                self.wheels = []
+
+            def eval_json(self, expression):
+                if "no_visible_panel" in expression:          # _COMMENT_SCROLL_JS
+                    return {"ok": True, "scrolled": 1, "items": 5}
+                if "innerWidth" in expression:                # 视口
+                    return {"w": 1200, "h": 800}
+                if "visibilityState" in expression:           # 可见性（滚轮只在可见时打）
+                    return "visible"
+                # comment_panel_rect：真机会给四个键；这里故意给一个"非空但没有 x"的形状
+                return {"found": False, "count": 2, "reason": "ambiguous_comment"}
+
+            def evaluate(self, expression):
+                # 滚轮只在页面 visible 时才打（铁律 1）：这里让可见性成立，
+                # 好让用例覆盖"真的把滚轮打出去"这条路径。
+                if expression == "document.visibilityState":
+                    return "visible"
+                return "ok"
+
+            def call(self, *args, **kwargs):
+                self.wheels.append(args)
+                return {}
+
+        cdp = Cdp()
+        info = douyin.scroll_comment_panel(cdp, rounds=1, pause=0)
+        self.assertEqual(info.get("wheelFallback"), "panel_rect_unavailable")
+        self.assertTrue(cdp.wheels, "兜底之后仍然要把滚轮打出去")
+
+    def test_a_complete_rect_uses_the_real_center(self):
+        """反向保护：rect 完整时必须用容器中心，别把兜底路径变成常态。"""
+        import douyin
+        self.assertEqual(douyin._rect_center({"x": 100, "y": 200, "width": 400, "height": 300},
+                                             1200, 800), (300, 350))
+        self.assertIsNone(douyin._rect_center({"x": 1}, 1200, 800))
+        self.assertIsNone(douyin._rect_center({"x": 1, "y": 2, "width": 0, "height": 5},
+                                             1200, 800))
+        self.assertIsNone(douyin._rect_center(None, 1200, 800))
+
+    def test_internal_exception_becomes_a_stable_reason(self):
+        """兜底原因不能是 Python 类名：宿主无法据此决策，也会带偏排查。"""
+        import send_actions
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            for started in (False, True):
+                send_id = "boom-%s" % started
+                gate.reserve(send_id, "author-1", "你好", kind="private")
+                if started:
+                    gate.mark_started(send_id)
+                row = send_actions._internal_failure(gate, send_id, started,
+                                                     KeyError("x"), "send_comment")
+                self.assertEqual(row["reason"], "internal_error")
+                self.assertNotIn("Error", row["reason"])
+
+    def test_the_exception_type_is_kept_in_evidence(self):
+        """稳定原因不等于丢证据：真实异常类型与信息必须留在 evidence 里。"""
+        import send_actions
+        with tempfile.TemporaryDirectory() as td:
+            gate = SendGate(td, "account-a")
+            gate.reserve("boom-ev", "author-1", "你好", kind="private")
+            row = send_actions._internal_failure(gate, "boom-ev", False,
+                                                 KeyError("panel rect"), "send_comment")
+        detail = row.get("evidence") or {}
+        self.assertEqual(detail.get("exception"), "KeyError")
+        self.assertEqual(detail.get("stage"), "send_comment")
+        self.assertIn("panel rect", str(detail.get("exceptionMessage")))
+
+
+class CursorIsolationRegressionTests(unittest.TestCase):
+    """游标必须绑定账号；且测试替身不得让搜索整体失败（PR #16 的失败根因）。"""
+
+    def test_a_cursor_from_another_account_is_refused(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1", "2"}, 3, "account-a")
+        with self.assertRaises(sidecar.SidecarError) as raised:
+            sidecar._decode_cursor(token, "宝宝辅食", "account-b")
+        self.assertEqual(raised.exception.code, "cursor_account_mismatch")
+
+    def test_the_same_account_still_decodes_its_own_cursor(self):
+        import sidecar
+        token = sidecar._encode_cursor("宝宝辅食", {"1", "2"}, 3, "account-a")
+        self.assertEqual(sidecar._decode_cursor(token, "宝宝辅食", "account-a"),
+                         ({"1", "2"}, 3))
+
+    def test_search_survives_a_double_without_account_scope(self):
+        """PR #16 把 getattr 守卫改成直接取属性，于是 __new__ 构造的替身全体 AttributeError。
+
+        游标绑定是【加法能力】，不该让既有搜索契约整体失败。
+        """
+        import sidecar
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (FakeSearchPage(), {})
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        sidecar.douyin.login_state = lambda _page: "ok"
+        sidecar.crawlmod.search_videos = make_fake_search([])
+        try:
+            result = instance.search({"keyword": "宝宝辅食"})
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+        self.assertEqual(result["status"], "ok")
+        self.assertGreater(result["poolSize"], 0)
+
+
+class ReleaseSwitchLockTests(unittest.TestCase):
+    """发行开关：拿不到真实平台送达证据之前，发送类能力必须保持 autoEligible=false。"""
+
+    SEND_CAPABILITIES = ("video_reply", "comment_batch", "live_batch", "live_reply",
+                         "private_reply", "live_private_reply", "live_danmaku_reply",
+                         "comment_flow", "comment_private_candidates")
+
+    def _caps(self):
+        import sidecar
+        with tempfile.TemporaryDirectory() as td:
+            instance = sidecar.Sidecar(os.path.join(td, "state"),
+                                       os.path.join(td, "profile"), 19251)
+            return instance.dispatch("capabilities", {})
+
+    def test_every_send_capability_stays_fail_closed(self):
+        """comment_batch 也要在内：它驱动 video_reply / private_reply 两个动作。"""
+        capability = self._caps()["capability"]
+        for name in self.SEND_CAPABILITIES:
+            self.assertIn(name, capability, name)
+            self.assertFalse(capability[name]["autoEligible"],
+                             "%s 未验证却标记为可自动发送" % name)
+
+    def test_every_capability_declares_its_evidence_level(self):
+        """每个能力都要写清楚证据等级：不能让"构建成功"冒充"真实抖音可用"。"""
+        capability = self._caps()["capability"]
+        for name, spec in capability.items():
+            validation = spec.get("validation") or {}
+            self.assertTrue(validation.get("status"),
+                            "%s 缺少证据等级声明" % name)
+
+    def test_sending_capabilities_declare_their_delivery_state(self):
+        """会发送的能力还必须声明"送达算不算确认"，否则无从判断发行条件。"""
+        capability = self._caps()["capability"]
+        for name in self.SEND_CAPABILITIES:
+            validation = capability[name].get("validation") or {}
+            self.assertTrue(validation.get("delivery"),
+                            "%s 缺少送达状态声明" % name)
+
+    def test_no_capability_claims_a_confirmed_platform_delivery(self):
+        """delivery 里出现 confirmed 就说明在用未到手的证据宣称送达。"""
+        capability = self._caps()["capability"]
+        for name, spec in capability.items():
+            delivery = str(((spec.get("validation") or {}).get("delivery")) or "")
+            self.assertNotIn("confirmed", delivery,
+                             "%s 宣称了已确认的平台送达：%s" % (name, delivery))
+
+    def test_uncertain_states_are_advertised_and_never_release_the_switch(self):
+        """失败 / 未知 / 被拦必须是明示状态，且它们本身不构成放行依据（红线 3）。"""
+        caps = self._caps()
+        for status in ("unknown", "failed", "blocked"):
+            self.assertIn(status, caps["sendStatuses"])
+        capability = caps["capability"]
+        self.assertFalse(capability["comment_flow"]["autoEligible"])
+        self.assertIn("sent_confirmed_only",
+                      capability["comment_flow"]["validation"]["privateGate"])
+
+
+class SearchDateRangeTests(unittest.TestCase):
+    """找视频：按【可配置】的发布时间区间筛（不依赖平台筛选面板）。
+
+    为什么由本侧筛：平台搜索的「筛选」只给"一天内/一周内/半年内"这类预设，
+    表达不了"2026 年 6–9 月"这种自选区间。所以把 crawl 已经解析出来的
+    create_time 透传给宿主，区间判定放在这里，参数化以便后面落到 UI。
+    口径是【北京时间】：商家说的"6 月"就是日历月，不做约定的话月初/月末会跨月。
+    """
+
+    VIDEO = "https://www.douyin.com/video/%d"
+
+    @staticmethod
+    def _cn(iso):
+        import datetime
+        import sidecar
+        return int(datetime.datetime.fromisoformat(iso).replace(tzinfo=sidecar._CN_TZ).timestamp())
+
+    def _videos(self):
+        return [
+            {"aweme_id": "jun", "url": self.VIDEO % 1, "desc": "怎么做副业 六月",
+             "author": "A", "author_sec_uid": "S1", "create_time": self._cn("2026-06-15T12:00:00")},
+            {"aweme_id": "may", "url": self.VIDEO % 2, "desc": "怎么做副业 五月",
+             "author": "B", "author_sec_uid": "S2", "create_time": self._cn("2026-05-31T23:59:59")},
+            {"aweme_id": "sep", "url": self.VIDEO % 3, "desc": "怎么做副业 九月末",
+             "author": "C", "author_sec_uid": "S3", "create_time": self._cn("2026-09-30T23:59:59")},
+            {"aweme_id": "oct", "url": self.VIDEO % 4, "desc": "怎么做副业 十月",
+             "author": "D", "author_sec_uid": "S4", "create_time": self._cn("2026-10-01T00:00:01")},
+            {"aweme_id": "notime", "url": self.VIDEO % 5, "desc": "怎么做副业 无时间",
+             "author": "E", "author_sec_uid": "S5", "create_time": None},
+        ]
+
+    def _run(self, params):
+        import sidecar
+        page = FakeSearchPage()
+        instance = sidecar.Sidecar.__new__(sidecar.Sidecar)
+        instance._page = lambda: (page, {})
+        original_search = sidecar.crawlmod.search_videos
+        original_login = sidecar.douyin.login_state
+        videos = self._videos()
+
+        def fake(_page, _keyword, **kwargs):
+            meta = kwargs.get("meta")
+            if isinstance(meta, dict):
+                meta["skipped_seen"] = 0
+                meta["platform_cursor"] = "pc-1"
+                meta["platform_has_more"] = 1
+            return list(videos)
+
+        sidecar.douyin.login_state = lambda _page: "ok"
+        sidecar.crawlmod.search_videos = fake
+        try:
+            return instance.search(params)
+        finally:
+            sidecar.crawlmod.search_videos = original_search
+            sidecar.douyin.login_state = original_login
+
+    def test_a_month_range_covers_the_whole_end_month(self):
+        """2026-06 ~ 2026-09 必须含 6/15 与 9/30 23:59:59，排除 5/31 与 10/1。"""
+        result = self._run({"keyword": "怎么做副业", "dateFrom": "2026-06", "dateTo": "2026-09"})
+        self.assertEqual([v["id"] for v in result["videos"]], ["jun", "sep"])
+        fl = result["filter"]
+        self.assertEqual(fl["dateFrom"], "2026-06")
+        self.assertEqual(fl["dateTo"], "2026-09")
+        self.assertEqual(fl["filteredByDate"], 2, "5/31 与 10/1 应被区间筛掉")
+        self.assertEqual(fl["unknownDate"], 1, "取不到发布时间的要单独计数")
+
+    def test_videos_expose_create_time_for_the_ui(self):
+        """区间功能要落到 UI，就必须把发布时间透传出去（此前只有相关度，没有时间）。"""
+        result = self._run({"keyword": "怎么做副业", "dateFrom": "2026-06", "dateTo": "2026-09"})
+        first = result["videos"][0]
+        self.assertEqual(first["createTime"], self._cn("2026-06-15T12:00:00"))
+        self.assertEqual(first["publishedAt"], "2026-06-15T12:00:00+08:00")
+
+    def test_without_a_range_everything_comes_back(self):
+        """反向保护：不给区间就不许筛 —— 否则这个功能会静默改变既有搜索语义。"""
+        result = self._run({"keyword": "怎么做副业"})
+        self.assertEqual(sorted(v["id"] for v in result["videos"]),
+                         ["jun", "may", "notime", "oct", "sep"])
+        self.assertEqual(result["filter"]["filteredByDate"], 0)
+
+    def test_a_reversed_or_malformed_range_is_refused(self):
+        """边界输入必须在打开浏览器之前拒绝，且不许猜宿主想表达什么。"""
+        import sidecar
+        for params in ({"dateFrom": "2026-09", "dateTo": "2026-06"},
+                       {"dateFrom": "2026-13"}, {"dateFrom": "2026"},
+                       {"dateFrom": "abc"}, {"dateTo": "202606"}, {"dateFrom": 202606}):
+            with self.assertRaises(sidecar.SidecarError) as raised:
+                self._run(dict({"keyword": "怎么做副业"}, **params))
+            self.assertEqual(raised.exception.code, "invalid_input", repr(params))
+class CommentReplyVisibilityConsistencyTests(unittest.TestCase):
+    """评审要求（2026-09-21）：comment_row_present 与 comment_reply_button 的判定必须一致。
+
+    钉住三条性质（离线可验证，不依赖 headless 浏览器）：
+
+      1. 两处共用同一份"回复按钮查找"片段 —— 结构上不可能各判一套；
+      2. 采集标注的 visible 取自 replyReady（唯一命中 + 按钮存在可见且在视口内），
+         而不是"行在渲染层"这种弱结论；
+      3. 发送阶段的拒绝原因与定位器枚举同名、不叠前缀，宿主能一一对上。
+    """
+
+    def test_both_locators_share_one_button_lookup(self):
+        import douyin
+        lookup = douyin._REPLY_BUTTON_LOOKUP_JS
+        self.assertIn("function replyButtonIn(row)", lookup)
+        self.assertIn(lookup, douyin._REPLY_BUTTON_JS)
+        self.assertIn(lookup, douyin._ROW_PRESENT_JS)
+        for field in ("present", "matches", "replyReady", "reason"):
+            self.assertIn(field + ":", douyin._ROW_PRESENT_JS)
+        self.assertIn("ambiguous_comment", douyin._ROW_PRESENT_JS)
+        self.assertIn("reply_button_not_found", douyin._ROW_PRESENT_JS)
+
+    def test_pure_numeric_body_has_a_fallback_but_noise_is_still_filtered(self):
+        """正文就是纯数字时必须有兜底，且噪声过滤不能被顺手删掉。"""
+        import douyin
+        js = douyin._row_helpers_js()
+        self.assertIn("var digits='';", js)
+        self.assertIn("if(/^\\d+$/.test(t)){if(!digits)digits=t;continue;}", js)
+        self.assertIn("return best||digits;", js)
+
+    def test_refusal_reasons_use_the_locator_enum_without_double_prefix(self):
+        import douyin
+        import send_actions
+
+        class Page:
+            def __init__(self):
+                self.clicks = []
+
+            def call(self, *_args, **_kwargs):
+                return {}
+
+            def evaluate(self, expression):
+                if expression == "document.readyState":
+                    return "complete"
+                if expression == "location.href":
+                    return "https://www.douyin.com/video/1"
+                return None
+
+            def click_at(self, x, y):
+                self.clicks.append((x, y))
+
+        def run(reason):
+            saved = (douyin.comment_reply_button, send_actions.douyin.login_state,
+                     send_actions.douyin.check_captcha, send_actions.douyin.visibility_state,
+                     send_actions.time.sleep)
+            page = Page()
+            douyin.comment_reply_button = lambda _cdp, _target, attempts=4, settle=1.2: {
+                "found": False, "reason": reason}
+            send_actions.douyin.login_state = lambda _cdp: "verified"
+            send_actions.douyin.check_captcha = lambda _cdp: False
+            send_actions.douyin.visibility_state = lambda _cdp: "visible"
+            send_actions.time.sleep = lambda _seconds: None
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    result = send_actions.send_comment(
+                        page, SendGate(td, "account-a"), "c-%s" % reason,
+                        {"id": "comment-1", "roomId": "https://www.douyin.com/video/1",
+                         "authorId": "author-1", "authorName": "Alice", "text": "same question"},
+                        "our reply", "video")
+            finally:
+                (douyin.comment_reply_button, send_actions.douyin.login_state,
+                 send_actions.douyin.check_captcha, send_actions.douyin.visibility_state,
+                 send_actions.time.sleep) = saved
+            return result, page
+
+        ambiguous, page = run("ambiguous_comment")
+        self.assertEqual(ambiguous["status"], "failed")
+        self.assertEqual(ambiguous["reason"], "reply_ambiguous_comment")
+        self.assertEqual(page.clicks, [], "歧义目标绝不能点")
+
+        missing, page = run("reply_button_not_found")
+        self.assertEqual(missing["reason"], "reply_button_not_found",
+                         "不能出现 reply_reply_button_not_found 这种叠前缀")
+        self.assertEqual(page.clicks, [])
 
 
 if __name__ == "__main__":

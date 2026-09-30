@@ -41,6 +41,34 @@ const PLATFORM_WORKFLOW_CONTRACTS = Object.freeze([
     ]
   },
   {
+    // 评论区【批次】固定工作流：采集并筛选评论，逐条公屏回复，确认后再私信。
+    // 单条 comment.reply_then_private 保留给兼容旧任务；新任务应使用批次契约。
+    workflowId: 'comment.batch',
+    version: '1',
+    kind: 'comment_batch',
+    steps: [
+      { stepId: 'plan', action: 'comment.plan', phase: 'plan', sideEffect: false },
+      {
+        stepId: 'reply_public',
+        action: 'comment.public_reply',
+        phase: 'public',
+        sideEffect: true,
+        resultRequired: true,
+        successStatuses: CONFIRMED_DELIVERY
+      },
+      {
+        stepId: 'private_message',
+        action: 'comment.private_message',
+        phase: 'private',
+        sideEffect: true,
+        resultRequired: true,
+        successStatuses: CONFIRMED_DELIVERY,
+        requiresPrevious: { stepId: 'reply_public', resultStatuses: CONFIRMED_DELIVERY }
+      },
+      { stepId: 'report', action: 'comment.result', phase: 'report', sideEffect: false }
+    ]
+  },
+  {
     workflowId: 'live.reply_then_private',
     version: '1',
     kind: 'live_reply_then_private',

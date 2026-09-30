@@ -76,6 +76,15 @@ const normalizeStatus = (value: unknown) => {
   return aliases[raw] ?? raw;
 };
 const runParams = (value: unknown) => objectValue(value ?? {}, 'params', 24_000);
+const policyRefValue = (value: unknown): RecordValue => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw badRequest('params.policyRef 必须是对象');
+  const ref = value as RecordValue;
+  rejectUnknown(ref, ['policyId', 'policyVersion', 'knowledgeSetVersion']);
+  if (typeof ref.policyId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(ref.policyId)) throw badRequest('params.policyRef.policyId 无效');
+  if (!Number.isSafeInteger(ref.policyVersion) || ref.policyVersion < 1) throw badRequest('params.policyRef.policyVersion 无效');
+  if (ref.knowledgeSetVersion !== undefined && (!Number.isSafeInteger(ref.knowledgeSetVersion) || ref.knowledgeSetVersion < 1)) throw badRequest('params.policyRef.knowledgeSetVersion 无效');
+  return { policyId: ref.policyId, policyVersion: ref.policyVersion, ...(ref.knowledgeSetVersion === undefined ? {} : { knowledgeSetVersion: ref.knowledgeSetVersion }) };
+};
 const douyinHosts = new Set(['douyin.com', 'www.douyin.com', 'v.douyin.com', 'live.douyin.com']);
 function workflowUrl(value: unknown, name: string, live = false) {
   if (typeof value !== 'string' || value.length > 2_048) throw badRequest(`${name} 无效`);
@@ -107,6 +116,7 @@ function validateWorkflowParams(id: string, params: RecordValue) {
     workflowKeywords(params.keywords);
     for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
   }
+  if (params.policyRef !== undefined) policyRefValue(params.policyRef);
   for (const key of ['reply', 'privateText']) if (params[key] !== undefined && (typeof params[key] !== 'string' || params[key].length > 2_000)) throw badRequest(`params.${key} 无效`);
   return params;
 }
@@ -369,8 +379,13 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
       if (params.knowledgeSetId !== undefined && params.knowledgeSetId !== knowledgeBinding.id) throw new AppError(503, 'PLANNER_KNOWLEDGE_BINDING_INVALID', '规划器返回了不匹配的话术知识集');
       params.knowledgeSetId = knowledgeBinding.id; params.knowledgeSetVersion = knowledgeBinding.version;
     }
+    const definition = catalog.find((item) => item.workflowId === id && String(item.version) === version);
     validateWorkflowParams(id, params); ensureWorkflowFeature(actor, id);
-    if (!store.get<RecordValue>("SELECT workflow_id FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version)) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
+    if (!definition) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
+    const contractHash = hashPayload(definition.contract);
+    const policyFingerprint = hashPayload({ workflowId: id, version, contractHash, knowledgeSetVersion: knowledgeBinding?.version ?? null });
+    const policyVersion = Math.max(1, Number.parseInt(policyFingerprint.slice(0, 8), 16) % 1_000_000_000);
+    params.policyRef = { policyId: `workflow-policy:${id}`, policyVersion, ...(knowledgeBinding ? { knowledgeSetVersion: knowledgeBinding.version } : {}) };
     const issuedAt = store.now(); const expiresAt = issuedAt + 10 * 60 * 1000;
     const response = { planId: randomId('plan'), workflowId: id, version, params, issuedAt, expiresAt };
     store.transaction(() => {
@@ -489,7 +504,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     let knowledgeSet: RecordValue | undefined;
     if (body.knowledgeSetId !== undefined) { const knowledgeSetId = stringValue(body.knowledgeSetId, 'knowledgeSetId', 100, true) as string; knowledgeSet = store.get<RecordValue>("SELECT id,version,status FROM knowledge_sets WHERE id=? AND user_id=? AND status='active'", knowledgeSetId, actor.user_id); if (!knowledgeSet) throw new AppError(404, 'KNOWLEDGE_SET_NOT_FOUND', '知识集不存在或未启用'); }
     const runId = randomId('run'); const now = store.now();
-    const policy = { workflowId: id, version, entitlement, platformAccountId: account?.id ?? null, contractHash: hashPayload(workflowContractValue), creditPrice: contractCreditPrice, capturedAt: now };
+    const policy = { workflowId: id, version, entitlement, platformAccountId: account?.id ?? null, contractHash: hashPayload(workflowContractValue), creditPrice: contractCreditPrice, policyRef: params.policyRef ?? null, capturedAt: now };
     const result = store.transaction(() => {
       store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.run', key, hashPayload(payload), 'pending', now);
       store.run('UPDATE workflow_plans SET status=\'consumed\',consumed_at=? WHERE id=? AND user_id=? AND status=\'issued\'', now, plan, actor.user_id);

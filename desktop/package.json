@@ -16,9 +16,9 @@
     "check": "node test/check-syntax.js && node test/run.js && node test/probe-protocol.js",
     "test:probe-runtime": "node test/check-probe-runtime.js",
     "test:probe-lifecycle": "node test/probe-bridge-lifecycle.js",
-    "build": "node test/check-probe-runtime.js && electron-builder --win --config.directories.output=release",
-    "build:portable": "node test/check-probe-runtime.js && electron-builder --win portable --config.directories.output=release",
-    "build:nsis": "node test/check-probe-runtime.js && electron-builder --win nsis --config.directories.output=release"
+    "build": "node test/check-probe-runtime.js && node scripts/build-with-d-temp.cjs --win --config.directories.output=release",
+    "build:portable": "node test/check-probe-runtime.js && node scripts/build-with-d-temp.cjs --win portable --config.directories.output=release",
+    "build:nsis": "node test/check-probe-runtime.js && node scripts/build-with-d-temp.cjs --win nsis --config.directories.output=release"
   },
   "devDependencies": {
     "electron": "^44.4.3",

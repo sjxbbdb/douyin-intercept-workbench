@@ -233,7 +233,10 @@ class NetworkRecorder:
     而不是"编辑器消失了 / 评论出现在列表里"这类 DOM 现象。
     """
 
-    def __init__(self, cdp, url_predicate):
+    def __init__(self, cdp, url_predicate, capture_post_data=False):
+        # capture_post_data 默认关闭：私信正文属于不得留存的用户内容。
+        # 只有需要把回执绑定到具体动作（例如评论发布）时才显式打开。
+        self.capture_post_data = bool(capture_post_data)
         self.cdp = cdp
         self.pred = url_predicate
         self.pending = {}   # requestId -> {url, method, status}
@@ -245,10 +248,16 @@ class NetworkRecorder:
     def _on_req(self, p):
         try:
             if self.pred(p["request"]["url"]):
-                self.pending[p["requestId"]] = {
-                    "url": p["request"]["url"],
-                    "method": p["request"].get("method"),
+                request = p["request"] or {}
+                record = {
+                    "url": request["url"],
+                    "method": request.get("method"),
                 }
+                if self.capture_post_data:
+                    # 请求体仅在本对象显式开启时留档（评论发布回执需要绑定到具体正文）；
+                    # 私信正文属于不得留存的用户内容，默认【连键都不出现】。
+                    record["postData"] = request.get("postData") or ""
+                self.pending[p["requestId"]] = record
         except Exception:
             pass
 

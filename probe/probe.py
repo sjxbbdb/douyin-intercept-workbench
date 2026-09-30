@@ -76,13 +76,19 @@ def find_chrome():
     return None
 
 
-def bring_chrome_front(log=p):
-    """把 Chrome 主窗口真正置前。
+def bring_chrome_front(pid=None, log=p):
+    """【诊断用】尝试把 Chrome 主窗口置前。
 
-    实现在 winfocus.py —— dm.py 也要用它（批量发送时标签失活是同一个坑），
-    放这里会形成 probe.py <-> dm.py 的循环 import。
+    🔴 已收紧（平台侧要求 2026-09-26）：必须传入 sidecar marker 里的 PID。
+    旧 CLI 拿不到 PID，因此这里【直接 fail-closed】—— 绝不遍历系统上的其它
+    Chrome 窗口（多账号下会抢走别的账号的前台状态）。
+
+    窗口级恢复的唯一生产入口是 Sidecar._page()；本函数仅供诊断。
     """
-    return winfocus.bring_chrome_front(log=log)
+    ok = winfocus.bring_chrome_front(pid, log=log)
+    if not ok:
+        log("   ⚠️ 未做窗口级恢复：本 CLI 没有 sidecar marker PID（诊断工具，不作为分发版发送入口）。")
+    return ok
 
 
 
@@ -429,6 +435,7 @@ def cmd_dm(args):
         else:
             p("   （--yes：已跳过交互确认）")
     if not getattr(args, "no_focus", False):
+        p("   ⚠️ 旧 CLI 仅用于诊断：无 sidecar marker PID，不做窗口级恢复，也不作为分发版发送入口。")
         bring_chrome_front()
     browser, page = connect(args.port)
     try:

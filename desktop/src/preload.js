@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('agentApi', {
   redeem: (code) => invoke('credits:redeem', { code }),
   openTarget: (url) => invoke('browser:open', url),
   searchTargets: (payload) => invoke('browser:search', payload),
+  searchPool: (payload) => invoke('browser:search-pool', payload),
   knowledgeListSets: () => invoke('knowledge:list-sets'),
   knowledgeCreateSet: (payload) => invoke('knowledge:create-set', payload),
   knowledgeListDocuments: (knowledgeSetId) => invoke('knowledge:list-documents', { knowledgeSetId }),

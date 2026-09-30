@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dm chat header strict matching</title>
+<style>
+  body { margin: 0; font: 14px/1.4 sans-serif; }
+  .messageEditor { display: block; border: 1px solid #333; padding: 8px; width: 300px; }
+  .head { width: 300px; padding: 4px; }
+</style>
+<body>
+  <!-- 真机结构（2026-09-28）：会话头部标题 class 里含 ChatHeadertitle；
+       收件人判定靠它，用户要求改成【严格昵称匹配】（前缀不算同一个人）。
+       页面只放一个头部：测试里改它的文本，分别验证"严格等值"与"脱敏星号归一化"。 -->
+  <div class="componentsEntrywrapper imContainer">
+    <div class="StackLayoutStackChatHeadertitle head" id="head">小明</div>
+    <div class="messageEditor" id="panel-a">
+      <div contenteditable="true" id="editor-a">​</div>
+    </div>
+  </div>
+</body>
