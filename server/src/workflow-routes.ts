@@ -18,6 +18,40 @@ interface WorkflowRouteDeps {
 
 const checkpointStatuses = new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']);
 const accountBoundWorkflowIds = new Set(['video.search', 'comment.reply_then_private', 'comment.batch', 'live.reply_then_private', 'live.batch']);
+/** Prices for the platform workflows are server policy, not client input. */
+const canonicalWorkflowPrices: Readonly<Record<string, number>> = Object.freeze({
+  'video.search': 1,
+  'comment.reply_then_private': 2,
+  'comment.batch': 2,
+  'live.reply_then_private': 2,
+  'live.batch': 2,
+});
+
+function workflowPrice(workflowId: string, contract: RecordValue): number | null {
+  const canonical = canonicalWorkflowPrices[workflowId];
+  if (canonical !== undefined) {
+    if (contract.creditPrice !== undefined) return integerValue(contract.creditPrice, 'contract.creditPrice', 1);
+    return canonical;
+  }
+  return contract.creditPrice === undefined ? null : integerValue(contract.creditPrice, 'contract.creditPrice', 1);
+}
+
+function isSendingWorkflow(workflowId: string, contract: RecordValue) {
+  if (workflowId !== 'video.search' && accountBoundWorkflowIds.has(workflowId)) return true;
+  return Array.isArray(contract.steps) && contract.steps.some((step: any) => step && typeof step === 'object' && step.sideEffect === true);
+}
+
+function assertReadOnlyCompletionEvidence(row: RecordValue, targetState: unknown) {
+  const contract = parseJson<RecordValue>(row.contract_json, {});
+  if (!isSendingWorkflow(row.workflow_id, contract)) return;
+  if (row.workflow_id !== 'video.search') {
+    throw conflict('SEND_EVIDENCE_REQUIRED', '发送流程必须提供服务端认可的平台响应证据；当前发行版保持 fail-closed');
+  }
+  const state = targetState && typeof targetState === 'object' && !Array.isArray(targetState) ? targetState as RecordValue : {};
+  if (state.phase !== 'search' || state.status !== 'ok' || !Number.isSafeInteger(state.count) || state.count < 0 || typeof state.hasMore !== 'boolean' || (state.cursor !== null && typeof state.cursor !== 'string')) {
+    throw conflict('READ_RESULT_INVALID', '视频搜索完成结果必须符合服务端固定只读结果结构');
+  }
+}
 const transitions: Record<string, Set<string>> = {
   PLANNED: new Set(['RUNNING', 'PAUSED', 'STOPPED']),
   RUNNING: new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']),
@@ -262,12 +296,12 @@ interface CheckpointInput {
   checkpointId?: string;
 }
 
-function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput, actor?: RecordValue, authority?: (row: RecordValue) => void) {
+function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput, actor?: RecordValue, authority?: (row: RecordValue, input?: CheckpointInput) => void) {
   input.status = normalizeStatus(input.status);
   if (!checkpointStatuses.has(input.status)) throw badRequest('checkpoint.status 无效');
   const row = getRun(store, userId, runId);
   if (actor) assertLease(store, row, actor);
-  if (authority) authority(row);
+  if (authority) authority(row, input);
   if (input.expectedVersion !== undefined && input.expectedVersion !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
   if (!transitions[row.status]?.has(input.status)) throw conflict('INVALID_RUN_TRANSITION', `不能从 ${row.status} 转为 ${input.status}`);
   if (input.status === 'WAITING_HUMAN' && !input.humanWait) throw badRequest('WAITING_HUMAN 必须提供 humanWait');
@@ -276,12 +310,13 @@ function applyCheckpoint(store: Store, userId: string, runId: string, input: Che
   const priorCheckpoint = parseJson<RecordValue>(row.checkpoint_json, {});
   const cursor = input.cursor ?? priorCheckpoint.cursor ?? {};
   const targetState = input.targetState ?? priorCheckpoint.targetState ?? {};
+  if (input.status === 'COMPLETED') assertReadOnlyCompletionEvidence(row, targetState);
     const checkpointId = input.checkpointId ?? randomId('checkpoint');
     if (store.get('SELECT 1 AS present FROM workflow_checkpoints WHERE id=?', checkpointId)) throw conflict('CHECKPOINT_EXISTS', '检查点已存在');
   return store.transaction(() => {
     const latest = getRun(store, userId, runId);
     if (actor) assertLease(store, latest, actor);
-    if (authority) authority(latest);
+    if (authority) authority(latest, input);
     if (latest.checkpoint_version !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
     store.run('INSERT INTO workflow_checkpoints(id,run_id,version,status,step_id,cursor_json,target_state_json,failure_json,human_wait_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', checkpointId, runId, version, input.status, input.stepId ?? latest.current_step, json(cursor), json(targetState), input.failure ? json(input.failure) : null, input.humanWait ? json(input.humanWait) : null, now);
     const completedAt = ['COMPLETED', 'STOPPED'].includes(input.status) ? now : null;
@@ -427,7 +462,9 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     rejectUnknown(body, ['workflowId', 'version', 'name', 'status', 'contract']);
     const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const name = stringValue(body.name, 'name', 200, true) as string;
     const status = body.status ?? 'active'; if (status !== 'active' && status !== 'disabled') throw badRequest('status 无效');
-    const contract = workflowContract(body.contract);
+    const submittedContract = workflowContract(body.contract);
+    const registeredPrice = workflowPrice(id, submittedContract);
+    const contract = registeredPrice === null ? submittedContract : { ...submittedContract, creditPrice: registeredPrice };
     if (store.get('SELECT 1 AS present FROM workflow_definitions WHERE workflow_id=? AND version=?', id, version)) throw conflict('WORKFLOW_VERSION_EXISTS', '流程版本已注册');
     const now = store.now(); const created = store.transaction(() => {
       store.run('INSERT INTO workflow_definitions(workflow_id,version,name,status,contract_json,created_by,created_at) VALUES(?,?,?,?,?,?,?)', id, version, name, status, json(contract), actor.admin_id, now);
@@ -491,7 +528,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const actorFeatures = parseJson<RecordValue>(actor.features_json, {});
     if (entitlement && actorFeatures[entitlement] !== true) throw forbidden('FEATURE_DISABLED', `该账号未开通 ${entitlement} 功能`);
     if (accountBoundWorkflowIds.has(id) && !account) throw new AppError(409, 'PLATFORM_ACCOUNT_REQUIRED', '业务流程必须绑定已启用的平台账号');
-    const contractCreditPrice = workflowContractValue.creditPrice === undefined ? null : integerValue(workflowContractValue.creditPrice, 'contract.creditPrice', 1);
+    const contractCreditPrice = workflowPrice(id, workflowContractValue);
     if (contractCreditPrice !== null && !creditActionId) throw new AppError(409, 'CREDIT_ACTION_REQUIRED', '该流程需要先完成服务端积分预留');
     const issuedPlan = store.get<RecordValue>('SELECT * FROM workflow_plans WHERE id=? AND user_id=?', plan, actor.user_id);
     if (!issuedPlan || issuedPlan.status !== 'issued' || issuedPlan.expires_at <= store.now()) throw new AppError(409, 'PLAN_INVALID', '流程计划不存在、已消费或已过期');
@@ -615,6 +652,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); assertLease(store, run, actor); assertRunAuthority(actor, run); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope=\'workflow.result-decision\' AND idem_key=?', actor.user_id, key); if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同结果'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     if (!deps.resultDecider) throw new AppError(503, 'RESULT_DECIDER_NOT_CONFIGURED', '结果决策器未配置');
+    if (status === 'COMPLETED') assertReadOnlyCompletionEvidence(run, summary.checkpoint ?? summary.targetState ?? summary);
     const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary }); const decision = stringValue(result.decision, 'decision', 40, true) as string; const allowedDecisions: Record<string, Set<string>> = { COMPLETED: new Set(['complete']), FAILED: new Set(['complete', 'retry', 'wait_human']), STOPPED: new Set(['complete', 'wait_human']), UNKNOWN: new Set(['wait_human']), CHECKPOINT: new Set(['continue', 'retry', 'complete', 'wait_human']), WAITING_HUMAN: new Set(['continue', 'wait_human']), PAUSED: new Set(['continue', 'wait_human']) }; if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || !allowedDecisions[status]?.has(decision) || Object.keys(result).some((key) => key !== 'decision')) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策与服务端流程状态不匹配');
     const response = { runId, workflowId: run.workflow_id, version: run.workflow_version, decision };
     store.transaction(() => {

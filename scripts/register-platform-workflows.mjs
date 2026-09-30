@@ -23,6 +23,13 @@ const WORKFLOWS = new Map([
   ['live.batch', '直播间批次：关键词命中后公屏回复与私信'],
   ['comment.batch', '评论区批次：关键词命中后公屏回复与私信']
 ]);
+const DEFAULT_PRICES = Object.freeze({
+  'video.search': 1,
+  'comment.reply_then_private': 2,
+  'comment.batch': 2,
+  'live.reply_then_private': 2,
+  'live.batch': 2,
+});
 
 function parseArgs(argv) {
   const args = {};
@@ -55,7 +62,8 @@ function workflowPayloads() {
   return [...WORKFLOWS].map(([workflowId, name]) => {
     const definition = contracts.find((item) => item.workflowId === workflowId);
     if (!definition) throw new Error(`桌面端没有 ${workflowId} 固定契约`);
-    return { workflowId, version: String(definition.version), name, status: 'active', contract: definition };
+    const creditPrice = DEFAULT_PRICES[workflowId];
+    return { workflowId, version: String(definition.version), name, status: 'active', contract: { ...definition, creditPrice } };
   });
 }
 

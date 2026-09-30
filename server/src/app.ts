@@ -27,6 +27,13 @@ const ADMIN_SESSION_TTL = 8 * 60 * 60 * 1000;
 const DEFAULT_DRAFT_HOLD_TTL = 60 * 1000;
 const DEFAULT_CREDIT_ACTION_TTL = 15 * 60 * 1000;
 const sourceSet = new Set(['video_comment', 'live_comment', 'live_danmaku']);
+const canonicalWorkflowPrices: Readonly<Record<string, number>> = Object.freeze({
+  'video.search': 1,
+  'comment.reply_then_private': 2,
+  'comment.batch': 2,
+  'live.reply_then_private': 2,
+  'live.batch': 2,
+});
 
 const json = (value: unknown) => JSON.stringify(value);
 const parseJson = <T>(value: string, fallback: T): T => { try { return JSON.parse(value) as T; } catch { return fallback; } };
@@ -103,7 +110,7 @@ function creditActionPolicy(store: Store, owner: string) {
     const definition = store.get<{ contract_json: string }>("SELECT contract_json FROM workflow_definitions WHERE workflow_id=? AND status='active' ORDER BY version DESC LIMIT 1", workflowId);
     if (!definition) return null;
     const contract = parseJson<AnyRecord>(definition.contract_json, {});
-    const amount = integer(contract.creditPrice, 1) ?? 1;
+    const amount = integer(contract.creditPrice, 1) ?? canonicalWorkflowPrices[workflowId] ?? 1;
     const ttlMs = integer(contract.creditReservationTtlMs, 5_000) ?? DEFAULT_CREDIT_ACTION_TTL;
     return { amounts: [amount], ttlMs: Math.min(ttlMs, 24 * 60 * 60 * 1000) };
   }
@@ -125,7 +132,17 @@ function getFeatures(row: AnyRecord, providerConfigured: boolean) {
 function recoverExpiredHolds(store: Store) {
   store.transaction(() => {
     const now = store.now();
+    const expired = store.all<AnyRecord>("SELECT id,user_id,owner,amount,expires_at FROM holds WHERE status='held' AND expires_at<=?", now);
     store.run("UPDATE holds SET status='released' WHERE status='held' AND expires_at<=?", now);
+    for (const hold of expired) {
+      audit(store, 'system', null, 'hold.expire', hold.user_id, {
+        holdId: hold.id,
+        owner: hold.owner,
+        amount: hold.amount,
+        expiresAt: hold.expires_at,
+        reason: 'reservation_ttl_elapsed',
+      });
+    }
   });
 }
 
@@ -362,6 +379,27 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
   app.get('/v1/credits/ledger', async (request) => {
     const user = userFromRequest(store, request, config); const rows = store.all<AnyRecord>('SELECT id,delta,balance_after AS balanceAfter,kind,metadata_json,created_at AS createdAt FROM ledger WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 500', user.user_id);
     return { entries: rows.map((x) => ({ ...x, metadata: parseJson(x.metadata_json, {}) })), balance: balance(store, user.user_id) };
+  });
+
+  app.get('/v1/audit', async (request) => {
+    const user = userFromRequest(store, request, config);
+    const rows = store.all<AnyRecord>(`SELECT id,action,metadata_json AS metadata,created_at AS createdAt
+      FROM audit
+      WHERE target_user_id=? AND (actor_type='user' OR actor_type='system')
+      ORDER BY created_at DESC,id DESC LIMIT 500`, user.user_id);
+    const safeMetadata = (value: unknown) => {
+      const input = value && typeof value === 'object' && !Array.isArray(value) ? value as AnyRecord : {};
+      const output: AnyRecord = {};
+      // Keep operational identifiers and outcomes useful to the tenant while
+      // excluding credentials, free-form content, and cross-tenant identity.
+      const allowed = new Set(['runId', 'workflowId', 'version', 'status', 'stepId', 'decision', 'creditOutcome', 'actionId', 'ledgerId', 'amount', 'owner', 'reason', 'expiresAt', 'recoveryAttempts', 'deviceIdHash', 'contractHash', 'paramsHash', 'knowledgeSetId', 'knowledgeSetVersion']);
+      for (const [key, item] of Object.entries(input)) {
+        if (!allowed.has(key)) continue;
+        if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean' || item === null) output[key] = item;
+      }
+      return output;
+    };
+    return { entries: rows.map((row) => ({ id: row.id, action: row.action, createdAt: row.createdAt, metadata: safeMetadata(parseJson(row.metadata, {})) })) };
   });
 
   app.post('/v1/credits/redeem', async (request) => {
