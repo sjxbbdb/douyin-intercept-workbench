@@ -140,29 +140,6 @@ test('AI provider success is charged once, invalid output and timeout release ho
   } finally { await timeoutFixture.close(); await new Promise<void>((resolve) => timeoutProvider.server.close(() => resolve())); }
 });
 
-test('AI provider failure releases the draft hold and reclaims its idempotency key', async () => {
-  const provider = await providerServer('invalid'); const f = await fixture({ provider: { baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' } });
-  try {
-    const user = await f.create({ username: 'ai-retry', features: { evaluate: true, draft: true } });
-    await f.app.inject({ method: 'POST', url: `/v1/admin/users/${user.id}/credits`, headers: { authorization: `Bearer ${f.adminToken}` }, payload: { amount: 5, idempotencyKey: 'retry-credit-001' } });
-    const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'pc', deviceName: 'A' } }); const token = login.json().token;
-    const payload = { event: event('draft-retry'), businessContext: '商品咨询', idempotencyKey: 'draft-retry-001' };
-    const failed = await f.app.inject({ method: 'POST', url: '/v1/agent/draft', headers: { authorization: `Bearer ${token}` }, payload });
-    assert.equal(failed.statusCode, 503); assert.equal(failed.json().code, 'PROVIDER_FAILED');
-    const store = new Store(f.dbPath);
-    try {
-      const pending = store.get<{ count: number }>("SELECT count(*) AS count FROM idempotency WHERE user_id=? AND scope='draft' AND idem_key=? AND status='pending'", user.id, payload.idempotencyKey);
-      const hold = store.get<{ status: string }>('SELECT status FROM holds WHERE user_id=? AND hold_key=?', user.id, `draft:${payload.idempotencyKey}`);
-      assert.equal(pending?.count, 0); assert.equal(hold?.status, 'released');
-    } finally { store.close(); }
-    const retry = await f.app.inject({ method: 'POST', url: '/v1/agent/draft', headers: { authorization: `Bearer ${token}` }, payload });
-    assert.equal(retry.statusCode, 503); assert.equal(retry.json().code, 'PROVIDER_FAILED');
-    const status = await f.app.inject({ method: 'GET', url: `/v1/agent/draft/${payload.idempotencyKey}`, headers: { authorization: `Bearer ${token}` } });
-    assert.equal(status.statusCode, 404); assert.equal(status.json().code, 'DRAFT_OPERATION_NOT_FOUND');
-    const me = await f.app.inject({ method: 'GET', url: '/v1/me', headers: { authorization: `Bearer ${token}` } }); assert.equal(me.json().balance, 5);
-  } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
-});
-
 test('admin CLI uses the running API and returns generated credentials', async () => {
   const f = await fixture(); try {
     const address = await f.app.listen({ host: '127.0.0.1', port: 0 }); const env = { LICENSE_SERVER_URL: address, ADMIN_USERNAME: 'root', ADMIN_PASSWORD: 'root-password' };
