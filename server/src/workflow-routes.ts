@@ -36,6 +36,11 @@ function workflowPrice(workflowId: string, contract: RecordValue): number | null
   return contract.creditPrice === undefined ? null : integerValue(contract.creditPrice, 'contract.creditPrice', 1);
 }
 
+function effectiveWorkflowContract(workflowId: string, contract: RecordValue) {
+  const price = workflowPrice(workflowId, contract);
+  return price === null ? contract : { ...contract, creditPrice: price };
+}
+
 function isSendingWorkflow(workflowId: string, contract: RecordValue) {
   if (workflowId !== 'video.search' && accountBoundWorkflowIds.has(workflowId)) return true;
   return Array.isArray(contract.steps) && contract.steps.some((step: any) => step && typeof step === 'object' && step.sideEffect === true);
@@ -394,7 +399,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
       throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中');
     }
     if (!deps.planner) throw new AppError(503, 'PLANNER_NOT_CONFIGURED', 'Agent 规划器未配置');
-    const catalog = store.all<RecordValue>("SELECT workflow_id,version,name,contract_json FROM workflow_definitions WHERE status='active' ORDER BY workflow_id,version DESC").map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, contract: parseJson(row.contract_json, {}) }));
+    const catalog = store.all<RecordValue>("SELECT workflow_id,version,name,contract_json FROM workflow_definitions WHERE status='active' ORDER BY workflow_id,version DESC").map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, contract: effectiveWorkflowContract(row.workflow_id, parseJson(row.contract_json, {})) }));
     if (!catalog.length) throw new AppError(503, 'WORKFLOW_CATALOG_EMPTY', '暂无可用固定流程');
     let plannerContext = context;
     let knowledgeBinding: { id: string; version: number } | null = null;
@@ -477,7 +482,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   app.get('/v1/admin/workflows', async (request) => {
     const actor = admin(request);
     const rows = store.all<RecordValue>('SELECT workflow_id,version,name,status,contract_json,created_by,created_at FROM workflow_definitions ORDER BY workflow_id,version DESC');
-    return { workflows: rows.map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, status: row.status, contract: parseJson(row.contract_json, {}), createdBy: row.created_by, createdAt: row.created_at })), actor: actor.admin_id };
+    return { workflows: rows.map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, status: row.status, contract: effectiveWorkflowContract(row.workflow_id, parseJson(row.contract_json, {})), createdBy: row.created_by, createdAt: row.created_at })), actor: actor.admin_id };
   });
 
   app.get('/v1/workflows', async (request) => {
@@ -523,7 +528,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const old = store.get<RecordValue>('SELECT response_json,status,payload_hash FROM idempotency WHERE user_id=? AND scope=\'workflow.run\' AND idem_key=?', actor.user_id, key);
     if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同请求'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     const definition = store.get<RecordValue>("SELECT * FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version); if (!definition) throw new AppError(404, 'WORKFLOW_NOT_FOUND', '流程版本不存在或未启用');
-    const workflowContractValue = parseJson<RecordValue>(definition.contract_json, {});
+    const workflowContractValue = effectiveWorkflowContract(id, parseJson<RecordValue>(definition.contract_json, {}));
     const entitlement = id.startsWith('video.') ? 'videoSearch' : id.startsWith('comment.') ? 'commentReply' : id.startsWith('live.') ? 'liveInteraction' : null;
     const actorFeatures = parseJson<RecordValue>(actor.features_json, {});
     if (entitlement && actorFeatures[entitlement] !== true) throw forbidden('FEATURE_DISABLED', `该账号未开通 ${entitlement} 功能`);
