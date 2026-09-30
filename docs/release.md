@@ -22,7 +22,7 @@ portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临
 - Windows 桌面端：先构建并复制完整 sidecar onedir，再执行 `npm ci`、`npm run check`、`npm test`、portable 和 NSIS 构建；两个产物必须使用不同文件名并分别启动一次。
 - 源码 Electron UI 实际检查：临时随机 `userData`，不使用开发机默认 AppData；覆盖积分流水、错误态、账号切换和离线状态，截图和日志不得包含密码、token、兑换码或 provider key。
 - sidecar：发行包携带完整 PyInstaller onedir（包含 `_internal`）和校验信息，用户不应被要求另行安装 Python。构建前置检查发现 `desktop/build/probe` 缺 runtime 时必须失败。按 [`sidecar-protocol.md`](sidecar-protocol.md) 验收协议、权限、进程退出、超时取消、账号隔离和升级回滚；取消只回收主进程自己创建的 child，unknown 不自动重试。
-- 真实抖音：按视频搜索、评论采集/筛选、评论回复、直播互动、私信触达分别记录页面版本、最终 URL、可见 DOM/API 候选、平台结果判据和未验证边界。视频/直播发送当前仅有 fixture 证据并保持自动发送关闭；私信自动资格依据已接受的 PR1 协作者账号流程证据。未取得对应证据前，保留开发和人工预检入口，不宣称生产可用。
+- 真实抖音：按视频搜索、评论采集/筛选、评论回复、直播互动、私信触达分别记录页面版本、最终 URL、可见 DOM/API 候选、平台结果判据和未验证边界。所有发送类能力当前均保持自动发送关闭；未取得绑定具体账号、页面版本和平台响应的充分证据前，保留开发和人工预检入口，不宣称生产可用。
 
 ## Windows 构建步骤
 
