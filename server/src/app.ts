@@ -98,7 +98,7 @@ function getPricing(store: Store) {
   return setting(store, 'pricing', { evaluateReplyPrice: 1, draftPrice: 2 });
 }
 
-function creditActionPolicy(store: Store, owner: string) {
+function creditActionPolicy(store: Store, owner: string, metadata: AnyRecord = {}) {
   // `reply` keeps the legacy one-credit fixture valid while the server still
   // limits the action to an explicit, finite price table.
   if (owner === 'reply') return { amounts: [1, 2], ttlMs: DEFAULT_CREDIT_ACTION_TTL };
@@ -107,7 +107,10 @@ function creditActionPolicy(store: Store, owner: string) {
   if (owner.startsWith('workflow:')) {
     const workflowId = owner.slice('workflow:'.length);
     if (!/^[a-z][a-z0-9._-]{1,99}$/.test(workflowId)) return null;
-    const definition = store.get<{ contract_json: string }>("SELECT contract_json FROM workflow_definitions WHERE workflow_id=? AND status='active' ORDER BY version DESC LIMIT 1", workflowId);
+    const requestedVersion = typeof metadata.version === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(metadata.version) ? metadata.version : null;
+    const definition = requestedVersion
+      ? store.get<{ contract_json: string }>("SELECT contract_json FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", workflowId, requestedVersion)
+      : store.get<{ contract_json: string }>("SELECT contract_json FROM workflow_definitions WHERE workflow_id=? AND status='active' ORDER BY version DESC LIMIT 1", workflowId);
     if (!definition) return null;
     const contract = parseJson<AnyRecord>(definition.contract_json, {});
     const amount = integer(contract.creditPrice, 1) ?? canonicalWorkflowPrices[workflowId] ?? 1;
@@ -475,7 +478,7 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
     const user = userFromRequest(store, request, config); const body = bodyObject(request.body); rejectUnknown(body, ['actionKey', 'owner', 'amount', 'metadata']);
     const actionKey = validateIdempotency(body.actionKey); const owner = boundedString(body.owner, 'owner', 120, true) as string; const requestedAmount = integer(body.amount, 1); if (!requestedAmount) throw badRequest('amount 无效'); const metadata = body.metadata === undefined ? {} : bodyObject(body.metadata);
     recoverExpiredCreditActions(store);
-    const policy = creditActionPolicy(store, owner); if (!policy) throw forbidden('ACTION_NOT_ENTITLED', '该积分动作未登记或未启用');
+    const policy = creditActionPolicy(store, owner, metadata); if (!policy) throw forbidden('ACTION_NOT_ENTITLED', '该积分动作未登记或未启用');
     if (!policy.amounts.includes(requestedAmount)) throw conflict('ACTION_PRICE_MISMATCH', '积分价格必须由服务端策略决定');
     const amount = requestedAmount;
     const action = store.transaction(() => { const existing = store.get<AnyRecord>('SELECT * FROM credit_actions WHERE user_id=? AND action_key=?', user.user_id, actionKey); if (existing) { if (existing.owner !== owner || existing.amount !== amount || existing.metadata_json !== json(metadata)) throw conflict('IDEMPOTENCY_CONFLICT', '相同 actionKey 不能用于不同动作'); return existing; } const reserved = store.get<{ total: number }>("SELECT COALESCE(sum(amount),0) AS total FROM credit_actions WHERE user_id=? AND status='reserved'", user.user_id)?.total ?? 0; if (balance(store, user.user_id) - reserved < amount) throw conflict('INSUFFICIENT_CREDITS', '积分不足'); const id = randomId('credit_action'); const now = store.now(); const expiresAt = now + policy.ttlMs; store.run("INSERT INTO credit_actions(id,user_id,action_key,owner,amount,status,metadata_json,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,'reserved',?,?,?,?)", id, user.user_id, actionKey, owner, amount, json(metadata), expiresAt, now, now); audit(store, 'user', user.user_id, 'credits.reserve', user.user_id, { actionId: id, owner, amount, expiresAt }); return store.get<AnyRecord>('SELECT * FROM credit_actions WHERE id=?', id)!; });
