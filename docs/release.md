@@ -6,7 +6,7 @@
 
 ### 4.0.3 本地候选包
 
-4.0.3 修复长 URL 在任务表格中的布局挤压，以及浏览器 owned target 失效后的恢复路径。portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录构建；portable 通过 `PACKAGE_DIAG_ONLY=portable` 隔离验收。portable SHA-256 为 `C969FC3F1387D3FC731B8A812E4F846E9622D2BDEDD781C93E335D76B1D170C1`（118,940,263 bytes）；NSIS SHA-256 为 `2B5E59C1127F0D8E9AC50EF6F3472185A8E6BC7DDD36A2A6CD96F0FB6FC830EB`（119,170,261 bytes）。报告见被忽略的 [`package-4.0.3-portable-diagnostic.json`](../evidence-private/package/package-4.0.3-portable-diagnostic.json)。NSIS 构建完成，未运行安装验收。
+4.0.3 修复长 URL 在任务表格中的布局挤压，以及浏览器 owned target 失效后的恢复路径。portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录构建；portable 与 NSIS 均通过 `scripts/verify-desktop-package.mjs` 隔离验收。portable SHA-256 为 `07B757BCDA9FBB0A1C63F43A624E45783917D456E7E4E8488353552B0CCE2820`（119,218,700 bytes）；NSIS SHA-256 为 `D784284F548BB9FB8E599973A61CAF7B8DA7CDAD8B4431C031E05D0FA72C3A40`（119,448,726 bytes）。报告见被忽略的 [`latest-package-check.json`](../evidence-private/package/latest-package-check.json)。未验证真实抖音页面、发送或生产部署。
 
 portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出（`exitCode=0`、CDP 端口关闭）和同一隔离 userData 重启授权恢复。未验证真实抖音页面、发送、NSIS 安装运行或生产部署；未启动真实 profile。
 
