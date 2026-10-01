@@ -6,7 +6,7 @@
 
 ### 4.0.3 本地候选包
 
-4.0.3 修复长 URL 在任务表格中的布局挤压，以及浏览器 owned target 失效后的恢复路径。portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录构建；portable 与 NSIS 均通过 `scripts/verify-desktop-package.mjs` 隔离验收。portable SHA-256 为 `07B757BCDA9FBB0A1C63F43A624E45783917D456E7E4E8488353552B0CCE2820`（119,218,700 bytes）；NSIS SHA-256 为 `D784284F548BB9FB8E599973A61CAF7B8DA7CDAD8B4431C031E05D0FA72C3A40`（119,448,726 bytes）。报告见被忽略的 [`latest-package-check.json`](../evidence-private/package/latest-package-check.json)。未验证真实抖音页面、发送或生产部署。
+4.0.3 在前版基础上加入冻结知识话术计划、人工完成证明、服务端有效契约指纹校验和追加版本快照；portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录重建。portable SHA-256 为 `337B75F7DB00E49680D656897768EAF4A396E1E1D33D41A6BACBB1E5EC97F5F2`（107,216,174 bytes）；NSIS SHA-256 为 `D4E011458002B2140B271DE91CC859EE06D6B2241341B513F6ACC26E9F68659E`（119,450,316 bytes）。两个构建均通过 sidecar 随包预检；完整安装验收待关闭正在运行的旧客户端后复跑，脚本不会自行终止用户进程。未验证真实抖音页面、发送或生产部署。
 
 portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出（`exitCode=0`、CDP 端口关闭）和同一隔离 userData 重启授权恢复。未验证真实抖音页面、发送、NSIS 安装运行或生产部署；未启动真实 profile。
 
