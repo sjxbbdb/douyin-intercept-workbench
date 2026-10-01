@@ -1,18 +1,19 @@
 # v4 验证记录
 
-更新时间：2026-09-30
-分支：`codex/pr56-merge`
-记录提交：`f4c6b30`（平台侧、三大适配器与 fail-closed 契约最终验证）
+更新时间：2026-10-01
+分支：`codex/release-4.0.3-artifacts`
+记录提交：`7ed4b27`（平台侧收口、契约校验与 4.0.3 产物记录）
 
-## 平台侧增量验证（2026-09-30）
+## 平台侧增量验证（2026-10-01）
 
-- `npm run check`、`npm test`：server 25/25，desktop 54/54，Probe protocol PASS；Probe Python 回归为 380/380；`node scripts/verify-integration.mjs` 报告 `Integration contract PASS`。
+- `npm run check`、`npm test`：server 34/34，desktop 56/56，Probe protocol PASS；Probe Python 回归为 380/380；`node scripts/verify-integration.mjs` 报告 `Integration contract PASS`。
+- 服务端新增回复流程知识集/冻结计划强制门禁、契约指纹返回与版本化话术快照；桌面端比较服务端有效契约后才注册本地执行器。手写公屏/私信模板、缺少知识集或不一致的策略引用均无法启动。
 - 集成修复覆盖：批次 `sendId` 的 `~public~`/`~private~` 语法校验、服务端 `policyRef` 签发与三阶段回传、缺失策略身份时的人工暂停，以及内部 web 响应监听的显式诊断开关；发行默认不依赖逆向 endpoint 或抓包回放。
 - 服务端新增可注入 OpenAI-compatible embeddings 后端、向量版本隔离和 Agent 规划知识上下文测试；未配置 embeddings 时只使用确定性本地 token-bag，不能冒充生产语义模型。
 - 工作台新增 Agent、找视频、评论区、直播间、任务/恢复、话术库入口；知识库 IPC 由主进程代持 token。评论批次固定为采集/冻结 → 公屏确认 → 仅对确认成功目标私信 → 报告。
-- Windows portable 与 NSIS 构建使用 D 盘缓存，产物为 `desktop/release/截流自动回复 Agent-4.0.3-x64-portable.exe`（SHA-256 `07B757BCDA9FBB0A1C63F43A624E45783917D456E7E4E8488353552B0CCE2820`，119,218,700 bytes）和 `desktop/release/截流自动回复 Agent-4.0.3-x64-installer.exe`（SHA-256 `D784284F548BB9FB8E599973A61CAF7B8DA7CDAD8B4431C031E05D0FA72C3A40`，119,448,726 bytes）。`scripts/verify-desktop-release-preflight.mjs` 与 `scripts/verify-desktop-package.mjs` 均 PASS；报告见被忽略的 `evidence-private/package/latest-package-check.json`。此次未把构建产物当作真实抖音发送验收。
+- Windows portable 与 NSIS 构建使用 D 盘缓存，产物为 `desktop/release/截流自动回复 Agent-4.0.3-x64-portable.exe`（SHA-256 `337B75F7DB00E49680D656897768EAF4A396E1E1D33D41A6BACBB1E5EC97F5F2`，107,216,174 bytes）和 `desktop/release/截流自动回复 Agent-4.0.3-x64-installer.exe`（SHA-256 `D4E011458002B2140B271DE91CC859EE06D6B2241341B513F6ACC26E9F68659E`，119,450,316 bytes）。`scripts/verify-desktop-release-preflight.mjs` 和两个构建命令通过；完整安装验收因检测到正在运行的旧客户端而由脚本安全中止，未自动关闭用户进程。此次未把构建产物当作真实抖音发送验收。
 
-## 4.0.3 验证记录
+## 4.0.3 验证记录（此前构建，历史）
 
 - 4.0.3 源码回归：task-editor fixture 8 组通过（含长 URL 表格布局、客户端错误态），并在 1366/1080 视口及 pending 长链接截图中检查；桌面单元测试 22 项、ProbeBridge 生命周期和 `scripts/verify-probe-integration.mjs` 均通过。
 - 4.0.3 Windows 交付：portable 与 NSIS 均构建完成；portable 以 `PACKAGE_DIAG_ONLY=portable` 在显式绝对临时 `user-data-dir` 中通过未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出和重启授权检查。报告为被忽略的 `evidence-private/package/package-4.0.3-portable-diagnostic.json`。
