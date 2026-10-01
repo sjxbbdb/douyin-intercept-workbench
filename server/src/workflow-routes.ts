@@ -19,6 +19,7 @@ interface WorkflowRouteDeps {
 const checkpointStatuses = new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']);
 const accountBoundWorkflowIds = new Set(['video.search', 'comment.reply_then_private', 'comment.batch', 'live.reply_then_private', 'live.batch']);
 const vectorReplyWorkflowIds = new Set(['comment.reply_then_private', 'comment.batch', 'live.reply_then_private', 'live.batch']);
+const composedWorkflowLimit = 8;
 /** Prices for the platform workflows are server policy, not client input. */
 const canonicalWorkflowPrices: Readonly<Record<string, number>> = Object.freeze({
   'video.search': 1,
@@ -45,6 +46,10 @@ function effectiveWorkflowContract(workflowId: string, contract: RecordValue) {
 function isSendingWorkflow(workflowId: string, contract: RecordValue) {
   if (workflowId !== 'video.search' && accountBoundWorkflowIds.has(workflowId)) return true;
   return Array.isArray(contract.steps) && contract.steps.some((step: any) => step && typeof step === 'object' && step.sideEffect === true);
+}
+
+function isUnknownSideEffectRun(row: RecordValue) {
+  return row.status === 'UNKNOWN' && isSendingWorkflow(row.workflow_id, parseJson<RecordValue>(row.contract_json, {}));
 }
 
 function assertReadOnlyCompletionEvidence(row: RecordValue, targetState: unknown, allowManualProof = false) {
@@ -110,6 +115,15 @@ const workflowVersion = (value: unknown) => {
   if (!version || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(version)) throw badRequest('version 格式无效');
   return version;
 };
+const policyVersionForWorkflow = (version: string) => {
+  const numeric = Number(version);
+  return Number.isSafeInteger(numeric) && numeric >= 1 && numeric <= 1_000_000_000 ? numeric : 1;
+};
+const workflowPolicyRef = (workflowIdValue: string, version: string, knowledgeSetVersion?: number) => ({
+  policyId: `workflow-policy:${workflowIdValue}`,
+  policyVersion: policyVersionForWorkflow(version),
+  ...(knowledgeSetVersion === undefined ? {} : { knowledgeSetVersion }),
+});
 const planId = (value: unknown) => stringValue(value, 'planId', 160, true) as string;
 const normalizeStatus = (value: unknown) => {
   const raw = stringValue(value, 'status', 40, true) as string;
@@ -328,59 +342,140 @@ interface CheckpointInput {
   humanWait?: RecordValue;
   expectedVersion?: number;
   checkpointId?: string;
+  idempotencyKey?: string;
 }
 
 function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput, actor?: RecordValue, authority?: (row: RecordValue, input?: CheckpointInput) => void, allowManualProof = false) {
   input.status = normalizeStatus(input.status);
   if (!checkpointStatuses.has(input.status)) throw badRequest('checkpoint.status 无效');
   const row = getRun(store, userId, runId);
+  const now = store.now();
+  const key = input.idempotencyKey ?? `checkpoint:${runId}:${hashPayload({ status: input.status, stepId: input.stepId ?? null, cursor: input.cursor ?? null, targetState: input.targetState ?? null, failure: input.failure ?? null, humanWait: input.humanWait ?? null })}`;
+  // The checkpoint id must be stable across a retry.  A random id here would
+  // make the payload hash change even when the caller correctly reuses its
+  // idempotency key, turning a safe replay into IDEMPOTENCY_CONFLICT.
+  const checkpointId = input.checkpointId ?? `checkpoint_${hashPayload({ runId, key }).slice(0, 48)}`;
+  const payload = { runId, operation: 'checkpoint', checkpointId, status: input.status, stepId: input.stepId ?? null, cursor: input.cursor ?? null, targetState: input.targetState ?? null, failure: input.failure ?? null, humanWait: input.humanWait ?? null, expectedVersion: input.expectedVersion ?? null, idempotencyKey: key };
+  const payloadHash = hashPayload(payload);
+  const prior = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.checkpoint' AND idem_key=?", userId, key);
+  if (prior) {
+    if (prior.payload_hash !== payloadHash) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同检查点');
+    if (prior.status === 'completed') return { row, response: parseJson(prior.response_json, null), replayed: true };
+    throw conflict('IDEMPOTENCY_PENDING', '相同检查点正在处理中');
+  }
   if (actor) assertLease(store, row, actor);
   if (authority) authority(row, input);
   if (input.expectedVersion !== undefined && input.expectedVersion !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
   if (!transitions[row.status]?.has(input.status)) throw conflict('INVALID_RUN_TRANSITION', `不能从 ${row.status} 转为 ${input.status}`);
   if (input.status === 'WAITING_HUMAN' && !input.humanWait) throw badRequest('WAITING_HUMAN 必须提供 humanWait');
   const version = row.checkpoint_version + 1;
-  const now = store.now();
   const priorCheckpoint = parseJson<RecordValue>(row.checkpoint_json, {});
   const cursor = input.cursor ?? priorCheckpoint.cursor ?? {};
-  const targetState = input.targetState ?? priorCheckpoint.targetState ?? {};
+  let targetState = input.targetState ?? priorCheckpoint.targetState ?? {};
+  // A side-effect UNKNOWN result may only be resumed after an explicit,
+  // server-issued reconciliation proof is presented. Mint the one-time
+  // challenge at the moment the server persists UNKNOWN so a client cannot
+  // manufacture a proof by echoing an adapter status.
+  const sendingUnknown = input.status === 'UNKNOWN' && isSendingWorkflow(row.workflow_id, parseJson<RecordValue>(row.contract_json, {}));
+  if (sendingUnknown) {
+    const operationId = typeof targetState.operationId === 'string' && targetState.operationId.trim()
+      ? targetState.operationId.trim().slice(0, 200)
+      : `workflow:${runId}:step:${input.stepId ?? row.current_step ?? 'unknown'}`;
+    const proofId = randomId('reconcile_proof');
+    const proofMeta = { checkpointId, version, operationId, issuedAt: now, expiresAt: now + 15 * 60 * 1000 };
+    targetState = { ...targetState, operationId, reconciliationProof: proofId, reconciliationProofMeta: proofMeta, reconciliationProofHash: hashPayload({ proofId, ...proofMeta }) };
+  }
   if (input.status === 'COMPLETED') assertReadOnlyCompletionEvidence(row, targetState, allowManualProof);
-    const checkpointId = input.checkpointId ?? randomId('checkpoint');
-    if (store.get('SELECT 1 AS present FROM workflow_checkpoints WHERE id=?', checkpointId)) throw conflict('CHECKPOINT_EXISTS', '检查点已存在');
   return store.transaction(() => {
+    const old = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.checkpoint' AND idem_key=?", userId, key);
+    if (old) {
+      if (old.payload_hash !== payloadHash) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同检查点');
+      if (old.status === 'completed') return { row: getRun(store, userId, runId), response: parseJson(old.response_json, null), replayed: true };
+      throw conflict('IDEMPOTENCY_PENDING', '相同检查点正在处理中');
+    }
     const latest = getRun(store, userId, runId);
     if (actor) assertLease(store, latest, actor);
     if (authority) authority(latest, input);
     if (latest.checkpoint_version !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
+    if (store.get('SELECT 1 AS present FROM workflow_checkpoints WHERE id=?', checkpointId)) throw conflict('CHECKPOINT_EXISTS', '检查点已存在');
+    store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), userId, 'workflow.checkpoint', key, payloadHash, 'pending', now);
     store.run('INSERT INTO workflow_checkpoints(id,run_id,version,status,step_id,cursor_json,target_state_json,failure_json,human_wait_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', checkpointId, runId, version, input.status, input.stepId ?? latest.current_step, json(cursor), json(targetState), input.failure ? json(input.failure) : null, input.humanWait ? json(input.humanWait) : null, now);
     const completedAt = ['COMPLETED', 'STOPPED'].includes(input.status) ? now : null;
     store.run('UPDATE workflow_runs SET status=?,current_step=?,checkpoint_version=?,checkpoint_json=?,failure_json=?,human_wait_json=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?', input.status, input.stepId ?? latest.current_step ?? null, version, json({ cursor, targetState }), input.failure ? json(input.failure) : null, input.humanWait ? json(input.humanWait) : null, now, completedAt, runId, userId);
-    return getRun(store, userId, runId);
+    const next = getRun(store, userId, runId);
+    const response = { run: runResponse(next) };
+    store.run("UPDATE idempotency SET status='completed',response_json=? WHERE user_id=? AND scope='workflow.checkpoint' AND idem_key=?", json(response), userId, key);
+    return { row: next, response, replayed: false };
   });
 }
 
 function recoverRun(store: Store, userId: string, runId: string, body: RecordValue, actor?: RecordValue, authority?: (row: RecordValue) => void) {
   const row = getRun(store, userId, runId);
-  if (actor) assertLease(store, row, actor);
-  if (authority) authority(row);
   const checksPassed = body.checksPassed === undefined ? 0 : integerValue(body.checksPassed, 'checksPassed', 0);
   const userConfirmed = body.userConfirmed === true;
-  if (body.expectedVersion !== undefined && integerValue(body.expectedVersion, 'expectedVersion', 0) !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
+  const reconciledProof = body.reconciledProof === undefined ? null : stringValue(body.reconciledProof, 'reconciledProof', 200, true) as string;
+  const reason = stringValue(body.reason, 'reason', 500) ?? null;
+  const expectedVersion = body.expectedVersion === undefined ? null : integerValue(body.expectedVersion, 'expectedVersion', 0);
+  const key = body.idempotencyKey === undefined
+    ? `recover:${runId}:${hashPayload({ checksPassed, userConfirmed, reason, expectedVersion, reconciledProofHash: reconciledProof ? hashPayload(reconciledProof) : null })}`
+    : idempotencyKey(body.idempotencyKey);
+  const payload = { runId, operation: 'recover', checksPassed, userConfirmed, reason, expectedVersion, reconciledProofHash: reconciledProof ? hashPayload(reconciledProof) : null };
+  const payloadHash = hashPayload(payload);
+  const prior = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.recover' AND idem_key=?", userId, key);
+  if (prior) {
+    if (prior.payload_hash !== payloadHash) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同恢复请求');
+    if (prior.status === 'completed') return { row, response: parseJson(prior.response_json, null), replayed: true };
+    throw conflict('IDEMPOTENCY_PENDING', '相同恢复请求正在处理中');
+  }
+  if (actor) assertLease(store, row, actor);
+  if (authority) authority(row);
+  if (expectedVersion !== null && expectedVersion !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
   if (row.status === 'PAUSED' && !userConfirmed) throw conflict('RESUME_CONFIRMATION_REQUIRED', '暂停的流程需要用户明确继续');
   if (['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'RUNNING'].includes(row.status) && checksPassed < 2) throw conflict('RECOVERY_CHECKS_REQUIRED', '恢复前必须连续通过两次检查');
+  if (isUnknownSideEffectRun(row) && !userConfirmed) throw conflict('RESUME_CONFIRMATION_REQUIRED', '未知副作用结果需要人工明确继续');
+  if (reconciledProof && row.status !== 'UNKNOWN') throw conflict('RECONCILIATION_PROOF_INVALID', '恢复凭证只能用于当前 UNKNOWN 检查点');
+  if (isUnknownSideEffectRun(row)) {
+    const checkpoint = parseJson<RecordValue>(row.checkpoint_json, {});
+    const expectedProof = (checkpoint.targetState && typeof checkpoint.targetState === 'object' && !Array.isArray(checkpoint.targetState))
+      ? checkpoint.targetState.reconciliationProof
+      : null;
+    const targetState = checkpoint.targetState && typeof checkpoint.targetState === 'object' && !Array.isArray(checkpoint.targetState) ? checkpoint.targetState as RecordValue : {};
+    const proofMeta = targetState.reconciliationProofMeta && typeof targetState.reconciliationProofMeta === 'object' && !Array.isArray(targetState.reconciliationProofMeta) ? targetState.reconciliationProofMeta as RecordValue : null;
+    const proofExpired = !proofMeta || !Number.isSafeInteger(proofMeta.expiresAt) || proofMeta.expiresAt <= store.now();
+    const proofBound = proofMeta && targetState.reconciliationProofHash === hashPayload({ proofId: reconciledProof, ...proofMeta });
+    if (!reconciledProof || typeof expectedProof !== 'string' || reconciledProof !== expectedProof || proofExpired || proofBound !== true) {
+      throw conflict('RECONCILIATION_PROOF_REQUIRED', '副作用结果为 UNKNOWN，必须先完成授权端签发的核验后才能恢复');
+    }
+  }
   if (!['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'RUNNING', 'PAUSED', 'PLANNED'].includes(row.status)) throw conflict('INVALID_RUN_TRANSITION', `不能从 ${row.status} 恢复`);
   const now = store.now();
   return store.transaction(() => {
+    const old = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.recover' AND idem_key=?", userId, key);
+    if (old) {
+      if (old.payload_hash !== payloadHash) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同恢复请求');
+      if (old.status === 'completed') return { row: getRun(store, userId, runId), response: parseJson(old.response_json, null), replayed: true };
+      throw conflict('IDEMPOTENCY_PENDING', '相同恢复请求正在处理中');
+    }
     const latest = getRun(store, userId, runId);
     if (actor) assertLease(store, latest, actor);
     if (authority) authority(latest);
     if (latest.checkpoint_version !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
     const version = latest.checkpoint_version + 1;
     const checkpoint = parseJson<RecordValue>(latest.checkpoint_json, {});
-    const recovery = { checksPassed, userConfirmed, reason: stringValue(body.reason, 'reason', 500) ?? null };
-    store.run('INSERT INTO workflow_checkpoints(id,run_id,version,status,step_id,cursor_json,target_state_json,failure_json,human_wait_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', randomId('checkpoint'), runId, version, 'RUNNING', latest.current_step, json(checkpoint.cursor ?? {}), json(checkpoint.targetState ?? {}), null, null, now);
-    store.run("UPDATE workflow_runs SET status='RUNNING',checkpoint_version=?,checkpoint_json=?,failure_json=NULL,human_wait_json=NULL,recovery_attempts=recovery_attempts+1,updated_at=? WHERE id=? AND user_id=?", version, json({ ...checkpoint, recovery }), now, runId, userId);
-    return getRun(store, userId, runId);
+    const recovery = { checksPassed, userConfirmed, reason, ...(reconciledProof ? { reconciledProofHash: hashPayload(reconciledProof) } : {}) };
+    const recoveredTargetState = { ...(checkpoint.targetState && typeof checkpoint.targetState === 'object' && !Array.isArray(checkpoint.targetState) ? checkpoint.targetState : {}) };
+    if (isUnknownSideEffectRun(latest)) {
+      delete recoveredTargetState.reconciliationProof;
+      delete recoveredTargetState.reconciliationProofMeta;
+      delete recoveredTargetState.reconciliationProofHash;
+    }
+    store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), userId, 'workflow.recover', key, payloadHash, 'pending', now);
+    store.run('INSERT INTO workflow_checkpoints(id,run_id,version,status,step_id,cursor_json,target_state_json,failure_json,human_wait_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', randomId('checkpoint'), runId, version, 'RUNNING', latest.current_step, json(checkpoint.cursor ?? {}), json(recoveredTargetState), null, null, now);
+    store.run("UPDATE workflow_runs SET status='RUNNING',checkpoint_version=?,checkpoint_json=?,failure_json=NULL,human_wait_json=NULL,recovery_attempts=recovery_attempts+1,updated_at=? WHERE id=? AND user_id=?", version, json({ ...checkpoint, targetState: recoveredTargetState, recovery }), now, runId, userId);
+    const next = getRun(store, userId, runId);
+    const response = { run: runResponse(next) };
+    store.run("UPDATE idempotency SET status='completed',response_json=? WHERE user_id=? AND scope='workflow.recover' AND idem_key=?", json(response), userId, key);
+    return { row: next, response, replayed: false };
   });
 }
 
@@ -453,9 +548,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     if (!definition) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
     if (vectorReplyWorkflowIds.has(id) && !knowledgeBinding) throw new AppError(409, 'REPLY_KNOWLEDGE_REQUIRED', '评论和直播回复流程必须先选择租户话术知识集');
     const contractHash = hashPayload(definition.contract);
-    const policyFingerprint = hashPayload({ workflowId: id, version, contractHash, knowledgeSetVersion: knowledgeBinding?.version ?? null });
-    const policyVersion = Math.max(1, Number.parseInt(policyFingerprint.slice(0, 8), 16) % 1_000_000_000);
-    params.policyRef = { policyId: `workflow-policy:${id}`, policyVersion, ...(knowledgeBinding ? { knowledgeSetVersion: knowledgeBinding.version } : {}) };
+    params.policyRef = workflowPolicyRef(id, version, knowledgeBinding?.version);
     const issuedAt = store.now(); const expiresAt = issuedAt + 10 * 60 * 1000;
     const response = { planId: randomId('plan'), workflowId: id, version, params, issuedAt, expiresAt };
     store.transaction(() => {
@@ -673,9 +766,9 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   });
 
   app.post('/v1/workflow-runs/:id/checkpoints', async (request) => {
-    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['status', 'stepId', 'cursor', 'targetState', 'failure', 'humanWait', 'expectedVersion', 'checkpointId']);
-    const input: CheckpointInput = { status: stringValue(body.status, 'status', 40, true) as string, stepId: stringValue(body.stepId, 'stepId', 200), cursor: body.cursor === undefined ? undefined : objectValue(body.cursor, 'cursor', 16_000), targetState: body.targetState === undefined ? undefined : objectValue(body.targetState, 'targetState', 16_000), failure: body.failure === undefined ? undefined : objectValue(body.failure, 'failure', 8_000), humanWait: body.humanWait === undefined ? undefined : objectValue(body.humanWait, 'humanWait', 8_000), expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true) };
-    const row = applyCheckpoint(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, input, actor, (run) => assertRunAuthority(actor, run)); audit(store, 'user', actor.user_id, 'workflow.checkpoint', actor.user_id, { runId: row.id, version: row.checkpoint_version, status: row.status, stepId: row.current_step }); return { run: runResponse(row) };
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['status', 'stepId', 'cursor', 'targetState', 'failure', 'humanWait', 'expectedVersion', 'checkpointId', 'idempotencyKey']);
+    const input: CheckpointInput = { status: stringValue(body.status, 'status', 40, true) as string, stepId: stringValue(body.stepId, 'stepId', 200), cursor: body.cursor === undefined ? undefined : objectValue(body.cursor, 'cursor', 16_000), targetState: body.targetState === undefined ? undefined : objectValue(body.targetState, 'targetState', 16_000), failure: body.failure === undefined ? undefined : objectValue(body.failure, 'failure', 8_000), humanWait: body.humanWait === undefined ? undefined : objectValue(body.humanWait, 'humanWait', 8_000), expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true), idempotencyKey: body.idempotencyKey === undefined ? undefined : idempotencyKey(body.idempotencyKey) };
+    const applied = applyCheckpoint(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, input, actor, (run) => assertRunAuthority(actor, run)); const row = applied.row; if (!applied.replayed) audit(store, 'user', actor.user_id, 'workflow.checkpoint', actor.user_id, { runId: row.id, version: row.checkpoint_version, status: row.status, stepId: row.current_step, idempotencyKeyHash: hashPayload(input.idempotencyKey ?? ''), reconciliationProofHash: row.status === 'UNKNOWN' ? hashPayload(parseJson<RecordValue>(row.checkpoint_json, {}).targetState?.reconciliationProof ?? '') : null }); return applied.response;
   });
 
   // A human may close a send workflow only through this explicit, audited
@@ -711,28 +804,66 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   });
 
   app.post('/v1/workflow-runs/:id/human-wait', async (request) => {
-    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['reason', 'context', 'expiresAt', 'expectedVersion', 'checkpointId']); const reason = stringValue(body.reason, 'reason', 500, true) as string; const context = body.context === undefined ? {} : objectValue(body.context, 'context', 8_000); const expiresAt = body.expiresAt === undefined ? null : integerValue(body.expiresAt, 'expiresAt', store.now() + 1); const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const row = applyCheckpoint(store, actor.user_id, runId, { status: 'waiting_human', humanWait: { reason, context, expiresAt }, expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true) }, actor, (run) => assertRunAuthority(actor, run)); audit(store, 'user', actor.user_id, 'workflow.human_wait', actor.user_id, { runId: row.id, reasonHash: hashPayload(reason) }); return { run: runResponse(row) };
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['reason', 'context', 'expiresAt', 'expectedVersion', 'checkpointId', 'idempotencyKey']); const reason = stringValue(body.reason, 'reason', 500, true) as string; const context = body.context === undefined ? {} : objectValue(body.context, 'context', 8_000); const expiresAt = body.expiresAt === undefined ? null : integerValue(body.expiresAt, 'expiresAt', store.now() + 1); const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const applied = applyCheckpoint(store, actor.user_id, runId, { status: 'waiting_human', humanWait: { reason, context, expiresAt }, expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true), idempotencyKey: body.idempotencyKey === undefined ? undefined : idempotencyKey(body.idempotencyKey) }, actor, (run) => assertRunAuthority(actor, run)); const row = applied.row; if (!applied.replayed) audit(store, 'user', actor.user_id, 'workflow.human_wait', actor.user_id, { runId: row.id, reasonHash: hashPayload(reason), idempotencyKeyHash: hashPayload(body.idempotencyKey ?? '') }); return applied.response;
   });
 
-  const recoverHandler = async (request: RequestValue) => { const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['checksPassed', 'userConfirmed', 'reason', 'expectedVersion']); const row = recoverRun(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, body, actor, (run) => assertRunAuthority(actor, run)); audit(store, 'user', actor.user_id, 'workflow.recover', actor.user_id, { runId: row.id, recoveryAttempts: row.recovery_attempts }); return { run: runResponse(row) }; };
+  const recoverHandler = async (request: RequestValue) => { const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['checksPassed', 'userConfirmed', 'reason', 'expectedVersion', 'reconciledProof', 'idempotencyKey']); const applied = recoverRun(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, body, actor, (run) => assertRunAuthority(actor, run)); if (!applied.replayed) audit(store, 'user', actor.user_id, 'workflow.recover', actor.user_id, { runId: applied.row.id, recoveryAttempts: applied.row.recovery_attempts, reconciledProofHash: typeof body.reconciledProof === 'string' ? hashPayload(body.reconciledProof) : null, idempotencyKeyHash: hashPayload(body.idempotencyKey ?? '') }); return applied.response; };
   app.post('/v1/workflow-runs/:id/recover', recoverHandler);
   app.post('/v1/workflow-runs/:id/human-wait/resolve', recoverHandler);
   app.post('/v1/workflow-runs/:id/result-decision', async (request) => {
     const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['status', 'summary', 'idempotencyKey']);
-    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); assertLease(store, run, actor); assertRunAuthority(actor, run); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); if (run.status !== 'COMPLETED') assertLease(store, run, actor); assertRunAuthority(actor, run); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope=\'workflow.result-decision\' AND idem_key=?', actor.user_id, key); if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同结果'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     if (!deps.resultDecider) throw new AppError(503, 'RESULT_DECIDER_NOT_CONFIGURED', '结果决策器未配置');
     if (status === 'COMPLETED') {
       const storedTarget = parseJson<RecordValue>(run.checkpoint_json, {}).targetState;
       assertReadOnlyCompletionEvidence(run, summary.checkpoint ?? summary.targetState ?? storedTarget ?? summary);
     }
-    const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary }); const decision = stringValue(result.decision, 'decision', 40, true) as string; const allowedDecisions: Record<string, Set<string>> = { COMPLETED: new Set(['complete']), FAILED: new Set(['complete', 'retry', 'wait_human']), STOPPED: new Set(['complete', 'wait_human']), UNKNOWN: new Set(['wait_human']), CHECKPOINT: new Set(['continue', 'retry', 'complete', 'wait_human']), WAITING_HUMAN: new Set(['continue', 'wait_human']), PAUSED: new Set(['continue', 'wait_human']) }; if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || !allowedDecisions[status]?.has(decision) || Object.keys(result).some((key) => key !== 'decision')) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策与服务端流程状态不匹配');
-    const response = { runId, workflowId: run.workflow_id, version: run.workflow_version, decision };
+    const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary });
+    const decision = stringValue(result.decision, 'decision', 40, true) as string;
+    const allowedDecisions: Record<string, Set<string>> = { COMPLETED: new Set(['complete', 'continue']), FAILED: new Set(['complete', 'retry', 'wait_human']), STOPPED: new Set(['complete', 'wait_human']), UNKNOWN: new Set(['wait_human']), CHECKPOINT: new Set(['continue', 'retry', 'complete', 'wait_human']), WAITING_HUMAN: new Set(['continue', 'wait_human']), PAUSED: new Set(['continue', 'wait_human']) };
+    if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || !allowedDecisions[status]?.has(decision) || Object.keys(result).some((key) => !['decision', 'nextPlan'].includes(key))) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策与服务端流程状态不匹配');
+    let nextPlan: RecordValue | null = null;
+    if (decision === 'continue' && status === 'COMPLETED') {
+      const candidate = objectValue(result.nextPlan, 'nextPlan', 24_000);
+      const nextWorkflowId = workflowId(candidate.workflowId);
+      const nextVersion = workflowVersion(candidate.version);
+      const nextParams = runParams(candidate.params);
+      const currentParams = parseJson<RecordValue>(run.params_json, {});
+      const currentDepth = currentParams.compositionDepth === undefined ? 0 : integerValue(currentParams.compositionDepth, 'params.compositionDepth', 0);
+      if (currentDepth >= composedWorkflowLimit) throw new AppError(409, 'RESULT_COMPOSITION_LIMIT', '连续固定流程达到安全上限，请转人工');
+      nextParams.compositionDepth = currentDepth + 1;
+      const nextDefinition = store.get<RecordValue>("SELECT * FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", nextWorkflowId, nextVersion);
+      if (!nextDefinition) throw new AppError(503, 'RESULT_NEXT_WORKFLOW_INVALID', '结果决策选择了未注册的下一流程');
+      ensureWorkflowFeature(actor, nextWorkflowId);
+      validateWorkflowParams(nextWorkflowId, nextParams, { requireReplyText: false });
+      if (vectorReplyWorkflowIds.has(nextWorkflowId) && (nextParams.publicReply !== undefined || nextParams.privateReply !== undefined || nextParams.replyPlan !== undefined)) throw new AppError(503, 'RESULT_NEXT_REPLY_UNFROZEN', '下一回复流程必须由授权中心重新生成冻结话术计划');
+      const nextAccount = accountBoundWorkflowIds.has(nextWorkflowId) ? platformAccount(actor, run.platform_account_id) : null;
+      if (accountBoundWorkflowIds.has(nextWorkflowId) && !nextAccount) throw new AppError(409, 'PLATFORM_ACCOUNT_REQUIRED', '下一业务流程必须绑定已启用的平台账号');
+      let nextKnowledge: RecordValue | null = null;
+      if (vectorReplyWorkflowIds.has(nextWorkflowId)) {
+        const knowledgeSetId = stringValue(nextParams.knowledgeSetId, 'nextPlan.params.knowledgeSetId', 100, true) as string;
+        nextKnowledge = store.get<RecordValue>("SELECT id,version,status FROM knowledge_sets WHERE id=? AND user_id=? AND status='active'", knowledgeSetId, actor.user_id) ?? null;
+        if (!nextKnowledge) throw new AppError(409, 'KNOWLEDGE_SET_NOT_FOUND', '下一回复流程的话术库不存在或未启用');
+        const requestedVersion = nextParams.knowledgeSetVersion === undefined ? nextKnowledge.version : integerValue(nextParams.knowledgeSetVersion, 'nextPlan.params.knowledgeSetVersion', 1);
+        if (requestedVersion > nextKnowledge.version) throw new AppError(409, 'KNOWLEDGE_VERSION_INVALID', '下一回复流程的话术库版本无效');
+        nextParams.knowledgeSetId = knowledgeSetId;
+        nextParams.knowledgeSetVersion = requestedVersion;
+      }
+      nextParams.policyRef = workflowPolicyRef(nextWorkflowId, nextVersion, nextKnowledge ? nextParams.knowledgeSetVersion : undefined);
+      const issuedAt = store.now();
+      nextPlan = { planId: randomId('plan'), workflowId: nextWorkflowId, version: nextVersion, params: nextParams, issuedAt, expiresAt: issuedAt + 10 * 60 * 1000 };
+    } else if (result.nextPlan !== undefined) {
+      throw new AppError(503, 'RESULT_DECISION_INVALID', '只有已完成流程才能选择下一流程');
+    }
+    if (decision === 'continue' && status === 'COMPLETED' && !nextPlan) throw new AppError(503, 'RESULT_NEXT_WORKFLOW_REQUIRED', '继续执行必须提供已校验的下一流程计划');
+    const response = { runId, workflowId: run.workflow_id, version: run.workflow_version, decision, ...(nextPlan ? { nextPlan } : {}) };
     store.transaction(() => {
       const outcome = status === 'COMPLETED' ? 'commit' : (status === 'FAILED' || status === 'STOPPED' ? 'release' : null);
       if (outcome) settleWorkflowCredit(store, actor.user_id, run.credit_action_id ?? null, outcome, runId);
+      if (nextPlan) store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', nextPlan.planId, actor.user_id, nextPlan.workflowId, nextPlan.version, json(nextPlan.params), 'issued', nextPlan.issuedAt, nextPlan.expiresAt);
       store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.result-decision', key, hashPayload(payload), 'completed', json(response), store.now());
-      audit(store, 'user', actor.user_id, 'workflow.result-decision', actor.user_id, { runId, decision, creditOutcome: outcome });
+      audit(store, 'user', actor.user_id, 'workflow.result-decision', actor.user_id, { runId, decision, creditOutcome: outcome, nextPlanId: nextPlan?.planId ?? null, nextWorkflowId: nextPlan?.workflowId ?? null });
     });
     return response;
   });

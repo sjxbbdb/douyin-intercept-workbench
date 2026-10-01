@@ -55,17 +55,19 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 ### 固定流程运行与恢复
 
-管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录；目录返回服务端有效 `contract`、`contractHash` 和价格。桌面端必须把它与本地固定契约指纹比对，不一致时拒绝启动。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
+管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录；目录返回服务端有效 `contract`、`contractHash` 和价格。桌面端必须把它与本地固定契约指纹比对，不一致时拒绝启动。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `idempotencyKey` 做安全重放，并以 `expectedVersion` 防止旧客户端覆盖新检查点。
 
 平台固定目录包括 `video.search`、`comment.reply_then_private`、`comment.batch`、`live.reply_then_private` 和 `live.batch`。`comment.batch` 的批量私信只能使用同一批次里 `sent_confirmed` 的公屏 `sendId`，部分成功可以生成报告，`unknown` 目标不会盲目重发。
 
-需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。服务端不会因为恢复请求自动重发未知发送动作。
+需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。恢复请求支持 `idempotencyKey`（省略时由运行实例和请求内容派生），响应丢失后的重试会回放原恢复结果而不会再次消费凭证。副作用流程进入 `UNKNOWN` 时，授权端会在该检查点签发一次性 `reconciliationProof`，并绑定检查点、操作身份和过期时间；恢复请求必须同时明确提交 `userConfirmed=true` 并原样带回该凭证，服务端消费后才允许回到 `RUNNING`，缺少任一条件不能仅凭健康检查重试。只读流程和非副作用未知状态仍沿用两次健康检查门槛。服务端不会因为恢复请求自动重发未知发送动作。
+
+流程完成后，结果决策器可以在 `decision=continue` 时返回一个受服务端目录、账号、功能和参数校验过的 `nextPlan`。授权端会把它作为新的短期计划写入台账，并在计划参数中持久化连续深度（服务端上限 8，跨重启仍有效）；桌面端先结束当前流程，再以同一平台账号启动下一固定流程。评论/直播下一流程仍必须重新走话术知识检索和冻结 reply-plan，模型不能直接提供发送文本；达到安全上限或下一计划校验失败时转人工。
 
 发送结果没有平台可验证回执时，运行实例会停在人工状态。操作者确认已在专用抖音页面处理后，可在持有租约的设备上调用 `POST /v1/workflow-runs/:id/manual-complete`（`note`、`idempotencyKey`、可选 `expectedVersion`）。授权端在事务中生成一次性 `manual_proof_*`、写入审计、完成服务端积分结算并把流程置为 `COMPLETED`；普通 checkpoint 不能伪造这个证明。
 
-同一个运行实例在多设备之间由任务租约保护：`POST /v1/workflow-runs/:id/lease/acquire`、`.../lease/renew`、`.../lease/release` 以当前登录会话的 `deviceId` 作为租约身份，默认 120 秒、允许 5 到 600 秒。持有有效租约的设备才能写入检查点、恢复流程和请求结果决策；其他设备收到 `LEASE_HELD` 或 `LEASE_OWNER_MISMATCH`。客户端异常退出后租约自然过期，其他设备可以接管；租约操作都需要幂等键并写入审计。完整请求和桌面生命周期见 [workflow-lease.md](contracts/workflow-lease.md)。
+同一个运行实例在多设备之间由任务租约保护：`POST /v1/workflow-runs/:id/lease/acquire`、`.../lease/renew`、`.../lease/release` 以当前登录会话的 `deviceId` 作为租约身份，默认 120 秒、允许 5 到 600 秒。持有有效租约的设备才能写入检查点、恢复流程和请求结果决策；已完成但结果决策暂未结算的只读流程允许授权账号在无租约状态下重试结果决策，避免响应丢失后积分预留永久悬挂。其他设备收到 `LEASE_HELD` 或 `LEASE_OWNER_MISMATCH`。客户端异常退出后租约自然过期，其他设备可以接管；租约操作都需要幂等键并写入审计。完整请求和桌面生命周期见 [workflow-lease.md](contracts/workflow-lease.md)。
 
-流程上报非 `RUNNING` 结果后，客户端可调用 `POST /v1/workflow-runs/:id/result-decision`，请求携带当前服务端状态、脱敏 `summary` 和幂等键。服务端只接受与数据库运行状态一致的 `FAILED`、`COMPLETED`、`STOPPED`、`UNKNOWN`、`CHECKPOINT`、`WAITING_HUMAN` 或 `PAUSED`；运行中的流程返回 `RESULT_DECISION_RUNNING`。结果模型只能返回 `continue`、`retry`、`complete` 或 `wait_human`，该响应不会直接修改流程状态。桌面端把 `retry` 作为下一步建议，未知发送结果和人工等待继续保持人工门控，不会自动重发。
+流程上报非 `RUNNING` 结果后，客户端可调用 `POST /v1/workflow-runs/:id/result-decision`，请求携带当前服务端状态、脱敏 `summary` 和幂等键。服务端只接受与数据库运行状态一致的 `FAILED`、`COMPLETED`、`STOPPED`、`UNKNOWN`、`CHECKPOINT`、`WAITING_HUMAN` 或 `PAUSED`；运行中的流程返回 `RESULT_DECISION_RUNNING`。结果模型只能返回 `continue`、`retry`、`complete` 或 `wait_human`，该响应不会直接修改流程状态。桌面端对授权端或模型暂时不可用执行三次短重试，仍失败时返回明确的 `requiresManualGate`，保持积分预留不结算并显示人工处理原因，不把流程伪装成成功。桌面端把 `retry` 作为下一步建议，未知发送结果和人工等待继续保持人工门控，不会自动重发。
 
 ### `GET /v1/audit`
 

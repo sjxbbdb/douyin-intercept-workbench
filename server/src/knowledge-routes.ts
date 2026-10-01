@@ -87,12 +87,25 @@ export function registerKnowledgeRoutes(app: FastifyInstance, deps: { store: Sto
   const getSet = (actor: Row, id: unknown) => { const setId = text(id, 'knowledgeSetId', 100, true) as string; const row = store.get<Row>('SELECT id,name,status,version FROM knowledge_sets WHERE id=? AND user_id=?', setId, actor.user_id); if (!row) throw new AppError(404, 'KNOWLEDGE_SET_NOT_FOUND', '知识集不存在'); if (row.status !== 'active') throw new AppError(409, 'KNOWLEDGE_SET_INACTIVE', '知识集未启用'); return row; };
 
   app.post('/v1/knowledge-documents', async (request) => {
-    const actor = user(request); const body = object(request.body, '请求体', 240_000); reject(body, ['knowledgeSetId', 'title', 'content', 'metadata']); const set = getSet(actor, body.knowledgeSetId); const title = text(body.title, 'title', 300, true) as string; const content = text(body.content, 'content', 200_000, true) as string; const metadata = body.metadata === undefined ? {} : object(body.metadata, 'metadata', 16_000); const parts = chunks(content); if (parts.length > 400) throw badRequest('文档分块数量过多'); const documentId = randomId('document'); const now = store.now();
+    const actor = user(request); const body = object(request.body, '请求体', 240_000); reject(body, ['knowledgeSetId', 'title', 'content', 'metadata']); const set = getSet(actor, body.knowledgeSetId); const title = text(body.title, 'title', 300, true) as string; const content = text(body.content, 'content', 200_000, true) as string; const metadata = body.metadata === undefined ? {} : object(body.metadata, 'metadata', 16_000); const parts = chunks(content); if (parts.length > 400) throw badRequest('文档分块数量过多'); const documentId = randomId('document');
     const vectors = await embedMany(embedding, parts);
-    const hasCurrentDocuments = !!store.get('SELECT 1 AS present FROM knowledge_documents WHERE user_id=? AND knowledge_set_id=? AND knowledge_set_version=? LIMIT 1', actor.user_id, set.id, set.version);
-    const version = hasCurrentDocuments ? set.version + 1 : set.version;
-    store.transaction(() => { if (version !== set.version) store.run('UPDATE knowledge_sets SET version=?,updated_at=? WHERE id=? AND user_id=? AND status=\'active\'', version, now, set.id, actor.user_id); store.run('INSERT INTO knowledge_documents(id,user_id,knowledge_set_id,knowledge_set_version,title,content_hash,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)', documentId, actor.user_id, set.id, version, title, hashPayload(content), json(metadata), now); parts.forEach((part, ordinal) => store.run('INSERT INTO knowledge_chunks(id,document_id,user_id,knowledge_set_id,knowledge_set_version,ordinal,text,vector_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)', randomId('chunk'), documentId, actor.user_id, set.id, version, ordinal, part, json(storedVector(embedding, vectors[ordinal])), now)); });
-    return { document: { id: documentId, knowledgeSetId: set.id, version, title, chunkCount: parts.length, metadata, createdAt: now } };
+    // Embedding can be slow and must stay outside the write transaction, but
+    // the version allocation cannot use the stale row read above.  BEGIN
+    // IMMEDIATE in Store.transaction serializes this short critical section;
+    // re-read the set and its current snapshot after the lock is acquired so
+    // concurrent uploads receive distinct monotonically increasing versions.
+    const committed = store.transaction(() => {
+      const latest = store.get<Row>('SELECT id,status,version FROM knowledge_sets WHERE id=? AND user_id=?', set.id, actor.user_id);
+      if (!latest || latest.status !== 'active') throw new AppError(409, 'KNOWLEDGE_SET_INACTIVE', '知识集未启用');
+      const hasCurrentDocuments = !!store.get('SELECT 1 AS present FROM knowledge_documents WHERE user_id=? AND knowledge_set_id=? AND knowledge_set_version=? LIMIT 1', actor.user_id, latest.id, latest.version);
+      const version = hasCurrentDocuments ? latest.version + 1 : latest.version;
+      const createdAt = store.now();
+      if (version !== latest.version) store.run('UPDATE knowledge_sets SET version=?,updated_at=? WHERE id=? AND user_id=? AND status=\'active\'', version, createdAt, latest.id, actor.user_id);
+      store.run('INSERT INTO knowledge_documents(id,user_id,knowledge_set_id,knowledge_set_version,title,content_hash,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?)', documentId, actor.user_id, latest.id, version, title, hashPayload(content), json(metadata), createdAt);
+      parts.forEach((part, ordinal) => store.run('INSERT INTO knowledge_chunks(id,document_id,user_id,knowledge_set_id,knowledge_set_version,ordinal,text,vector_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)', randomId('chunk'), documentId, actor.user_id, latest.id, version, ordinal, part, json(storedVector(embedding, vectors[ordinal])), createdAt));
+      return { version, createdAt };
+    });
+    return { document: { id: documentId, knowledgeSetId: set.id, version: committed.version, title, chunkCount: parts.length, metadata, createdAt: committed.createdAt } };
   });
 
   app.get('/v1/knowledge-documents', async (request) => { const actor = user(request); const query = object(request.query ?? {}, 'query', 2_000); const set = getSet(actor, query.knowledgeSetId); const version = query.version === undefined ? set.version : integer(query.version, 'version', 1, set.version); const rows = store.all<Row>('SELECT id,title,knowledge_set_version AS version,content_hash AS contentHash,metadata_json,created_at AS createdAt FROM knowledge_documents WHERE user_id=? AND knowledge_set_id=? AND knowledge_set_version<=? ORDER BY created_at DESC,id DESC', actor.user_id, set.id, version); return { knowledgeSetId: set.id, version, documents: rows.map((row) => ({ ...row, metadata: parse(row.metadata_json, {}) })) }; });

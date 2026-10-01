@@ -301,12 +301,15 @@ class WorkflowRuntime {
     return promise;
   }
 
-  async resumeRun(runId, { skipHealthCheck = false } = {}) {
+  async resumeRun(runId, { skipHealthCheck = false, reconciledProof = null } = {}) {
     const run = this.getRun(runId);
     if (!RESUMABLE_STATES.has(run.status)) throw new Error(`workflow cannot be resumed from ${run.status}`);
     if (this.healthCheck && !skipHealthCheck) await this.checkHealth(run.runId);
     if (run.status === RUN_STATES.UNKNOWN) {
-      const reconciled = await this.#reconcileUnknown(run);
+      const proof = reconciledProof == null ? null : requiredText(reconciledProof, 'reconciledProof', 200);
+      const reconciled = proof
+        ? this.#authorizeUnknown(run, proof)
+        : await this.#reconcileUnknown(run);
       if (!reconciled) return this.getRun(run.runId);
     }
     return this.run(run.runId);
@@ -354,6 +357,17 @@ class WorkflowRuntime {
     run.checkpoint = { ...(run.checkpoint || {}), phase: 'manual', status: 'manual_confirmed', proofId: value };
     run.lastError = null;
     run.resultDecision = { decision: 'manual_complete', proofId: value, at: this.clock() };
+    run.updatedAt = this.clock();
+    this.#writeData(data);
+    return clone(run);
+  }
+
+  setRecoveryProof(runId, proofId) {
+    const proof = requiredText(proofId, 'reconciliation proof', 200);
+    const data = this.#readData();
+    const run = this.#findOwned(data, runId);
+    if (run.status !== RUN_STATES.UNKNOWN) throw new Error(`workflow recovery proof cannot be attached to ${run.status}`);
+    run.checkpoint = { ...(run.checkpoint || {}), reconciliationProof: proof };
     run.updatedAt = this.clock();
     this.#writeData(data);
     return clone(run);
@@ -540,6 +554,25 @@ class WorkflowRuntime {
     current.updatedAt = this.clock();
     this.#writeData(data);
     return result.status === 'confirmed' || (result.status === 'not_found' && result.safeToRetry === true);
+  }
+
+  // A server-issued reconciliation proof represents an explicit operator or
+  // provider check. It is the only path that may turn an unknown side-effect
+  // into a runnable checkpoint; absent this proof, #reconcileUnknown remains
+  // fail-closed and never resends the action.
+  #authorizeUnknown(run, proof) {
+    const data = this.#readData();
+    const current = this.#findOwned(data, run.runId);
+    if (current.status !== RUN_STATES.UNKNOWN) return current.status === RUN_STATES.RUNNING;
+    const step = current.steps[current.currentStep];
+    if (!step) throw new Error('workflow action checkpoint is missing');
+    step.status = 'pending';
+    current.status = RUN_STATES.RUNNING;
+    current.checkpoint = { ...(current.checkpoint || {}), reconciled: 'server_proof', proofId: proof };
+    current.lastError = null;
+    current.updatedAt = this.clock();
+    this.#writeData(data);
+    return true;
   }
 
   #checkPrerequisite(run, definitionStep) {

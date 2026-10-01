@@ -223,33 +223,146 @@ function emitState() {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:state', { ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, workflowAccounts: [...workflowAccountRuns.values()], platformAccounts, platformAccountId: currentPlatformAccountId });
 }
 
+const COMPOSED_WORKFLOW_LIMIT = 8;
+const REPLY_WORKFLOW_IDS = new Set(['comment.batch', 'comment.reply_then_private', 'live.batch', 'live.reply_then_private']);
+function checkpointIdempotencyKey(remoteRunId, status, expectedVersion, stepId, suffix = '') {
+  return safeIdempotencyKey(`checkpoint:${remoteRunId}:${status}:${expectedVersion ?? 'current'}:${stepId ?? 'current'}:${suffix}`);
+}
+const RESULT_SECRET_KEY = /(token|password|secret|authorization|cookie|localstorage|credential|api.?key)/i;
+function resultEvidence(value, depth = 0, key = '') {
+  if (RESULT_SECRET_KEY.test(key)) return '[REDACTED]';
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.length > 600 ? `${value.slice(0, 600)}…` : value;
+  if (depth >= 3) return '[TRUNCATED]';
+  if (Array.isArray(value)) return value.slice(0, 12).map((item) => resultEvidence(item, depth + 1, key));
+  if (typeof value !== 'object') return null;
+  const output = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    if (Object.keys(output).length >= 32) break;
+    output[childKey] = resultEvidence(childValue, depth + 1, childKey);
+  }
+  return output;
+}
+
+function resultSummary(result) {
+  const steps = Array.isArray(result?.steps) ? result.steps.slice(0, 12).map((step) => ({
+    stepId: step.stepId,
+    status: step.status,
+    resultStatus: step.resultStatus,
+    result: resultEvidence(step.result),
+  })) : [];
+  return { currentStep: result.currentStep, checkpoint: resultEvidence(result.checkpoint), failure: resultEvidence(result.lastError), plan: result.plan ? { workflowId: result.plan.workflowId, version: result.plan.version } : null, steps };
+}
+
 async function requestResultDecision(remoteRunId, result) {
   if (!remoteRunId || !result || result.status === 'RUNNING') return null;
   if (typeof api?.resultDecision !== 'function') return { state: 'unavailable', reason: 'result_decision_api_unavailable', requiresManualGate: true };
   const idempotencyKey = safeIdempotencyKey(`result:${remoteRunId}:${result.status}:${result.currentStep ?? 'final'}`);
-  try {
-    const response = await api.resultDecision(remoteRunId, { status: result.status, summary: { currentStep: result.currentStep, checkpoint: result.checkpoint || null, failure: result.lastError || null }, idempotencyKey });
-    return { ...response, requiresManualGate: result.status === 'UNKNOWN' || result.status === 'WAITING_HUMAN' };
-  } catch (error) {
-    return { state: 'unavailable', code: error.code || 'RESULT_DECISION_FAILED', reason: error.message, requiresManualGate: true };
+  const request = { status: result.status, summary: resultSummary(result), idempotencyKey };
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await api.resultDecision(remoteRunId, request);
+      return { ...response, requiresManualGate: result.status === 'UNKNOWN' || result.status === 'WAITING_HUMAN' };
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
   }
+  return { state: 'unavailable', code: lastError?.code || 'RESULT_DECISION_FAILED', reason: lastError?.message || '结果决策暂时不可用', requiresManualGate: true, retryable: true };
 }
 
-async function solidifyRemoteWorkflow(remoteRunId, reason) {
+async function materializeNextWorkflowPlan(nextPlan, currentPlan) {
+  if (!nextPlan || typeof nextPlan !== 'object' || typeof nextPlan.planId !== 'string' || typeof nextPlan.workflowId !== 'string' || nextPlan.params == null || typeof nextPlan.params !== 'object') throw new Error('授权中心返回的下一流程计划无效');
+  if (!REPLY_WORKFLOW_IDS.has(nextPlan.workflowId)) return { planId: nextPlan.planId, workflowId: nextPlan.workflowId, version: nextPlan.version, params: nextPlan.params };
+  const params = { ...nextPlan.params };
+  const knowledgeSetId = typeof params.knowledgeSetId === 'string' && params.knowledgeSetId.trim()
+    ? params.knowledgeSetId.trim()
+    : (typeof currentPlan?.params?.knowledgeSetId === 'string' ? currentPlan.params.knowledgeSetId.trim() : '');
+  if (!knowledgeSetId) throw new Error('下一回复流程缺少租户话术库，已转人工');
+  const query = Array.isArray(params.keywords) ? params.keywords.join('、') : '继续处理目标';
+  const frozen = await prepareReplyPlan({ workflowId: nextPlan.workflowId, version: nextPlan.version, params: { ...params, knowledgeSetId }, knowledgeSetId, knowledgeSetVersion: params.knowledgeSetVersion, query });
+  if (frozen?.status !== 'issued' || !frozen.planId || !frozen.params) throw new Error(frozen?.status === 'UNKNOWN' ? '下一流程话术结果未知，已转人工' : '下一流程未获得授权中心冻结话术');
+  return { planId: frozen.planId, workflowId: frozen.workflowId, version: frozen.version, params: frozen.params };
+}
+
+async function applyResultDecisionAndCompose({ runtime, accountId, accountContext, requestedPlatform, deviceId, result, nextDecision, compositionDepth = 0 }) {
+  let decisionApplied = null;
+  let nextRun = null;
+  const sendWorkflow = Array.isArray(result?.steps) && result.steps.some((step) => step && step.sideEffect === true);
+  const sendEvidenceMissing = result?.status === 'COMPLETED' && sendWorkflow;
+  const reportedCheckpoint = sendEvidenceMissing ? { ...(result.checkpoint || {}), phase: 'send', reason: 'server_send_evidence_required' } : (result.checkpoint || {});
+  if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status))) {
+    decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
+  } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
+    if (nextDecision.decision === 'continue') {
+      if (!nextDecision.nextPlan) throw new Error('授权中心未提供下一流程计划，已停止自动接续');
+      if (compositionDepth >= COMPOSED_WORKFLOW_LIMIT) throw new Error('连续流程达到安全上限，已转人工');
+    }
+    decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
+    if (nextDecision.decision === 'continue') {
+      const plan = await materializeNextWorkflowPlan(nextDecision.nextPlan, result.plan);
+      nextRun = await startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, compositionDepth: compositionDepth + 1 });
+    }
+  } else if (nextDecision?.decision) {
+    decisionApplied = { action: 'suggested', decision: nextDecision.decision, requiresManualGate: true };
+  } else if (nextDecision?.requiresManualGate) {
+    // Keep the local terminal result visible while making the unresolved
+    // server decision explicit.  The remote credit hold remains untouched;
+    // callers must retry or use an audited human action before it can settle.
+    decisionApplied = { action: 'manual_gate', requiresManualGate: true, retryable: nextDecision.retryable === true, reason: nextDecision.reason || '结果决策暂时不可用', run: { ...result, resultDecisionPending: true, lastError: { code: nextDecision.code || 'RESULT_DECISION_REQUIRED', message: nextDecision.reason || '结果决策暂时不可用' } } };
+  }
+  return { decisionApplied, nextRun };
+}
+
+async function solidifyRemoteWorkflow(remoteRunId, reason, localRun = null, leaseContext = null) {
   if (!remoteRunId || typeof api?.workflowRun !== 'function') return;
   try {
     const remote = await api.workflowRun(remoteRunId);
     if (remote?.run?.status !== 'RUNNING') return;
+    const run = remote.run;
+    // A heartbeat failure may have let the lease expire before this catch
+    // handler runs. Reclaim the same device-scoped lease before persisting the
+    // human/UNKNOWN checkpoint; otherwise the remote run can remain RUNNING
+    // while the local runtime is already paused.
+    if (leaseContext?.accountId && leaseContext?.deviceId && typeof api.acquireWorkflowLease === 'function') {
+      await api.acquireWorkflowLease(remoteRunId, {
+        ttlMs: 120000,
+        idempotencyKey: safeIdempotencyKey(`lease:solidify:${remoteRunId}:${leaseContext.accountId}:${leaseContext.deviceId}:${run.checkpointVersion ?? 0}`)
+      });
+    }
+    const stepId = String(run.currentStep ?? localRun?.currentStep ?? 0);
+    const step = Array.isArray(run.contract?.steps) ? run.contract.steps.find((item) => (typeof item === 'string' ? item : item?.stepId || item?.id) === stepId) : null;
+    const sideEffect = Boolean((typeof step === 'object' && step?.sideEffect === true) || localRun?.steps?.[localRun.currentStep]?.sideEffect === true);
+    const currentTarget = run.checkpoint?.targetState && typeof run.checkpoint.targetState === 'object' ? run.checkpoint.targetState : {};
+    const operationId = typeof currentTarget.operationId === 'string' && currentTarget.operationId.trim()
+      ? currentTarget.operationId
+      : `workflow:${remoteRunId}:step:${stepId}`;
+    const status = sideEffect ? 'UNKNOWN' : 'WAITING_HUMAN';
+    const targetState = { ...currentTarget, phase: sideEffect ? 'send' : 'workflow', operationId, reason: String(reason || '桌面端流程异常，等待人工核对') };
     await api.checkpointWorkflow(remoteRunId, {
-      status: 'WAITING_HUMAN',
-      stepId: String(remote.run.currentStep ?? 0),
-      expectedVersion: remote.run.checkpointVersion,
-      humanWait: { reason: String(reason || '桌面端流程异常，等待人工核对'), context: { source: 'desktop_platform' } },
-      failure: { code: 'DESKTOP_WORKFLOW_INTERRUPTED', message: String(reason || '桌面端流程异常') }
+      status,
+      stepId,
+      expectedVersion: run.checkpointVersion,
+      idempotencyKey: checkpointIdempotencyKey(remoteRunId, status, run.checkpointVersion, stepId, sideEffect ? 'unknown' : 'human'),
+      targetState,
+      humanWait: { reason: String(reason || '桌面端流程异常，等待人工核对'), context: { source: 'desktop_platform', operationId } },
+      failure: { code: sideEffect ? 'DESKTOP_SIDE_EFFECT_UNKNOWN' : 'DESKTOP_WORKFLOW_INTERRUPTED', message: String(reason || '桌面端流程异常') }
     });
   } catch (error) {
     console.warn('[workflow] failed to solidify remote run', remoteRunId, error.message);
   }
+}
+
+function startLeaseHeartbeat(remoteRunId, accountId, deviceId) {
+  let failure = null;
+  const timer = setInterval(() => {
+    api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:heartbeat:${remoteRunId}:${accountId}:${deviceId}:${Date.now()}`) }).catch((error) => {
+      if (!failure) failure = error;
+    });
+  }, 30_000);
+  timer.unref?.();
+  return { stop: () => clearInterval(timer), error: () => failure, assertHealthy: () => { if (failure) throw new Error(`授权端流程租约续期失败，已暂停并等待人工：${failure.message}`); } };
 }
 
 function currentProfile() { return dataStore.get().selectorProfile || DEFAULT_SELECTOR_PROFILE; }
@@ -449,7 +562,7 @@ async function handleRedeem(_event, input) {
   return result;
 }
 
-async function startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage = null }) {
+async function startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage = null, compositionDepth = 0 }) {
     const runtime = accountContext.runtime;
     let localRun = null;
     let remoteRunId = null;
@@ -516,16 +629,19 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
     }
     accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === localRun.runId ? { ...candidate, remoteRunId } : candidate) }));
     let leaseHeld = false;
+    let leaseHeartbeat = null;
     let remoteVersion = Number.isSafeInteger(remote?.run?.checkpointVersion) ? remote.run.checkpointVersion : 0;
     try {
       await api.acquireWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${remoteRunId}:${accountId}:${deviceId}`) });
       leaseHeld = true;
-      const running = await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: remoteVersion });
+      const running = await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: remoteVersion, idempotencyKey: checkpointIdempotencyKey(remoteRunId, 'RUNNING', remoteVersion, String(localRun.currentStep ?? 0), 'start') });
       remoteVersion = Number.isSafeInteger(running?.run?.checkpointVersion) ? running.run.checkpointVersion : remoteVersion + 1;
       const run = localRun;
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: { ...run, status: 'RUNNING' } });
       emitState();
+      leaseHeartbeat = startLeaseHeartbeat(remoteRunId, accountId, deviceId);
       const result = await runtime.run(run.runId);
+      leaseHeartbeat.assertHealthy();
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
       await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
       const sendWorkflow = contractSteps.some((step) => step && step.sideEffect === true);
@@ -534,20 +650,18 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
       const reportedCheckpoint = sendEvidenceMissing
         ? { ...(result.checkpoint || {}), phase: 'send', reason: 'server_send_evidence_required' }
         : (result.checkpoint || {});
-      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
+      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, idempotencyKey: checkpointIdempotencyKey(remoteRunId, reportedStatus, remoteVersion, String(result.currentStep), 'result'), failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
       remoteVersion = Number.isSafeInteger(finalRemote?.run?.checkpointVersion) ? finalRemote.run.checkpointVersion : remoteVersion + 1;
+      const reconciliationProof = finalRemote?.run?.checkpoint?.targetState?.reconciliationProof;
+      if (result.status === 'UNKNOWN' && typeof reconciliationProof === 'string' && typeof runtime.setRecoveryProof === 'function') runtime.setRecoveryProof(result.runId, reconciliationProof);
       const nextDecision = sendEvidenceMissing ? { decision: 'wait_human', reason: 'server_send_evidence_required' } : await requestResultDecision(remoteRunId, result);
-      let decisionApplied = null;
-      if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status))) {
-        decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
-        if (result.status !== 'WAITING_HUMAN') {
-          const humanCheckpoint = await api.checkpointWorkflow(remoteRunId, { status: 'WAITING_HUMAN', stepId: String(result.currentStep), expectedVersion: remoteVersion, humanWait: { reason: 'Agent 结果决策要求人工处理', context: result.checkpoint || {} }, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
-          remoteVersion = Number.isSafeInteger(humanCheckpoint?.run?.checkpointVersion) ? humanCheckpoint.run.checkpointVersion : remoteVersion + 1;
-        }
-      } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
-        decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
-      } else if (nextDecision?.decision) {
-        decisionApplied = { action: 'suggested', decision: nextDecision.decision, requiresManualGate: true };
+      leaseHeartbeat.assertHealthy();
+      const applied = await applyResultDecisionAndCompose({ runtime, accountId, accountContext, requestedPlatform, deviceId, result, nextDecision, compositionDepth });
+      const decisionApplied = applied.decisionApplied;
+      const nextRun = applied.nextRun;
+      if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status)) && result.status !== 'WAITING_HUMAN') {
+        const humanCheckpoint = await api.checkpointWorkflow(remoteRunId, { status: 'WAITING_HUMAN', stepId: String(result.currentStep), expectedVersion: remoteVersion, idempotencyKey: checkpointIdempotencyKey(remoteRunId, 'WAITING_HUMAN', remoteVersion, String(result.currentStep), 'decision'), humanWait: { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : 'Agent 结果决策要求人工处理', context: result.checkpoint || {} }, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
+        remoteVersion = Number.isSafeInteger(humanCheckpoint?.run?.checkpointVersion) ? humanCheckpoint.run.checkpointVersion : remoteVersion + 1;
       }
       const displayRun = decisionApplied?.run || result;
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: displayRun });
@@ -556,7 +670,7 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
         ? `；找到 ${searchResult.videos?.length || 0} 个候选视频${(searchResult.videos || []).slice(0, 3).map((video) => `\n${video.title || video.url}`).join('')}`
         : '';
       const humanHint = displayRun.status === 'UNKNOWN' || displayRun.status === 'WAITING_HUMAN' || decisionApplied?.requiresManualGate ? '；需要人工处理后再继续' : '';
-      const decisionHint = nextDecision?.decision ? `；结果决策：${nextDecision.decision}` : '';
+      const decisionHint = nextDecision?.decision ? `；结果决策：${nextDecision.decision}${nextRun ? `，已接续 ${nextRun.plan?.workflowId || nextRun.run?.workflowId || '下一流程'}` : ''}` : '';
       // 只有聊天触发才写聊天记录；任务面板触发时由面板自己展示检查点与统一台账，
       // 不往聊天里塞一条假的用户消息。
       if (chatMessage) {
@@ -564,14 +678,15 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
         accountContext.store.update((data) => ({ ...data, chat: [...(Array.isArray(data.chat) ? data.chat : []), { role: 'user', content: chatMessage, at: new Date().toISOString() }, { role: 'assistant', content: assistantLine, runId: result.runId, at: new Date().toISOString() }].slice(-100) }));
       }
       emitState();
-      return { plan, run: displayRun, nextDecision, decisionApplied };
+      return { plan, run: displayRun, nextDecision, decisionApplied, nextRun };
     } catch (error) {
-      if (leaseHeld && remoteRunId) await solidifyRemoteWorkflow(remoteRunId, error.message);
+      if (leaseHeld && remoteRunId) await solidifyRemoteWorkflow(remoteRunId, error.message, localRun, { accountId, deviceId });
       if (localRun && !['COMPLETED', 'FAILED', 'STOPPED', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED'].includes(runtime.getRun(localRun.runId).status)) {
         runtime.pauseRun(localRun.runId, remoteRunId ? 'remote_workflow_interrupted' : 'remote_workflow_not_created');
       }
       throw error;
     } finally {
+      leaseHeartbeat?.stop();
       if (leaseHeld && remoteRunId) {
         try { await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${accountId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', remoteRunId, error.message); }
       }
@@ -737,17 +852,26 @@ function registerIpc() {
       }
       let remoteVersion = null;
       let leaseHeld = false;
+      let reconciledProof = null;
+      let leaseHeartbeat = null;
       try {
         if (local.remoteRunId) {
           await api.acquireWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:acquire:${local.remoteRunId}:${accountId}:${local.runId}:${deviceId}`) });
           leaseHeld = true;
         }
+        if (local.status === 'UNKNOWN' && local.remoteRunId) {
+          const remoteState = await api.workflowRun(local.remoteRunId);
+          reconciledProof = remoteState?.run?.checkpoint?.targetState?.reconciliationProof || null;
+          if (typeof reconciledProof !== 'string' || !reconciledProof) throw new Error('副作用结果未知，授权端尚未签发恢复核验凭证');
+        }
         const health = await runtime.checkHealth(local.runId);
         if (local.remoteRunId) {
-          const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: health.checksPassed, userConfirmed: true, reason: 'desktop_manual_resume' });
+          const recovered = await api.recoverWorkflow(local.remoteRunId, { checksPassed: health.checksPassed, userConfirmed: true, reason: 'desktop_manual_resume', idempotencyKey: safeIdempotencyKey(`recover:${local.remoteRunId}:${local.status}:${reconciledProof || 'none'}`), ...(reconciledProof ? { reconciledProof } : {}) });
           remoteVersion = Number.isSafeInteger(recovered?.run?.checkpointVersion) ? recovered.run.checkpointVersion : null;
+          leaseHeartbeat = startLeaseHeartbeat(local.remoteRunId, accountId, deviceId);
         }
-        const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true });
+        const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true, ...(reconciledProof ? { reconciledProof } : {}) });
+        leaseHeartbeat?.assertHealthy();
         workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
         const sendWorkflow = local.steps.some((step) => step && step.sideEffect === true);
         const sendEvidenceMissing = result.status === 'COMPLETED' && sendWorkflow;
@@ -757,28 +881,42 @@ function registerIpc() {
           : (result.checkpoint || {});
         if (local.remoteRunId && remoteVersion != null) {
           await api.renewWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${local.remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
+          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, idempotencyKey: checkpointIdempotencyKey(local.remoteRunId, reportedStatus, remoteVersion, String(result.currentStep), 'resume-result'), failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
           remoteVersion = Number.isSafeInteger(checkpoint?.run?.checkpointVersion) ? checkpoint.run.checkpointVersion : remoteVersion + 1;
         }
         const nextDecision = sendEvidenceMissing ? { decision: 'wait_human', reason: 'server_send_evidence_required' } : await requestResultDecision(local.remoteRunId, result);
-        let decisionApplied = null;
-        if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'PAUSED'].includes(result.status))) {
-          decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
-        } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
-          decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
-        } else if (nextDecision?.decision) {
-          decisionApplied = { action: 'suggested', decision: nextDecision.decision, requiresManualGate: true };
-        }
-        emitState(); return { ...(decisionApplied?.run || result), nextDecision, decisionApplied };
+        leaseHeartbeat?.assertHealthy();
+        const applied = await applyResultDecisionAndCompose({ runtime, accountId, accountContext, requestedPlatform, deviceId, result, nextDecision });
+        const decisionApplied = applied.decisionApplied;
+        emitState(); return { ...(decisionApplied?.run || result), nextDecision, decisionApplied, nextRun: applied.nextRun };
       } catch (error) {
-        if (leaseHeld) await solidifyRemoteWorkflow(local.remoteRunId, error.message);
+        if (leaseHeld) await solidifyRemoteWorkflow(local.remoteRunId, error.message, local, { accountId, deviceId });
         throw error;
       } finally {
+        leaseHeartbeat?.stop();
         if (leaseHeld) {
           try { await api.releaseWorkflowLease(local.remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${local.remoteRunId}:${local.runId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', local.remoteRunId, error.message); }
         }
       }
     }, { taskId: `resume:${normalizedRunId}`, metadata: { platformAccountId: requestedPlatform } });
+  }));
+  ipcMain.handle('agent:retry-result-decision', wrap(async (_event, input) => {
+    if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+    const runId = text(typeof input === 'string' ? input : input?.runId, 'run id', 160);
+    const requestedPlatform = typeof input === 'object' && input?.platformAccountId ? normalizePlatformAccountId(input.platformAccountId) : currentPlatformAccountId;
+    if (!runId || !requestedPlatform || !currentAccountUserId || !platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('结果决策重试缺少有效的账号或流程');
+    const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
+    return workflowManager.run(accountId, async ({ context: accountContext }) => {
+      const runtime = accountContext.runtime;
+      const local = runtime.getRun(runId);
+      if (!local.remoteRunId || local.status !== 'COMPLETED') throw new Error('只有已完成且结果决策未结算的流程可以重试结果决策');
+      const nextDecision = await requestResultDecision(local.remoteRunId, local);
+      const applied = await applyResultDecisionAndCompose({ runtime, accountId, accountContext, requestedPlatform, deviceId: authStore.getDevice().id, result: local, nextDecision });
+      const displayRun = applied.decisionApplied?.run || local;
+      workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: displayRun });
+      emitState();
+      return { run: displayRun, nextDecision, decisionApplied: applied.decisionApplied, nextRun: applied.nextRun };
+    }, { taskId: `result-decision:${runId}`, metadata: { platformAccountId: requestedPlatform } });
   }));
   ipcMain.handle('agent:manual-complete-workflow', wrap(async (_event, input) => {
     if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');

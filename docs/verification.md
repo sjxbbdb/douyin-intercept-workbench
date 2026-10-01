@@ -1,17 +1,19 @@
 # v4 验证记录
 
 更新时间：2026-10-01
-分支：`codex/release-4.0.3-artifacts`
-记录提交：`7ed4b27`（平台侧收口、契约校验与 4.0.3 产物记录）
+分支：`codex/distribution-verification`
+记录提交：平台侧编排、未知恢复和可分发验收（本轮提交）
 
 ## 平台侧增量验证（2026-10-01）
 
-- `npm run check`、`npm test`：server 34/34，desktop 56/56，Probe protocol PASS；Probe Python 回归为 380/380；`node scripts/verify-integration.mjs` 报告 `Integration contract PASS`。
-- 服务端新增回复流程知识集/冻结计划强制门禁、契约指纹返回与版本化话术快照；桌面端比较服务端有效契约后才注册本地执行器。手写公屏/私信模板、缺少知识集或不一致的策略引用均无法启动。
-- 集成修复覆盖：批次 `sendId` 的 `~public~`/`~private~` 语法校验、服务端 `policyRef` 签发与三阶段回传、缺失策略身份时的人工暂停，以及内部 web 响应监听的显式诊断开关；发行默认不依赖逆向 endpoint 或抓包回放。
-- 服务端新增可注入 OpenAI-compatible embeddings 后端、向量版本隔离和 Agent 规划知识上下文测试；未配置 embeddings 时只使用确定性本地 token-bag，不能冒充生产语义模型。
-- 工作台新增 Agent、找视频、评论区、直播间、任务/恢复、话术库入口；知识库 IPC 由主进程代持 token。评论批次固定为采集/冻结 → 公屏确认 → 仅对确认成功目标私信 → 报告。
-- Windows portable 与 NSIS 构建使用 D 盘缓存，产物为 `desktop/release/截流自动回复 Agent-4.0.3-x64-portable.exe`（SHA-256 `337B75F7DB00E49680D656897768EAF4A396E1E1D33D41A6BACBB1E5EC97F5F2`，107,216,174 bytes）和 `desktop/release/截流自动回复 Agent-4.0.3-x64-installer.exe`（SHA-256 `D4E011458002B2140B271DE91CC859EE06D6B2241341B513F6ACC26E9F68659E`，119,450,316 bytes）。`scripts/verify-desktop-release-preflight.mjs` 和两个构建命令通过；完整安装验收因检测到正在运行的旧客户端而由脚本安全中止，未自动关闭用户进程。此次未把构建产物当作真实抖音发送验收。
+- `npm test`：server 37/37、desktop 57/57；`npm run check` 通过；Probe Python 回归 380/380；Probe protocol PASS；`node scripts/verify-integration.mjs` 报告 `Integration contract PASS`。
+- 服务端新增固定流程结果决策后的受控接续计划：只接受服务端校验的下一流程、租户功能、账号、策略和契约指纹；桌面端完成当前流程后才接续，并对评论/直播回复流程重新冻结租户话术版本，连续接续最多 8 个流程。
+- 未知副作用恢复现在同时要求两次健康检查、人工明确继续和一次性服务端 `reconciliationProof`；凭证只保存 hash、成功后消费，缺失/重放均拒绝。长流程增加 30 秒租约心跳，租约续期失败会固化到人工状态。
+- 检查点和恢复动作都支持稳定幂等回放；恢复响应丢失时不会重复消费核验凭证。桌面端固化前会尝试重新获取同设备租约，结果决策请求执行三次短重试，仍不可用时返回明确人工门控并保持积分预留。
+- 知识库上传在事务内重新分配单调版本，并有并发上传测试；模型只负责意图/结果判断，固定步骤执行和积分结算仍由服务端契约控制。
+- Windows portable 与 NSIS 构建使用 D 盘缓存，产物为 `desktop/release/截流自动回复 Agent-4.0.3-x64-portable.exe`（SHA-256 `16C2D273E65E00C8A3DA2720A0518B1783CFCC0243415E9B86C4399430C29A99`，107,219,075 bytes）和 `desktop/release/截流自动回复 Agent-4.0.3-x64-installer.exe`（SHA-256 `388B3A6FE5E635BF62759DF4FC4A147DD9D4A70A68BF72E1EB72B341AD9BA44A`，119,452,704 bytes）。`scripts/verify-desktop-release-preflight.mjs`、portable/NSIS 构建和 `scripts/verify-desktop-package.mjs` 均通过；包验收覆盖未授权空态、登录/退出/重登、任务编辑保持、35 秒授权心跳、重启授权、sidecar protocol 和进程清理。
+- Linux 归档由 `scripts/build-linux-package.mjs` 生成：`release-local/linux-server-4.0.0.tar.gz`，SHA-256 `4848E1BE7D2D5D2B950EB4D01CBFC129670DEB7B2A87025458F1E840CB149118`，83,814 bytes。归档不包含 `node_modules`、数据库或凭据；在 WSL Ubuntu 24.04 的官方 Node v22.23.3、Linux 原生临时目录中完成 bootstrap、健康检查、账号登录、积分台账和重启持久化验收。
+- 发行产物仍不宣称真实抖音发送或生产部署：sidecar 能力矩阵中的发送能力保持 `autoEligible=false`，真实账号、平台响应、官方 scope、支付和生产 TLS/备份需要单独验收。
 
 ## 4.0.3 验证记录（此前构建，历史）
 

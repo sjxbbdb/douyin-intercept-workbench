@@ -396,6 +396,25 @@ testAsync('unknown side-effect action requires reconciliation and never blindly 
   await assert.rejects(new WorkflowRuntime({ store: new JsonStore(path.join(dir, 'other.json'), { workflowRuns: [] }), accountId: 'account-b', modelDecider: async () => ({ workflowId: 'side-effect.fixture', version: '1', params: {} }), workflows: [{ workflowId: 'side-effect.fixture', version: '1', steps: ['send'] }], stepExecutor: async () => ({ status: 'unknown' }) }).resumeRun('missing'), /workflow run not found/);
 });
 
+testAsync('server reconciliation proof is required before an unknown side effect resumes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-proof-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
+  let sends = 0;
+  const runtime = new WorkflowRuntime({
+    store,
+    accountId: 'account-proof',
+    modelDecider: async () => ({ workflowId: 'proof.fixture', version: '1', params: {} }),
+    workflows: [{ workflowId: 'proof.fixture', version: '1', steps: [{ stepId: 'send', sideEffect: true }] }],
+    stepExecutor: async () => { sends += 1; return sends === 1 ? { status: 'unknown', error: { code: 'NETWORK_UNKNOWN' } } : { status: 'completed', result: { deliveryStatus: 'sent_confirmed' } }; },
+    healthCheck: async () => ({ ok: true })
+  });
+  const run = runtime.startPlan(await runtime.planFromIntent('未知副作用'));
+  const unknown = await runtime.run(run.runId); assert.equal(unknown.status, RUN_STATES.UNKNOWN); assert.equal(sends, 1);
+  await assert.rejects(runtime.resumeRun(run.runId), (error) => error.code === 'RECONCILE_REQUIRED');
+  const recovered = await runtime.resumeRun(run.runId, { reconciledProof: 'reconcile_proof_server_001' });
+  assert.equal(recovered.status, RUN_STATES.COMPLETED); assert.equal(sends, 2);
+});
+
 testAsync('workflow recovery health gate performs two injected checks', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });

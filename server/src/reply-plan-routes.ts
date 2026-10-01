@@ -64,6 +64,10 @@ const workflowVersion = (value: unknown) => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(version)) throw badRequest('version 格式无效');
   return version;
 };
+const policyVersionForWorkflow = (version: string) => {
+  const numeric = Number(version);
+  return Number.isSafeInteger(numeric) && numeric >= 1 && numeric <= 1_000_000_000 ? numeric : 1;
+};
 const targetList = (value: unknown): unknown[] => {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > 200) throw badRequest('targets 无效');
@@ -126,10 +130,7 @@ export function registerReplyPlanRoutes(app: FastifyInstance, deps: ReplyPlanRou
       const generated = await deps.providerReplyPlan({ workflowId: id, version, params, idempotencyKey: key, knowledge: { ...knowledge, results: snippets }, targets });
       if (!generated || typeof generated !== 'object' || Array.isArray(generated) || Object.keys(generated).some((field) => !['publicReply', 'privateReply'].includes(field))) throw new AppError(503, 'REPLY_PLAN_INVALID', '模型返回了未支持的字段');
       const publicReply = strictReply(generated?.publicReply, 'publicReply'); const privateReply = strictReply(generated?.privateReply, 'privateReply');
-      const contractHash = hashPayload(parseJson<RecordValue>(definition.contract_json, {}));
-      const policyFingerprint = hashPayload({ workflowId: id, version, contractHash, knowledgeSetVersion: knowledge.version });
-      const policyVersion = Math.max(1, Number.parseInt(policyFingerprint.slice(0, 8), 16) % 1_000_000_000);
-      const policyRef = { policyId: `workflow-policy:${id}`, policyVersion, knowledgeSetVersion: knowledge.version };
+      const policyRef = { policyId: `workflow-policy:${id}`, policyVersion: policyVersionForWorkflow(version), knowledgeSetVersion: knowledge.version };
       const frozenParams = { ...params, publicReply, privateReply, policyRef, knowledgeSetId: knowledge.knowledgeSetId, knowledgeSetVersion: knowledge.version, replyPlan: { publicReply, privateReply, policyRef, knowledgeSetId: knowledge.knowledgeSetId, knowledgeSetVersion: knowledge.version, snippets: snippets.map((item) => ({ chunkId: item.chunkId ?? null, documentId: item.documentId ?? null, title: item.title ?? null, score: item.score ?? null })) } };
       if (Buffer.byteLength(json(frozenParams), 'utf8') > 24_000) throw new AppError(503, 'REPLY_PLAN_INVALID', '冻结话术计划过大');
       const planId = randomId('plan'); const now = store.now(); const issued = { status: 'issued', planId, workflowId: id, version, params: frozenParams, knowledgeSet: { id: knowledge.knowledgeSetId, version: knowledge.version }, issuedAt: now, expiresAt: now + 10 * 60 * 1000, idempotencyKey: key };

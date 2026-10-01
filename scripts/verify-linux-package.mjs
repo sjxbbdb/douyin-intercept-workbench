@@ -16,7 +16,7 @@ const bootstrapPassword = `package-password-${Date.now()}`;
 
 function ensureRuntimeDependencies() {
   if (existsSync(join(packageRoot, 'node_modules', 'fastify', 'package.json'))) return;
-  const npmCommand = process.platform === 'win32' ? process.execPath : 'npm';
+  const npmCommand = process.platform === 'win32' ? process.execPath : join(dirname(process.execPath), 'npm');
   const npmArgs = process.platform === 'win32' ? [join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'), 'ci', '--omit=dev', '--ignore-scripts'] : ['ci', '--omit=dev', '--ignore-scripts'];
   const result = spawnSync(npmCommand, npmArgs, {
     cwd: packageRoot,
@@ -25,6 +25,18 @@ function ensureRuntimeDependencies() {
     stdio: 'pipe'
   });
   if (result.status !== 0) throw new Error(`production dependency install failed: ${result.error?.message || result.stderr || result.stdout}`);
+}
+
+async function requestJson(baseUrl, path, init = {}) {
+  const response = await fetch(`${baseUrl}${path}`, { ...init, headers: { 'content-type': 'application/json', ...(init.headers ?? {}) } });
+  const body = await response.json();
+  assert.equal(response.ok, true, `${response.status} ${path}: ${JSON.stringify(body)}`);
+  return body;
+}
+
+function waitExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolvePromise) => child.once('exit', resolvePromise));
 }
 
 function freePort() {
@@ -102,13 +114,29 @@ async function main() {
   assert.equal(bootstrap.stdout.includes(bootstrapPassword), false, 'bootstrap output must not echo password');
   const first = await start(port);
   assert.equal(first.health.ok, true);
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const adminLogin = await requestJson(baseUrl, '/v1/admin/auth/login', { method: 'POST', body: JSON.stringify({ username: bootstrapUser, password: bootstrapPassword }) });
+  const adminHeaders = { authorization: `Bearer ${adminLogin.token}` };
+  const created = await requestJson(baseUrl, '/v1/admin/users', { method: 'POST', headers: adminHeaders, body: JSON.stringify({ username: `package-shop-${Date.now()}`, expiresAt: Date.now() + 86_400_000 }) });
+  assert.ok(created.username && created.password && created.password.length >= 8, 'admin must return generated merchant credentials');
+  const merchantLogin = await requestJson(baseUrl, '/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: created.username, password: created.password, deviceId: 'linux-package-verifier', deviceName: 'Linux package verifier' }) });
+  const merchantHeaders = { authorization: `Bearer ${merchantLogin.token}` };
+  const credit = await requestJson(baseUrl, `/v1/admin/users/${encodeURIComponent(created.id)}/credits`, { method: 'POST', headers: adminHeaders, body: JSON.stringify({ amount: 3, idempotencyKey: `linux-package-credit-${Date.now()}` }) });
+  assert.equal(credit.balance, 3);
+  const me = await requestJson(baseUrl, '/v1/me', { headers: merchantHeaders });
+  assert.equal(me.user.username, created.username); assert.equal(me.balance, 3);
+  const ledger = await requestJson(baseUrl, `/v1/admin/users/${encodeURIComponent(created.id)}/ledger`, { headers: adminHeaders });
+  assert.equal(ledger.balance, 3); assert.ok(ledger.entries.some((entry) => entry.delta === 3), 'credit ledger entry must persist');
   stop(first.child);
-  await new Promise((resolvePromise) => first.child.once('exit', resolvePromise));
+  await waitExit(first.child);
   const second = await start(port);
   assert.equal(second.health.ok, true, 'restart must open the same database');
+  const restartedAdminLogin = await requestJson(baseUrl, '/v1/admin/auth/login', { method: 'POST', body: JSON.stringify({ username: bootstrapUser, password: bootstrapPassword }) });
+  const restartedLedger = await requestJson(baseUrl, `/v1/admin/users/${encodeURIComponent(created.id)}/ledger`, { headers: { authorization: `Bearer ${restartedAdminLogin.token}` } });
+  assert.equal(restartedLedger.balance, 3, 'credit ledger must survive restart');
   stop(second.child);
-  await new Promise((resolvePromise) => second.child.once('exit', resolvePromise));
-  console.log(JSON.stringify({ pass: true, packageRoot, bootstrapUser, health: second.health, restart: true }));
+  await waitExit(second.child);
+  console.log(JSON.stringify({ pass: true, packageRoot, bootstrapUser, health: second.health, restart: true, generatedUser: true, balance: restartedLedger.balance, ledgerEntries: restartedLedger.entries.length }));
 }
 
 try {

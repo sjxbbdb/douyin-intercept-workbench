@@ -76,10 +76,69 @@ class CdpClient {
   close() { try { this.socket.close(); } catch {} }
 }
 
-function killTree(child) {
-  if (!child?.pid) return;
-  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-  else child.kill('SIGTERM');
+function powershellLiteral(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function ownedWindowsProcesses(userData) {
+  if (process.platform !== 'win32' || !userData) return [];
+  const profile = powershellLiteral(userData);
+  const command = `$profile = ${profile}; $rows = @(Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid = [int]$_.ProcessId; parentPid = [int]$_.ParentProcessId; commandLine = [string]$_.CommandLine } }); $rows | ConvertTo-Json -Compress`;
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', command], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) return null;
+  let rows;
+  try {
+    rows = JSON.parse(String(result.stdout || '[]'));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(rows)) rows = rows ? [rows] : [];
+  const profileNeedles = [`--user-data-dir=${userData}`, `--user-data-dir="${userData}"`].map((needle) => needle.toLowerCase());
+  const owned = new Set();
+  for (const row of rows) {
+    const commandLine = String(row.commandLine || '').toLowerCase();
+    if (profileNeedles.some((needle) => commandLine.includes(needle))) owned.add(Number(row.pid));
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const row of rows) {
+      if (owned.has(Number(row.parentPid)) && !owned.has(Number(row.pid))) {
+        owned.add(Number(row.pid));
+        changed = true;
+      }
+    }
+  }
+  return [...owned].filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
+function killTree(child, { userData, rootPids = [] } = {}) {
+  const roots = [...rootPids, child?.pid].filter((pid) => Number.isInteger(pid) && pid > 0);
+  if (process.platform === 'win32') {
+    // The portable wrapper can exit before its Chromium children. Match only
+    // this run's unique profile, then kill the verified PIDs individually.
+    const matched = userData ? ownedWindowsProcesses(userData) : roots;
+    const pids = [...new Set(userData ? (matched || roots) : roots)];
+    for (const pid of pids) spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+    return pids;
+  }
+  if (child?.pid) child.kill('SIGTERM');
+  return roots;
+}
+
+async function waitForOwnedProcessesGone(userData, timeoutMs = 8_000) {
+  if (process.platform !== 'win32' || !userData) return true;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const processes = ownedWindowsProcesses(userData);
+    if (processes?.length === 0) return true;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+  }
+  const processes = ownedWindowsProcesses(userData);
+  return processes?.length === 0;
 }
 
 function assertProductNotRunningBeforeInstall() {
@@ -136,13 +195,20 @@ async function waitForPortClosed(port, timeoutMs = 15_000) {
   return false;
 }
 
-async function closePackageWindow({ cdp, child, port, mode }) {
+async function closePackageWindow({ cdp, child, port, userData, mode }) {
   const observed = observeChild(child);
   if (mode === 'force') {
-    killTree(child);
+    killTree(child, { userData });
     const processState = await waitForObservedChild(observed);
-    const portClosed = await waitForPortClosed(port);
-    return { mode, processState, portClosed };
+    let portClosed = await waitForPortClosed(port);
+    let ownedProcessesClosed = await waitForOwnedProcessesGone(userData);
+    if (!portClosed || !ownedProcessesClosed) {
+      killTree(child, { userData });
+      portClosed = portClosed || await waitForPortClosed(port, 5_000);
+      ownedProcessesClosed = ownedProcessesClosed || await waitForOwnedProcessesGone(userData);
+    }
+    if (!portClosed || !ownedProcessesClosed) throw new Error(`force close timeout: CDP port ${port} remained open or owned processes survived`);
+    return { mode, processState, portClosed, ownedProcessesClosed };
   }
   let windowClose = 'ack';
   try {
@@ -158,21 +224,32 @@ async function closePackageWindow({ cdp, child, port, mode }) {
   cdp.close();
   const portClosed = await waitForPortClosed(port);
   const processState = await waitForObservedChild(observed);
-  if (!portClosed) throw new Error(`normal close timeout: CDP port ${port} remained open`);
-  return { mode, windowClose, processState, portClosed };
+  let ownedProcessesClosed = await waitForOwnedProcessesGone(userData, 2_000);
+  if (!portClosed || !ownedProcessesClosed) {
+    // A portable wrapper may acknowledge window.close while a detached
+    // Chromium child remains. Force only this profile's verified processes.
+    killTree(child, { userData });
+    ownedProcessesClosed = await waitForOwnedProcessesGone(userData);
+  }
+  const finalPortClosed = portClosed || await waitForPortClosed(port, 5_000);
+  if (!finalPortClosed || !ownedProcessesClosed) throw new Error(`normal close timeout: CDP port ${port} remained open or owned processes survived`);
+  return { mode, windowClose, processState, portClosed: finalPortClosed, ownedProcessesClosed };
 }
 
 function cleanEnv(extra = {}) {
   return { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path' && key !== 'DOUYIN_PROBE_PYTHON')), ...extra };
 }
 
-async function spawnPackage(executable, userData, port, envOverrides = {}) {
+async function spawnPackage(executable, userData, port, envOverrides = {}, onSpawn = () => {}) {
   const child = spawn(executable, [`--user-data-dir=${userData}`, `--remote-debugging-port=${port}`, '--disable-gpu'], {
     cwd: root,
     windowsHide: true,
     env: cleanEnv(envOverrides),
     stdio: ['ignore', 'pipe', 'pipe']
   });
+  // Register synchronously so failures in waitForPage/hideProcessWindow/CDP
+  // setup still let launchAndCheck clean up this run's process tree.
+  onSpawn(child);
   let stderr = '';
   child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
   const page = await waitForPage(port);
@@ -225,7 +302,8 @@ async function submit(cdp, selector) {
 }
 
 async function readState(cdp) {
-  return cdp.evaluate(`(() => ({ title: document.title, license: document.querySelector('#license-status')?.textContent || '', login: Boolean(document.querySelector('#login-form')), body: document.body?.innerText || '' }))()`);
+  const state = await cdp.evaluate(`window.agentApi.getState()`);
+  return cdp.evaluate(`(() => ({ title: document.title, license: document.querySelector('#license-status')?.textContent || '', login: Boolean(document.querySelector('#login-form')), browserStatus: document.querySelector('#browser-status')?.textContent || '', body: document.body?.innerText || '', state: ${JSON.stringify(state)} }))()`);
 }
 
 async function enablePackageDiagnostics(cdp, windowInfo = []) {
@@ -469,11 +547,12 @@ async function launchAndCheck(label, executable, auth = null) {
   let readStderr;
   let restartChild;
   let restartCdp;
+  let restartPort;
   let readRestartStderr = () => '';
   const exitMode = process.env.PACKAGE_EXIT_MODE || 'normal';
   let authResult = { tested: false, restarted: false, exitMode };
   try {
-    ({ child, cdp, stderr: readStderr, windowInfo } = await spawnPackage(executable, userData, port, auth ? { DOUYIN_LICENSE_API: auth.baseUrl } : {}));
+    ({ child, cdp, stderr: readStderr, windowInfo } = await spawnPackage(executable, userData, port, auth ? { DOUYIN_LICENSE_API: auth.baseUrl } : {}, (spawned) => { child = spawned; }));
     let state;
     const stateDeadline = Date.now() + 20_000;
     while (Date.now() < stateDeadline) {
@@ -504,10 +583,10 @@ async function launchAndCheck(label, executable, auth = null) {
       await waitFor(cdp, `document.querySelector('#license-status')?.textContent.startsWith('已授权至')`, `${label} relogin`);
       await checkTaskEditorRegression(cdp, label, readStderr, windowInfo);
       authResult.beforeStop = readAuthSnapshot(userData);
-      authResult.shutdown = await closePackageWindow({ cdp, child, port, mode: exitMode });
+      authResult.shutdown = await closePackageWindow({ cdp, child, port, userData, mode: exitMode });
       authResult.afterStop = readAuthSnapshot(userData);
-      const restartPort = await freePort();
-      ({ child: restartChild, cdp: restartCdp, stderr: readRestartStderr } = await spawnPackage(executable, userData, restartPort, { DOUYIN_LICENSE_API: auth.baseUrl }));
+      restartPort = await freePort();
+      ({ child: restartChild, cdp: restartCdp, stderr: readRestartStderr } = await spawnPackage(executable, userData, restartPort, { DOUYIN_LICENSE_API: auth.baseUrl }, (spawned) => { restartChild = spawned; }));
       await waitFor(restartCdp, `document.querySelector('#license-status')?.textContent.startsWith('已授权至')`, `${label} restart session`);
       authResult.afterBoot = readAuthSnapshot(userData);
       authResult.tested = true;
@@ -520,8 +599,11 @@ async function launchAndCheck(label, executable, auth = null) {
   } finally {
     cdp?.close();
     restartCdp?.close();
-    killTree(child);
-    killTree(restartChild);
+    killTree(child, { userData });
+    killTree(restartChild, { userData });
+    await waitForPortClosed(port, 5_000).catch(() => false);
+    if (restartPort) await waitForPortClosed(restartPort, 5_000).catch(() => false);
+    await waitForOwnedProcessesGone(userData).catch(() => false);
     if (process.env.KEEP_PACKAGE_USERDATA !== '1') {
       try { rmSync(workDir, { recursive: true, force: true }); } catch {}
     }

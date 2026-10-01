@@ -71,7 +71,7 @@ Fastify 默认不信任 `X-Forwarded-For`，因此不会无条件把客户端提
 
 积分余额不直接作为可被覆盖的字段使用；每次变化追加 ledger，事务内维护余额快照，余额永不小于零。AI draft 的 hold 带 owner、幂等键、过期时间和状态；每次请求前回收过期 hold。provider 超时或响应未知时，服务端保留 pending 幂等记录和 hold，客户端必须先查询同一操作；过期后释放并审计，不能换 key 自动重发。成功结果和扣费在同一事务提交。
 
-固定流程运行实例使用 `workflow_definitions`、`workflow_runs` 和 `workflow_checkpoints` 保存版本化契约、冻结参数、知识集版本、当前步骤和恢复次数。模型规划只负责选择注册的 `workflowId/version/params`；运行中的步骤由桌面固定执行器上报，服务端拒绝未注册版本、旧 checkpoint 和跨账号知识集。`UNKNOWN`、`WAITING_HUMAN` 和 `PAUSED` 不会被服务端自动改写为成功或触发重发，恢复必须使用原运行实例并通过两次健康检查。
+固定流程运行实例使用 `workflow_definitions`、`workflow_runs` 和 `workflow_checkpoints` 保存版本化契约、冻结参数、知识集版本、当前步骤和恢复次数。模型规划只负责选择注册的 `workflowId/version/params`；运行中的步骤由桌面固定执行器上报，服务端拒绝未注册版本、旧 checkpoint 和跨账号知识集。`UNKNOWN`、`WAITING_HUMAN` 和 `PAUSED` 不会被服务端自动改写为成功或触发重发，恢复必须使用原运行实例并通过两次健康检查；副作用流程还必须提交该 UNKNOWN 检查点签发的一次性 `reconciliationProof`，服务端消费后才允许恢复。恢复和检查点动作都支持幂等回放，响应丢失时不会重复推进版本或消费核验凭证。
 
 当 Agent 规划上下文包含 `knowledgeSetId` 时，授权端先按租户和版本检索知识片段，再把有限结果作为不可信输入交给规划器；成功计划会绑定同一知识集 ID 和版本。回复流程还必须经过独立的冻结话术计划，不能用 planner 或手写模板直接启动。知识集文档写入采用追加版本快照，旧版本检索不会被新文档改写。embedding provider 不可用时，文档写入和检索失败并保持 fail-closed，不会静默混用另一向量空间。
 

@@ -48,6 +48,10 @@ async function resultDecisionServer() {
   const server: Server = createServer((_request, response) => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"decision":"complete"}' } }] })); }).listen(0, '127.0.0.1');
   await new Promise<void>((resolve) => server.once('listening', () => resolve())); const address = server.address(); if (!address || typeof address === 'string') throw new Error('result decider did not bind'); return { server, baseUrl: `http://127.0.0.1:${address.port}` };
 }
+async function nextResultDecisionServer() {
+  const server: Server = createServer((_request, response) => { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"decision":"continue","nextPlan":{"workflowId":"decision.next","version":"1","params":{}}}' } }] })); }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => server.once('listening', () => resolve())); const address = server.address(); if (!address || typeof address === 'string') throw new Error('next result decider did not bind'); return { server, baseUrl: `http://127.0.0.1:${address.port}` };
+}
 async function runCli(args: string[], env: Record<string, string>) {
   return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => { const child = spawn('node', ['--import', 'tsx', 'src/cli.ts', ...args], { cwd: process.cwd(), env: { ...process.env, ...env }, windowsHide: true }); let stdout = ''; let stderr = ''; let finished = false; const done = (code: number | null) => { if (!finished) { finished = true; clearTimeout(timer); resolve({ code, stdout, stderr }); } }; const timer = setTimeout(() => { child.kill(); stderr += 'CLI subprocess timeout'; done(null); }, 5000); child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.on('data', (chunk) => { stderr += chunk; }); child.on('error', (error) => { stderr += String(error); done(null); }); child.on('close', (code) => done(code)); });
 }
@@ -281,6 +285,29 @@ test('knowledge documents are chunked, version-frozen, isolated and searchable',
   } finally { await f.close(); }
 });
 
+test('concurrent knowledge uploads allocate distinct immutable versions', async () => {
+  const embedding = {
+    id: 'test-delayed-embedding',
+    async embed(input: string) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { [input]: 1 };
+    },
+  };
+  const f = await fixture({ embedding }); try {
+    const user = await f.create({ username: 'kb-concurrent' });
+    const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'kb-concurrent', deviceName: 'A' } }); const token = login.json().token;
+    const set = await f.app.inject({ method: 'POST', url: '/v1/knowledge-sets', headers: { authorization: `Bearer ${token}` }, payload: { name: '并发资料' } }); const setId = set.json().id;
+    const upload = (title: string, content: string) => f.app.inject({ method: 'POST', url: '/v1/knowledge-documents', headers: { authorization: `Bearer ${token}` }, payload: { knowledgeSetId: setId, title, content } });
+    const [first, second] = await Promise.all([upload('甲', 'alpha'), upload('乙', 'beta')]);
+    assert.equal(first.statusCode, 200, first.body); assert.equal(second.statusCode, 200, second.body);
+    assert.deepEqual([first.json().document.version, second.json().document.version].sort((a, b) => a - b), [1, 2]);
+    const old = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${token}` }, payload: { knowledgeSetId: setId, version: 1, query: 'beta' } });
+    assert.equal(old.statusCode, 200, old.body); assert.equal(old.json().results.length, 0, 'version 1 must not contain the second concurrent upload');
+    const current = await f.app.inject({ method: 'POST', url: '/v1/knowledge-retrieve', headers: { authorization: `Bearer ${token}` }, payload: { knowledgeSetId: setId, version: 2, query: 'beta' } });
+    assert.equal(current.statusCode, 200, current.body); assert.ok(current.json().results.length > 0);
+  } finally { await f.close(); }
+});
+
 test('workflow result decision is post-run only, scoped and idempotent', async () => {
   const provider = await resultDecisionServer(); const f = await fixture({ provider: { baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' } }); try {
     const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'decision.test', version: 1, name: '决策测试', contract: { steps: ['done'] } } }); assert.equal(workflow.statusCode, 200);
@@ -293,6 +320,24 @@ test('workflow result decision is post-run only, scoped and idempotent', async (
     const failed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', expectedVersion: 1 } }); assert.equal(failed.statusCode, 200);
     const decision = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', summary: { reason: 'x' }, idempotencyKey: 'decision-key-002' } }); assert.equal(decision.statusCode, 200); assert.equal(decision.json().decision, 'complete'); const replay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenA}` }, payload: { status: 'FAILED', summary: { reason: 'x' }, idempotencyKey: 'decision-key-002' } }); assert.deepEqual(replay.json(), decision.json());
     const hidden = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'FAILED', summary: {}, idempotencyKey: 'decision-hidden-001' } }); assert.equal(hidden.statusCode, 404);
+  } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
+});
+
+test('completed result can issue a validated next fixed workflow plan', async () => {
+  const provider = await nextResultDecisionServer(); const f = await fixture({ provider: { baseUrl: provider.baseUrl, apiKey: 'test-key', model: 'test-model' } }); try {
+    for (const [workflowId, name] of [['decision.source', '当前流程'], ['decision.next', '下一流程']] as const) {
+      const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId, version: 1, name, contract: { steps: ['done'] } } }); assert.equal(workflow.statusCode, 200, workflow.body);
+    }
+    const user = await f.create({ username: 'next-plan-user' }); const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'next-device', deviceName: 'A' } }); const token = login.json().token;
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'source-plan-001', user.id, 'decision.source', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
+    const created = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'source-plan-001', workflowId: 'decision.source', version: 1, params: {}, idempotencyKey: 'source-run-001' } }); assert.equal(created.statusCode, 200, created.body); const runId = created.json().run.id;
+    const lease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${token}` }, payload: { idempotencyKey: 'source-lease-001' } }); assert.equal(lease.statusCode, 200, lease.body);
+    const running = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(running.statusCode, 200, running.body);
+    const completed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'COMPLETED', expectedVersion: 1 } }); assert.equal(completed.statusCode, 200, completed.body);
+    const released = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/release`, headers: { authorization: `Bearer ${token}` }, payload: { idempotencyKey: 'source-lease-release-001' } }); assert.equal(released.statusCode, 200, released.body);
+    const decision = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'COMPLETED', summary: {}, idempotencyKey: 'source-decision-001' } }); assert.equal(decision.statusCode, 200, decision.body); assert.equal(decision.json().decision, 'continue'); assert.equal(decision.json().nextPlan.workflowId, 'decision.next'); assert.match(decision.json().nextPlan.planId, /^plan_/);
+    const next = (f.app as any).store.get<any>('SELECT status,workflow_id FROM workflow_plans WHERE id=?', decision.json().nextPlan.planId); assert.equal(next.status, 'issued'); assert.equal(next.workflow_id, 'decision.next');
+    const replay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/result-decision`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'COMPLETED', summary: {}, idempotencyKey: 'source-decision-001' } }); assert.deepEqual(replay.json(), decision.json());
   } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
 });
 
@@ -313,10 +358,34 @@ test('workflow leases are device scoped, reclaimable after expiry and terminal s
     (f.app as any).store.run('UPDATE workflow_runs SET lease_expires_at=? WHERE id=?', Date.now() - 1, runId);
     const reacquired = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${tokenB}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-acquire-b-002' } }); assert.equal(reacquired.statusCode, 200); assert.equal(reacquired.json().lease.deviceId, 'lease-b');
     const wrongRelease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/release`, headers: { authorization: `Bearer ${tokenA}` }, payload: { idempotencyKey: 'lease-release-a-001' } }); assert.equal(wrongRelease.statusCode, 409); assert.equal(wrongRelease.json().code, 'LEASE_OWNER_MISMATCH');
-    const started = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(started.statusCode, 200);
+    const startedPayload = { status: 'RUNNING', expectedVersion: 0, idempotencyKey: 'lease-checkpoint-start-001' };
+    const started = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: startedPayload }); assert.equal(started.statusCode, 200);
+    const startedReplay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: startedPayload }); assert.deepEqual(startedReplay.json(), started.json());
+    (f.app as any).store.run('UPDATE workflow_runs SET lease_expires_at=? WHERE id=?', Date.now() - 1, runId);
+    const expiredReplay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: startedPayload }); assert.deepEqual(expiredReplay.json(), started.json());
+    const replayLease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${tokenB}` }, payload: { idempotencyKey: 'lease-acquire-b-replay-001' } }); assert.equal(replayLease.statusCode, 200, replayLease.body);
     const failed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${tokenB}` }, payload: { status: 'FAILED', expectedVersion: 1 } }); assert.equal(failed.statusCode, 200);
     const terminalRenew = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/renew`, headers: { authorization: `Bearer ${tokenB}` }, payload: { ttlMs: 5_000, idempotencyKey: 'lease-renew-terminal-001' } }); assert.equal(terminalRenew.statusCode, 409); assert.equal(terminalRenew.json().code, 'LEASE_TERMINAL');
     const released = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/release`, headers: { authorization: `Bearer ${tokenB}` }, payload: { idempotencyKey: 'lease-release-b-001' } }); assert.equal(released.statusCode, 200); assert.equal(released.json().lease, null);
+  } finally { await f.close(); }
+});
+
+test('side-effect UNKNOWN recovery requires and consumes a server reconciliation proof', async () => {
+  const f = await fixture(); try {
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'unknown.send', version: 1, name: '未知发送恢复', contract: { steps: [{ stepId: 'send', sideEffect: true }] } } }); assert.equal(workflow.statusCode, 200, workflow.body);
+    const user = await f.create({ username: 'unknown-recovery' });
+    const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'unknown-device', deviceName: 'A' } }); const token = login.json().token;
+    (f.app as any).store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'unknown-plan-1', user.id, 'unknown.send', '1', '{}', 'issued', Date.now(), Date.now() + 60_000);
+    const created = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'unknown-plan-1', workflowId: 'unknown.send', version: 1, params: {}, idempotencyKey: 'unknown-run-001' } }); assert.equal(created.statusCode, 200, created.body); const runId = created.json().run.id;
+    const running = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(running.statusCode, 200, running.body);
+    const unknown = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'UNKNOWN', expectedVersion: 1, targetState: { phase: 'send', status: 'unknown' } } }); assert.equal(unknown.statusCode, 200, unknown.body);
+    const proof = unknown.json().run.checkpoint.targetState.reconciliationProof; assert.match(proof, /^reconcile_proof_/);
+    const confirmationMissing = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/recover`, headers: { authorization: `Bearer ${token}` }, payload: { checksPassed: 2, reason: '未明确继续' } }); assert.equal(confirmationMissing.statusCode, 409); assert.equal(confirmationMissing.json().code, 'RESUME_CONFIRMATION_REQUIRED');
+    const blocked = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/recover`, headers: { authorization: `Bearer ${token}` }, payload: { checksPassed: 2, userConfirmed: true, reason: '没有凭证' } }); assert.equal(blocked.statusCode, 409); assert.equal(blocked.json().code, 'RECONCILIATION_PROOF_REQUIRED');
+    const recoveryPayload = { checksPassed: 2, userConfirmed: true, reconciledProof: proof, reason: '人工核验后继续', idempotencyKey: 'unknown-recovery-apply-001' };
+    const recovered = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/recover`, headers: { authorization: `Bearer ${token}` }, payload: recoveryPayload }); assert.equal(recovered.statusCode, 200, recovered.body); assert.equal(recovered.json().run.status, 'RUNNING'); assert.equal(recovered.json().run.checkpoint.targetState.reconciliationProof, undefined); assert.match(recovered.json().run.checkpoint.recovery.reconciledProofHash, /^[a-f0-9]{64}$/);
+    const recoveredReplay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/recover`, headers: { authorization: `Bearer ${token}` }, payload: recoveryPayload }); assert.deepEqual(recoveredReplay.json(), recovered.json());
+    const replay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/recover`, headers: { authorization: `Bearer ${token}` }, payload: { checksPassed: 2, reconciledProof: proof, reason: '重放' } }); assert.equal(replay.statusCode, 409); assert.equal(replay.json().code, 'RECONCILIATION_PROOF_INVALID');
   } finally { await f.close(); }
 });
 

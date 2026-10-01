@@ -1,14 +1,14 @@
 # 发布草稿
 
-当前没有正式 GitHub Release 或预发行版。已有本地 Windows 候选包在隔离的临时 `userData` 中通过启动、空态、授权、正常退出/重启授权保留和随包 sidecar IPC 检查；最终 CI 结果与哈希见 [`verification.md`](verification.md)。积分流水和错误态属于源码 Electron UI 验收，不能从包启动检查推导。能力优先开发不等于能力全部随包发布。
+当前没有正式 GitHub Release 或预发行版。4.0.3 本地候选包已在隔离临时 `userData` 中通过启动、空态、授权、任务编辑保持、授权心跳、正常退出/重启授权保留和随包 sidecar IPC 检查；Linux 授权端归档也已在 WSL Ubuntu 24.04 + Node 22 上完成启动、积分台账和重启验收。最终证据与哈希见 [`verification.md`](verification.md)。真实抖音发送、支付和生产部署仍需按能力开关单独验收。
 
 ## 预发行清单
 
 ### 4.0.3 本地候选包
 
-4.0.3 在前版基础上加入冻结知识话术计划、人工完成证明、服务端有效契约指纹校验和追加版本快照；portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录重建。portable SHA-256 为 `337B75F7DB00E49680D656897768EAF4A396E1E1D33D41A6BACBB1E5EC97F5F2`（107,216,174 bytes）；NSIS SHA-256 为 `D4E011458002B2140B271DE91CC859EE06D6B2241341B513F6ACC26E9F68659E`（119,450,316 bytes）。两个构建均通过 sidecar 随包预检；完整安装验收待关闭正在运行的旧客户端后复跑，脚本不会自行终止用户进程。未验证真实抖音页面、发送或生产部署。
+4.0.3 在前版基础上加入冻结知识话术计划、人工完成证明、服务端有效契约指纹校验、结果决策后的固定流程接续、租约心跳、未知副作用核验凭证、恢复幂等和并发知识版本保护；portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录重建。portable SHA-256 为 `16C2D273E65E00C8A3DA2720A0518B1783CFCC0243415E9B86C4399430C29A99`（107,219,075 bytes）；NSIS SHA-256 为 `388B3A6FE5E635BF62759DF4FC4A147DD9D4A70A68BF72E1EB72B341AD9BA44A`（119,452,704 bytes）。两个构建和 `scripts/verify-desktop-package.mjs` 均通过，覆盖未授权空态、登录/退出/重登、任务编辑保持、35 秒授权心跳、正常退出、重启授权、sidecar protocol 和进程清理。未验证真实抖音页面、发送或生产部署。
 
-portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出（`exitCode=0`、CDP 端口关闭）和同一隔离 userData 重启授权恢复。未验证真实抖音页面、发送、NSIS 安装运行或生产部署；未启动真实 profile。
+portable 与 NSIS 隔离验收均覆盖未授权空态、随包 sidecar、临时 HTTP 授权、正常退出（`exitCode=0`、CDP 端口关闭）和同一隔离 userData 重启授权恢复；NSIS 还验证安装目录内 `resources/probe/probe-agent.exe` 的 capabilities 协议。未验证真实抖音页面、发送或生产部署；未启动真实用户 profile。
 
 ### 4.0.2 本地候选包
 
