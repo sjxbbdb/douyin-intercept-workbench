@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { AppError, badRequest, conflict } from './errors.js';
 import { hashPayload, randomId } from './security.js';
 import { Store } from './store.js';
+import { validateWorkflowParams } from './workflow-routes.js';
 
 type RecordValue = Record<string, any>;
 type RequestValue = { body?: unknown; params?: unknown };
@@ -105,13 +106,12 @@ export function registerReplyPlanRoutes(app: FastifyInstance, deps: ReplyPlanRou
     const actor = user(request); const body = objectValue(request.body, '请求体', 64_000);
     const allowed = ['workflowId', 'version', 'params', 'knowledgeSetId', 'knowledgeSetVersion', 'query', 'topK', 'targets', 'idempotencyKey'];
     const unknown = Object.keys(body).filter((key) => !allowed.includes(key)); if (unknown.length) throw badRequest('存在未支持的字段', { fields: unknown });
-    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); const params = objectValue(body.params, 'params', 24_000); const setId = stringValue(body.knowledgeSetId, 'knowledgeSetId', 100, true) as string; const query = stringValue(body.query, 'query', 4_000, true) as string; const key = keyValue(body.idempotencyKey); const targets = targetList(body.targets);
+    const id = workflowId(body.workflowId); const version = workflowVersion(body.version); deps.authorizeWorkflow?.(actor, id, version); const params = objectValue(body.params, 'params', 24_000); validateWorkflowParams(id, params, { requireReplyText: false }); const setId = stringValue(body.knowledgeSetId, 'knowledgeSetId', 100, true) as string; const query = stringValue(body.query, 'query', 4_000, true) as string; const key = keyValue(body.idempotencyKey); const targets = targetList(body.targets);
     const setVersion = body.knowledgeSetVersion === undefined ? undefined : (() => { if (!Number.isSafeInteger(body.knowledgeSetVersion) || body.knowledgeSetVersion < 1) throw badRequest('knowledgeSetVersion 无效'); return body.knowledgeSetVersion as number; })();
     const topK = body.topK === undefined ? 5 : (() => { if (!Number.isSafeInteger(body.topK) || body.topK < 1 || body.topK > 20) throw badRequest('topK 无效'); return body.topK as number; })();
     const payload = { workflowId: id, version, params, knowledgeSetId: setId, knowledgeSetVersion: setVersion ?? null, query, topK, targets, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,status,payload_hash,idem_key FROM idempotency WHERE user_id=? AND scope=? AND idem_key=?', actor.user_id, 'reply.plan', key);
     if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同请求'); return responseFor(old); }
-    deps.authorizeWorkflow?.(actor, id, version);
     const definition = store.get<RecordValue>("SELECT workflow_id,version,contract_json FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version);
     if (!definition) throw new AppError(404, 'WORKFLOW_NOT_FOUND', '流程版本不存在或未启用');
     store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'reply.plan', key, hashPayload(payload), 'pending', store.now());

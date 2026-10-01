@@ -18,6 +18,7 @@ interface WorkflowRouteDeps {
 
 const checkpointStatuses = new Set(['RUNNING', 'CHECKPOINT', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED', 'FAILED', 'COMPLETED', 'STOPPED']);
 const accountBoundWorkflowIds = new Set(['video.search', 'comment.reply_then_private', 'comment.batch', 'live.reply_then_private', 'live.batch']);
+const vectorReplyWorkflowIds = new Set(['comment.reply_then_private', 'comment.batch', 'live.reply_then_private', 'live.batch']);
 /** Prices for the platform workflows are server policy, not client input. */
 const canonicalWorkflowPrices: Readonly<Record<string, number>> = Object.freeze({
   'video.search': 1,
@@ -139,7 +140,33 @@ function workflowKeywords(value: unknown) {
   if (!Array.isArray(value) || value.length < 1 || value.length > 50 || value.some((item) => typeof item !== 'string' || !item.trim() || item.length > 200)) throw badRequest('params.keywords 无效');
   return value.map((item) => item.trim());
 }
-function validateWorkflowParams(id: string, params: RecordValue) {
+function validateReplyPlanParams(id: string, params: RecordValue, requireFrozenPlan: boolean) {
+  if (!vectorReplyWorkflowIds.has(id)) return;
+  if (typeof params.knowledgeSetId !== 'string' || !params.knowledgeSetId.trim() || params.knowledgeSetId.length > 100) {
+    if (requireFrozenPlan) throw new AppError(409, 'REPLY_KNOWLEDGE_REQUIRED', '评论和直播回复流程必须绑定租户话术知识集');
+    return;
+  }
+  if (!Number.isSafeInteger(params.knowledgeSetVersion) || params.knowledgeSetVersion < 1) {
+    if (requireFrozenPlan) throw new AppError(409, 'REPLY_KNOWLEDGE_VERSION_REQUIRED', '回复流程必须绑定不可变的话术库版本');
+    return;
+  }
+  if (!requireFrozenPlan) return;
+  if (!params.replyPlan || typeof params.replyPlan !== 'object' || Array.isArray(params.replyPlan)) throw new AppError(409, 'REPLY_PLAN_REQUIRED', '回复流程必须使用授权中心签发的话术计划');
+  const plan = params.replyPlan as RecordValue;
+  const allowed = new Set(['publicReply', 'privateReply', 'policyRef', 'knowledgeSetId', 'knowledgeSetVersion', 'snippets']);
+  if (Object.keys(plan).some((key) => !allowed.has(key))) throw new AppError(409, 'REPLY_PLAN_INVALID', '话术计划包含未支持的字段');
+  if (plan.knowledgeSetId !== params.knowledgeSetId || plan.knowledgeSetVersion !== params.knowledgeSetVersion) throw new AppError(409, 'REPLY_PLAN_KNOWLEDGE_MISMATCH', '话术计划与知识集版本不一致');
+  for (const key of ['publicReply', 'privateReply']) if (plan[key] !== params[key] || typeof plan[key] !== 'string' || !plan[key].trim() || plan[key].length > 2_000) throw new AppError(409, 'REPLY_PLAN_INVALID', `话术计划 ${key} 无效`);
+  if (!plan.policyRef || typeof plan.policyRef !== 'object' || Array.isArray(plan.policyRef)) throw new AppError(409, 'REPLY_PLAN_POLICY_REQUIRED', '话术计划缺少冻结策略引用');
+  const policy = policyRefValue(plan.policyRef);
+  if (!params.policyRef || typeof params.policyRef !== 'object' || Array.isArray(params.policyRef)) throw new AppError(409, 'REPLY_PLAN_POLICY_REQUIRED', '回复流程缺少冻结策略引用');
+  const paramsPolicy = policyRefValue(params.policyRef);
+  if (paramsPolicy.policyId !== policy.policyId || paramsPolicy.policyVersion !== policy.policyVersion || paramsPolicy.knowledgeSetVersion !== policy.knowledgeSetVersion) throw new AppError(409, 'REPLY_PLAN_POLICY_MISMATCH', '回复流程策略引用与话术计划不一致');
+  if (policy.knowledgeSetVersion !== params.knowledgeSetVersion || !policy.policyId.startsWith(`workflow-policy:${id}`)) throw new AppError(409, 'REPLY_PLAN_POLICY_MISMATCH', '话术计划策略引用不匹配');
+}
+
+export function validateWorkflowParams(id: string, params: RecordValue, options: { requireReplyText?: boolean } = {}) {
+  const requireReplyText = options.requireReplyText !== false;
   if (id === 'video.search') {
     if (typeof params.keyword !== 'string' || !params.keyword.trim() || params.keyword.length > 200) throw badRequest('视频搜索必须提供 keyword');
     if (params.maxVideos !== undefined && (!Number.isSafeInteger(params.maxVideos) || params.maxVideos < 1 || params.maxVideos > 100)) throw badRequest('params.maxVideos 无效');
@@ -149,15 +176,16 @@ function validateWorkflowParams(id: string, params: RecordValue) {
   if (id === 'comment.reply_then_private' || id === 'comment.batch') {
     workflowUrl(params.url, 'params.url');
     workflowKeywords(params.keywords);
-    for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
+    if (requireReplyText) for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
   }
   if (id === 'live.reply_then_private' || id === 'live.batch') {
     workflowUrl(params.url, 'params.url', true);
     workflowKeywords(params.keywords);
-    for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
+    if (requireReplyText) for (const key of ['publicReply', 'privateReply']) if (typeof params[key] !== 'string' || !params[key].trim() || params[key].length > 2_000) throw badRequest(`params.${key} 无效`);
   }
   if (params.policyRef !== undefined) policyRefValue(params.policyRef);
   for (const key of ['reply', 'privateText']) if (params[key] !== undefined && (typeof params[key] !== 'string' || params[key].length > 2_000)) throw badRequest(`params.${key} 无效`);
+  validateReplyPlanParams(id, params, requireReplyText);
   return params;
 }
 const workflowContract = (value: unknown) => {
@@ -421,8 +449,9 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
       params.knowledgeSetId = knowledgeBinding.id; params.knowledgeSetVersion = knowledgeBinding.version;
     }
     const definition = catalog.find((item) => item.workflowId === id && String(item.version) === version);
-    validateWorkflowParams(id, params); ensureWorkflowFeature(actor, id);
+    validateWorkflowParams(id, params, { requireReplyText: false }); ensureWorkflowFeature(actor, id);
     if (!definition) throw new AppError(503, 'PLANNER_INVALID_WORKFLOW', '规划器返回了未注册流程');
+    if (vectorReplyWorkflowIds.has(id) && !knowledgeBinding) throw new AppError(409, 'REPLY_KNOWLEDGE_REQUIRED', '评论和直播回复流程必须先选择租户话术知识集');
     const contractHash = hashPayload(definition.contract);
     const policyFingerprint = hashPayload({ workflowId: id, version, contractHash, knowledgeSetVersion: knowledgeBinding?.version ?? null });
     const policyVersion = Math.max(1, Number.parseInt(policyFingerprint.slice(0, 8), 16) % 1_000_000_000);
@@ -489,7 +518,7 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
   app.get('/v1/workflows', async (request) => {
     const actor = user(request);
     const rows = store.all<RecordValue>("SELECT workflow_id,version,name,status,contract_json,created_at FROM workflow_definitions WHERE status='active' ORDER BY workflow_id,version DESC");
-    return { workflows: rows.map((row) => ({ workflowId: row.workflow_id, version: row.version, name: row.name, status: row.status, contract: parseJson(row.contract_json, {}), createdAt: row.created_at })), tenantId: actor.user_id };
+    return { workflows: rows.map((row) => { const contract = effectiveWorkflowContract(row.workflow_id, parseJson(row.contract_json, {})); return { workflowId: row.workflow_id, version: row.version, name: row.name, status: row.status, contract, contractHash: hashPayload(contract), createdAt: row.created_at }; }), tenantId: actor.user_id };
   });
 
   app.post('/v1/knowledge-sets', async (request) => {
@@ -546,6 +575,9 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     }
     let knowledgeSet: RecordValue | undefined;
     if (body.knowledgeSetId !== undefined) { const knowledgeSetId = stringValue(body.knowledgeSetId, 'knowledgeSetId', 100, true) as string; knowledgeSet = store.get<RecordValue>("SELECT id,version,status FROM knowledge_sets WHERE id=? AND user_id=? AND status='active'", knowledgeSetId, actor.user_id); if (!knowledgeSet) throw new AppError(404, 'KNOWLEDGE_SET_NOT_FOUND', '知识集不存在或未启用'); }
+    if (vectorReplyWorkflowIds.has(id)) {
+      if (!knowledgeSet || knowledgeSet.id !== params.knowledgeSetId || knowledgeSet.version !== params.knowledgeSetVersion) throw new AppError(409, 'REPLY_KNOWLEDGE_BINDING_INVALID', '回复流程必须绑定与冻结话术计划相同的知识集版本');
+    }
     const runId = randomId('run'); const now = store.now();
     const policy = { workflowId: id, version, entitlement, platformAccountId: account?.id ?? null, contractHash: hashPayload(workflowContractValue), creditPrice: contractCreditPrice, policyRef: params.policyRef ?? null, capturedAt: now };
     const result = store.transaction(() => {

@@ -73,7 +73,7 @@ Fastify 默认不信任 `X-Forwarded-For`，因此不会无条件把客户端提
 
 固定流程运行实例使用 `workflow_definitions`、`workflow_runs` 和 `workflow_checkpoints` 保存版本化契约、冻结参数、知识集版本、当前步骤和恢复次数。模型规划只负责选择注册的 `workflowId/version/params`；运行中的步骤由桌面固定执行器上报，服务端拒绝未注册版本、旧 checkpoint 和跨账号知识集。`UNKNOWN`、`WAITING_HUMAN` 和 `PAUSED` 不会被服务端自动改写为成功或触发重发，恢复必须使用原运行实例并通过两次健康检查。
 
-当 Agent 规划上下文包含 `knowledgeSetId` 时，授权端先按租户和版本检索知识片段，再把有限结果作为不可信输入交给规划器；成功计划会绑定同一知识集 ID 和版本。embedding provider 不可用时，文档写入和检索失败并保持 fail-closed，不会静默混用另一向量空间。
+当 Agent 规划上下文包含 `knowledgeSetId` 时，授权端先按租户和版本检索知识片段，再把有限结果作为不可信输入交给规划器；成功计划会绑定同一知识集 ID 和版本。回复流程还必须经过独立的冻结话术计划，不能用 planner 或手写模板直接启动。知识集文档写入采用追加版本快照，旧版本检索不会被新文档改写。embedding provider 不可用时，文档写入和检索失败并保持 fail-closed，不会静默混用另一向量空间。
 
 备份优先在停服后复制数据库文件；需要在线备份时使用 Node `node:sqlite` 的一致性 backup 能力或 SQLite 官方 backup API，不能只复制仍在 WAL 写入的 `.sqlite` 文件。恢复前停止服务、替换整个数据库文件与 WAL/SHM 文件，再启动并检查 `/healthz`。
 

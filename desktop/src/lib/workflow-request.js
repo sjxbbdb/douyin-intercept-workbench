@@ -10,10 +10,10 @@
 //   核对不过就拒绝启动（fail-closed），绝不"跑一个差不多的流程"。
 
 const WORKFLOW_IDS = Object.freeze({
-  'live.batch': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'live_batch' }),
-  'comment.batch': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'comment_batch' }),
-  'live.reply_then_private': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'live_reply_then_private' }),
-  'comment.reply_then_private': Object.freeze({ version: '1', required: ['url', 'keywords', 'publicReply', 'privateReply'], kind: 'comment_reply_then_private' }),
+  'live.batch': Object.freeze({ version: '1', required: ['url', 'keywords'], kind: 'live_batch' }),
+  'comment.batch': Object.freeze({ version: '1', required: ['url', 'keywords'], kind: 'comment_batch' }),
+  'live.reply_then_private': Object.freeze({ version: '1', required: ['url', 'keywords'], kind: 'live_reply_then_private' }),
+  'comment.reply_then_private': Object.freeze({ version: '1', required: ['url', 'keywords'], kind: 'comment_reply_then_private' }),
   'video.search': Object.freeze({ version: '1', required: ['keyword'], kind: 'video_search' })
 });
 

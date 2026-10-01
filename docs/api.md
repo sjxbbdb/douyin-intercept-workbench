@@ -47,15 +47,15 @@
 
 ### `POST /v1/agent/plan`
 
-Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `params`，不会返回步骤、浏览器动作或发送内容。请求还必须带 `idempotencyKey`；服务端使用账号 feature、活动 workflow 目录和服务端 provider 重验结果。provider 未配置、目录为空或模型返回未注册版本时分别返回 `PLANNER_NOT_CONFIGURED`、`WORKFLOW_CATALOG_EMPTY` 或 `PLANNER_INVALID_WORKFLOW`。规划结果只是冻结计划，不能直接发送。
+Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `params`，不会返回步骤、浏览器动作或发送内容。请求还必须带 `idempotencyKey`；服务端使用账号 feature、活动 workflow 目录和服务端 provider 重验结果。评论/直播回复流程必须在 `context` 中指定当前租户的 `knowledgeSetId`，否则返回 `REPLY_KNOWLEDGE_REQUIRED`，不能用模型或手工模板直接启动。provider 未配置、目录为空或模型返回未注册版本时分别返回 `PLANNER_NOT_CONFIGURED`、`WORKFLOW_CATALOG_EMPTY` 或 `PLANNER_INVALID_WORKFLOW`。规划结果只是冻结计划，不能直接发送。
 
 ### `POST /v1/reply-plans`
 
-评论区和直播间的回复流程在启动前使用两阶段计划：客户端提交已选固定流程、租户自己的 `knowledgeSetId`/可选版本、检索问题和幂等键；授权端完成租户隔离的向量检索，再调用服务端 provider 生成 `publicReply` 与 `privateReply`。服务端只接受这两个字段，写入带 `policyRef`、知识集版本和片段引用的冻结 `workflow_plans`，返回 `status: "issued"` 后客户端才能创建运行实例。没有命中知识返回 `WAITING_HUMAN`；provider 超时、连接中断或输出不确定返回 `UNKNOWN`，同一幂等键只允许查询原结果，不会再次调用模型。回复生成发生在固定流程启动前；流程进入 `RUNNING` 后执行器不再调用模型。
+评论区和直播间的回复流程在启动前使用两阶段计划：客户端提交已选固定流程、租户自己的 `knowledgeSetId`/可选版本、检索问题和幂等键；授权端完成租户隔离的向量检索，再调用服务端 provider 生成 `publicReply` 与 `privateReply`。服务端只接受这两个字段，写入带 `policyRef`、知识集版本和片段引用的冻结 `workflow_plans`，返回 `status: "issued"` 后客户端才能创建运行实例。`POST /v1/workflow-runs` 会再次验证知识集、版本、策略引用和冻结 `replyPlan`，手写话术或缺少知识集一律拒绝。没有命中知识返回 `WAITING_HUMAN`；provider 超时、连接中断或输出不确定返回 `UNKNOWN`，同一幂等键只允许查询原结果，不会再次调用模型。回复生成发生在固定流程启动前；流程进入 `RUNNING` 后执行器不再调用模型。
 
 ### 固定流程运行与恢复
 
-管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
+管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录；目录返回服务端有效 `contract`、`contractHash` 和价格。桌面端必须把它与本地固定契约指纹比对，不一致时拒绝启动。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
 
 平台固定目录包括 `video.search`、`comment.reply_then_private`、`comment.batch`、`live.reply_then_private` 和 `live.batch`。`comment.batch` 的批量私信只能使用同一批次里 `sent_confirmed` 的公屏 `sendId`，部分成功可以生成报告，`unknown` 目标不会盲目重发。
 
@@ -73,7 +73,7 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 ### `knowledge-sets`
 
-`POST/GET/PATCH /v1/knowledge-sets` 只管理当前工作台账号的知识集元数据和版本。运行实例可冻结 `knowledgeSetId + knowledgeSetVersion`；任何跨账号访问返回 `KNOWLEDGE_SET_NOT_FOUND`。向量内容和 provider key 不通过桌面端接口暴露。
+`POST/GET/PATCH /v1/knowledge-sets` 只管理当前工作台账号的知识集元数据和版本。添加文档会创建新的不可变版本快照；检索指定版本时只会看到该版本及之前已经存在的文档，历史 `knowledgeSetVersion` 不会被后续写入改写。运行实例可冻结 `knowledgeSetId + knowledgeSetVersion`；任何跨账号访问返回 `KNOWLEDGE_SET_NOT_FOUND`。向量内容和 provider key 不通过桌面端接口暴露。
 
 `POST /v1/agent/plan` 的 `context` 可带 `knowledgeSetId`、可选 `knowledgeSetVersion`、`knowledgeQuery` 和 `knowledgeTopK`。授权端先按租户和版本检索，再把片段作为不可信参考交给规划器；成功计划会把同一知识集 ID/版本写回 `params`，客户端不能替换它。每个计划还会写入服务端生成的 `params.policyRef`（策略 ID、策略版本和可选知识集版本）；桌面端和 sidecar 必须在计划、公开回复、私信三个阶段原样回传，缺失或不一致直接暂停人工。服务端默认使用确定性的 `deterministic-token-bag`，配置 `EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL` 后才启用 OpenAI-compatible `/embeddings`；不同 embedding 版本不会混用向量。
 

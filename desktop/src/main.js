@@ -14,7 +14,7 @@ const { TaskEngine } = require('./lib/task-engine');
 const { WorkflowRuntime } = require('./lib/workflow-runtime');
 const { createWorkflowAdapter } = require('./lib/workflow-adapter');
 const workflowRequest = require('./lib/workflow-request');
-const { platformWorkflowDefinitions } = require('./lib/workflow-contracts');
+const { platformWorkflowDefinitions, workflowContractHash } = require('./lib/workflow-contracts');
 const { AccountRuntimeManager } = require('./lib/account-runtime-manager');
 const { platformAccountId: normalizePlatformAccountId, platformScope, accountDataPath: scopedAccountDataPath, accountDir: scopedAccountDir, browserPartition, sidecarPort: scopedSidecarPort } = require('./lib/platform-account');
 const { targetUrl, text, safeIdempotencyKey } = require('./lib/validation');
@@ -458,7 +458,10 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
     const registered = catalog.find((item) => item.workflowId === plan.workflowId && String(item.version) === String(plan.version) && item.status === 'active');
     if (!registered) throw new Error('授权中心未开放该固定流程');
     const canonical = PLATFORM_WORKFLOWS.find((item) => item.workflowId === registered.workflowId && String(item.version) === String(registered.version));
-    const contractSteps = canonical?.steps || (Array.isArray(registered.contract?.steps) ? registered.contract.steps : []);
+    if (!canonical || !registered.contract || typeof registered.contractHash !== 'string' || !registered.contractHash) throw new Error('授权中心固定流程缺少本地可验证的契约指纹，已拒绝启动');
+    const effectiveLocalContract = { ...canonical, ...(Number.isSafeInteger(registered.contract.creditPrice) ? { creditPrice: registered.contract.creditPrice } : {}) };
+    if (workflowContractHash(effectiveLocalContract) !== registered.contractHash) throw new Error('授权中心固定流程契约与客户端不一致，已拒绝启动');
+    const contractSteps = canonical.steps;
     if (!contractSteps.length) throw new Error('授权中心返回的固定流程没有可执行步骤');
     runtime.registerWorkflow({ workflowId: registered.workflowId, version: String(registered.version), steps: contractSteps });
     // Workflow pricing is authoritative on the server.  Reserve the exact
@@ -597,7 +600,8 @@ async function runAgentChat(input) {
     // planner from smuggling unsourced reply text into a fixed workflow.
     const replyWorkflow = ['comment.batch', 'comment.reply_then_private', 'live.batch', 'live.reply_then_private'].includes(plan.workflowId);
     const selectedKnowledgeSet = typeof context.knowledgeSetId === 'string' && context.knowledgeSetId.trim() ? context.knowledgeSetId.trim() : '';
-    if (replyWorkflow && selectedKnowledgeSet) {
+    if (replyWorkflow && !selectedKnowledgeSet) throw new Error('评论和直播回复流程必须先选择租户话术库');
+    if (replyWorkflow) {
       const replyPlan = await api.createReplyPlan({
         workflowId: plan.workflowId,
         version: plan.version,
@@ -671,6 +675,12 @@ async function runExplicitWorkflow(input) {
     if (input?.replyPlan?.status === 'issued' && input.replyPlan.planId && input.replyPlan.params) {
       plan = { planId: input.replyPlan.planId, workflowId: input.replyPlan.workflowId, version: input.replyPlan.version, params: input.replyPlan.params };
       if (plan.workflowId !== request.workflowId || String(plan.version) !== String(request.version)) throw new Error('授权中心话术计划与请求流程不一致，已拒绝启动');
+    } else if (['comment.batch', 'comment.reply_then_private', 'live.batch', 'live.reply_then_private'].includes(request.workflowId)) {
+      const knowledgeSetId = typeof request.params.knowledgeSetId === 'string' ? request.params.knowledgeSetId.trim() : '';
+      if (!knowledgeSetId) throw new Error('评论和直播回复流程必须先选择租户话术库');
+      const replyPlan = await prepareReplyPlan({ workflowId: request.workflowId, version: request.version, params: request.params, knowledgeSetId, query: request.params.keywords.join('、') });
+      if (replyPlan?.status !== 'issued' || !replyPlan.planId || !replyPlan.params) throw new Error(replyPlan?.status === 'UNKNOWN' ? '话术生成结果未知，请先查询原幂等请求' : '授权中心未签发冻结话术计划');
+      plan = { planId: replyPlan.planId, workflowId: replyPlan.workflowId, version: replyPlan.version, params: replyPlan.params };
     } else {
       plan = await accountContext.runtime.planFromIntent(intent, context);
       const check = workflowRequest.planMatchesRequest(plan, request);

@@ -11,6 +11,7 @@ const { TaskEngine } = require('../src/lib/task-engine');
 const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
 const { createWorkflowAdapter } = require('../src/lib/workflow-adapter');
 const { platformWorkflowDefinitions } = require('../src/lib/workflow-contracts');
+const { workflowContractHash } = require('../src/lib/workflow-contracts');
 const { AuthStore } = require('../src/lib/auth-store');
 const { platformScope, accountDataPath, browserPartition, sidecarPort, allocateSidecarPorts } = require('../src/lib/platform-account');
 const { AccountRuntimeManager } = require('../src/lib/account-runtime-manager');
@@ -842,8 +843,7 @@ testAsync('structured workflow requests are validated and the issued plan is ver
   const commentRequest = { workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicReply: '欢迎咨询', privateReply: '您好，已私信您' } };
   assert.equal(requestForWorkflow(commentRequest).workflowId, 'comment.batch');
   assert.match(buildWorkflowIntent(commentRequest), /video\/1/);
-  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], privateReply: '您好' } }), /missing publicReply/);
-  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicReply: '您好' } }), /missing privateReply/);
+  assert.equal(requestForWorkflow({ workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'] } }).params.publicReply, undefined);
   assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1' } }), /missing keywords/);
 
   // 平台签发的计划必须与结构化请求逐项一致，否则拒绝启动
@@ -855,6 +855,14 @@ testAsync('structured workflow requests are validated and the issued plan is ver
   assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, keywords: ['价格'] } }, request).reason, 'param_mismatch');
   assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, url: 'https://live.douyin.com/2' } }, request).field, 'url');
   assert.equal(planMatchesRequest(null, request).reason, 'plan_missing');
+});
+
+test('workflow contract fingerprint changes when the server contract changes', () => {
+  const definition = platformWorkflowDefinitions().find((item) => item.workflowId === 'comment.batch');
+  assert.ok(definition);
+  const base = workflowContractHash({ ...definition, creditPrice: 2 });
+  assert.match(base, /^[a-f0-9]{64}$/);
+  assert.notEqual(base, workflowContractHash({ ...definition, creditPrice: 2, steps: [...definition.steps, { stepId: 'unexpected', sideEffect: false }] }));
 });
 
 Promise.all(pendingTests).then(() => console.log(`\n${passed} desktop tests passed`)).catch(() => { process.exitCode = 1; });

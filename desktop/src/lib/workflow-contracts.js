@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('node:crypto');
+
 // These definitions describe the platform orchestration boundary.  They do
 // not claim that a browser adapter is verified or that a send succeeded.  A
 // registered adapter must return a structured delivery result for every
@@ -135,6 +137,19 @@ const PLATFORM_WORKFLOW_CONTRACTS = Object.freeze([
 
 function clone(value) { return structuredClone(value); }
 
+// Keep the contract fingerprint algorithm byte-for-byte compatible with the
+// authorization server. Prices are added by server policy and are therefore
+// included by the caller when comparing an effective contract.
+function stable(value) {
+  if (Array.isArray(value)) return '[' + value.map(stable).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + stable(value[key])).join(',') + '}';
+  return JSON.stringify(value);
+}
+
+function workflowContractHash(value) {
+  return crypto.createHash('sha256').update(stable(value)).digest('hex');
+}
+
 function platformWorkflowDefinitions() { return clone(PLATFORM_WORKFLOW_CONTRACTS); }
 
 function workflowContractKey(workflowId, version) { return `${workflowId}@${version}`; }
@@ -155,5 +170,6 @@ module.exports = {
   platformWorkflowDefinitions,
   workflowContractKey,
   findPlatformWorkflow,
+  workflowContractHash,
   deliveryStatus
 };

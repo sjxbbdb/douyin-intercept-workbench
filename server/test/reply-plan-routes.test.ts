@@ -35,7 +35,7 @@ test('reply plan freezes provider output with tenant/version snippets and is ide
 
 test('missing knowledge waits for a human and provider is not called', async () => {
   const f = await fixture(); try {
-    let calls = 0; const body = { workflowId: 'comment.batch', version: '1', params: {}, knowledgeSetId: 'set-empty', query: '未知', idempotencyKey: 'reply-plan-empty' };
+    let calls = 0; const body = { workflowId: 'comment.batch', version: '1', params: { url: 'https://www.douyin.com/video/1', keywords: ['未知'] }, knowledgeSetId: 'set-empty', query: '未知', idempotencyKey: 'reply-plan-empty' };
     (f as any).app.close; // keep fixture setup shared while replacing only the provider is out of scope
     const app = Fastify({ logger: false }); registerReplyPlanRoutes(app, { store: f.store, userFromRequest: () => ({ user_id: f.userId }), knowledgeRetrieve: async ({ knowledgeSetId }) => ({ knowledgeSetId, version: 1, results: [] }), providerReplyPlan: async () => { calls += 1; return { publicReply: 'x', privateReply: 'y' }; } }); await app.ready();
     const result = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.equal(result.statusCode, 200); assert.equal(result.json().status, 'WAITING_HUMAN'); assert.equal(calls, 0); await app.close();
@@ -45,6 +45,6 @@ test('missing knowledge waits for a human and provider is not called', async () 
 test('provider timeout is returned as unknown and same key can be queried without retrying', async () => {
   const f = await fixture(); try {
     const app = Fastify({ logger: false }); let calls = 0; registerReplyPlanRoutes(app, { store: f.store, userFromRequest: () => ({ user_id: f.userId }), knowledgeRetrieve: async ({ knowledgeSetId }) => ({ knowledgeSetId, version: 1, results: [{ text: '证据' }] }), providerReplyPlan: async () => { calls += 1; throw new Error('timeout'); } }); await app.ready();
-    const body = { workflowId: 'comment.batch', version: '1', params: {}, knowledgeSetId: 'set-a', query: '证据', idempotencyKey: 'reply-plan-unknown' }; const first = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.equal(first.json().status, 'UNKNOWN'); const second = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.deepEqual(second.json(), first.json()); const lookup = await app.inject({ method: 'GET', url: '/v1/reply-plans/reply-plan-unknown' }); assert.deepEqual(lookup.json(), first.json()); assert.equal(calls, 1); await app.close();
+    const body = { workflowId: 'comment.batch', version: '1', params: { url: 'https://www.douyin.com/video/1', keywords: ['证据'] }, knowledgeSetId: 'set-a', query: '证据', idempotencyKey: 'reply-plan-unknown' }; const first = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.equal(first.json().status, 'UNKNOWN'); const second = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.deepEqual(second.json(), first.json()); const lookup = await app.inject({ method: 'GET', url: '/v1/reply-plans/reply-plan-unknown' }); assert.deepEqual(lookup.json(), first.json()); assert.equal(calls, 1); await app.close();
   } finally { await f.close(); }
 });

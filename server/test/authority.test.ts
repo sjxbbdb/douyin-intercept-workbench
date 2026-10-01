@@ -67,12 +67,13 @@ test('sending workflow cannot complete from client-reported sent_confirmed and k
     const user = await f.create('send-owner'); const creditSeed = await f.app.inject({ method: 'POST', url: `/v1/admin/users/${user.id}/credits`, headers: { authorization: `Bearer ${f.adminToken}` }, payload: { amount: 2, idempotencyKey: 'send-owner-seed' } }); assert.equal(creditSeed.statusCode, 200); const token = await f.login(user);
     const account = await f.app.inject({ method: 'POST', url: '/v1/platform-accounts', headers: { authorization: `Bearer ${token}` }, payload: { platform: 'douyin', accountRef: 'seller-1', displayName: 'seller' } });
     const platformAccountId = account.json().id;
-    const params = { url: 'https://www.douyin.com/video/123', keywords: ['购买'], publicReply: '请咨询', privateReply: '已私信', policyRef: { policyId: 'test', policyVersion: 1 } };
+    const knowledgeSetId = 'authority-knowledge-1'; const seedKnowledge = new Store(f.dbPath); seedKnowledge.run("INSERT INTO knowledge_sets(id,user_id,name,description,status,version,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", knowledgeSetId, user.id, '测试话术', '', 'active', 1, '{}', Date.now(), Date.now()); seedKnowledge.close();
+    const params = { url: 'https://www.douyin.com/video/123', keywords: ['购买'], publicReply: '请咨询', privateReply: '已私信', knowledgeSetId, knowledgeSetVersion: 1, policyRef: { policyId: 'workflow-policy:comment.batch', policyVersion: 1, knowledgeSetVersion: 1 }, replyPlan: { publicReply: '请咨询', privateReply: '已私信', knowledgeSetId, knowledgeSetVersion: 1, policyRef: { policyId: 'workflow-policy:comment.batch', policyVersion: 1, knowledgeSetVersion: 1 }, snippets: [] } };
     const planId = 'authority-plan-1';
     const seed = new Store(f.dbPath); seed.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', planId, user.id, 'comment.batch', '1', JSON.stringify(params), 'issued', Date.now(), Date.now() + 60_000); seed.close();
     const reserve = await f.app.inject({ method: 'POST', url: '/v1/credits/actions/reserve', headers: { authorization: `Bearer ${token}` }, payload: { actionKey: 'send-hold-1', owner: 'workflow:comment.batch', amount: 2, metadata: {} } });
     assert.equal(reserve.statusCode, 200, reserve.body);
-    const run = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId, workflowId: 'comment.batch', version: '1', params, platformAccountId, creditActionId: reserve.json().action.id, idempotencyKey: 'send-run-001' } });
+    const run = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId, workflowId: 'comment.batch', version: '1', params, knowledgeSetId, platformAccountId, creditActionId: reserve.json().action.id, idempotencyKey: 'send-run-001' } });
     assert.equal(run.statusCode, 200, run.body); const runId = run.json().run.id;
     const running = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(running.statusCode, 200);
     const spoofed = await f.app.inject({
@@ -87,6 +88,18 @@ test('sending workflow cannot complete from client-reported sent_confirmed and k
   } finally { await f.close(); }
 });
 
+test('reply workflow rejects hand-written text without a frozen knowledge plan', async () => {
+  const f = await fixture();
+  try {
+    await register(f.app, f.adminToken, 'comment.batch', { steps: [{ stepId: 'reply', sideEffect: true }] });
+    const user = await f.create('reply-gate-owner'); const token = await f.login(user);
+    const params = { url: 'https://www.douyin.com/video/789', keywords: ['购买'], publicReply: '手写公屏', privateReply: '手写私信', policyRef: { policyId: 'workflow-policy:comment.batch', policyVersion: 1 } };
+    const seed = new Store(f.dbPath); seed.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', 'reply-gate-plan', user.id, 'comment.batch', '1', JSON.stringify(params), 'issued', Date.now(), Date.now() + 60_000); seed.close();
+    const response = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId: 'reply-gate-plan', workflowId: 'comment.batch', version: '1', params, idempotencyKey: 'reply-gate-run-001' } });
+    assert.equal(response.statusCode, 409); assert.equal(response.json().code, 'REPLY_KNOWLEDGE_REQUIRED');
+  } finally { await f.close(); }
+});
+
 test('manual completion mints server proof, settles credit, and is idempotent', async () => {
   const f = await fixture();
   try {
@@ -95,10 +108,11 @@ test('manual completion mints server proof, settles credit, and is idempotent', 
     const creditSeed = await f.app.inject({ method: 'POST', url: `/v1/admin/users/${user.id}/credits`, headers: { authorization: `Bearer ${f.adminToken}` }, payload: { amount: 2, idempotencyKey: 'manual-owner-seed' } }); assert.equal(creditSeed.statusCode, 200);
     const token = await f.login(user);
     const account = await f.app.inject({ method: 'POST', url: '/v1/platform-accounts', headers: { authorization: `Bearer ${token}` }, payload: { platform: 'douyin', accountRef: 'manual-seller', displayName: 'seller' } }); assert.equal(account.statusCode, 200);
-    const params = { url: 'https://www.douyin.com/video/456', keywords: ['购买'], publicReply: '请咨询', privateReply: '已私信', policyRef: { policyId: 'test', policyVersion: 1 } };
+    const knowledgeSetId = 'manual-knowledge-1'; const seedKnowledge = new Store(f.dbPath); seedKnowledge.run("INSERT INTO knowledge_sets(id,user_id,name,description,status,version,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", knowledgeSetId, user.id, '测试话术', '', 'active', 1, '{}', Date.now(), Date.now()); seedKnowledge.close();
+    const params = { url: 'https://www.douyin.com/video/456', keywords: ['购买'], publicReply: '请咨询', privateReply: '已私信', knowledgeSetId, knowledgeSetVersion: 1, policyRef: { policyId: 'workflow-policy:comment.batch', policyVersion: 1, knowledgeSetVersion: 1 }, replyPlan: { publicReply: '请咨询', privateReply: '已私信', knowledgeSetId, knowledgeSetVersion: 1, policyRef: { policyId: 'workflow-policy:comment.batch', policyVersion: 1, knowledgeSetVersion: 1 }, snippets: [] } };
     const planId = 'manual-plan-1'; const seed = new Store(f.dbPath); seed.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', planId, user.id, 'comment.batch', '1', JSON.stringify(params), 'issued', Date.now(), Date.now() + 60_000); seed.close();
     const reserve = await f.app.inject({ method: 'POST', url: '/v1/credits/actions/reserve', headers: { authorization: `Bearer ${token}` }, payload: { actionKey: 'manual-hold-1', owner: 'workflow:comment.batch', amount: 2, metadata: {} } }); assert.equal(reserve.statusCode, 200);
-    const run = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId, workflowId: 'comment.batch', version: '1', params, platformAccountId: account.json().id, creditActionId: reserve.json().action.id, idempotencyKey: 'manual-run-001' } }); assert.equal(run.statusCode, 200, run.body);
+    const run = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId, workflowId: 'comment.batch', version: '1', params, knowledgeSetId, platformAccountId: account.json().id, creditActionId: reserve.json().action.id, idempotencyKey: 'manual-run-001' } }); assert.equal(run.statusCode, 200, run.body);
     const runId = run.json().run.id; const lease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${token}` }, payload: { idempotencyKey: 'manual-lease-001' } }); assert.equal(lease.statusCode, 200);
     const running = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(running.statusCode, 200);
     const waiting = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'WAITING_HUMAN', expectedVersion: 1, humanWait: { reason: '平台回执未验证' } } }); assert.equal(waiting.statusCode, 200);
