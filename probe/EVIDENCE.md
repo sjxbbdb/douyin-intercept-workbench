@@ -487,10 +487,11 @@ Semi Design 的浮层在隐藏时被放到屏幕外（实测 `(-9947, -9941)`）
 | 场景 | 返回 | 语义 |
 |---|---|---|
 | 平台明确拒绝私信 | `blocked` + `dm_not_available` | 跳过 |
-| 入口存在但面板打不开 | `blocked` + `dm_panel_unavailable` | 跳过 |
+| 入口存在但面板始终不开 | `blocked` + `dm_panel_unavailable` | 跳过 |
+| 面板开了但停在消息列表、列表里没有对方那一行 | `blocked` + `dm_conversation_unavailable` | 跳过 |
 | 主页是错误页（占位 id） | `blocked` + `profile_not_found` | 跳过 |
 
-三者都带 `evidence.skipped = true`，**不发送、不重试、换下一个目标**；
+四者都带 `evidence.skipped = true`，**不发送、不自动重试、换下一个目标**；
 `live_private` 的响应里单列 `skipped` 列表，宿主不会把它统计成"发送失败"
 （失败状态会误导成"通道坏了"，也会挡住后面的目标）。
 
@@ -502,8 +503,112 @@ Semi Design 的浮层在隐藏时被放到屏幕外（实测 `(-9947, -9941)`）
 * 这是幂等门禁**在正确工作**（红线 3：不确定结果不得重复触达）；
 * 但报表因此失真，所以调用方必须给每个目标派生独立的 `sendId`（本轮已修）。
 
----
+### 12.14 🔴「打开了私信，却没有真的发私信」（2026-09-26 用户反馈 → 真机定位 → 修复）
 
+用户反馈真机现象：**面板明明打开了，工具却什么都没发**。真机逐帧取证后，原因是这段重试：
+
+```
+旧逻辑：面板没开 -> 再点一次「私信」入口（最多 3 次，都在同一个坐标）
+```
+
+而「私信」入口的坐标（真机 `963,132`）在面板打开之后**落在面板内部**（那一带是面板的搜索框/
+标题栏，实测 `elementFromPoint` 命中的是 `INPUT.semi-input placeholder="搜索"`）。于是：
+
+1. 第 1 次点击把面板打开（实测 1.5-4s，会话头部标题 = 对方昵称）；
+2. 内层轮询错过之后，第 2、3 次点击打进了已经打开的面板，把面板切到「消息列表」；
+3. 三轮结束判定 `panel_not_opened` —— **我们一条消息都没输入就跳过了这个目标**。
+
+修复（本 PR）：
+
+* 入口**只在面板关着时**点，且最多两次；第 2 次必须先**重新导航回主页**（坐标与面板状态
+  都回到干净状态），绝不拿着旧坐标在可能已经打开的面板上补点；
+* 面板开着但停在「消息列表」时，像真人一样**点开对方那一行**（真机行标题 = 对方昵称，
+  选择器 `[class*="ConversationItemwrapper"]` / `[class*="ConversationItemtitle"]`）；
+* 新增跳过原因 `dm_conversation_unavailable`（面板开了、但列表里没有对方那一行），
+  evidence 里带 `attempts`（每轮的面板/会话状态）与 `entryClicks`。
+
+🔴 同一次真机复盘中还发现第二个坑（同一类问题，一起修）：**会话打开之后，整列会话列表仍然
+挂在 DOM 里、仍然有真实尺寸**，但整列被会话内容盖住 —— 真机实测 `elementFromPoint` 命中的是
+`TextMessageTextpureText`（消息气泡），不是列表行：
+
+```
+一日九万里    x=852 y=201  hit=DIV.messageMessageBoxmessageBox   inside=false
+Mr.吉～～     x=852 y=268  hit=SPAN.TextMessageTextpureText      inside=false
+紫风玲        x=852 y=335  hit=DIV(空 class)                     inside=false
+```
+
+照这种「伪可见」的坐标点下去就是点进对方的会话里（可能点到消息里的链接），所以会话行现在和
+私信入口走**同一套遮挡判定**：行中心必须自己接住 `elementFromPoint`，否则返回
+`conversation_row_covered`，一个点击都不发。真机复核：会话打开时四个目标全部 `covered`，
+随机名仍然是 `conversation_row_not_found`。
+
+⚠️ 平台那句「对方回复或关注你之前，只能发送一条文字消息。请礼貌发言…」**不是拒绝**：
+平台允许发一条，遇到它必须照常发出去（用户 2026-09-26 明确）。
+
+真机验证（2026-09-26，直播间来的陌生人，未互关）：
+
+```
+status=unknown reason=platform_response_unavailable
+evidence: mechanism=enter recipientVerification=live_panel_header
+          composerCleared=true conversationEcho=true conversationListPreview=true
+```
+
+整页重载 + 离开再回来后复核：会话里仍在，且**平台自己的会话列表**里那一行的预览已经是这条话术：
+
+```
+用户3565058804794 刚刚 你好，看到你在直播间的提问，我整理了一份入门步骤，可以先发你参考。
+燕归来            16分钟前 你好，看到你在直播间的提问，我整理了一份入门步骤，可以先发你参考。
+知足常乐          28分钟前 对方回复或关注你之前，只能发送一条文字消息。请礼貌发言…
+```
+
+（没发出去的人那一行只剩平台提示语 —— 这条对比就是 `conversationListPreview` 这个观察字段的来源。）
+
+边界（不许含糊）：私信走长连接，**没有 HTTP 回执**，所以状态仍然是 `unknown`；
+`conversationListPreview` 只是页面观察（有力旁证），**不足以宣告 `sent_confirmed`**，
+也不能解锁任何后续动作。
+
+### 12.14 🔴 高流量房间里「弹幕已经滚走」的可用窗口（2026-09-26 实测 + 修复）
+
+用户反馈：高流量直播间里公屏回复成片失败在 `danmaku_not_found_in_list`。真机把一个房间
+（`live.douyin.com/685317364746`，斗地主赛事，公屏每秒好几条）量了一遍 ——
+**采集那一刻还在屏上的弹幕，过多久还能被点开回复**：
+
+| 采集后 | 直接定位 | 上滚找回 |
+|---|---|---|
+| 0s | 4/4 命中 | —— |
+| 15s | 0/4 命中 | 上滚 3600px 找回 2/4；再滚到 6000px 剩下的也没回来 |
+| 30s | 0/4 | 上滚 6000px 仍然 0/4 |
+| 60s | 0/4 | 上滚 6000px 仍然 0/4 |
+
+（定位判据是 `find_danmaku_in_list`：只在主聊天列表矩形内、按「昵称 + 正文」唯一命中。）
+
+结论与修复：
+
+* 抖音网页端聊天列表 **DOM 只渲染十几行**，被顶走的那条连节点都没了；但页面的历史窗口还在，
+  所以【上滚】能把 15 秒左右的弹幕找回来 —— 420px 在快房间里只够买一秒，**必须滚 1200px 级别**；
+* `open_reply_menu` 第 2..4 轮改成「上滚 1200px 再重新定位」（最多 3600px），并把 `scrolledPx`
+  回报出去；滚了还找不到就照旧 fail-closed，绝不猜坐标；
+* 上滚之后必须 `resume_chat_bottom()` 回滚（距离按 `scrolledPx` 算），否则下一轮采集看到的
+  还是那批旧弹幕；
+* 超过 30 秒的弹幕**任何手段都救不回来**：这不是定位器不够努力，是平台侧的历史窗口过去了。
+  所以批次窗口要开小、两个阶段之间不要插入任何「复核」动作。
+
+受控真机验证（同一房间，采集后固定等 15 秒再走真实原生回复流程）：
+
+```
+[1] 安于朝夕 | 炸不了啦   结果 unknown/platform_response_unavailable
+    evidence: mechanism=enter via=native_reply_ta mentionInserted=true
+              danmakuLocated=true scrolledPx=3600 composerCleared=true roomEcho=true
+    —— 第 1 轮没点开，正是靠上滚 3600px 找回之后才回复成功
+[2] 孤星伴月 | ？         结果 failed/danmaku_not_found_in_list scrolledPx=3600
+    —— 上滚到上限仍找不到，如实失败（这条弹幕正文只有 1 个字，早就被顶没了）
+```
+
+⚠️ 测试脚本自己踩到的坑（写进这里免得后人再踩）：先给一个目标做「公屏 + 私信 + 整页重载复核」
+（复核本身要 40 秒）再处理下一个，等于把窗口全耗光 —— 后面的目标必然失败。正确的用法是
+**阶段一先把公屏回复连着做完，阶段二再挨个私信，最后统一复核**。
+
+---
 ## 13. 直播间能力 · 四类证据与发行开关冻结（2026-09-21）
 
 > 本节按评审要求把「关键词匹配 / 公屏回复 / 私信门禁 / 平台可见性」四类证据集中列在一处，
@@ -573,3 +678,74 @@ Semi Design 的浮层在隐藏时被放到屏幕外（实测 `(-9947, -9941)`）
 > 与全部私信能力保持 `autoEligible: false`，**不得声称"真实抖音自动发送可用"**。
 > 客户端据此 fail-closed：`desktop/src/lib/probe-bridge.js` 的 `canSend()` 只有在
 > `implemented && autoEligible` 同时成立时才允许自动发送，否则一律转人工。
+
+---
+
+## 14. 三大模块 · 证据分级与失败状态矩阵（2026-09-29）
+
+> 评审要求：把「搜视频 / 评论区 / 直播间」三个模块的证据与失败状态整理到一处，
+> 并**明确哪些是 `sent_confirmed`、哪些只是 `sent_echoed`、哪些是 `unknown`**——
+> **页面回显一律不得写成"送达成功"**。
+
+### 14.1 一条硬规则（先看这条）
+
+| 观测 | 是什么 | 能证明什么 |
+|---|---|---|
+| 平台 HTTP 回执且 `status_code=0`（仅评论 `comment/publish` 有） | **`sent_confirmed`** | 平台确认收到这条公开回复 —— 唯一允许进入私信阶段的状态 |
+| 直播间公屏的房间回声（`roomEcho`） | **`sent_echoed`**（队列证据） | 只是在**页面自己的消息流**里看到了这句话；默认策略**不放行**，不放行就不进私信 |
+| 私信会话回显（`conversationEcho`）、会话列表预览（`conversationListPreview`） | **页面观察** | 只进 `evidence`，**不改状态**：私信一律 `unknown` |
+| 以上都没有 | **`unknown`** | 不知道发没发出去 —— 落台账、**禁止自动重试**（同一目标的二次请求被 `target_has_unresolved_send` 挡下） |
+
+```
+页面回显 ≠ 送达。私信走长连接、没有 HTTP 回执，所以它永远停在 unknown；
+能解锁下一阶段的只有评论通路的 status_code=0。
+```
+
+### 14.2 搜视频（发现候选）
+
+| 维度 | 证据 / 状态 |
+|---|---|
+| 关键词 | 复用同一套匹配器 `crawl.comment_matches`（`phrase/seg/all/any` + 排除词优先） |
+| 分页 | `pageOutcome`：`more` / `exhausted` / `captcha` / `blocked`；`platformHasMore` 与本地新增分开上报（本地没有新候选 ≠ 平台没有更多） |
+| 去重 | 按视频 id 去重，池内 `seen` 计数；同页重复不再回传 |
+| 账号绑定 | 结果池按 **`account_scope`** 分库（`search_pool`），换账号只见自己的候选（`test_pool_is_isolated_per_account_scope`） |
+| 失败状态 | `login_required` / `login_state_unknown` / `captcha_requires_manual_action` / `page_not_visible` —— 全部 fail-closed，不猜 |
+
+### 14.3 评论区（关键词匹配 → 回复 → 私信）
+
+| 维度 | 证据 / 状态 |
+|---|---|
+| 关键词匹配 | 同上匹配器；行定位要求正文唯一命中（含纯数字正文的兜底） |
+| 评论回复 | **唯一有平台回执的通道**：`comment/publish` + 请求体结构化绑定（评论 id 优先，其次正文）→ `sent_confirmed`；无回执 / 绑定不上 / 多条分不清 → `unknown`（`platform_response_unavailable` / `_unbound` / `_ambiguous` / `_unreadable`） |
+| 回复阶段不刷新 | 已在目标视频页时**绝不重新导航**（重新导航会清空采集时渲染出来的评论列表）；离开过才导航（`test_it_does_not_reload_the_video_page_it_is_already_on`） |
+| 私信触达 | 必须带 `publicSendId`，且是**这次**那条已确认的公开回复：`public_missing` / `public_not_found` / `public_not_a_reply` / `public_pending` / `public_unknown` / `public_failed` / `public_blocked` |
+| 幂等键 | 每个目标独立 `sendId`（同一次运行两个目标共用 id 会让台账把第二条当成重复请求）；同一目标的未决结果（`reserved/started/unknown`）**直接拒绝**，不重复触达 |
+| 多账号隔离 | 同一个视频 URL 换账号：`send_gate` 按 `account_scope` 分账，A 的 `sent_confirmed` 对 B **不可见**（`test_comment_evidence_does_not_cross_accounts_on_the_same_video`） |
+| 固定顺序 | 评论回复确认成功 → 才允许私信；`unknown/failed/blocked` 一律在**打开浏览器之前**被拒 |
+
+### 14.4 直播间（关键词匹配 → 公屏回复 → 私信）
+
+| 维度 | 证据 / 状态 |
+|---|---|
+| 关键词匹配 | 与评论链路同一匹配器；候选从**此刻渲染中的行**里取 |
+| 公屏回复 | 原生「回复 TA」：点弹幕 → 菜单 → 平台插入 @提及 → 真实按键 → 回车。证据 `mentionInserted` / `composerCleared` / `roomEcho` → 台账 `unknown`，队列最多 `sent_echoed`（**没有平台回执**） |
+| 私信门禁 | 三层：批次候选（默认只放行 `sent_confirmed`）→ 逐项 `publicSendId` → 归属校验（必须是该事件自己那次）。公屏是 `unknown`/`sent_echoed` 时**不会**自动解锁（`test_an_unknown_live_public_state_never_unlocks_the_private_message`） |
+| 滚动恢复 | 上滚按**实测像素**记账（`moved`，`(path, mtime, size)` 级别的指纹只用于策略缓存）；停滚那一次也计入；连续滚不动就停手 |
+| 失败状态 | 定位不到 → `danmaku_not_found_in_list`（一个点击都不发）；多条同名 → `danmaku_ambiguous`；被遮挡 → `danmaku_covered`；页面不可见 → `page_not_visible` / `page_visibility_unknown`（转人工）；对方不可私信 → `dm_not_available` / `dm_panel_unavailable` / `dm_conversation_unavailable`（跳过）。**全部 fail-closed，绝不猜坐标** |
+
+### 14.5 私信回显的绑定（本次新增）
+
+评审要求：回显必须绑定**目标收件人**与**本次发送动作**，历史会话里的相同文字不能算。
+
+* 发送前先取基线：`dm_conversation_echo_count()` 数出"当前会话里与本次话术完全相同的消息气泡"有几条，
+  并且**先要求会话头部标题 = 目标昵称**（否则返回 `recipient_not_confirmed`，别人会话里的同样文字不算）；
+* 发送后只认 `dm_conversation_echo_after_send()`：计数必须**比基线多**才算"这次看到了新的一条"；
+* evidence 里新增 `conversationEchoBaseline` / `conversationEchoCount` / `conversationEchoReason`，
+  事后一眼能看出"这是本次新出现的"还是"历史里本来就有"；
+* 输入框子树被显式排除（"刚敲进去还没发"不算回显）；
+* **状态仍是 `unknown`**：回显只是页面观察，永远不会被写成送达成功。
+
+回归：`test_the_echo_counts_only_messages_inside_the_confirmed_recipient`、
+`test_the_echo_after_send_requires_the_count_to_grow`（夹具 `probe/tests/fixtures/dm_echo.html`）。
+
+---

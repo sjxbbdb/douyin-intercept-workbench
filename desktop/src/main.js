@@ -14,7 +14,7 @@ const { TaskEngine } = require('./lib/task-engine');
 const { WorkflowRuntime } = require('./lib/workflow-runtime');
 const { createWorkflowAdapter } = require('./lib/workflow-adapter');
 const workflowRequest = require('./lib/workflow-request');
-const { platformWorkflowDefinitions } = require('./lib/workflow-contracts');
+const { platformWorkflowDefinitions, workflowContractHash } = require('./lib/workflow-contracts');
 const { AccountRuntimeManager } = require('./lib/account-runtime-manager');
 const { platformAccountId: normalizePlatformAccountId, platformScope, accountDataPath: scopedAccountDataPath, accountDir: scopedAccountDir, browserPartition, sidecarPort: scopedSidecarPort } = require('./lib/platform-account');
 const { targetUrl, text, safeIdempotencyKey } = require('./lib/validation');
@@ -71,16 +71,36 @@ function accountDir(userId, platformAccount = currentPlatformAccountId) {
 }
 
 function sidecarPort(userId, platformAccount = currentPlatformAccountId) {
-  return scopedSidecarPort(apiEndpoint, userId || 'guest', platformAccount);
+  const knownAccounts = platformAccounts.map((account) => account?.id).filter(Boolean);
+  return scopedSidecarPort(apiEndpoint, userId || 'guest', platformAccount, knownAccounts);
 }
 
 function runtimeAccountId(userId, platformAccount) {
   return platformScope({ workbenchUserId: userId || 'guest', platformAccountId: platformAccount }).runtimeAccountId;
 }
 
+const WORKFLOW_PAUSE_COLLECTORS = new Set(['open_error', 'error', 'capability_error', 'closed', 'disconnected', 'close_error', 'close_timeout']);
+
+function browserPauseReason(status) {
+  const collector = typeof status?.collector === 'string' ? status.collector : '';
+  if (!WORKFLOW_PAUSE_COLLECTORS.has(collector) && !(status?.connected === false && status?.disconnected === true)) return null;
+  const detail = typeof status?.error === 'string' && status.error.trim() ? `:${status.error.trim().slice(0, 240)}` : '';
+  return `browser_${collector || 'disconnected'}${detail}`;
+}
+
+function pauseWorkflowForBrowserStatus(accountId, runtime, status) {
+  const reason = browserPauseReason(status);
+  if (!reason) return;
+  try { runtime?.invalidate(reason); } catch (error) { console.warn('[workflow] failed to persist browser pause', error.message); }
+  if (accountId) workflowManager?.invalidate(accountId, reason);
+}
+
 function createBrowserInstance(userId, platformAccount = currentPlatformAccountId, callbacks = {}) {
   const common = { onStatus: callbacks.onStatus || (() => {}), onEvents: callbacks.onEvents || (() => {}) };
-  return process.env.DOUYIN_ELECTRON_BRIDGE === '1'
+  // The Electron DOM bridge is an offline development fallback only.  A
+  // packaged build must always use the bundled sidecar, even if an inherited
+  // environment variable happens to enable the fallback.
+  return process.env.DOUYIN_ELECTRON_BRIDGE === '1' && !app.isPackaged
     ? new BrowserBridge({ parentWindow: mainWindow, getPartition: () => browserPartition(apiEndpoint, userId || 'guest', platformAccount), ...common })
     : new ProbeBridge({ accountDir: accountDir(userId, platformAccount), port: sidecarPort(userId, platformAccount), cwd: path.resolve(__dirname, '..', '..'), resourcesPath: process.resourcesPath, packaged: app.isPackaged, ...common });
 }
@@ -90,8 +110,9 @@ async function createBrowser(userId, platformAccount = currentPlatformAccountId)
   browser = null;
   if (previous) await previous.close?.();
   const callbackEpoch = sessionEpoch;
+  const accountId = userId && platformAccount ? runtimeAccountId(userId, platformAccount) : null;
   browser = createBrowserInstance(userId, platformAccount, {
-    onStatus: (status) => { if (callbackEpoch !== sessionEpoch) return; if (status.navigating) engine?.pauseAll('browser_navigation'); if (['captcha', 'login_required', 'unsupported'].includes(status.status)) engine?.pauseAll(`sidecar_${status.status}`); browserState = { ...browserState, ...status }; emitState(); },
+    onStatus: (status) => { if (callbackEpoch !== sessionEpoch) return; pauseWorkflowForBrowserStatus(accountId, workflowRuntime, status); if (status.navigating) engine?.pauseAll('browser_navigation'); if (['captcha', 'login_required', 'unsupported'].includes(status.status)) engine?.pauseAll(`sidecar_${status.status}`); if (browserPauseReason(status)) engine?.pauseAll(browserPauseReason(status)); browserState = { ...browserState, ...status }; emitState(); },
     onEvents: (events) => { if (callbackEpoch !== sessionEpoch) return; void engine?.ingest(events); }
   });
 }
@@ -157,10 +178,20 @@ function switchAccountStore(userId, reason = 'account_switch', isCurrent = () =>
   const transition = accountTransition.then(async () => {
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
     const targetPlatformAccount = userId ? (platformAccount || null) : null;
+    const previousWorkflowAccountId = currentAccountUserId && currentPlatformAccountId
+      ? runtimeAccountId(currentAccountUserId, currentPlatformAccountId)
+      : null;
     browserState = { connected: false, collector: 'closed', matchCount: 0 };
     lastProbe = null;
     engine?.invalidate(reason);
     workflowRuntime?.invalidate(reason);
+    if (previousWorkflowAccountId) {
+      // Invalidate the exact account before closing its browser.  This aborts
+      // queued/running manager jobs and prevents the old account from sending
+      // after the new platform account becomes current.
+      invalidateManagedWorkflows(reason, (accountId) => accountId === previousWorkflowAccountId);
+      await closeInvalidatedWorkflows();
+    }
     const previous = browser;
     if (previous) await previous.close?.();
     if (ownEpoch !== sessionEpoch || !isCurrent()) return false;
@@ -223,15 +254,15 @@ async function solidifyRemoteWorkflow(remoteRunId, reason) {
 
 function currentProfile() { return dataStore.get().selectorProfile || DEFAULT_SELECTOR_PROFILE; }
 
-function normalizedPlatformAccounts(payload) {
+function normalizedPlatformAccounts(payload, includeDisabled = false) {
   const rows = Array.isArray(payload) ? payload : payload?.accounts;
   if (!Array.isArray(rows)) throw new Error('授权中心返回的平台账号列表无效');
-  return rows.filter((item) => item && typeof item.id === 'string' && item.id.trim() && item.status !== 'disabled').map((item) => ({ ...item, id: normalizePlatformAccountId(item.id) }));
+  return rows.filter((item) => item && typeof item.id === 'string' && item.id.trim() && (includeDisabled || item.status !== 'disabled')).map((item) => ({ ...item, id: normalizePlatformAccountId(item.id) }));
 }
 
-async function fetchPlatformAccounts(requestApi = api, tokenOverride = null) {
+async function fetchPlatformAccounts(requestApi = api, tokenOverride = null, includeDisabled = false) {
   const response = await requestApi.platformAccounts(tokenOverride || authStore.getToken());
-  return normalizedPlatformAccounts(response);
+  return normalizedPlatformAccounts(response, includeDisabled);
 }
 
 function preferredPlatformAccount(userId, accounts) {
@@ -248,6 +279,10 @@ async function switchPlatformAccount(platformAccount) {
   if (!accounts.some((item) => item.id === selected)) throw new Error('平台账号不属于当前工作台或已停用');
   if (selected === currentPlatformAccountId) { platformAccounts = accounts; authStore.setPlatformAccountId(currentAccountUserId, selected); emitState(); return { accounts, platformAccountId: selected }; }
   const license = authStore.getLicense();
+  // Make the complete account set available while constructing the new
+  // browser, so its deterministic allocator can avoid another account's hash
+  // port before either sidecar is launched.
+  platformAccounts = accounts;
   const switched = await switchAccountStore(currentAccountUserId, 'platform_account_switch', () => requestApi === api && authStore.getToken() === requestToken, selected);
   if (!switched) throw new Error('平台账号切换已过期');
   platformAccounts = accounts;
@@ -276,6 +311,12 @@ async function listPlatformAccounts() {
   if (currentPlatformAccountId && !accounts.some((item) => item.id === currentPlatformAccountId)) {
     const selected = preferredPlatformAccount(currentAccountUserId, accounts);
     if (selected) await switchPlatformAccount(selected);
+    else {
+      invalidateManagedWorkflows('platform_account_unavailable');
+      await closeInvalidatedWorkflows();
+      await switchAccountStore(currentAccountUserId, 'platform_account_unavailable', () => Boolean(authStore.getToken()), null);
+      authStore.setPlatformAccountId(currentAccountUserId, null);
+    }
   }
   emitState();
   return { accounts: platformAccounts, platformAccountId: currentPlatformAccountId };
@@ -295,16 +336,26 @@ async function refreshLicense(tokenOverride = null) {
     if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) return { state: 'stale' };
     const safe = publicLicensePayload(me);
     if (!safe.user?.id) throw new Error('授权中心响应缺少用户身份');
-    const accounts = await fetchPlatformAccounts(requestApi, requestToken);
+    const allAccounts = await fetchPlatformAccounts(requestApi, requestToken, true);
+    const accounts = allAccounts.filter((item) => item.status !== 'disabled');
     const selected = preferredPlatformAccount(safe.user.id, accounts);
+    const currentRecord = allAccounts.find((item) => item.id === currentPlatformAccountId);
     const currentStillValid = currentPlatformAccountId && accounts.some((item) => item.id === currentPlatformAccountId);
+    const currentDisabled = Boolean(currentRecord && currentRecord.status === 'disabled');
     const needsAccountSwitch = currentAccountUserId !== safe.user.id
-      || (!currentStillValid && selected !== currentPlatformAccountId && selected != null);
+      || (!currentStillValid && currentPlatformAccountId != null)
+      || (currentPlatformAccountId == null && selected != null);
     if (needsAccountSwitch) {
       if (currentAccountUserId !== safe.user.id) invalidateManagedWorkflows('workbench_account_switch');
+      if (currentDisabled) {
+        invalidateManagedWorkflows('platform_account_disabled');
+        await closeInvalidatedWorkflows();
+      }
+      platformAccounts = accounts;
       const switched = await switchAccountStore(safe.user.id, 'account_switch_from_refresh', () => requestApi === api && authStore.getToken() === requestToken, selected);
       if (!switched) return { state: 'stale' };
       if (selected) authStore.setPlatformAccountId(safe.user.id, selected);
+      else authStore.setPlatformAccountId(safe.user.id, null);
     }
     platformAccounts = accounts;
     engine.setLicense(safe);
@@ -339,6 +390,7 @@ async function handleLogin(_event, input) {
     const selected = preferredPlatformAccount(safe.user.id, accounts);
     invalidateManagedWorkflows('login_account_switch');
     await closeInvalidatedWorkflows();
+    platformAccounts = accounts;
     const switched = await switchAccountStore(safe.user.id, 'login_account_switch', () => attempt === loginAttempt && requestApi === api, selected);
     if (!switched || attempt !== loginAttempt || requestApi !== api) throw new Error('登录会话已切换，请重试');
     platformAccounts = accounts;
@@ -399,17 +451,70 @@ async function handleRedeem(_event, input) {
 
 async function startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage = null }) {
     const runtime = accountContext.runtime;
+    let localRun = null;
+    let remoteRunId = null;
     const catalogResponse = await api.workflows();
     const catalog = Array.isArray(catalogResponse?.workflows) ? catalogResponse.workflows : [];
     const registered = catalog.find((item) => item.workflowId === plan.workflowId && String(item.version) === String(plan.version) && item.status === 'active');
     if (!registered) throw new Error('授权中心未开放该固定流程');
     const canonical = PLATFORM_WORKFLOWS.find((item) => item.workflowId === registered.workflowId && String(item.version) === String(registered.version));
-    const contractSteps = canonical?.steps || (Array.isArray(registered.contract?.steps) ? registered.contract.steps : []);
+    if (!canonical || !registered.contract || typeof registered.contractHash !== 'string' || !registered.contractHash) throw new Error('授权中心固定流程缺少本地可验证的契约指纹，已拒绝启动');
+    const effectiveLocalContract = { ...canonical, ...(Number.isSafeInteger(registered.contract.creditPrice) ? { creditPrice: registered.contract.creditPrice } : {}) };
+    if (workflowContractHash(effectiveLocalContract) !== registered.contractHash) throw new Error('授权中心固定流程契约与客户端不一致，已拒绝启动');
+    const contractSteps = canonical.steps;
     if (!contractSteps.length) throw new Error('授权中心返回的固定流程没有可执行步骤');
     runtime.registerWorkflow({ workflowId: registered.workflowId, version: String(registered.version), steps: contractSteps });
-    const remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: requestedPlatform, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}:${requestedPlatform}`) });
-    const remoteRunId = remote?.run?.id;
-    if (!remoteRunId) throw new Error('授权中心未返回流程实例');
+    // Workflow pricing is authoritative on the server.  Reserve the exact
+    // server-issued amount before creating a run; the server settles it only
+    // after a terminal, verified result decision.  A transport-unknown
+    // reservation is deliberately left to its bounded TTL instead of being
+    // guessed as refundable, preventing duplicate side effects.
+    let creditAction = null;
+    const creditPrice = Number.isSafeInteger(registered.contract?.creditPrice) ? registered.contract.creditPrice : null;
+    if (creditPrice !== null && creditPrice > 0) {
+      const reservation = await api.reserveCreditAction({
+        actionKey: safeIdempotencyKey(`workflow-credit:${plan.planId}:${requestedPlatform}:${registered.workflowId}:${registered.version}`),
+        owner: `workflow:${registered.workflowId}`,
+        amount: creditPrice,
+        metadata: { planId: plan.planId, workflowId: registered.workflowId, version: String(registered.version), platformAccountId: requestedPlatform }
+      });
+      creditAction = reservation?.action || null;
+      if (!creditAction?.id || creditAction.status !== 'reserved') throw new Error('授权中心未返回有效的积分预留');
+      const license = engine.publicLicense();
+      engine.setLicense({ ...license, balance: reservation.balance });
+    }
+    // Persist the frozen local plan before creating the remote mirror.  A
+    // process exit during the HTTP handshake then leaves a resumable local
+    // checkpoint instead of a remote RUNNING record with no local run.
+    try {
+      localRun = runtime.startPlan(plan);
+    } catch (error) {
+      if (creditAction?.id) {
+        try { await api.releaseCreditAction(creditAction.id, { idempotencyKey: safeIdempotencyKey(`workflow-credit-release:${plan.planId}:${requestedPlatform}`) }); } catch (releaseError) { console.warn('[workflow] credit release failed', creditAction.id, releaseError.message); }
+      }
+      throw error;
+    }
+    workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: localRun });
+    emitState();
+    let remote;
+    try {
+      remote = await api.createWorkflowRun({ planId: plan.planId, workflowId: plan.workflowId, version: plan.version, params: plan.params, platformAccountId: requestedPlatform, creditActionId: creditAction?.id, knowledgeSetId: typeof plan.params.knowledgeSetId === 'string' ? plan.params.knowledgeSetId : undefined, idempotencyKey: safeIdempotencyKey(`run:${plan.planId}:${requestedPlatform}`) });
+    } catch (error) {
+      runtime.pauseRun(localRun.runId, 'remote_workflow_not_created');
+      // A definite HTTP rejection means no run was accepted by the server;
+      // release the local reservation.  Network/timeout errors remain
+      // indeterminate and are recovered through the action TTL/query path.
+      if (creditAction?.id && Number.isInteger(error?.status) && error.status > 0) {
+        try { await api.releaseCreditAction(creditAction.id, { idempotencyKey: safeIdempotencyKey(`workflow-credit-release:${plan.planId}:${requestedPlatform}`) }); } catch (releaseError) { console.warn('[workflow] credit release failed', creditAction.id, releaseError.message); }
+      }
+      throw error;
+    }
+    remoteRunId = remote?.run?.id;
+    if (!remoteRunId) {
+      runtime.pauseRun(localRun.runId, 'remote_workflow_protocol_error');
+      throw new Error('授权中心未返回流程实例，已暂停本地流程');
+    }
+    accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === localRun.runId ? { ...candidate, remoteRunId } : candidate) }));
     let leaseHeld = false;
     let remoteVersion = Number.isSafeInteger(remote?.run?.checkpointVersion) ? remote.run.checkpointVersion : 0;
     try {
@@ -417,19 +522,24 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
       leaseHeld = true;
       const running = await api.checkpointWorkflow(remoteRunId, { status: 'RUNNING', expectedVersion: remoteVersion });
       remoteVersion = Number.isSafeInteger(running?.run?.checkpointVersion) ? running.run.checkpointVersion : remoteVersion + 1;
-      const run = runtime.startPlan(plan);
+      const run = localRun;
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: { ...run, status: 'RUNNING' } });
       emitState();
-      accountContext.store.update((data) => ({ ...data, workflowRuns: data.workflowRuns.map((candidate) => candidate.runId === run.runId ? { ...candidate, remoteRunId } : candidate) }));
       const result = await runtime.run(run.runId);
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
       await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {}, humanWait: result.status === 'WAITING_HUMAN' ? { reason: result.lastError?.message || '平台适配器需要人工处理', context: result.checkpoint || {} } : undefined });
+      const sendWorkflow = contractSteps.some((step) => step && step.sideEffect === true);
+      const sendEvidenceMissing = result.status === 'COMPLETED' && sendWorkflow;
+      const reportedStatus = sendEvidenceMissing ? 'WAITING_HUMAN' : result.status;
+      const reportedCheckpoint = sendEvidenceMissing
+        ? { ...(result.checkpoint || {}), phase: 'send', reason: 'server_send_evidence_required' }
+        : (result.checkpoint || {});
+      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
       remoteVersion = Number.isSafeInteger(finalRemote?.run?.checkpointVersion) ? finalRemote.run.checkpointVersion : remoteVersion + 1;
-      const nextDecision = await requestResultDecision(remoteRunId, result);
+      const nextDecision = sendEvidenceMissing ? { decision: 'wait_human', reason: 'server_send_evidence_required' } : await requestResultDecision(remoteRunId, result);
       let decisionApplied = null;
-      if (nextDecision?.decision === 'wait_human' && ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status)) {
-        decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: 'server_result_decision', checkpoint: result.checkpoint || null });
+      if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status))) {
+        decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
         if (result.status !== 'WAITING_HUMAN') {
           const humanCheckpoint = await api.checkpointWorkflow(remoteRunId, { status: 'WAITING_HUMAN', stepId: String(result.currentStep), expectedVersion: remoteVersion, humanWait: { reason: 'Agent 结果决策要求人工处理', context: result.checkpoint || {} }, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
           remoteVersion = Number.isSafeInteger(humanCheckpoint?.run?.checkpointVersion) ? humanCheckpoint.run.checkpointVersion : remoteVersion + 1;
@@ -456,10 +566,13 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
       emitState();
       return { plan, run: displayRun, nextDecision, decisionApplied };
     } catch (error) {
-      if (leaseHeld) await solidifyRemoteWorkflow(remoteRunId, error.message);
+      if (leaseHeld && remoteRunId) await solidifyRemoteWorkflow(remoteRunId, error.message);
+      if (localRun && !['COMPLETED', 'FAILED', 'STOPPED', 'UNKNOWN', 'WAITING_HUMAN', 'PAUSED'].includes(runtime.getRun(localRun.runId).status)) {
+        runtime.pauseRun(localRun.runId, remoteRunId ? 'remote_workflow_interrupted' : 'remote_workflow_not_created');
+      }
       throw error;
     } finally {
-      if (leaseHeld) {
+      if (leaseHeld && remoteRunId) {
         try { await api.releaseWorkflowLease(remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release:${remoteRunId}:${accountId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] lease release failed', remoteRunId, error.message); }
       }
     }
@@ -479,9 +592,54 @@ async function runAgentChat(input) {
   const context = input?.context && typeof input.context === 'object' && !Array.isArray(input.context) ? input.context : {};
 
   return workflowManager.run(accountId, async ({ context: accountContext }) => {
-    const plan = await accountContext.runtime.planFromIntent(message, context);
+    let plan = await accountContext.runtime.planFromIntent(message, context);
+    // Intent planning only chooses a registered workflow. For reply-capable
+    // workflows, a selected knowledge set must produce a second, server-issued
+    // frozen reply plan before the executor is allowed to start. This keeps
+    // vector retrieval/provider generation out of RUNNING and prevents the
+    // planner from smuggling unsourced reply text into a fixed workflow.
+    const replyWorkflow = ['comment.batch', 'comment.reply_then_private', 'live.batch', 'live.reply_then_private'].includes(plan.workflowId);
+    const selectedKnowledgeSet = typeof context.knowledgeSetId === 'string' && context.knowledgeSetId.trim() ? context.knowledgeSetId.trim() : '';
+    if (replyWorkflow && !selectedKnowledgeSet) throw new Error('评论和直播回复流程必须先选择租户话术库');
+    if (replyWorkflow) {
+      const replyPlan = await api.createReplyPlan({
+        workflowId: plan.workflowId,
+        version: plan.version,
+        params: plan.params,
+        knowledgeSetId: selectedKnowledgeSet,
+        knowledgeSetVersion: context.knowledgeSetVersion,
+        query: typeof context.knowledgeQuery === 'string' && context.knowledgeQuery.trim() ? context.knowledgeQuery : message,
+        targets: Array.isArray(context.targets) ? context.targets.slice(0, 200) : [],
+        idempotencyKey: safeIdempotencyKey(`reply-plan:${requestKey}:${plan.workflowId}:${plan.version}`)
+      });
+      if (replyPlan?.status !== 'issued' || !replyPlan.planId || !replyPlan.params) {
+        const reason = replyPlan?.reason === 'KNOWLEDGE_NOT_FOUND' ? '话术库没有命中内容，已转人工' : '话术生成结果未被授权中心确认，已转人工';
+        throw new Error(reason);
+      }
+      plan = { planId: replyPlan.planId, workflowId: replyPlan.workflowId, version: replyPlan.version, params: replyPlan.params };
+    }
     return startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage: message });
   }, { idempotencyKey: requestKey, metadata: { message, platformAccountId: requestedPlatform } });
+}
+
+async function prepareReplyPlan(input) {
+  if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+  if (!api) throw new Error('授权中心尚未连接');
+  const workflowId = text(input?.workflowId, 'workflow id', 100);
+  const version = input?.version === undefined ? '1' : String(input.version);
+  const knowledgeSetId = text(input?.knowledgeSetId, 'knowledge set id', 100);
+  const query = text(input?.query, 'knowledge query', 4000);
+  if (!workflowId || !knowledgeSetId || !query) throw new Error('生成话术前必须指定固定流程、话术库和问题');
+  const request = {
+    workflowId, version, params: input?.params && typeof input.params === 'object' ? input.params : {},
+    knowledgeSetId, knowledgeSetVersion: input?.knowledgeSetVersion, query,
+    topK: input?.topK, targets: Array.isArray(input?.targets) ? input.targets.slice(0, 200) : [],
+    idempotencyKey: safeIdempotencyKey(typeof input?.idempotencyKey === 'string' && input.idempotencyKey.trim() ? input.idempotencyKey : `reply-plan:${workflowId}:${crypto.randomUUID()}`)
+  };
+  const requestEpoch = sessionEpoch; const requestApi = api; const requestToken = authStore.getToken();
+  const result = await requestApi.createReplyPlan(request);
+  if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，话术计划未应用');
+  return result;
 }
 
 
@@ -513,10 +671,20 @@ async function runExplicitWorkflow(input) {
   const intent = workflowRequest.buildWorkflowIntent(request);
   const context = workflowRequest.buildWorkflowContext(request);
   return workflowManager.run(accountId, async ({ context: accountContext }) => {
-    const plan = await accountContext.runtime.planFromIntent(intent, context);
-    const check = workflowRequest.planMatchesRequest(plan, request);
-    if (!check.ok) {
-      throw new Error('平台返回的计划与请求不一致（' + check.reason + (check.field ? '/' + check.field : '') + '），已拒绝启动');
+    let plan;
+    if (input?.replyPlan?.status === 'issued' && input.replyPlan.planId && input.replyPlan.params) {
+      plan = { planId: input.replyPlan.planId, workflowId: input.replyPlan.workflowId, version: input.replyPlan.version, params: input.replyPlan.params };
+      if (plan.workflowId !== request.workflowId || String(plan.version) !== String(request.version)) throw new Error('授权中心话术计划与请求流程不一致，已拒绝启动');
+    } else if (['comment.batch', 'comment.reply_then_private', 'live.batch', 'live.reply_then_private'].includes(request.workflowId)) {
+      const knowledgeSetId = typeof request.params.knowledgeSetId === 'string' ? request.params.knowledgeSetId.trim() : '';
+      if (!knowledgeSetId) throw new Error('评论和直播回复流程必须先选择租户话术库');
+      const replyPlan = await prepareReplyPlan({ workflowId: request.workflowId, version: request.version, params: request.params, knowledgeSetId, query: request.params.keywords.join('、') });
+      if (replyPlan?.status !== 'issued' || !replyPlan.planId || !replyPlan.params) throw new Error(replyPlan?.status === 'UNKNOWN' ? '话术生成结果未知，请先查询原幂等请求' : '授权中心未签发冻结话术计划');
+      plan = { planId: replyPlan.planId, workflowId: replyPlan.workflowId, version: replyPlan.version, params: replyPlan.params };
+    } else {
+      plan = await accountContext.runtime.planFromIntent(intent, context);
+      const check = workflowRequest.planMatchesRequest(plan, request);
+      if (!check.ok) throw new Error('平台返回的计划与请求不一致（' + check.reason + (check.field ? '/' + check.field : '') + '），已拒绝启动');
     }
     return startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId });
   }, { idempotencyKey: requestKey, metadata: { workflowId: request.workflowId, platformAccountId: requestedPlatform } });
@@ -524,12 +692,23 @@ async function runExplicitWorkflow(input) {
 
 function registerIpc() {
   const wrap = (handler) => async (event, payload) => { assertLocalSender(event); return handler(event, payload); };
+  const authorizedApiCall = async (operation) => {
+    if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+    const requestEpoch = sessionEpoch;
+    const requestApi = api;
+    const requestToken = authStore.getToken();
+    if (!requestApi || !requestToken) throw new Error('请先登录并通过授权检查');
+    const result = await operation(requestApi, requestToken);
+    if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，结果未应用');
+    return result;
+  };
   ipcMain.handle('agent:get-state', wrap(() => ({ ...engine.snapshot(), browser: browserState, workflow: workflowRuntime?.snapshot() || { accountId: runtimeAccountId(currentAccountUserId, currentPlatformAccountId), runs: [] }, workflowAccounts: [...workflowAccountRuns.values()], platformAccounts, platformAccountId: currentPlatformAccountId })));
   ipcMain.handle('agent:list-workflows', wrap(() => workflowRuntime.listWorkflows()));
   ipcMain.handle('platform-accounts:list', wrap(() => listPlatformAccounts()));
   ipcMain.handle('platform-accounts:select', wrap((_event, platformId) => switchPlatformAccount(platformId)));
   ipcMain.handle('platform-accounts:create', wrap((_event, input) => createPlatformAccount(input)));
   ipcMain.handle('agent:chat', wrap((_event, input) => runAgentChat(input)));
+  ipcMain.handle('agent:prepare-reply-plan', wrap((_event, input) => prepareReplyPlan(input)));
   ipcMain.handle('agent:start-workflow', wrap((_event, input) => runExplicitWorkflow(input)));
   ipcMain.handle('agent:resume-workflow', wrap(async (_event, input) => {
     const runId = typeof input === 'string' ? input : input?.runId;
@@ -546,6 +725,16 @@ function registerIpc() {
       } catch (error) {
         throw new Error(`当前选中的平台账号没有该流程，已拒绝恢复：${error.message}`);
       }
+      if (!local.remoteRunId) {
+        // A timeout after the server committed the idempotent create can leave
+        // the local checkpoint without the remote id. Reconcile by the
+        // server-issued plan id; never execute an unbound local run.
+        const remoteRows = await api.workflowRuns();
+        const candidate = (Array.isArray(remoteRows?.runs) ? remoteRows.runs : []).find((item) => item.planId === local.plan?.planId && item.platformAccountId === requestedPlatform && !['COMPLETED', 'FAILED', 'STOPPED'].includes(item.status));
+        if (!candidate?.id) throw new Error('该流程缺少授权端运行实例，已拒绝恢复；请重新创建任务');
+        runtime.attachRemoteRun(local.runId, candidate.id);
+        local = runtime.getRun(normalizedRunId);
+      }
       let remoteVersion = null;
       let leaseHeld = false;
       try {
@@ -560,15 +749,21 @@ function registerIpc() {
         }
         const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true });
         workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
+        const sendWorkflow = local.steps.some((step) => step && step.sideEffect === true);
+        const sendEvidenceMissing = result.status === 'COMPLETED' && sendWorkflow;
+        const reportedStatus = sendEvidenceMissing ? 'WAITING_HUMAN' : result.status;
+        const reportedCheckpoint = sendEvidenceMissing
+          ? { ...(result.checkpoint || {}), phase: 'send', reason: 'server_send_evidence_required' }
+          : (result.checkpoint || {});
         if (local.remoteRunId && remoteVersion != null) {
           await api.renewWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${local.remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {}, humanWait: result.status === 'WAITING_HUMAN' ? { reason: result.lastError?.message || '平台适配器需要人工处理', context: result.checkpoint || {} } : undefined });
+          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
           remoteVersion = Number.isSafeInteger(checkpoint?.run?.checkpointVersion) ? checkpoint.run.checkpointVersion : remoteVersion + 1;
         }
-        const nextDecision = await requestResultDecision(local.remoteRunId, result);
+        const nextDecision = sendEvidenceMissing ? { decision: 'wait_human', reason: 'server_send_evidence_required' } : await requestResultDecision(local.remoteRunId, result);
         let decisionApplied = null;
-        if (nextDecision?.decision === 'wait_human' && ['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'PAUSED'].includes(result.status)) {
-          decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: 'server_result_decision', checkpoint: result.checkpoint || null });
+        if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'PAUSED'].includes(result.status))) {
+          decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
         } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
           decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
         } else if (nextDecision?.decision) {
@@ -584,6 +779,35 @@ function registerIpc() {
         }
       }
     }, { taskId: `resume:${normalizedRunId}`, metadata: { platformAccountId: requestedPlatform } });
+  }));
+  ipcMain.handle('agent:manual-complete-workflow', wrap(async (_event, input) => {
+    if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+    const runId = text(typeof input === 'string' ? input : input?.runId, 'run id', 160);
+    const note = typeof input === 'object' && typeof input?.note === 'string' ? input.note.slice(0, 500) : '';
+    const requestedPlatform = typeof input === 'object' && input?.platformAccountId ? normalizePlatformAccountId(input.platformAccountId) : currentPlatformAccountId;
+    if (!runId || !requestedPlatform || !currentAccountUserId || !platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('人工确认缺少有效的账号或流程');
+    const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
+    const deviceId = authStore.getDevice().id;
+    return workflowManager.run(accountId, async ({ context: accountContext }) => {
+      const runtime = accountContext.runtime; const local = runtime.getRun(runId);
+      if (!local.remoteRunId) throw new Error('该流程尚未绑定授权端运行实例，无法人工确认');
+      let leaseHeld = false;
+      try {
+        await api.acquireWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:manual-complete:${local.remoteRunId}:${deviceId}`) });
+        leaseHeld = true;
+        const response = await api.manualCompleteWorkflow(local.remoteRunId, { note, idempotencyKey: safeIdempotencyKey(typeof input === 'object' && input?.idempotencyKey ? input.idempotencyKey : `manual-complete:${local.remoteRunId}`) });
+        const proofId = text(response?.proofId, 'manual proof id', 180);
+        if (!proofId) throw new Error('授权端未返回人工确认凭证');
+        const result = runtime.manualComplete(runId, proofId);
+        workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
+        emitState();
+        return result;
+      } finally {
+        if (leaseHeld) {
+          try { await api.releaseWorkflowLease(local.remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release-manual-complete:${local.remoteRunId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] manual completion lease release failed', error.message); }
+        }
+      }
+    }, { taskId: `manual-complete:${runId}`, metadata: { platformAccountId: requestedPlatform } });
   }));
   ipcMain.handle('agent:pause-workflow', wrap(async (_event, runId) => {
     const accountId = registerWorkflowAccount(currentAccountUserId, currentPlatformAccountId);
@@ -604,9 +828,14 @@ function registerIpc() {
   ipcMain.handle('reply:retry-draft', wrap((_event, eventKey) => engine.retryDraft(text(eventKey, 'event key', 240))));
   ipcMain.handle('credits:redeem', wrap(handleRedeem));
   ipcMain.handle('credits:ledger', wrap(async () => { if (!authStore.getToken()) throw new Error('请先登录'); const requestEpoch = sessionEpoch; const requestApi = api; const requestToken = authStore.getToken(); const result = await requestApi.ledger(requestToken); if (requestEpoch !== sessionEpoch || requestApi !== api || authStore.getToken() !== requestToken) throw new Error('授权会话已切换，台账未应用'); return Array.isArray(result) ? result : result.entries || result.ledger || result.items || []; }));
+  ipcMain.handle('knowledge:list-sets', wrap(() => authorizedApiCall((requestApi, token) => requestApi.knowledgeSets(token))));
+  ipcMain.handle('knowledge:create-set', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.createKnowledgeSet({ name: text(input?.name, 'knowledge set name', 100), description: typeof input?.description === 'string' ? input.description : '' }, token))));
+  ipcMain.handle('knowledge:list-documents', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.knowledgeDocuments(text(input?.knowledgeSetId, 'knowledge set id', 100), token))));
+  ipcMain.handle('knowledge:add-document', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.addKnowledgeDocument({ knowledgeSetId: text(input?.knowledgeSetId, 'knowledge set id', 100), title: text(input?.title, 'document title', 300), content: text(input?.content, 'document content', 200000), metadata: input?.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata) ? input.metadata : {} }, token))));
+  ipcMain.handle('knowledge:retrieve', wrap((_event, input) => authorizedApiCall((requestApi, token) => requestApi.retrieveKnowledge({ knowledgeSetId: text(input?.knowledgeSetId, 'knowledge set id', 100), query: text(input?.query, 'knowledge query', 4000), topK: Number(input?.topK || 5) }, token))));
   ipcMain.handle('browser:open', wrap(async (_event, url) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const requested = targetUrl(url); engine.pauseAll('browser_navigation'); const finalUrl = await requestBrowser.open(requested); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，页面结果已丢弃'); if (finalUrl && finalUrl !== requested) dataStore.update((data) => ({ ...data, tasks: data.tasks.map((task) => task.url === requested ? { ...task, url: finalUrl, updatedAt: new Date().toISOString() } : task) })); return browserState; }));
-  ipcMain.handle('browser:search', wrap(async (_event, input) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const result = await requestBrowser.search({ keyword: text(input?.keyword, 'keyword', 200), maxVideos: Number(input?.maxVideos || 20), scrollRounds: Number(input?.scrollRounds || 2), cursor: input?.cursor || undefined, minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索结果已丢弃'); return result; }));
-  ipcMain.handle('browser:search-pool', wrap(async (_event, input) => { if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查'); const requestEpoch = sessionEpoch; const requestBrowser = browser; if (typeof requestBrowser.searchPool !== 'function') throw new Error('当前侧车未提供搜索池'); const result = await requestBrowser.searchPool({ keyword: input?.keyword ? text(input.keyword, 'keyword', 200) : undefined, limit: Number(input?.limit || 200), minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索池结果已丢弃'); return result; }));
+  ipcMain.handle('browser:search', wrap(async (_event, input) => { const license = engine.publicLicense(); if (license.state !== 'authorized') throw new Error('请先登录并通过授权检查'); if (license.features?.videoSearch !== true) throw new Error('当前授权未开通找视频功能'); const requestEpoch = sessionEpoch; const requestBrowser = browser; const result = await requestBrowser.search({ keyword: text(input?.keyword, 'keyword', 200), maxVideos: Number(input?.maxVideos || 20), scrollRounds: Number(input?.scrollRounds || 2), cursor: input?.cursor || undefined, minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索结果已丢弃'); return result; }));
+  ipcMain.handle('browser:search-pool', wrap(async (_event, input) => { const license = engine.publicLicense(); if (license.state !== 'authorized') throw new Error('请先登录并通过授权检查'); if (license.features?.videoSearch !== true) throw new Error('当前授权未开通找视频功能'); const requestEpoch = sessionEpoch; const requestBrowser = browser; if (typeof requestBrowser.searchPool !== 'function') throw new Error('当前侧车未提供搜索池'); const result = await requestBrowser.searchPool({ keyword: input?.keyword ? text(input.keyword, 'keyword', 200) : undefined, limit: Number(input?.limit || 200), minRelevance: Number(input?.minRelevance || 0) }); if (requestEpoch !== sessionEpoch || requestBrowser !== browser) throw new Error('授权会话已切换，搜索池结果已丢弃'); return result; }));
   ipcMain.handle('browser:close', wrap(() => browser.close()));
   ipcMain.handle('selectors:probe', wrap(async (_event, profile) => {
     const normalized = normalizeProfile(profile || currentProfile());
@@ -665,9 +894,18 @@ async function boot() {
       const platformAccount = options?.platformAccountId;
       if (!userId || !platformAccount || accountId !== runtimeAccountId(userId, platformAccount)) throw new Error('工作流账号上下文范围无效');
       const store = new JsonStore(accountDataPath(userId, platformAccount), defaultData);
-      const accountBrowser = createBrowserInstance(userId, platformAccount);
-      const runtime = createWorkflowRuntimeForStore(store, userId, platformAccount, accountBrowser);
-      return { accountId, store, runtime, close: () => accountBrowser.close() };
+      let runtime;
+      const accountBrowser = createBrowserInstance(userId, platformAccount, {
+        onStatus: (status) => pauseWorkflowForBrowserStatus(accountId, runtime, status)
+      });
+      runtime = createWorkflowRuntimeForStore(store, userId, platformAccount, accountBrowser);
+      return {
+        accountId,
+        store,
+        runtime,
+        invalidate: (reason) => { runtime.invalidate(reason); accountBrowser.stop?.(); },
+        close: () => accountBrowser.close()
+      };
     }
   });
   // Read the encrypted token before clearing the cached display license. This

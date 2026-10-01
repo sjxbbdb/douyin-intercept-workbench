@@ -75,13 +75,16 @@ sidecar 按事件顺序输出 JSONL，每行一个对象，且都带同一个 `i
 ## 能力和发行开关
 
 `capabilities` 的 `result.capability` 每项都必须有 `implemented`、`autoEligible`、`validation`。
+代码中对内部 web 响应的 `NetworkRecorder` 只保留诊断用途，必须显式设置
+`DOUYIN_DIAGNOSTIC_NETWORK_CAPTURE=1` 才会启用；发行包默认关闭，不依赖逆向 endpoint、签名参数或抓包回放。
+正式能力只能来自可见 DOM 或已核验的官方开放 API；来源不明时保持 `autoEligible: false` 并转人工。
 下面是**当前实现**的取值（完整清单以 `capabilities` 的实际返回为准；本文件与方法表、能力取值
 由 `probe/tests/test_protocol_doc_contract.py` 一起对着代码校验，改代码不改文档会失败）：
 
 ```json
 {
   "result": {"capability": {
-    "video_capture": {"implemented": true, "autoEligible": true, "validation": {"status": "api_or_visible_dom", "delivery": "capture_only"}},
+    "video_capture": {"implemented": true, "autoEligible": true, "validation": {"status": "visible_dom_or_explicit_diagnostic_capture", "delivery": "capture_only", "releaseDefault": "dom_only"}},
     "comment_filter": {"implemented": true, "autoEligible": true, "validation": {"status": "offline_fixture", "delivery": "filter_only"}},
     "video_pool": {"implemented": true, "autoEligible": true, "validation": {"status": "offline_unit_tests", "delivery": "durable_candidate_pool"}},
     "video_search_paging": {"implemented": true, "autoEligible": true, "validation": {"status": "offline_unit_tests", "delivery": "paging_only"}},

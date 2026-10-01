@@ -11,8 +11,9 @@ const { TaskEngine } = require('../src/lib/task-engine');
 const { WorkflowRuntime, RUN_STATES } = require('../src/lib/workflow-runtime');
 const { createWorkflowAdapter } = require('../src/lib/workflow-adapter');
 const { platformWorkflowDefinitions } = require('../src/lib/workflow-contracts');
+const { workflowContractHash } = require('../src/lib/workflow-contracts');
 const { AuthStore } = require('../src/lib/auth-store');
-const { platformScope, accountDataPath, browserPartition, sidecarPort } = require('../src/lib/platform-account');
+const { platformScope, accountDataPath, browserPartition, sidecarPort, allocateSidecarPorts } = require('../src/lib/platform-account');
 const { AccountRuntimeManager } = require('../src/lib/account-runtime-manager');
 
 let passed = 0;
@@ -111,6 +112,18 @@ test('JsonStore rejects a directory containing only damaged versions', () => { c
 test('JsonStore EXDEV fallback is revision based and reopens latest data', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated EFS rename'); error.code = 'EXDEV'; throw error; }; const store = new JsonStore(file, { state: 'initial' }); store.set({ state: 'one' }); store.set({ state: 'two' }); const reopened = new JsonStore(file, {}); assert.equal(reopened.get().state, 'two'); assert.equal(reopened.revision, 2); } finally { fs.renameSync = originalRename; } });
 test('JsonStore does not commit memory when disk write fails', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const file = path.join(dir, 'data.json'); const store = new JsonStore(file, { state: 'initial' }); const originalRename = fs.renameSync; try { fs.renameSync = () => { const error = new Error('simulated disk full'); error.code = 'ENOSPC'; throw error; }; assert.throws(() => store.set({ state: 'failed' }), /disk full/); assert.equal(store.get().state, 'initial'); assert.equal(store.revision, 0); } finally { fs.renameSync = originalRename; } });
 test('restarts pause persisted running tasks without an active collector', () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-')); const store = new JsonStore(path.join(dir, 'data.json'), () => ({ tasks: [{ id: 'task-running', status: 'running', generation: 2 }], events: [], leads: [], logs: [], pending: [], selectorProfile: {} })); const authStore = { getLicense: () => null, setLicense: () => {} }; new TaskEngine({ store, api: {}, authStore, browser: { close: () => {} }, selectorProfile: {}, onStateChange: () => {} }); const recovered = store.get(); assert.equal(recovered.tasks[0].status, 'paused'); assert.equal(recovered.tasks[0].generation, 3); assert.equal(recovered.logs.at(-1).detail.reason, 'desktop_restarted_without_active_collector'); });
+test('workflow runtime recovers persisted running steps without blindly resending side effects', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-recovery-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [
+    { runId: 'paused-run', accountId: 'account-a', workflowId: 'recovery.fixture', version: '1', plan: { workflowId: 'recovery.fixture', version: '1', params: {} }, status: RUN_STATES.RUNNING, currentStep: 0, steps: [{ stepId: 'collect', sideEffect: false, status: 'running' }], checkpoint: null, lastError: null },
+    { runId: 'unknown-run', accountId: 'account-a', workflowId: 'recovery.fixture', version: '1', plan: { workflowId: 'recovery.fixture', version: '1', params: {} }, status: RUN_STATES.RUNNING, currentStep: 0, steps: [{ stepId: 'send', sideEffect: true, status: 'running' }], checkpoint: null, lastError: null }
+  ] });
+  const runtime = new WorkflowRuntime({ store, accountId: 'account-a', workflows: [{ workflowId: 'recovery.fixture', version: '1', steps: [{ stepId: 'collect', sideEffect: false }, { stepId: 'send', sideEffect: true }] }] });
+  assert.equal(runtime.getRun('paused-run').status, RUN_STATES.PAUSED);
+  assert.equal(runtime.getRun('paused-run').lastError.code, 'DESKTOP_RESTARTED_WITH_RUNNING_WORKFLOW');
+  assert.equal(runtime.getRun('unknown-run').status, RUN_STATES.UNKNOWN);
+  assert.equal(runtime.getRun('unknown-run').lastError.code, 'DESKTOP_RESTARTED_DURING_SIDE_EFFECT');
+});
 
 test('platform account selection is persisted per workbench user and derives isolated runtime/browser scopes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-platform-'));
@@ -127,6 +140,17 @@ test('platform account selection is persisted per workbench user and derives iso
   assert.notEqual(accountDataPath(dir, 'https://license.example', 'workbench-a', 'platform-a'), accountDataPath(dir, 'https://license.example', 'workbench-a', 'platform-b'));
   assert.notEqual(browserPartition('https://license.example', 'workbench-a', 'platform-a'), browserPartition('https://license.example', 'workbench-a', 'platform-b'));
   assert.notEqual(sidecarPort('https://license.example', 'workbench-a', 'platform-a'), sidecarPort('https://license.example', 'workbench-a', 'platform-b'));
+});
+
+test('sidecar port allocation resolves same-user hash collisions deterministically', () => {
+  const accounts = ['acct-104', 'acct-69', 'acct-104'];
+  assert.equal(sidecarPort('https://license.example', 'workbench-a', 'acct-69'), sidecarPort('https://license.example', 'workbench-a', 'acct-104'));
+  const first = allocateSidecarPorts('https://license.example', 'workbench-a', accounts);
+  const second = allocateSidecarPorts('https://license.example', 'workbench-a', [...accounts].reverse());
+  assert.equal(first.get('acct-69') === first.get('acct-104'), false);
+  assert.deepEqual([...first.entries()], [...second.entries()]);
+  assert.equal(sidecarPort('https://license.example', 'workbench-a', 'acct-69', accounts), first.get('acct-69'));
+  assert.equal(sidecarPort('https://license.example', 'workbench-a', 'acct-104', accounts), first.get('acct-104'));
 });
 
 testAsync('workflow runtime isolates two platform accounts under one workbench user', async () => {
@@ -433,6 +457,16 @@ testAsync('workflow wait_human pauses at a checkpoint and resume never asks the 
   assert.equal(stepCalls, 2);
 });
 
+testAsync('manual completion closes a waiting send without invoking the model', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-manual-complete-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] }); let modelCalls = 0;
+  const runtime = new WorkflowRuntime({ store, accountId: 'manual-account', modelDecider: async () => { modelCalls += 1; return { workflowId: 'manual.fixture', version: '1', params: {} }; }, workflows: [{ workflowId: 'manual.fixture', version: '1', steps: [{ stepId: 'send', sideEffect: true }] }], stepExecutor: async () => ({ status: 'wait_human', checkpoint: { phase: 'send', reason: 'evidence_missing' } }) });
+  const run = runtime.startPlan(await runtime.planFromIntent('需要人工确认发送结果')); const waiting = await runtime.run(run.runId);
+  assert.equal(waiting.status, RUN_STATES.WAITING_HUMAN);
+  const completed = runtime.manualComplete(run.runId, 'manual_proof_fixture');
+  assert.equal(completed.status, RUN_STATES.COMPLETED); assert.equal(completed.checkpoint.status, 'manual_confirmed'); assert.equal(completed.resultDecision.decision, 'manual_complete'); assert.equal(modelCalls, 1);
+});
+
 testAsync('workflow runtime fails closed when no fixed executor is supplied', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
@@ -651,7 +685,7 @@ testAsync('live batch workflow drives the five live_* methods and unifies the le
   const adapter = createWorkflowAdapter({ browser });
   const run = { runId: 'live-batch-1', workflowId: 'live.batch' };
   // 话术由平台侧下发：没有话术时 plan 必须拒绝（fail-closed），这里给出话术才能冻结批次。
-  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['价格'], excludeKeywords: ['广告'], matchMode: 'seg', windowSeconds: 600, maxItems: 5, maxSends: 2, replyMode: 'danmaku', replyVia: 'native', publicReply: '谢谢支持', privateReply: '你好呀' } };
+  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['价格'], excludeKeywords: ['广告'], matchMode: 'seg', windowSeconds: 600, maxItems: 5, maxSends: 2, replyMode: 'danmaku', replyVia: 'native', publicReply: '谢谢支持', privateReply: '你好呀', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } } };
 
   const listen = await adapter.execute({ run, plan, step: { stepId: 'listen' } });
   assert.equal(listen.status, 'completed');
@@ -714,7 +748,7 @@ testAsync('live batch private step binds each confirmed public send and records 
   };
   const adapter = createWorkflowAdapter({ browser });
   const run = { runId: 'live-batch-2', workflowId: 'live.batch' };
-  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['多少钱'], publicReply: '谢谢支持', privateReply: '你好呀', maxSends: 2 } };
+  const plan = { params: { url: 'https://live.douyin.com/1', keywords: ['多少钱'], publicReply: '谢谢支持', privateReply: '你好呀', maxSends: 2, policyRef: { policyId: 'workflow-policy', policyVersion: 1 } } };
   await adapter.execute({ run, plan, step: { stepId: 'listen' } });
   await adapter.execute({ run, plan, step: { stepId: 'plan' } });
 
@@ -741,6 +775,7 @@ testAsync('comment batch connects search-pool videoId to public reply and bound 
     { eventId: 'c2', authorId: 'u2', authorName: '客户乙', roomId: 'https://www.douyin.com/video/1', text: '多少钱', publicText: '可以给您介绍方案', privateText: '方便私信沟通吗' }
   ];
   const browser = {
+    commentCollect: async (params) => { calls.push({ type: 'collect', params }); return { status: 'ok', events: [{ id: 'c1', text: '价格怎么问' }, { id: 'c2', text: '多少钱' }] }; },
     commentPlan: async (params) => { calls.push({ type: 'plan', params }); return { status: 'ok', batch: { batchId: 'comment-batch-1' }, targets, blocked: [], filter: { matched: 2 } }; },
     commentReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
     commentPrivate: async (params) => { calls.push({ type: 'private', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
@@ -748,17 +783,19 @@ testAsync('comment batch connects search-pool videoId to public reply and bound 
   };
   const adapter = createWorkflowAdapter({ browser });
   const run = { runId: 'comment-batch-1', workflowId: 'comment.batch' };
-  const plan = { params: { videoId: 'video-1', keywords: ['价格'], excludeKeywords: ['投诉'], maxSends: 2, publicText: '可以给您介绍方案', privateText: '方便私信沟通吗' } };
+  const plan = { params: { videoId: 'video-1', keywords: ['价格'], excludeKeywords: ['投诉'], maxSends: 2, publicText: '可以给您介绍方案', privateText: '方便私信沟通吗', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } } };
+  const collected = await adapter.execute({ run, plan, step: { stepId: 'collect' } });
+  assert.equal(collected.status, 'completed');
   const planned = await adapter.execute({ run, plan, step: { stepId: 'plan' } });
   assert.equal(planned.status, 'completed');
-  assert.equal(calls[0].params.videoId, 'video-1');
-  assert.deepEqual(calls[0].params.commentKeywords, ['价格']);
+  assert.equal(calls[1].params.videoId, 'video-1');
+  assert.deepEqual(calls[1].params.commentKeywords, ['价格']);
   const publicReply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'comment-act-1' } });
   assert.equal(publicReply.status, 'completed');
   const privateReply = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'comment-act-1' } });
   assert.equal(privateReply.status, 'completed');
-  assert.deepEqual(calls[2].params.items.map((item) => item.publicSendId), ['comment-act-1~public~c1', 'comment-act-1~public~c2']);
-  assert.deepEqual(calls[2].params.items.map((item) => item.sendId), ['comment-act-1~private~c1', 'comment-act-1~private~c2']);
+  assert.deepEqual(calls[3].params.items.map((item) => item.publicSendId), ['comment-act-1~public~c1', 'comment-act-1~public~c2']);
+  assert.deepEqual(calls[3].params.items.map((item) => item.sendId), ['comment-act-1~private~c1', 'comment-act-1~private~c2']);
   const report = await adapter.execute({ run, plan, step: { stepId: 'report' } });
   assert.equal(report.result.ledger[0].private.status, 'sent_confirmed');
   assert.equal(report.checkpoint.platformCheckpoint.version, 4);
@@ -766,15 +803,18 @@ testAsync('comment batch connects search-pool videoId to public reply and bound 
 
 testAsync('comment batch never invokes private sidecar when public delivery is unknown', async () => {
   let privateCalls = 0;
-  const targets = [{ eventId: 'c1', authorId: 'u1', roomId: 'https://www.douyin.com/video/1', text: '价格', publicText: '已收到', privateText: '请私信' }];
+  const targets = [{ eventId: 'c1', authorId: 'u1', roomId: 'https://www.douyin.com/video/1', text: '价格', publicText: '已收到', privateText: '请私信', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } }];
   const browser = {
+    commentCollect: async () => ({ status: 'ok', events: [{ id: 'c1', text: '价格' }] }),
     commentPlan: async () => ({ status: 'ok', batch: { batchId: 'comment-batch-unknown' }, targets, blocked: [] }),
     commentReply: async (params) => ({ status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable' })) }),
     commentPrivate: async () => { privateCalls += 1; return { status: 'ok', results: [] }; }
   };
   const adapter = createWorkflowAdapter({ browser });
   const run = { runId: 'comment-batch-unknown', workflowId: 'comment.batch' };
-  const plan = { params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicText: '已收到', privateText: '请私信' } };
+  const plan = { params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicText: '已收到', privateText: '请私信', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } } };
+  const collected = await adapter.execute({ run, plan, step: { stepId: 'collect' } });
+  assert.equal(collected.status, 'completed');
   await adapter.execute({ run, plan, step: { stepId: 'plan' } });
   const publicReply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'comment-act-unknown' } });
   assert.equal(publicReply.status, 'unknown');
@@ -785,7 +825,7 @@ testAsync('comment batch never invokes private sidecar when public delivery is u
 
 testAsync('structured workflow requests are validated and the issued plan is verified', async () => {
   const { requestForWorkflow, buildWorkflowIntent, buildWorkflowContext, planMatchesRequest } = require('../src/lib/workflow-request');
-  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
+  const request = { workflowId: 'live.batch', params: { url: 'https://live.douyin.com/1', keywords: ['价格', '多少钱'], publicReply: '欢迎咨询', privateReply: '您好，已私信您', windowSeconds: 600, maxSends: 3, replyVia: 'native' } };
   const spec = requestForWorkflow(request);
   assert.equal(spec.workflowId, 'live.batch');
   assert.equal(spec.version, '1');
@@ -800,11 +840,11 @@ testAsync('structured workflow requests are validated and the issued plan is ver
   assert.match(intent, /价格/);
   assert.match(intent, /原生「回复 TA」/);
   assert.equal(buildWorkflowContext(request).requestedBy, 'task_panel');
-  const commentRequest = { workflowId: 'comment.batch', params: { videoId: 'video-1', commentKeywords: ['价格'] } };
+  const commentRequest = { workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicReply: '欢迎咨询', privateReply: '您好，已私信您' } };
   assert.equal(requestForWorkflow(commentRequest).workflowId, 'comment.batch');
-  assert.match(buildWorkflowIntent(commentRequest), /video-1/);
-  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { videoId: 'video-1' } }), /missing commentKeywords/);
-  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { commentKeywords: ['价格'] } }), /missing url or videoId/);
+  assert.match(buildWorkflowIntent(commentRequest), /video\/1/);
+  assert.equal(requestForWorkflow({ workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'] } }).params.publicReply, undefined);
+  assert.throws(() => requestForWorkflow({ workflowId: 'comment.batch', params: { url: 'https://www.douyin.com/video/1' } }), /missing keywords/);
 
   // 平台签发的计划必须与结构化请求逐项一致，否则拒绝启动
   const good = { planId: 'plan_1', workflowId: 'live.batch', version: '1', params: { ...spec.params, policy: 'server_issued' } };
@@ -815,6 +855,14 @@ testAsync('structured workflow requests are validated and the issued plan is ver
   assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, keywords: ['价格'] } }, request).reason, 'param_mismatch');
   assert.equal(planMatchesRequest({ ...good, params: { ...spec.params, url: 'https://live.douyin.com/2' } }, request).field, 'url');
   assert.equal(planMatchesRequest(null, request).reason, 'plan_missing');
+});
+
+test('workflow contract fingerprint changes when the server contract changes', () => {
+  const definition = platformWorkflowDefinitions().find((item) => item.workflowId === 'comment.batch');
+  assert.ok(definition);
+  const base = workflowContractHash({ ...definition, creditPrice: 2 });
+  assert.match(base, /^[a-f0-9]{64}$/);
+  assert.notEqual(base, workflowContractHash({ ...definition, creditPrice: 2, steps: [...definition.steps, { stepId: 'unexpected', sideEffect: false }] }));
 });
 
 Promise.all(pendingTests).then(() => console.log(`\n${passed} desktop tests passed`)).catch(() => { process.exitCode = 1; });

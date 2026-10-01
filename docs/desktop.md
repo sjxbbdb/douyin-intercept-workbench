@@ -53,7 +53,10 @@ desktop/
 | GET | `/v1/credits/ledger` | 无 | 积分台账 |
 | POST | `/v1/credits/redeem` | `{ code, idempotencyKey }` | 兑换卡密，必须幂等 |
 | POST | `/v1/agent/evaluate` | `{ event, rule, idempotencyKey }` | 规则筛选与模板回复，服务端重验规则并按 `features.prices.evaluateReplyPrice` 扣积分，响应 `{ matched, intent, confidence, reason, reply, charged, balance, eventId, actionId? }` |
-| POST | `/v1/agent/draft` | `{ event, businessContext, targetCustomer, replyInstructions, idempotencyKey }` | AI 意向判断和回复草稿，只有账号开通 `features.draft` 才可调用，按 `features.prices.draftPrice` 扣积分 |
+| POST | `/v1/agent/draft` | `{ event, businessContext, targetCustomer, replyInstructions, idempotencyKey }` | AI 意向判断和回复草稿，只有账号开通 `features.draft` 才可调用，按 `features.prices.draftPrice` 扣积分；provider 未知时保留原幂等操作 |
+| GET | `/v1/agent/draft/:idempotencyKey` | 无 | 查询草稿操作的 `completed/unknown`，未知状态不得换 key 自动重试 |
+| POST | `/v1/platform-accounts` | `{ platform, accountRef, displayName }` | 登记当前工作台自己的平台账号标识 |
+| PATCH | `/v1/platform-accounts/:id` | `{ displayName?, status? }` | 更新名称或停用/启用账号；停用会阻断绑定流程的继续写入 |
 
 `event.observedAt` 在发送给授权中心前统一为毫秒整数；桌面端把完整请求方法和原始 payload 与事件一起持久化，恢复生成始终复用该方法和幂等键，不随后来修改的任务模式改路由。
 
@@ -78,8 +81,16 @@ window.agentApi = {
   listLeads(), listLogs(), getLedger(), redeem(code),
   openTarget(url), closeTarget(), probeSelectors(profile), saveSelectors(profile),
   searchTargets({ keyword, maxVideos, scrollRounds })
+  listWorkflows(), startWorkflow(request), chat({ message, context }),
+  resumeWorkflow({ runId, platformAccountId }), pauseWorkflow(runId),
+  prepareReplyPlan({ workflowId, version, params, knowledgeSetId, query, targets }),
+  knowledgeListSets(), knowledgeCreateSet({ name, description }),
+  knowledgeListDocuments(knowledgeSetId), knowledgeAddDocument(document),
+  knowledgeRetrieve({ knowledgeSetId, query, topK })
 }
 ```
+
+知识库 IPC 由主进程代持授权 token；renderer 只接收知识集、文档摘要和检索结果。进入评论区或直播间页面后启动的是服务端登记的固定批次流程：评论批次按“采集 → 冻结计划 → 公屏逐条确认 → 仅对确认成功目标私信 → 报告”执行，直播批次使用同样的公屏确认门禁。评论和直播流程必须选择租户话术库，不能输入手写公屏/私信模板绕过知识计划；`prepareReplyPlan` 先让授权端完成租户隔离的向量检索和双渠道话术冻结，服务端再验证 `knowledgeSetId`、版本、策略引用和 `replyPlan`。只有 `status: "issued"` 的服务端计划可以启动运行。模型不参与步骤执行，`UNKNOWN` 或 `WAITING_HUMAN` 会停在原检查点。
 
 主进程对每次 IPC 校验 `event.sender` 必须是主窗口的 `webContents.id`，并再次校验 URL、字段长度和任务状态。没有通用 `executeJavaScript` IPC；DOM 脚本只能由 `browser-bridge.js` 使用固定脚本执行。
 

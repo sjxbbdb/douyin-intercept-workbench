@@ -34,6 +34,12 @@ from urllib.parse import quote
 import cdp as cdpmod
 import douyin
 
+# Internal web endpoint bodies are never a production data source. Keeping this
+# diagnostic recorder behind an explicit opt-in prevents an accidental release
+# build from depending on reverse-engineered requests or replaying captured traffic.
+def diagnostic_network_capture_enabled():
+    return os.environ.get("DOUYIN_DIAGNOSTIC_NETWORK_CAPTURE") == "1"
+
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 
 
@@ -468,6 +474,8 @@ def parse_search_item(item):
 
 
 def _absorb_search_api(rec, videos, stats):
+    if rec is None:
+        return 0
     """把已到达的搜索接口响应体吃进 videos（按 aweme_id 去重）。返回新增条数。"""
     added = 0
     for r in rec.collect(wait_seconds=2.0, drain=True):
@@ -549,7 +557,8 @@ def search_videos(page, keyword, scroll_rounds=12, max_videos=200, log=print,
     info.setdefault("stopped_reason", None)
 
     cdpmod.ensure_domains(page, "Network")
-    rec = cdpmod.NetworkRecorder(page, lambda u: SEARCH_API_MARK in (u or ""))
+    rec = cdpmod.NetworkRecorder(page, lambda u: SEARCH_API_MARK in (u or "")) if diagnostic_network_capture_enabled() else None
+    info["network_capture"] = rec is not None
 
     info["navigated"] = bool(navigate)
     if navigate:
@@ -716,6 +725,8 @@ def _comment_key(row):
 
 
 def _absorb_comments(rec, comments, aweme_id, video_title, stats):
+    if rec is None:
+        return 0
     """把已到达的评论接口响应体吃进 comments。返回新增条数。"""
     added = 0
     for r in rec.collect(wait_seconds=2.0, drain=True):
@@ -874,7 +885,8 @@ def crawl_video_comments(page, video, log=print, scroll_rounds=7, settle=3.0, wa
 
     cdpmod.ensure_domains(page, "Network")
     rec = cdpmod.NetworkRecorder(
-        page, lambda u: COMMENT_API_MARK in (u or "") and ("aweme_id=%s" % aweme_id) in (u or ""))
+        page, lambda u: COMMENT_API_MARK in (u or "") and ("aweme_id=%s" % aweme_id) in (u or "")) if diagnostic_network_capture_enabled() else None
+    stats["network_capture"] = rec is not None
 
     # Callers that already performed a controlled navigation (the sidecar's
     # persistent owned tab) can opt out to avoid a reload and losing the

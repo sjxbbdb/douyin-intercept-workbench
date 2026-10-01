@@ -10,7 +10,15 @@ const MAX_LINE = 1024 * 1024;
 function requireText(value, name, max = 2000) { if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS'); return value.trim(); }
 function requireUrl(value) { const url = new URL(requireText(value, 'url', 2048)); const allowedHosts = new Set(['douyin.com', 'www.douyin.com', 'live.douyin.com', 'v.douyin.com']); if (url.protocol !== 'https:' || !allowedHosts.has(url.hostname) || url.username || url.password) throw new ProbeError('侧车目标 URL 无效或暂不支持该抖音域名', 'SIDECAR_INVALID_PARAMS'); if (url.hostname === 'douyin.com') url.hostname = 'www.douyin.com'; return url.href; }
 function integer(value, name, min, max) { if (!Number.isInteger(value) || value < min || value > max) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS'); return value; }
-function identifier(value, name, max = 240, required = true) { if (!required && (value == null || value === '')) return ''; const text = requireText(value, name, max); if (!/^[a-zA-Z0-9._:-]+$/.test(text)) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS'); return text; }
+function identifier(value, name, max = 240, required = true) { if (!required && (value == null || value === '')) return ''; const text = requireText(value, name, max); if (!/^[a-zA-Z0-9._:~\-]+$/.test(text)) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS'); return text; }
+function policyRef(value, name = 'policyRef') {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS');
+  allowedKeys(value, ['policyId', 'policyVersion', 'knowledgeSetVersion'], name);
+  const result = { policyId: identifier(value.policyId, `${name}.policyId`, 128), policyVersion: integer(value.policyVersion, `${name}.policyVersion`, 1, 1000000000) };
+  if (value.knowledgeSetVersion !== undefined && value.knowledgeSetVersion !== null) result.knowledgeSetVersion = integer(value.knowledgeSetVersion, `${name}.knowledgeSetVersion`, 1, 1000000000);
+  return result;
+}
 function allowedKeys(value, keys, name = 'params') { for (const key of Object.keys(value)) if (!keys.includes(key)) throw new ProbeError(`${name}.${key} 参数不受支持`, 'SIDECAR_INVALID_PARAMS'); }
 function textArray(value, name, maxItems = 100, itemMax = 120) { if (!Array.isArray(value) || value.length > maxItems) throw new ProbeError(`${name} 参数无效`, 'SIDECAR_INVALID_PARAMS'); return value.map((item, index) => requireText(item, `${name}[${index}]`, itemMax)); }
 function batchItems(value, name = 'items') {
@@ -55,7 +63,7 @@ function validateParams(method, params) {
     return result;
   }
   if (method === 'comment_plan') {
-    allowedKeys(params, ['url', 'videoId', 'maxItems', 'windowSeconds', 'scrollRounds', 'collectMaxItems', 'minDigg', 'commentKeywords', 'excludeKeywords', 'matchMode', 'dedupeAuthors', 'publicText', 'privateText', 'policy']);
+    allowedKeys(params, ['url', 'videoId', 'maxItems', 'windowSeconds', 'scrollRounds', 'collectMaxItems', 'minDigg', 'commentKeywords', 'excludeKeywords', 'matchMode', 'dedupeAuthors', 'publicText', 'privateText', 'policy', 'policyRef']);
     const hasUrl = params.url !== undefined && params.url !== null && params.url !== '';
     const hasVideoId = params.videoId !== undefined && params.videoId !== null && params.videoId !== '';
     if (hasUrl === hasVideoId) throw new ProbeError('评论计划必须提供 url 或 videoId 之一', 'SIDECAR_INVALID_PARAMS');
@@ -69,12 +77,14 @@ function validateParams(method, params) {
     result.dedupeAuthors = params.dedupeAuthors === undefined ? true : params.dedupeAuthors;
     result.publicText = requireText(params.publicText, 'publicText', 1000);
     result.privateText = requireText(params.privateText, 'privateText', 1000);
+    result.policyRef = policyRef(params.policyRef);
     return result;
   }
   if (method === 'comment_reply' || method === 'comment_private') {
-    allowedKeys(params, ['batchId', 'items']);
+    allowedKeys(params, ['batchId', 'items', 'policyRef']);
     const result = { batchId: identifier(params.batchId, 'batchId'), items: batchItems(params.items) };
     if (!result.items.length) throw new ProbeError('items 参数无效', 'SIDECAR_INVALID_PARAMS');
+    result.policyRef = policyRef(params.policyRef);
     return result;
   }
   if (method === 'comment_result') { allowedKeys(params, ['batchId']); return { batchId: identifier(params.batchId, 'batchId') }; }
@@ -82,7 +92,7 @@ function validateParams(method, params) {
   if (method === 'send_private' || method === 'send_comment') {
     allowedKeys(params, method === 'send_private' ? ['sendId', 'publicSendId', 'target', 'text'] : ['sendId', 'target', 'text', 'source']);
     const sendId = requireText(params.sendId, 'sendId', 160);
-    if (!/^[a-zA-Z0-9._:-]+$/.test(sendId)) throw new ProbeError('sendId 参数无效', 'SIDECAR_INVALID_PARAMS');
+    if (!/^[a-zA-Z0-9._:~\-]+$/.test(sendId)) throw new ProbeError('sendId 参数无效', 'SIDECAR_INVALID_PARAMS');
     if (!params.target || typeof params.target !== 'object' || Array.isArray(params.target)) throw new ProbeError('发送目标缺失', 'SIDECAR_INVALID_PARAMS');
     allowedKeys(params.target, ['id', 'roomId', 'authorId', 'authorName', 'text'], 'target');
     const target = { id: params.target.id ? requireText(params.target.id, 'target.id', 240) : '', roomId: params.target.roomId ? requireUrl(params.target.roomId) : undefined, authorId: params.target.authorId ? requireText(params.target.authorId, 'target.authorId', 240) : '', authorName: params.target.authorName ? requireText(params.target.authorName, 'target.authorName', 120) : '' };
@@ -109,7 +119,7 @@ function validateParams(method, params) {
     return { url, maxItems: integer(params.maxItems ?? 100, 'maxItems', 1, 500) };
   }
   if (method === 'live_plan') {
-    allowedKeys(params, ['maxItems', 'windowSeconds', 'scripts', 'keywords', 'excludeKeywords', 'matchMode', 'replyMode', 'replyVia', 'policy']);
+    allowedKeys(params, ['maxItems', 'windowSeconds', 'scripts', 'keywords', 'excludeKeywords', 'matchMode', 'replyMode', 'replyVia', 'policy', 'policyRef']);
     if (params.policy !== undefined) throw new ProbeError('策略必须由授权服务端签发', 'SIDECAR_POLICY_NOT_SERVER_ISSUED');
     const result = { maxItems: integer(params.maxItems ?? 20, 'maxItems', 1, 50), windowSeconds: integer(params.windowSeconds ?? 900, 'windowSeconds', 1, 86400) };
     if (params.replyMode !== undefined) { if (!['composer', 'danmaku'].includes(params.replyMode)) throw new ProbeError('replyMode 参数无效', 'SIDECAR_INVALID_PARAMS'); result.replyMode = params.replyMode; }
@@ -126,12 +136,14 @@ function validateParams(method, params) {
     if (params.keywords !== undefined) result.keywords = textArray(params.keywords, 'keywords');
     if (params.excludeKeywords !== undefined) result.excludeKeywords = textArray(params.excludeKeywords, 'excludeKeywords');
     if (params.matchMode !== undefined) { if (!['phrase', 'seg', 'all', 'any'].includes(params.matchMode)) throw new ProbeError('matchMode 参数无效', 'SIDECAR_INVALID_PARAMS'); result.matchMode = params.matchMode; }
+    result.policyRef = policyRef(params.policyRef);
     return result;
   }
   if (method === 'live_reply' || method === 'live_private') {
-    allowedKeys(params, ['batchId', 'items', 'mode']);
+    allowedKeys(params, ['batchId', 'items', 'mode', 'policyRef']);
     const result = { batchId: identifier(params.batchId, 'batchId'), items: batchItems(params.items) };
     if (params.mode !== undefined) { if (!['composer', 'danmaku'].includes(params.mode)) throw new ProbeError('mode 参数无效', 'SIDECAR_INVALID_PARAMS'); result.mode = params.mode; }
+    result.policyRef = policyRef(params.policyRef);
     return result;
   }
   if (method === 'live_result') { allowedKeys(params, ['batchId']); return { batchId: identifier(params.batchId, 'batchId') }; }

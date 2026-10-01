@@ -1,4 +1,6 @@
-# feat(desktop): 固定工作流接入直播间【批次】协议（五个 live_* 方法 + 统一台账）
+# [历史说明] feat(desktop): 固定工作流接入直播间【批次】协议（五个 live_* 方法 + 统一台账）
+
+> 当前版本已经提供直播间批次 UI 入口；本文只记录早期接线阶段，最新边界以 `docs/desktop.md` 和服务端契约为准。
 
 > 对应评审意见（只看代码/契约/平台接线，不含实机）：固定工作流没有调用
 > `live_listen` / `live_plan` / `live_reply` / `live_private` / `live_result`；

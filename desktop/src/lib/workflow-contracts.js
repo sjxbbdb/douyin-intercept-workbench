@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('node:crypto');
+
 // These definitions describe the platform orchestration boundary.  They do
 // not claim that a browser adapter is verified or that a send succeeded.  A
 // registered adapter must return a structured delivery result for every
@@ -38,34 +40,6 @@ const PLATFORM_WORKFLOW_CONTRACTS = Object.freeze([
         successStatuses: CONFIRMED_DELIVERY,
         requiresPrevious: { stepId: 'reply_comment', resultStatuses: CONFIRMED_DELIVERY }
       }
-    ]
-  },
-  {
-    // 评论区【批次】固定工作流：采集并筛选评论，逐条公屏回复，确认后再私信。
-    // 单条 comment.reply_then_private 保留给兼容旧任务；新任务应使用批次契约。
-    workflowId: 'comment.batch',
-    version: '1',
-    kind: 'comment_batch',
-    steps: [
-      { stepId: 'plan', action: 'comment.plan', phase: 'plan', sideEffect: false },
-      {
-        stepId: 'reply_public',
-        action: 'comment.public_reply',
-        phase: 'public',
-        sideEffect: true,
-        resultRequired: true,
-        successStatuses: CONFIRMED_DELIVERY
-      },
-      {
-        stepId: 'private_message',
-        action: 'comment.private_message',
-        phase: 'private',
-        sideEffect: true,
-        resultRequired: true,
-        successStatuses: CONFIRMED_DELIVERY,
-        requiresPrevious: { stepId: 'reply_public', resultStatuses: CONFIRMED_DELIVERY }
-      },
-      { stepId: 'report', action: 'comment.result', phase: 'report', sideEffect: false }
     ]
   },
   {
@@ -128,10 +102,53 @@ const PLATFORM_WORKFLOW_CONTRACTS = Object.freeze([
       },
       { stepId: 'report', action: 'live.result', phase: 'report', sideEffect: false }
     ]
+  },
+  {
+    // 评论区【批次】固定工作流：采集与计划冻结分开记录，随后整批公屏回复，
+    // 只有本批次、本动作确认的公屏结果才能进入私信阶段。
+    // 单条 comment.reply_then_private 保留给兼容旧任务；新任务应使用批次契约。
+    workflowId: 'comment.batch',
+    version: '1',
+    kind: 'comment_batch',
+    steps: [
+      { stepId: 'collect', action: 'comment.collect', phase: 'collect', sideEffect: false },
+      { stepId: 'plan', action: 'comment.plan', phase: 'plan', sideEffect: false },
+      {
+        stepId: 'reply_public',
+        action: 'comment.public_reply',
+        phase: 'public',
+        sideEffect: true,
+        resultRequired: true,
+        successStatuses: CONFIRMED_DELIVERY
+      },
+      {
+        stepId: 'private_message',
+        action: 'comment.private_message',
+        phase: 'private',
+        sideEffect: true,
+        resultRequired: true,
+        successStatuses: CONFIRMED_DELIVERY,
+        requiresPrevious: { stepId: 'reply_public', resultStatuses: CONFIRMED_DELIVERY }
+      },
+      { stepId: 'report', action: 'comment.result', phase: 'report', sideEffect: false }
+    ]
   }
 ]);
 
 function clone(value) { return structuredClone(value); }
+
+// Keep the contract fingerprint algorithm byte-for-byte compatible with the
+// authorization server. Prices are added by server policy and are therefore
+// included by the caller when comparing an effective contract.
+function stable(value) {
+  if (Array.isArray(value)) return '[' + value.map(stable).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + stable(value[key])).join(',') + '}';
+  return JSON.stringify(value);
+}
+
+function workflowContractHash(value) {
+  return crypto.createHash('sha256').update(stable(value)).digest('hex');
+}
 
 function platformWorkflowDefinitions() { return clone(PLATFORM_WORKFLOW_CONTRACTS); }
 
@@ -153,5 +170,6 @@ module.exports = {
   platformWorkflowDefinitions,
   workflowContractKey,
   findPlatformWorkflow,
+  workflowContractHash,
   deliveryStatus
 };

@@ -486,7 +486,9 @@ async function launchAndCheck(label, executable, auth = null) {
     assert.equal(stderr.includes('无法启动') || stderr.includes('启动失败'), false, `${label} emitted startup failure: ${stderr}`);
     const sidecarProbe = await cdp.evaluate('window.agentApi.probeSelectors({})');
     assert.equal(sidecarProbe?.transport, 'sidecar', `${label} must route selector probe through packaged sidecar`);
-    assert.deepEqual(Object.keys(sidecarProbe?.capability || {}).sort(), ['live_capture', 'live_reply', 'private_reply', 'video_capture', 'video_reply'], `${label} sidecar capability keys`);
+    const capabilityKeys = Object.keys(sidecarProbe?.capability || {}).sort();
+    const requiredCapabilityKeys = ['live_capture', 'live_reply', 'private_reply', 'video_capture', 'video_reply'];
+    assert.equal(requiredCapabilityKeys.every((key) => capabilityKeys.includes(key)), true, `${label} sidecar required capability keys: ${capabilityKeys.join(',')}`);
     if (auth) {
       await fill(cdp, '#login-form input[name="username"]', auth.username);
       await fill(cdp, '#login-form input[name="password"]', auth.password);

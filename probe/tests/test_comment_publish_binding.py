@@ -32,18 +32,23 @@ COMMENT_ID = 'comment-1'
 
 
 class FakeTab:
-    def __init__(self):
+    def __init__(self, url=ROOM):
         self.clicks = []
         self.typed = []
         self.calls = []
+        self.url = url
 
     def call(self, *args, **kwargs):
         self.calls.append(args)
+        # 更忠实的替身：真的导航过一次之后，location.href 就是新地址
+        # （否则"导航后校验目标页"这条永远拿到旧 URL，测不出真实行为）。
+        if args and args[0] == 'Page.navigate' and len(args) > 1 and isinstance(args[1], dict):
+            self.url = args[1].get('url') or self.url
         return {}
 
     def evaluate(self, expression):
         if expression == 'location.href':
-            return ROOM
+            return self.url
         if expression == 'document.readyState':
             return 'complete'
         return None
@@ -357,6 +362,93 @@ class SendCommentReceiptTests(unittest.TestCase):
             self.assertEqual(result["reason"], "platform_response_unreadable", repr(raw))
             self.assertEqual(result["evidence"]["platformStatusCodes"], [None], repr(raw))
 
+    def test_an_unknown_page_state_before_the_send_is_refused_too(self):
+        """评审 2026-09-28：unknown 不是可恢复状态。
+
+        发送键那一刻读不到可见性 -> 不点、不恢复、交人工（page_visibility_unknown），
+        而不是 attempt 恢复后继续点。
+        """
+        self.states = ["visible"] + ["unknown"] * 4
+        send_actions.douyin.ensure_visible = lambda tab, **kw: self.ensure_calls.append(tab) or True
+        result = self._run("vis-unknown-late")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_visibility_unknown")
+        self.assertTrue(result["evidence"]["manualAction"])
+        self.assertEqual(self.ensure_calls, [], "unknown 不许拿去恢复")
+        self.assertNotIn((5, 6), self.tab.clicks, "读不到状态时不得点发送键")
+
+    def test_a_page_that_hides_before_the_click_is_refused(self):
+        """真机结论（2026-09-28）：页面 hidden 时 Input 点击不送达渲染进程，
+        发送键点了没反应。必须在【点击之前】拦住，并给出可重试的 page_not_visible，
+        而不是让它变成"定位器找不到/发送键不可用"这种误导性的结论。
+        """
+        self.states = ["visible"] + ["hidden"] * 4
+        send_actions.douyin.ensure_visible = lambda tab, **kw: self.ensure_calls.append(tab) or True
+        result = self._run("vis-hide-late")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "page_not_visible")
+        # 前置的两次点击（回复按钮、输入框）是流程本身，无害；
+        # 真正要紧的是【发送键 (5,6)】—— 页面不可见时绝不能点它。
+        self.assertNotIn((5, 6), self.tab.clicks, "页面不可见时不得点发送键")
+
+    def test_a_page_that_hides_right_after_the_send_click_is_unknown(self):
+        """真机结论的延伸（2026-09-28）：可见性检查 -> 真正点下去之间还有好几次 CDP 往返，
+        页面完全可能在这一瞬间被切到后台。点完就不可见时，"可能送达了也可能没有" ——
+        必须 unknown，不许猜成 failed（那会允许自动重试，等于重复发一条评论）。
+        """
+        sent = {"done": False}
+        original_click = self.tab.click_at
+
+        def click_at(x, y):
+            original_click(x, y)
+            if (x, y) == (5, 6):
+                sent["done"] = True
+
+        self.tab.click_at = click_at
+        send_actions.douyin.visibility_state = lambda _tab: "hidden" if sent["done"] else "visible"
+        result = self._run("race-after-click")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "page_hidden_during_send")
+        self.assertFalse(result["evidence"]["sendRace"]["visibleAfter"])
+        self.assertTrue(result["evidence"]["sendRace"]["clicked"], "点击本身是发出去了的")
+
+    def test_a_transport_failure_on_the_send_click_is_unknown_and_never_retried(self):
+        """点击本身抛异常（CDP 传输失败）：也可能已经送达 —— unknown + 台账禁止自动重试。"""
+        original_click = self.tab.click_at
+
+        def click_at(x, y):
+            if (x, y) == (5, 6):
+                raise RuntimeError("simulated click transport failure")
+            original_click(x, y)
+
+        self.tab.click_at = click_at
+        gate = SendGate(self.tmp.name, "account-a")
+        result = send_actions.send_comment(self.tab, gate, "race-transport", self.target, TEXT, "video")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["reason"], "send_click_transport_failure")
+        self.assertEqual(result["evidence"]["sendRace"]["error"], "RuntimeError")
+        self.assertEqual(gate.lookup("race-transport")["status"], "unknown")
+        again = send_actions.send_comment(self.tab, gate, "race-transport-2", self.target, TEXT, "video")
+        self.assertEqual(again["status"], "blocked", "未知结果不得自动重试")
+
+    def test_a_receipt_still_wins_over_the_race(self):
+        """有回执就以回执为准：点完页面失焦不该把已经确认成功的回执丢掉。"""
+        sent = {"done": False}
+        original_click = self.tab.click_at
+
+        def click_at(x, y):
+            original_click(x, y)
+            if (x, y) == (5, 6):
+                sent["done"] = True
+
+        self.tab.click_at = click_at
+        send_actions.douyin.visibility_state = lambda _tab: "hidden" if sent["done"] else "visible"
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("race-with-receipt")
+        self.assertEqual(result["reason"], "platform_response")
+        self.assertEqual(result["evidence"]["platformStatusCodes"], [0])
+        self.assertFalse(result["evidence"]["sendRace"]["visibleAfter"])
     def test_the_request_body_is_never_persisted(self):
         """请求体只在内存里用于绑定：不写台账、不进 evidence、不写日志文件。"""
         marker = 'NONCE-abc123'
@@ -378,5 +470,26 @@ class SendCommentReceiptTests(unittest.TestCase):
         self.assertNotIn(marker, blob, '请求体不得进入任何持久化位置')
 
 
+    def test_it_does_not_reload_the_video_page_it_is_already_on(self):
+        """真机（2026-09-28）：重新导航会把采集时滚动加载出来的评论列表清空，
+        目标行于是再也找不到（reply_target_not_rendered）。已经在目标视频页上时不得重新导航。
+        """
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("no-reload")
+        self.assertEqual(result["reason"], "platform_response")
+        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
+        self.assertEqual(navigations, [], "已经在目标视频页上时不得重新导航")
+
+    def test_it_still_navigates_when_the_tab_is_somewhere_else(self):
+        """反向保护：不在目标页上时必须照旧导航（安全校验不能少）。"""
+        self.tab = FakeTab(url="https://www.douyin.com/video/999")
+        self.records = [{"url": ROOM + "/" + MARK, "postData": "reply_id=" + COMMENT_ID,
+                         "parsed": {"status_code": 0}}]
+        result = self._run("needs-navigate")
+        self.assertEqual(result["reason"], "platform_response")
+        navigations = [c for c in self.tab.calls if c and c[0] == "Page.navigate"]
+        self.assertEqual(len(navigations), 1, "不在目标页上必须导航过去")
+        self.assertEqual(navigations[0][1], {"url": ROOM})
 if __name__ == '__main__':
     unittest.main()

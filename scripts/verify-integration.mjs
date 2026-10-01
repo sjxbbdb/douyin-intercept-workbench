@@ -223,20 +223,24 @@ async function main() {
       await addCredits(user, 5, 'c-draft-credit');
       const ledgerBeforeDraft = await client.ledger();
       const draftKey = `draft-fail-${crypto.randomUUID()}`;
+      const draftPayload = { event: event('c-draft'), replyInstructions: 'fixture failure', idempotencyKey: draftKey };
       providerState.fail = true;
-      await expectApiError(client.draft({ event: event('c-draft'), replyInstructions: 'fixture failure', idempotencyKey: draftKey }), 'PROVIDER_FAILED');
+      await expectApiError(client.draft(draftPayload), 'PROVIDER_FAILED');
       const ledgerAfterDraft = await client.ledger();
       assert.equal(ledgerAfterDraft.balance, ledgerBeforeDraft.balance, 'provider 失败不得扣积分');
-      await expectApiError(client.draft({ event: event('c-draft'), replyInstructions: 'fixture failure', idempotencyKey: draftKey }), 'PROVIDER_FAILED');
+      await expectApiError(client.draft(draftPayload), 'IDEMPOTENCY_PENDING');
+      const draftStatus = await client.draftOperation(draftKey);
+      assert.equal(draftStatus.status, 'unknown', 'provider 结果未知时只能进入 unknown 恢复路径');
+      assert.equal(draftStatus.hold?.status, 'held', '未知 provider 结果必须保留积分预留');
       const store = new Store(dbPath);
       try {
         const holds = store.all('SELECT status FROM holds WHERE user_id=? AND hold_key=?', user.id, `draft:${draftKey}`);
         assert.equal(holds.length, 1, '同一 draft key 只应留下一个可复用 hold 记录');
-        assert.equal(holds[0].status, 'released', 'provider 失败后的 hold 必须释放');
+        assert.equal(holds[0].status, 'held', 'provider 结果未知时 hold 必须保留');
       } finally { store.close(); }
     });
 
-    await check('C expired hold clears pending idempotency', async () => {
+    await check('C expired hold reports unknown without re-running provider', async () => {
       const user = users.get('c');
       const { client } = clients.get('c');
       const key = `draft-expired-${crypto.randomUUID()}`;
@@ -247,7 +251,10 @@ async function main() {
         store.run("INSERT INTO holds(id,user_id,owner,hold_key,amount,status,expires_at,created_at) VALUES(?,?,?,?,?,'held',?,?)", randomId('hold'), user.id, 'agent.draft', `draft:${key}`, 1, Date.now() - 1000, Date.now() - 2000);
       } finally { store.close(); }
       providerState.fail = true;
-      await expectApiError(client.draft(payload), 'PROVIDER_FAILED');
+      await expectApiError(client.draft(payload), 'IDEMPOTENCY_PENDING');
+      const status = await client.draftOperation(key);
+      assert.equal(status.status, 'unknown', '过期 hold 只能通过 unknown 查询恢复');
+      assert.equal(status.hold?.status, 'released', '过期 hold 应由服务端回收');
     });
 
     await check('C evaluate respects an active AI hold', async () => {

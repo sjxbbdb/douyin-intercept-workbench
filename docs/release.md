@@ -6,7 +6,7 @@
 
 ### 4.0.3 本地候选包
 
-4.0.3 修复长 URL 在任务表格中的布局挤压，以及浏览器 owned target 失效后的恢复路径。portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录构建；portable 通过 `PACKAGE_DIAG_ONLY=portable` 隔离验收。portable SHA-256 为 `C969FC3F1387D3FC731B8A812E4F846E9622D2BDEDD781C93E335D76B1D170C1`（118,940,263 bytes）；NSIS SHA-256 为 `2B5E59C1127F0D8E9AC50EF6F3472185A8E6BC7DDD36A2A6CD96F0FB6FC830EB`（119,170,261 bytes）。报告见被忽略的 [`package-4.0.3-portable-diagnostic.json`](../evidence-private/package/package-4.0.3-portable-diagnostic.json)。NSIS 构建完成，未运行安装验收。
+4.0.3 修复长 URL 在任务表格中的布局挤压，以及浏览器 owned target 失效后的恢复路径。portable 与 NSIS 已使用 `desktop/.builder-cache` 和同盘临时目录构建；portable 与 NSIS 均通过 `scripts/verify-desktop-package.mjs` 隔离验收。portable SHA-256 为 `07B757BCDA9FBB0A1C63F43A624E45783917D456E7E4E8488353552B0CCE2820`（119,218,700 bytes）；NSIS SHA-256 为 `D784284F548BB9FB8E599973A61CAF7B8DA7CDAD8B4431C031E05D0FA72C3A40`（119,448,726 bytes）。报告见被忽略的 [`latest-package-check.json`](../evidence-private/package/latest-package-check.json)。未验证真实抖音页面、发送或生产部署。
 
 portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临时 HTTP 授权、正常退出（`exitCode=0`、CDP 端口关闭）和同一隔离 userData 重启授权恢复。未验证真实抖音页面、发送、NSIS 安装运行或生产部署；未启动真实 profile。
 
@@ -22,7 +22,7 @@ portable 隔离验收覆盖未授权空态、随包 sidecar、隐藏窗口、临
 - Windows 桌面端：先构建并复制完整 sidecar onedir，再执行 `npm ci`、`npm run check`、`npm test`、portable 和 NSIS 构建；两个产物必须使用不同文件名并分别启动一次。
 - 源码 Electron UI 实际检查：临时随机 `userData`，不使用开发机默认 AppData；覆盖积分流水、错误态、账号切换和离线状态，截图和日志不得包含密码、token、兑换码或 provider key。
 - sidecar：发行包携带完整 PyInstaller onedir（包含 `_internal`）和校验信息，用户不应被要求另行安装 Python。构建前置检查发现 `desktop/build/probe` 缺 runtime 时必须失败。按 [`sidecar-protocol.md`](sidecar-protocol.md) 验收协议、权限、进程退出、超时取消、账号隔离和升级回滚；取消只回收主进程自己创建的 child，unknown 不自动重试。
-- 真实抖音：按视频搜索、评论采集/筛选、评论回复、直播互动、私信触达分别记录页面版本、最终 URL、可见 DOM/API 候选、平台结果判据和未验证边界。视频/直播发送当前仅有 fixture 证据并保持自动发送关闭；私信自动资格依据已接受的 PR1 协作者账号流程证据。未取得对应证据前，保留开发和人工预检入口，不宣称生产可用。
+- 真实抖音：按视频搜索、评论采集/筛选、评论回复、直播互动、私信触达分别记录页面版本、最终 URL、可见 DOM/API 候选、平台结果判据和未验证边界。所有发送类能力当前均保持自动发送关闭；未取得绑定具体账号、页面版本和平台响应的充分证据前，保留开发和人工预检入口，不宣称生产可用。
 
 ## Windows 构建步骤
 

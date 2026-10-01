@@ -66,12 +66,28 @@ class ApiClient {
     return this.request('GET', '/v1/credits/ledger', undefined, 12000, tokenOverride);
   }
 
+  reserveCreditAction(body) {
+    return this.request('POST', '/v1/credits/actions/reserve', body, 12000);
+  }
+
+  creditAction(actionId) {
+    return this.request('GET', `/v1/credits/actions/${encodeURIComponent(actionId)}`);
+  }
+
+  releaseCreditAction(actionId, body = {}) {
+    return this.request('POST', `/v1/credits/actions/${encodeURIComponent(actionId)}/release`, body, 12000);
+  }
+
   redeem(body, tokenOverride = null) {
     return this.request('POST', '/v1/credits/redeem', body, 12000, tokenOverride);
   }
 
   draft(body) {
     return this.request('POST', '/v1/agent/draft', body, 30000);
+  }
+
+  draftOperation(idempotencyKey) {
+    return this.request('GET', `/v1/agent/draft/${encodeURIComponent(idempotencyKey)}`);
   }
 
   evaluate(body) {
@@ -82,8 +98,20 @@ class ApiClient {
     return this.request('POST', '/v1/agent/plan', body, 30000);
   }
 
+  createReplyPlan(body) {
+    return this.request('POST', '/v1/reply-plans', body, 30000);
+  }
+
+  replyPlan(idempotencyKey) {
+    return this.request('GET', `/v1/reply-plans/${encodeURIComponent(idempotencyKey)}`, undefined, 12000);
+  }
+
   workflows() {
     return this.request('GET', '/v1/workflows');
+  }
+
+  workflowRuns() {
+    return this.request('GET', '/v1/workflow-runs');
   }
 
   createWorkflowRun(body) {
@@ -100,6 +128,10 @@ class ApiClient {
 
   recoverWorkflow(runId, body) {
     return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/recover`, body, 12000);
+  }
+
+  manualCompleteWorkflow(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/manual-complete`, body, 12000);
   }
 
   resultDecision(runId, body) {
@@ -124,6 +156,31 @@ class ApiClient {
 
   createPlatformAccount(body, tokenOverride = null) {
     return this.request('POST', '/v1/platform-accounts', body, 12000, tokenOverride);
+  }
+
+  updatePlatformAccount(platformAccountId, body, tokenOverride = null) {
+    return this.request('PATCH', `/v1/platform-accounts/${encodeURIComponent(platformAccountId)}`, body, 12000, tokenOverride);
+  }
+
+  knowledgeSets(tokenOverride = null) {
+    return this.request('GET', '/v1/knowledge-sets', undefined, 12000, tokenOverride);
+  }
+
+  createKnowledgeSet(body, tokenOverride = null) {
+    return this.request('POST', '/v1/knowledge-sets', body, 12000, tokenOverride);
+  }
+
+  knowledgeDocuments(knowledgeSetId, tokenOverride = null) {
+    const query = new URLSearchParams({ knowledgeSetId: String(knowledgeSetId || '') });
+    return this.request('GET', `/v1/knowledge-documents?${query.toString()}`, undefined, 12000, tokenOverride);
+  }
+
+  addKnowledgeDocument(body, tokenOverride = null) {
+    return this.request('POST', '/v1/knowledge-documents', body, 12000, tokenOverride);
+  }
+
+  retrieveKnowledge(body, tokenOverride = null) {
+    return this.request('POST', '/v1/knowledge-retrieve', body, 12000, tokenOverride);
   }
 }
 
