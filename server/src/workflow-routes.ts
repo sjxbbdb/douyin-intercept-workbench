@@ -46,13 +46,14 @@ function isSendingWorkflow(workflowId: string, contract: RecordValue) {
   return Array.isArray(contract.steps) && contract.steps.some((step: any) => step && typeof step === 'object' && step.sideEffect === true);
 }
 
-function assertReadOnlyCompletionEvidence(row: RecordValue, targetState: unknown) {
+function assertReadOnlyCompletionEvidence(row: RecordValue, targetState: unknown, allowManualProof = false) {
   const contract = parseJson<RecordValue>(row.contract_json, {});
+  const state = targetState && typeof targetState === 'object' && !Array.isArray(targetState) ? targetState as RecordValue : {};
   if (row.workflow_id !== 'video.search') {
     if (!isSendingWorkflow(row.workflow_id, contract)) return;
+    if (allowManualProof && state.phase === 'manual' && state.status === 'manual_confirmed' && typeof state.proofId === 'string' && /^manual_proof_[A-Za-z0-9_-]{8,160}$/.test(state.proofId)) return;
     throw conflict('SEND_EVIDENCE_REQUIRED', '发送流程必须提供服务端认可的平台响应证据；当前发行版保持 fail-closed');
   }
-  const state = targetState && typeof targetState === 'object' && !Array.isArray(targetState) ? targetState as RecordValue : {};
   if (state.phase !== 'search' || state.status !== 'ok' || !Number.isSafeInteger(state.count) || state.count < 0 || typeof state.hasMore !== 'boolean' || (state.cursor !== null && typeof state.cursor !== 'string')) {
     throw conflict('READ_RESULT_INVALID', '视频搜索完成结果必须符合服务端固定只读结果结构');
   }
@@ -301,7 +302,7 @@ interface CheckpointInput {
   checkpointId?: string;
 }
 
-function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput, actor?: RecordValue, authority?: (row: RecordValue, input?: CheckpointInput) => void) {
+function applyCheckpoint(store: Store, userId: string, runId: string, input: CheckpointInput, actor?: RecordValue, authority?: (row: RecordValue, input?: CheckpointInput) => void, allowManualProof = false) {
   input.status = normalizeStatus(input.status);
   if (!checkpointStatuses.has(input.status)) throw badRequest('checkpoint.status 无效');
   const row = getRun(store, userId, runId);
@@ -315,7 +316,7 @@ function applyCheckpoint(store: Store, userId: string, runId: string, input: Che
   const priorCheckpoint = parseJson<RecordValue>(row.checkpoint_json, {});
   const cursor = input.cursor ?? priorCheckpoint.cursor ?? {};
   const targetState = input.targetState ?? priorCheckpoint.targetState ?? {};
-  if (input.status === 'COMPLETED') assertReadOnlyCompletionEvidence(row, targetState);
+  if (input.status === 'COMPLETED') assertReadOnlyCompletionEvidence(row, targetState, allowManualProof);
     const checkpointId = input.checkpointId ?? randomId('checkpoint');
     if (store.get('SELECT 1 AS present FROM workflow_checkpoints WHERE id=?', checkpointId)) throw conflict('CHECKPOINT_EXISTS', '检查点已存在');
   return store.transaction(() => {
@@ -645,6 +646,38 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const row = applyCheckpoint(store, actor.user_id, stringValue((request.params as RecordValue).id, 'runId', 100, true) as string, input, actor, (run) => assertRunAuthority(actor, run)); audit(store, 'user', actor.user_id, 'workflow.checkpoint', actor.user_id, { runId: row.id, version: row.checkpoint_version, status: row.status, stepId: row.current_step }); return { run: runResponse(row) };
   });
 
+  // A human may close a send workflow only through this explicit, audited
+  // action. The proof id is minted by the server inside the same transaction;
+  // a renderer cannot turn an arbitrary `sent_confirmed` payload into a paid
+  // COMPLETED result through the generic checkpoint endpoint.
+  app.post('/v1/workflow-runs/:id/manual-complete', async (request) => {
+    const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['note', 'expectedVersion', 'idempotencyKey']);
+    const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string;
+    const note = stringValue(body.note, 'note', 500) ?? '';
+    const expectedVersion = body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0);
+    const key = idempotencyKey(body.idempotencyKey); const payload = { runId, operation: 'manual-complete', noteHash: hashPayload(note), expectedVersion: expectedVersion ?? null };
+    const old = store.get<RecordValue>("SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope='workflow.manual-complete' AND idem_key=?", actor.user_id, key);
+    if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同人工确认'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
+    const response = store.transaction(() => {
+      const row = getRun(store, actor.user_id, runId); assertLease(store, row, actor); assertRunAuthority(actor, row);
+      if (!['WAITING_HUMAN', 'UNKNOWN', 'PAUSED'].includes(row.status)) throw conflict('MANUAL_COMPLETION_STATE', '只有等待人工、未知或暂停的流程可以人工确认完成');
+      if (expectedVersion !== undefined && expectedVersion !== row.checkpoint_version) throw conflict('CHECKPOINT_CONFLICT', '检查点版本已变化');
+      const contract = parseJson<RecordValue>(row.contract_json, {});
+      if (!isSendingWorkflow(row.workflow_id, contract)) throw conflict('MANUAL_COMPLETION_NOT_REQUIRED', '只读流程不需要人工发送确认');
+      const proofId = randomId('manual_proof'); const now = store.now(); const prior = parseJson<RecordValue>(row.checkpoint_json, {}); const targetState = { phase: 'manual', status: 'manual_confirmed', proofId };
+      assertReadOnlyCompletionEvidence(row, targetState, true);
+      const version = row.checkpoint_version + 1;
+      store.run('INSERT INTO workflow_checkpoints(id,run_id,version,status,step_id,cursor_json,target_state_json,failure_json,human_wait_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)', randomId('checkpoint'), runId, version, 'COMPLETED', row.current_step, json(prior.cursor ?? {}), json(targetState), null, null, now);
+      store.run('UPDATE workflow_runs SET status=\'COMPLETED\',checkpoint_version=?,checkpoint_json=?,failure_json=NULL,human_wait_json=NULL,updated_at=?,completed_at=? WHERE id=? AND user_id=?', version, json({ cursor: prior.cursor ?? {}, targetState }), now, now, runId, actor.user_id);
+      settleWorkflowCredit(store, actor.user_id, row.credit_action_id ?? null, 'commit', runId);
+      const next = getRun(store, actor.user_id, runId); const result = { run: runResponse(next), proofId };
+      store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,response_json,created_at) VALUES(?,?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'workflow.manual-complete', key, hashPayload(payload), 'completed', json(result), now);
+      audit(store, 'user', actor.user_id, 'workflow.manual_complete', actor.user_id, { runId, proofId, noteHash: hashPayload(note), creditOutcome: 'commit' });
+      return result;
+    });
+    return response;
+  });
+
   app.post('/v1/workflow-runs/:id/human-wait', async (request) => {
     const actor = user(request); const body = bodyObject(request.body); rejectUnknown(body, ['reason', 'context', 'expiresAt', 'expectedVersion', 'checkpointId']); const reason = stringValue(body.reason, 'reason', 500, true) as string; const context = body.context === undefined ? {} : objectValue(body.context, 'context', 8_000); const expiresAt = body.expiresAt === undefined ? null : integerValue(body.expiresAt, 'expiresAt', store.now() + 1); const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const row = applyCheckpoint(store, actor.user_id, runId, { status: 'waiting_human', humanWait: { reason, context, expiresAt }, expectedVersion: body.expectedVersion === undefined ? undefined : integerValue(body.expectedVersion, 'expectedVersion', 0), checkpointId: body.checkpointId === undefined ? undefined : stringValue(body.checkpointId, 'checkpointId', 100, true) }, actor, (run) => assertRunAuthority(actor, run)); audit(store, 'user', actor.user_id, 'workflow.human_wait', actor.user_id, { runId: row.id, reasonHash: hashPayload(reason) }); return { run: runResponse(row) };
   });
@@ -657,7 +690,10 @@ export function registerWorkflowRoutes(app: FastifyInstance, deps: WorkflowRoute
     const runId = stringValue((request.params as RecordValue).id, 'runId', 100, true) as string; const run = getRun(store, actor.user_id, runId); assertLease(store, run, actor); assertRunAuthority(actor, run); const requestedStatus = stringValue(body.status, 'status', 40, true) as string; const status = normalizeStatus(requestedStatus); if (run.status === 'RUNNING' || status === 'RUNNING') throw conflict('RESULT_DECISION_RUNNING', '运行中的流程不能调用结果决策'); if (status !== run.status) throw conflict('RESULT_STATUS_MISMATCH', '结果状态必须与服务端流程状态一致'); if (!new Set(['FAILED', 'COMPLETED', 'STOPPED', 'UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED']).has(status)) throw badRequest('结果状态无效'); const summary = objectValue(body.summary ?? {}, 'summary', 16_000); const key = idempotencyKey(body.idempotencyKey); const payload = { runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,payload_hash,status FROM idempotency WHERE user_id=? AND scope=\'workflow.result-decision\' AND idem_key=?', actor.user_id, key); if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同结果'); if (old.status === 'completed') return parseJson(old.response_json, null); throw conflict('IDEMPOTENCY_PENDING', '相同请求正在处理中'); }
     if (!deps.resultDecider) throw new AppError(503, 'RESULT_DECIDER_NOT_CONFIGURED', '结果决策器未配置');
-    if (status === 'COMPLETED') assertReadOnlyCompletionEvidence(run, summary.checkpoint ?? summary.targetState ?? summary);
+    if (status === 'COMPLETED') {
+      const storedTarget = parseJson<RecordValue>(run.checkpoint_json, {}).targetState;
+      assertReadOnlyCompletionEvidence(run, summary.checkpoint ?? summary.targetState ?? storedTarget ?? summary);
+    }
     const result = await deps.resultDecider({ runId, workflowId: run.workflow_id, version: run.workflow_version, status, summary }); const decision = stringValue(result.decision, 'decision', 40, true) as string; const allowedDecisions: Record<string, Set<string>> = { COMPLETED: new Set(['complete']), FAILED: new Set(['complete', 'retry', 'wait_human']), STOPPED: new Set(['complete', 'wait_human']), UNKNOWN: new Set(['wait_human']), CHECKPOINT: new Set(['continue', 'retry', 'complete', 'wait_human']), WAITING_HUMAN: new Set(['continue', 'wait_human']), PAUSED: new Set(['continue', 'wait_human']) }; if (!new Set(['continue', 'retry', 'complete', 'wait_human']).has(decision) || !allowedDecisions[status]?.has(decision) || Object.keys(result).some((key) => key !== 'decision')) throw new AppError(503, 'RESULT_DECISION_INVALID', '结果决策与服务端流程状态不匹配');
     const response = { runId, workflowId: run.workflow_id, version: run.workflow_version, decision };
     store.transaction(() => {

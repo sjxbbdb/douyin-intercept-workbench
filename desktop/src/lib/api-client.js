@@ -130,6 +130,10 @@ class ApiClient {
     return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/recover`, body, 12000);
   }
 
+  manualCompleteWorkflow(runId, body) {
+    return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/manual-complete`, body, 12000);
+  }
+
   resultDecision(runId, body) {
     return this.request('POST', `/v1/workflow-runs/${encodeURIComponent(runId)}/result-decision`, body, 12000);
   }

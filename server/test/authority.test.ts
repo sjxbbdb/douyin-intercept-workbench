@@ -87,6 +87,28 @@ test('sending workflow cannot complete from client-reported sent_confirmed and k
   } finally { await f.close(); }
 });
 
+test('manual completion mints server proof, settles credit, and is idempotent', async () => {
+  const f = await fixture();
+  try {
+    await register(f.app, f.adminToken, 'comment.batch', { steps: [{ stepId: 'reply', sideEffect: true }] });
+    const user = await f.create('manual-owner');
+    const creditSeed = await f.app.inject({ method: 'POST', url: `/v1/admin/users/${user.id}/credits`, headers: { authorization: `Bearer ${f.adminToken}` }, payload: { amount: 2, idempotencyKey: 'manual-owner-seed' } }); assert.equal(creditSeed.statusCode, 200);
+    const token = await f.login(user);
+    const account = await f.app.inject({ method: 'POST', url: '/v1/platform-accounts', headers: { authorization: `Bearer ${token}` }, payload: { platform: 'douyin', accountRef: 'manual-seller', displayName: 'seller' } }); assert.equal(account.statusCode, 200);
+    const params = { url: 'https://www.douyin.com/video/456', keywords: ['购买'], publicReply: '请咨询', privateReply: '已私信', policyRef: { policyId: 'test', policyVersion: 1 } };
+    const planId = 'manual-plan-1'; const seed = new Store(f.dbPath); seed.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', planId, user.id, 'comment.batch', '1', JSON.stringify(params), 'issued', Date.now(), Date.now() + 60_000); seed.close();
+    const reserve = await f.app.inject({ method: 'POST', url: '/v1/credits/actions/reserve', headers: { authorization: `Bearer ${token}` }, payload: { actionKey: 'manual-hold-1', owner: 'workflow:comment.batch', amount: 2, metadata: {} } }); assert.equal(reserve.statusCode, 200);
+    const run = await f.app.inject({ method: 'POST', url: '/v1/workflow-runs', headers: { authorization: `Bearer ${token}` }, payload: { planId, workflowId: 'comment.batch', version: '1', params, platformAccountId: account.json().id, creditActionId: reserve.json().action.id, idempotencyKey: 'manual-run-001' } }); assert.equal(run.statusCode, 200, run.body);
+    const runId = run.json().run.id; const lease = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/lease/acquire`, headers: { authorization: `Bearer ${token}` }, payload: { idempotencyKey: 'manual-lease-001' } }); assert.equal(lease.statusCode, 200);
+    const running = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'RUNNING', expectedVersion: 0 } }); assert.equal(running.statusCode, 200);
+    const waiting = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/checkpoints`, headers: { authorization: `Bearer ${token}` }, payload: { status: 'WAITING_HUMAN', expectedVersion: 1, humanWait: { reason: '平台回执未验证' } } }); assert.equal(waiting.statusCode, 200);
+    const body = { note: '人工检查页面后确认', expectedVersion: 2, idempotencyKey: 'manual-complete-001' };
+    const completed = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/manual-complete`, headers: { authorization: `Bearer ${token}` }, payload: body }); assert.equal(completed.statusCode, 200, completed.body); assert.match(completed.json().proofId, /^manual_proof_/); assert.equal(completed.json().run.status, 'COMPLETED');
+    const replay = await f.app.inject({ method: 'POST', url: `/v1/workflow-runs/${runId}/manual-complete`, headers: { authorization: `Bearer ${token}` }, payload: body }); assert.deepEqual(replay.json(), completed.json());
+    const action = await f.app.inject({ method: 'GET', url: `/v1/credits/actions/${reserve.json().action.id}`, headers: { authorization: `Bearer ${token}` } }); assert.equal(action.json().action.status, 'committed'); assert.equal(action.json().balance, 0);
+  } finally { await f.close(); }
+});
+
 test('tenant audit is scoped and expired holds emit redacted audit without deleting pending idempotency', async () => {
   const f = await fixture();
   try {

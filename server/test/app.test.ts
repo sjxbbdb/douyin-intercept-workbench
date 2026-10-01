@@ -228,6 +228,25 @@ test('agent planner receives tenant-scoped knowledge and freezes its version', a
   } finally { await f.close(); await new Promise<void>((resolve) => provider.server.close(() => resolve())); }
 });
 
+test('reply plan route is wired to tenant vectors and provider output before execution', async () => {
+  let providerPayload: any = null;
+  const provider: Server = createServer((request, response) => {
+    let raw = ''; request.setEncoding('utf8'); request.on('data', (chunk) => { raw += chunk; }); request.on('end', () => {
+      try { providerPayload = raw ? JSON.parse(raw) : null; } catch { providerPayload = null; }
+      response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ choices: [{ message: { content: '{"publicReply":"欢迎咨询","privateReply":"已把资料发给您"}' } }] }));
+    });
+  }).listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => provider.once('listening', () => resolve())); const address = provider.address(); if (!address || typeof address === 'string') throw new Error('reply provider did not bind');
+  const f = await fixture({ provider: { baseUrl: `http://127.0.0.1:${address.port}`, apiKey: 'reply-key', model: 'reply-model' } }); try {
+    const workflow = await f.app.inject({ method: 'POST', url: '/v1/admin/workflows', headers: { authorization: `Bearer ${f.adminToken}` }, payload: { workflowId: 'comment.batch', version: '1', name: '评论批次', contract: { steps: [{ stepId: 'collect' }, { stepId: 'reply', sideEffect: true }] } } }); assert.equal(workflow.statusCode, 200, workflow.body);
+    const user = await f.create({ username: 'reply-wired' }); const login = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: user.username, password: user.password, deviceId: 'pc', deviceName: 'A' } }); const token = login.json().token;
+    const set = await f.app.inject({ method: 'POST', url: '/v1/knowledge-sets', headers: { authorization: `Bearer ${token}` }, payload: { name: '回复资料' } }); const knowledgeSetId = set.json().id;
+    const doc = await f.app.inject({ method: 'POST', url: '/v1/knowledge-documents', headers: { authorization: `Bearer ${token}` }, payload: { knowledgeSetId, title: '套餐', content: '套餐详情请先确认需求后由客服说明' } }); assert.equal(doc.statusCode, 200);
+    const plan = await f.app.inject({ method: 'POST', url: '/v1/reply-plans', headers: { authorization: `Bearer ${token}` }, payload: { workflowId: 'comment.batch', version: '1', params: { url: 'https://www.douyin.com/video/789', keywords: ['套餐'] }, knowledgeSetId, query: '套餐详情', targets: [], idempotencyKey: 'reply-wired-001' } }); assert.equal(plan.statusCode, 200, plan.body); assert.equal(plan.json().status, 'issued'); assert.equal(plan.json().params.publicReply, '欢迎咨询'); assert.equal(plan.json().params.privateReply, '已把资料发给您'); assert.match(plan.json().params.policyRef.policyId, /^workflow-policy:comment\.batch$/); assert.equal(providerPayload?.messages?.[1]?.content?.includes('套餐详情'), true);
+    const disabled = await f.create({ username: 'reply-wired-disabled', features: { commentReply: false } }); const disabledLogin = await f.app.inject({ method: 'POST', url: '/v1/auth/login', payload: { username: disabled.username, password: disabled.password, deviceId: 'pc', deviceName: 'A' } }); const denied = await f.app.inject({ method: 'POST', url: '/v1/reply-plans', headers: { authorization: `Bearer ${disabledLogin.json().token}` }, payload: { workflowId: 'comment.batch', version: '1', params: {}, knowledgeSetId, query: '套餐', idempotencyKey: 'reply-wired-denied' } }); assert.equal(denied.statusCode, 403); assert.equal(denied.json().code, 'FEATURE_DISABLED');
+  } finally { await f.close(); await new Promise<void>((resolve) => provider.close(() => resolve())); }
+});
+
 test('credit action reserve commit release is idempotent and bounded', async () => {
   const f = await fixture(); try {
     const user = await f.create({ username: 'credit-actions' });

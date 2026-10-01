@@ -456,6 +456,16 @@ testAsync('workflow wait_human pauses at a checkpoint and resume never asks the 
   assert.equal(stepCalls, 2);
 });
 
+testAsync('manual completion closes a waiting send without invoking the model', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-manual-complete-'));
+  const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] }); let modelCalls = 0;
+  const runtime = new WorkflowRuntime({ store, accountId: 'manual-account', modelDecider: async () => { modelCalls += 1; return { workflowId: 'manual.fixture', version: '1', params: {} }; }, workflows: [{ workflowId: 'manual.fixture', version: '1', steps: [{ stepId: 'send', sideEffect: true }] }], stepExecutor: async () => ({ status: 'wait_human', checkpoint: { phase: 'send', reason: 'evidence_missing' } }) });
+  const run = runtime.startPlan(await runtime.planFromIntent('需要人工确认发送结果')); const waiting = await runtime.run(run.runId);
+  assert.equal(waiting.status, RUN_STATES.WAITING_HUMAN);
+  const completed = runtime.manualComplete(run.runId, 'manual_proof_fixture');
+  assert.equal(completed.status, RUN_STATES.COMPLETED); assert.equal(completed.checkpoint.status, 'manual_confirmed'); assert.equal(completed.resultDecision.decision, 'manual_complete'); assert.equal(modelCalls, 1);
+});
+
 testAsync('workflow runtime fails closed when no fixed executor is supplied', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-agent-workflow-'));
   const store = new JsonStore(path.join(dir, 'data.json'), { workflowRuns: [] });
@@ -764,6 +774,7 @@ testAsync('comment batch connects search-pool videoId to public reply and bound 
     { eventId: 'c2', authorId: 'u2', authorName: '客户乙', roomId: 'https://www.douyin.com/video/1', text: '多少钱', publicText: '可以给您介绍方案', privateText: '方便私信沟通吗' }
   ];
   const browser = {
+    commentCollect: async (params) => { calls.push({ type: 'collect', params }); return { status: 'ok', events: [{ id: 'c1', text: '价格怎么问' }, { id: 'c2', text: '多少钱' }] }; },
     commentPlan: async (params) => { calls.push({ type: 'plan', params }); return { status: 'ok', batch: { batchId: 'comment-batch-1' }, targets, blocked: [], filter: { matched: 2 } }; },
     commentReply: async (params) => { calls.push({ type: 'public', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
     commentPrivate: async (params) => { calls.push({ type: 'private', params }); return { status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'sent_confirmed' })) }; },
@@ -772,16 +783,18 @@ testAsync('comment batch connects search-pool videoId to public reply and bound 
   const adapter = createWorkflowAdapter({ browser });
   const run = { runId: 'comment-batch-1', workflowId: 'comment.batch' };
   const plan = { params: { videoId: 'video-1', keywords: ['价格'], excludeKeywords: ['投诉'], maxSends: 2, publicText: '可以给您介绍方案', privateText: '方便私信沟通吗', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } } };
+  const collected = await adapter.execute({ run, plan, step: { stepId: 'collect' } });
+  assert.equal(collected.status, 'completed');
   const planned = await adapter.execute({ run, plan, step: { stepId: 'plan' } });
   assert.equal(planned.status, 'completed');
-  assert.equal(calls[0].params.videoId, 'video-1');
-  assert.deepEqual(calls[0].params.commentKeywords, ['价格']);
+  assert.equal(calls[1].params.videoId, 'video-1');
+  assert.deepEqual(calls[1].params.commentKeywords, ['价格']);
   const publicReply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'comment-act-1' } });
   assert.equal(publicReply.status, 'completed');
   const privateReply = await adapter.execute({ run, plan, step: { stepId: 'private_message' }, action: { idempotencyKey: 'comment-act-1' } });
   assert.equal(privateReply.status, 'completed');
-  assert.deepEqual(calls[2].params.items.map((item) => item.publicSendId), ['comment-act-1~public~c1', 'comment-act-1~public~c2']);
-  assert.deepEqual(calls[2].params.items.map((item) => item.sendId), ['comment-act-1~private~c1', 'comment-act-1~private~c2']);
+  assert.deepEqual(calls[3].params.items.map((item) => item.publicSendId), ['comment-act-1~public~c1', 'comment-act-1~public~c2']);
+  assert.deepEqual(calls[3].params.items.map((item) => item.sendId), ['comment-act-1~private~c1', 'comment-act-1~private~c2']);
   const report = await adapter.execute({ run, plan, step: { stepId: 'report' } });
   assert.equal(report.result.ledger[0].private.status, 'sent_confirmed');
   assert.equal(report.checkpoint.platformCheckpoint.version, 4);
@@ -791,6 +804,7 @@ testAsync('comment batch never invokes private sidecar when public delivery is u
   let privateCalls = 0;
   const targets = [{ eventId: 'c1', authorId: 'u1', roomId: 'https://www.douyin.com/video/1', text: '价格', publicText: '已收到', privateText: '请私信', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } }];
   const browser = {
+    commentCollect: async () => ({ status: 'ok', events: [{ id: 'c1', text: '价格' }] }),
     commentPlan: async () => ({ status: 'ok', batch: { batchId: 'comment-batch-unknown' }, targets, blocked: [] }),
     commentReply: async (params) => ({ status: 'ok', results: params.items.map((item) => ({ eventId: item.eventId, sendId: item.sendId, status: 'unknown', reason: 'platform_response_unavailable' })) }),
     commentPrivate: async () => { privateCalls += 1; return { status: 'ok', results: [] }; }
@@ -798,6 +812,8 @@ testAsync('comment batch never invokes private sidecar when public delivery is u
   const adapter = createWorkflowAdapter({ browser });
   const run = { runId: 'comment-batch-unknown', workflowId: 'comment.batch' };
   const plan = { params: { url: 'https://www.douyin.com/video/1', keywords: ['价格'], publicText: '已收到', privateText: '请私信', policyRef: { policyId: 'workflow-policy', policyVersion: 1 } } };
+  const collected = await adapter.execute({ run, plan, step: { stepId: 'collect' } });
+  assert.equal(collected.status, 'completed');
   await adapter.execute({ run, plan, step: { stepId: 'plan' } });
   const publicReply = await adapter.execute({ run, plan, step: { stepId: 'reply_public' }, action: { idempotencyKey: 'comment-act-unknown' } });
   assert.equal(publicReply.status, 'unknown');

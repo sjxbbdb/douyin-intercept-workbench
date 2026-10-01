@@ -6,6 +6,8 @@ import { AppError, badRequest, conflict, forbidden, unauthorized } from './error
 import { registerWorkflowRoutes } from './workflow-routes.js';
 import { createKnowledgeRetriever, registerKnowledgeRoutes } from './knowledge-routes.js';
 import type { OpenAIEmbeddingConfig } from './knowledge-routes.js';
+import { registerReplyPlanRoutes } from './reply-plan-routes.js';
+import type { ReplyPlanProviderInput, ReplyPlanProviderOutput } from './reply-plan-routes.js';
 
 export interface AppConfig {
   dbPath?: string;
@@ -291,6 +293,59 @@ async function providerPlan(cfg: AppConfig, input: AnyRecord): Promise<AnyRecord
     throw new AppError(503, 'PROVIDER_FAILED', error instanceof Error && error.name === 'AbortError' ? 'AI provider 超时' : 'AI provider 不可用');
   } finally { clearTimeout(timer); }
 }
+
+/**
+ * Generate both reply channels from server-retrieved knowledge before a
+ * fixed workflow is issued. The result is deliberately smaller than the
+ * general planner contract: the provider cannot choose steps, accounts,
+ * prices, or delivery status.
+ */
+async function providerReplyPlan(cfg: AppConfig, input: ReplyPlanProviderInput): Promise<ReplyPlanProviderOutput> {
+  const provider = cfg.provider ?? {};
+  if (!provider.baseUrl || !provider.apiKey || !provider.model) throw new AppError(503, 'PROVIDER_NOT_CONFIGURED', 'AI provider 未配置');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.draftTimeoutMs ?? 30_000);
+  try {
+    const knowledge = input.knowledge.results.slice(0, 20).map((item) => ({
+      chunkId: item.chunkId ?? null,
+      documentId: item.documentId ?? null,
+      title: item.title ?? null,
+      text: item.text,
+      score: item.score ?? null,
+      metadata: item.metadata ?? {},
+    }));
+    const response = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${provider.apiKey}` },
+      body: JSON.stringify({
+        model: provider.model,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content: '你是抖音商家客服话术生成器。只输出 JSON：publicReply(string), privateReply(string)。只能根据提供的知识片段和任务参数生成简短、合规、可人工审核的话术；不要承诺价格、效果、资质或平台动作，不要输出步骤、工具、账号、积分、策略、代码或额外字段。若证据不足，使用需要人工确认的中性表达。',
+          },
+          { role: 'user', content: JSON.stringify({ workflowId: input.workflowId, version: input.version, params: input.params, knowledge, targets: input.targets }) },
+        ],
+      }),
+    });
+    if (!response.ok) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 请求失败');
+    const raw = await response.text();
+    if (raw.length > 100_000) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 响应过大');
+    const content = (JSON.parse(raw) as AnyRecord).choices?.[0]?.message?.content;
+    if (typeof content !== 'string') throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 响应无效');
+    const parsed = JSON.parse(content) as AnyRecord;
+    if (Object.keys(parsed).some((key) => !['publicReply', 'privateReply'].includes(key))) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 返回了未支持的字段');
+    const publicReply = typeof parsed.publicReply === 'string' && parsed.publicReply.trim().length <= 2_000 ? parsed.publicReply.trim() : '';
+    const privateReply = typeof parsed.privateReply === 'string' && parsed.privateReply.trim().length <= 2_000 ? parsed.privateReply.trim() : '';
+    if (!publicReply || !privateReply) throw new AppError(503, 'PROVIDER_FAILED', 'AI provider 话术不符合契约');
+    return { publicReply, privateReply };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(503, error instanceof Error && error.name === 'AbortError' ? 'REPLY_PLAN_TIMEOUT' : 'PROVIDER_FAILED', error instanceof Error && error.name === 'AbortError' ? 'AI provider 超时' : 'AI provider 不可用');
+  } finally { clearTimeout(timer); }
+}
 async function providerResultDecision(cfg: AppConfig, input: AnyRecord): Promise<AnyRecord> {
   const provider = cfg.provider ?? {}; if (!provider.baseUrl || !provider.apiKey || !provider.model) throw new AppError(503, 'PROVIDER_NOT_CONFIGURED', 'AI provider 未配置');
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), cfg.draftTimeoutMs ?? 30_000);
@@ -376,7 +431,7 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
 
   app.get('/v1/me', async (request) => {
     const user = userFromRequest(store, request, config); const features = getFeatures(user, providerConfigured); const pricing = getPricing(store);
-    return { user: { id: user.user_id, username: user.username, expiresAt: user.user_expires_at, status: user.status }, balance: balance(store, user.user_id), features: { ...features, prices: pricing }, device: { id: user.device_row_id, name: user.device_name } };
+    return { user: { id: user.user_id, username: user.username, expiresAt: user.user_expires_at, status: user.status }, balance: balance(store, user.user_id), features: { ...features, prices: { ...pricing, workflows: canonicalWorkflowPrices } }, device: { id: user.device_row_id, name: user.device_name } };
   });
 
   app.get('/v1/credits/ledger', async (request) => {
@@ -504,13 +559,26 @@ export async function buildApp(config: AppConfig = {}): Promise<FastifyInstance>
   });
   app.get('/v1/admin/audit', async (request) => { const admin = adminFromRequest(store, request); const rows = store.all<AnyRecord>('SELECT id,actor_type AS actorType,actor_id AS actorId,action,target_user_id AS targetUserId,metadata_json AS metadata,created_at AS createdAt FROM audit ORDER BY id DESC LIMIT 1000'); return { entries: rows.map((x) => ({ ...x, metadata: parseJson(x.metadata, {}) })), actor: admin.admin_id }; });
 
+  const knowledgeRetriever = createKnowledgeRetriever({ store, embedding: config.embedding });
   registerWorkflowRoutes(app, {
     store,
     userFromRequest: (request) => userFromRequest(store, request, config),
     adminFromRequest: (request) => adminFromRequest(store, request),
     planner: (input) => providerPlan(config, input),
     resultDecider: (input) => providerResultDecision(config, input),
-    knowledgeRetrieve: createKnowledgeRetriever({ store, embedding: config.embedding }),
+    knowledgeRetrieve: knowledgeRetriever,
+  });
+  registerReplyPlanRoutes(app, {
+    store,
+    userFromRequest: (request) => userFromRequest(store, request, config),
+    knowledgeRetrieve: knowledgeRetriever,
+    providerReplyPlan: (input) => providerReplyPlan(config, input),
+    authorizeWorkflow: (actor, workflowId) => {
+      const features = parseJson<AnyRecord>(actor.features_json, {});
+      if (features.workflow === false) throw forbidden('FEATURE_DISABLED', '该账号未开通固定流程功能');
+      const entitlement = workflowId.startsWith('video.') ? 'videoSearch' : workflowId.startsWith('comment.') ? 'commentReply' : workflowId.startsWith('live.') ? 'liveInteraction' : null;
+      if (entitlement && features[entitlement] !== true) throw forbidden('FEATURE_DISABLED', `该账号未开通 ${entitlement} 功能`);
+    },
   });
   registerKnowledgeRoutes(app, {
     store,

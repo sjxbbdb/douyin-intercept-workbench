@@ -22,7 +22,7 @@
 {
   "user": { "id": "u_…", "username": "shop", "expiresAt": 1770000000000, "status": "active" },
   "balance": 12,
-  "features": { "evaluate": true, "draft": false },
+  "features": { "evaluate": true, "draft": false, "workflow": true, "prices": { "evaluateReplyPrice": 1, "draftPrice": 2, "workflows": { "video.search": 1, "comment.batch": 2, "live.batch": 2 } } },
   "device": { "id": "d_…", "name": "店铺电脑" }
 }
 ```
@@ -49,6 +49,10 @@
 
 Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `params`，不会返回步骤、浏览器动作或发送内容。请求还必须带 `idempotencyKey`；服务端使用账号 feature、活动 workflow 目录和服务端 provider 重验结果。provider 未配置、目录为空或模型返回未注册版本时分别返回 `PLANNER_NOT_CONFIGURED`、`WORKFLOW_CATALOG_EMPTY` 或 `PLANNER_INVALID_WORKFLOW`。规划结果只是冻结计划，不能直接发送。
 
+### `POST /v1/reply-plans`
+
+评论区和直播间的回复流程在启动前使用两阶段计划：客户端提交已选固定流程、租户自己的 `knowledgeSetId`/可选版本、检索问题和幂等键；授权端完成租户隔离的向量检索，再调用服务端 provider 生成 `publicReply` 与 `privateReply`。服务端只接受这两个字段，写入带 `policyRef`、知识集版本和片段引用的冻结 `workflow_plans`，返回 `status: "issued"` 后客户端才能创建运行实例。没有命中知识返回 `WAITING_HUMAN`；provider 超时、连接中断或输出不确定返回 `UNKNOWN`，同一幂等键只允许查询原结果，不会再次调用模型。回复生成发生在固定流程启动前；流程进入 `RUNNING` 后执行器不再调用模型。
+
 ### 固定流程运行与恢复
 
 管理员通过 `POST /v1/admin/workflows` 注册带步骤契约的版本，普通账号通过 `GET /v1/workflows` 查看已启用目录。`POST /v1/workflow-runs` 使用 `planId + workflowId + version + params` 创建幂等运行实例；视频搜索、评论和直播的正式流程必须绑定当前用户的 active `platformAccountId`，服务端同时冻结契约 hash、功能 entitlement、账号作用域和积分价格策略。运行器通过 `POST /v1/workflow-runs/:id/checkpoints` 上报 `RUNNING`、`CHECKPOINT`、`UNKNOWN`、`WAITING_HUMAN`、`PAUSED`、`COMPLETED` 等状态，使用 `expectedVersion` 防止旧客户端覆盖新检查点。
@@ -57,9 +61,15 @@ Agent 规划只返回已注册固定流程的 `workflowId`、`version` 和 `para
 
 需要人工处理的运行实例使用 `.../human-wait` 记录脱敏原因和上下文。`.../recover` 或 `.../human-wait/resolve` 必须带连续两次健康检查结果；手动暂停还需要 `userConfirmed=true`。服务端不会因为恢复请求自动重发未知发送动作。
 
+发送结果没有平台可验证回执时，运行实例会停在人工状态。操作者确认已在专用抖音页面处理后，可在持有租约的设备上调用 `POST /v1/workflow-runs/:id/manual-complete`（`note`、`idempotencyKey`、可选 `expectedVersion`）。授权端在事务中生成一次性 `manual_proof_*`、写入审计、完成服务端积分结算并把流程置为 `COMPLETED`；普通 checkpoint 不能伪造这个证明。
+
 同一个运行实例在多设备之间由任务租约保护：`POST /v1/workflow-runs/:id/lease/acquire`、`.../lease/renew`、`.../lease/release` 以当前登录会话的 `deviceId` 作为租约身份，默认 120 秒、允许 5 到 600 秒。持有有效租约的设备才能写入检查点、恢复流程和请求结果决策；其他设备收到 `LEASE_HELD` 或 `LEASE_OWNER_MISMATCH`。客户端异常退出后租约自然过期，其他设备可以接管；租约操作都需要幂等键并写入审计。完整请求和桌面生命周期见 [workflow-lease.md](contracts/workflow-lease.md)。
 
 流程上报非 `RUNNING` 结果后，客户端可调用 `POST /v1/workflow-runs/:id/result-decision`，请求携带当前服务端状态、脱敏 `summary` 和幂等键。服务端只接受与数据库运行状态一致的 `FAILED`、`COMPLETED`、`STOPPED`、`UNKNOWN`、`CHECKPOINT`、`WAITING_HUMAN` 或 `PAUSED`；运行中的流程返回 `RESULT_DECISION_RUNNING`。结果模型只能返回 `continue`、`retry`、`complete` 或 `wait_human`，该响应不会直接修改流程状态。桌面端把 `retry` 作为下一步建议，未知发送结果和人工等待继续保持人工门控，不会自动重发。
+
+### `GET /v1/audit`
+
+普通账号只能读取自己的脱敏审计条目（流程、检查点、积分结算、策略/知识版本和恢复原因）；原文、密码、token、provider key 和其他租户身份不会返回。管理员使用独立的 `/v1/admin/audit`。
 
 ### `knowledge-sets`
 

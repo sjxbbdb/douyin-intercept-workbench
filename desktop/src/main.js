@@ -525,12 +525,18 @@ async function startWorkflowRun({ accountId, accountContext, plan, requestedPlat
       const result = await runtime.run(run.runId);
       workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
       await api.renewWorkflowLease(remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {}, humanWait: result.status === 'WAITING_HUMAN' ? { reason: result.lastError?.message || '平台适配器需要人工处理', context: result.checkpoint || {} } : undefined });
+      const sendWorkflow = contractSteps.some((step) => step && step.sideEffect === true);
+      const sendEvidenceMissing = result.status === 'COMPLETED' && sendWorkflow;
+      const reportedStatus = sendEvidenceMissing ? 'WAITING_HUMAN' : result.status;
+      const reportedCheckpoint = sendEvidenceMissing
+        ? { ...(result.checkpoint || {}), phase: 'send', reason: 'server_send_evidence_required' }
+        : (result.checkpoint || {});
+      const finalRemote = await api.checkpointWorkflow(remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
       remoteVersion = Number.isSafeInteger(finalRemote?.run?.checkpointVersion) ? finalRemote.run.checkpointVersion : remoteVersion + 1;
-      const nextDecision = await requestResultDecision(remoteRunId, result);
+      const nextDecision = sendEvidenceMissing ? { decision: 'wait_human', reason: 'server_send_evidence_required' } : await requestResultDecision(remoteRunId, result);
       let decisionApplied = null;
-      if (nextDecision?.decision === 'wait_human' && ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status)) {
-        decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: 'server_result_decision', checkpoint: result.checkpoint || null });
+      if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['UNKNOWN', 'CHECKPOINT', 'WAITING_HUMAN', 'PAUSED'].includes(result.status))) {
+        decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
         if (result.status !== 'WAITING_HUMAN') {
           const humanCheckpoint = await api.checkpointWorkflow(remoteRunId, { status: 'WAITING_HUMAN', stepId: String(result.currentStep), expectedVersion: remoteVersion, humanWait: { reason: 'Agent 结果决策要求人工处理', context: result.checkpoint || {} }, failure: result.lastError || undefined, targetState: result.checkpoint || {} });
           remoteVersion = Number.isSafeInteger(humanCheckpoint?.run?.checkpointVersion) ? humanCheckpoint.run.checkpointVersion : remoteVersion + 1;
@@ -583,7 +589,31 @@ async function runAgentChat(input) {
   const context = input?.context && typeof input.context === 'object' && !Array.isArray(input.context) ? input.context : {};
 
   return workflowManager.run(accountId, async ({ context: accountContext }) => {
-    const plan = await accountContext.runtime.planFromIntent(message, context);
+    let plan = await accountContext.runtime.planFromIntent(message, context);
+    // Intent planning only chooses a registered workflow. For reply-capable
+    // workflows, a selected knowledge set must produce a second, server-issued
+    // frozen reply plan before the executor is allowed to start. This keeps
+    // vector retrieval/provider generation out of RUNNING and prevents the
+    // planner from smuggling unsourced reply text into a fixed workflow.
+    const replyWorkflow = ['comment.batch', 'comment.reply_then_private', 'live.batch', 'live.reply_then_private'].includes(plan.workflowId);
+    const selectedKnowledgeSet = typeof context.knowledgeSetId === 'string' && context.knowledgeSetId.trim() ? context.knowledgeSetId.trim() : '';
+    if (replyWorkflow && selectedKnowledgeSet) {
+      const replyPlan = await api.createReplyPlan({
+        workflowId: plan.workflowId,
+        version: plan.version,
+        params: plan.params,
+        knowledgeSetId: selectedKnowledgeSet,
+        knowledgeSetVersion: context.knowledgeSetVersion,
+        query: typeof context.knowledgeQuery === 'string' && context.knowledgeQuery.trim() ? context.knowledgeQuery : message,
+        targets: Array.isArray(context.targets) ? context.targets.slice(0, 200) : [],
+        idempotencyKey: safeIdempotencyKey(`reply-plan:${requestKey}:${plan.workflowId}:${plan.version}`)
+      });
+      if (replyPlan?.status !== 'issued' || !replyPlan.planId || !replyPlan.params) {
+        const reason = replyPlan?.reason === 'KNOWLEDGE_NOT_FOUND' ? '话术库没有命中内容，已转人工' : '话术生成结果未被授权中心确认，已转人工';
+        throw new Error(reason);
+      }
+      plan = { planId: replyPlan.planId, workflowId: replyPlan.workflowId, version: replyPlan.version, params: replyPlan.params };
+    }
     return startWorkflowRun({ accountId, accountContext, plan, requestedPlatform, deviceId, chatMessage: message });
   }, { idempotencyKey: requestKey, metadata: { message, platformAccountId: requestedPlatform } });
 }
@@ -709,15 +739,21 @@ function registerIpc() {
         }
         const result = await runtime.resumeRun(local.runId, { skipHealthCheck: true });
         workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
+        const sendWorkflow = local.steps.some((step) => step && step.sideEffect === true);
+        const sendEvidenceMissing = result.status === 'COMPLETED' && sendWorkflow;
+        const reportedStatus = sendEvidenceMissing ? 'WAITING_HUMAN' : result.status;
+        const reportedCheckpoint = sendEvidenceMissing
+          ? { ...(result.checkpoint || {}), phase: 'send', reason: 'server_send_evidence_required' }
+          : (result.checkpoint || {});
         if (local.remoteRunId && remoteVersion != null) {
           await api.renewWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:renew:${local.remoteRunId}:${result.runId}:${result.status}:${deviceId}`) });
-          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: result.status, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: result.lastError || undefined, targetState: result.checkpoint || {}, humanWait: result.status === 'WAITING_HUMAN' ? { reason: result.lastError?.message || '平台适配器需要人工处理', context: result.checkpoint || {} } : undefined });
+          const checkpoint = await api.checkpointWorkflow(local.remoteRunId, { status: reportedStatus, stepId: String(result.currentStep), expectedVersion: remoteVersion, failure: sendEvidenceMissing ? { code: 'SEND_EVIDENCE_REQUIRED', message: '平台未提供授权端可验证的送达证据' } : (result.lastError || undefined), targetState: reportedCheckpoint, humanWait: reportedStatus === 'WAITING_HUMAN' ? { reason: sendEvidenceMissing ? '平台送达证据未验证，需人工检查' : (result.lastError?.message || '平台适配器需要人工处理'), context: reportedCheckpoint } : undefined });
           remoteVersion = Number.isSafeInteger(checkpoint?.run?.checkpointVersion) ? checkpoint.run.checkpointVersion : remoteVersion + 1;
         }
-        const nextDecision = await requestResultDecision(local.remoteRunId, result);
+        const nextDecision = sendEvidenceMissing ? { decision: 'wait_human', reason: 'server_send_evidence_required' } : await requestResultDecision(local.remoteRunId, result);
         let decisionApplied = null;
-        if (nextDecision?.decision === 'wait_human' && ['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'PAUSED'].includes(result.status)) {
-          decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: 'server_result_decision', checkpoint: result.checkpoint || null });
+        if (nextDecision?.decision === 'wait_human' && (sendEvidenceMissing || ['WAITING_HUMAN', 'UNKNOWN', 'CHECKPOINT', 'PAUSED'].includes(result.status))) {
+          decisionApplied = runtime.applyResultDecision(result.runId, 'wait_human', { reason: sendEvidenceMissing ? 'server_send_evidence_required' : 'server_result_decision', checkpoint: reportedCheckpoint || null });
         } else if (nextDecision?.decision && result.status === 'COMPLETED' && ['continue', 'complete'].includes(nextDecision.decision)) {
           decisionApplied = runtime.applyResultDecision(result.runId, nextDecision.decision, { reason: 'server_result_decision' });
         } else if (nextDecision?.decision) {
@@ -733,6 +769,35 @@ function registerIpc() {
         }
       }
     }, { taskId: `resume:${normalizedRunId}`, metadata: { platformAccountId: requestedPlatform } });
+  }));
+  ipcMain.handle('agent:manual-complete-workflow', wrap(async (_event, input) => {
+    if (engine.publicLicense().state !== 'authorized') throw new Error('请先登录并通过授权检查');
+    const runId = text(typeof input === 'string' ? input : input?.runId, 'run id', 160);
+    const note = typeof input === 'object' && typeof input?.note === 'string' ? input.note.slice(0, 500) : '';
+    const requestedPlatform = typeof input === 'object' && input?.platformAccountId ? normalizePlatformAccountId(input.platformAccountId) : currentPlatformAccountId;
+    if (!runId || !requestedPlatform || !currentAccountUserId || !platformAccounts.some((account) => account.id === requestedPlatform)) throw new Error('人工确认缺少有效的账号或流程');
+    const accountId = registerWorkflowAccount(currentAccountUserId, requestedPlatform);
+    const deviceId = authStore.getDevice().id;
+    return workflowManager.run(accountId, async ({ context: accountContext }) => {
+      const runtime = accountContext.runtime; const local = runtime.getRun(runId);
+      if (!local.remoteRunId) throw new Error('该流程尚未绑定授权端运行实例，无法人工确认');
+      let leaseHeld = false;
+      try {
+        await api.acquireWorkflowLease(local.remoteRunId, { ttlMs: 120000, idempotencyKey: safeIdempotencyKey(`lease:manual-complete:${local.remoteRunId}:${deviceId}`) });
+        leaseHeld = true;
+        const response = await api.manualCompleteWorkflow(local.remoteRunId, { note, idempotencyKey: safeIdempotencyKey(typeof input === 'object' && input?.idempotencyKey ? input.idempotencyKey : `manual-complete:${local.remoteRunId}`) });
+        const proofId = text(response?.proofId, 'manual proof id', 180);
+        if (!proofId) throw new Error('授权端未返回人工确认凭证');
+        const result = runtime.manualComplete(runId, proofId);
+        workflowAccountRuns.set(accountId, { accountId, platformAccountId: requestedPlatform, run: result });
+        emitState();
+        return result;
+      } finally {
+        if (leaseHeld) {
+          try { await api.releaseWorkflowLease(local.remoteRunId, { idempotencyKey: safeIdempotencyKey(`lease:release-manual-complete:${local.remoteRunId}:${deviceId}`) }); } catch (error) { console.warn('[workflow] manual completion lease release failed', error.message); }
+        }
+      }
+    }, { taskId: `manual-complete:${runId}`, metadata: { platformAccountId: requestedPlatform } });
   }));
   ipcMain.handle('agent:pause-workflow', wrap(async (_event, runId) => {
     const accountId = registerWorkflowAccount(currentAccountUserId, currentPlatformAccountId);

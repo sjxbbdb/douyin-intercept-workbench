@@ -33,6 +33,8 @@ interface ReplyPlanRouteDeps {
   userFromRequest: AuthFn;
   knowledgeRetrieve: (input: { userId: string; knowledgeSetId: string; version?: number; query: string; topK?: number }) => Promise<ReplyKnowledgeResult>;
   providerReplyPlan: (input: ReplyPlanProviderInput) => Promise<ReplyPlanProviderOutput>;
+  /** Optional server-side entitlement check. It runs before retrieval/provider use. */
+  authorizeWorkflow?: (actor: RecordValue, workflowId: string, version: string) => void;
 }
 
 const json = (value: unknown) => JSON.stringify(value);
@@ -109,6 +111,9 @@ export function registerReplyPlanRoutes(app: FastifyInstance, deps: ReplyPlanRou
     const payload = { workflowId: id, version, params, knowledgeSetId: setId, knowledgeSetVersion: setVersion ?? null, query, topK, targets, idempotencyKey: key };
     const old = store.get<RecordValue>('SELECT response_json,status,payload_hash,idem_key FROM idempotency WHERE user_id=? AND scope=? AND idem_key=?', actor.user_id, 'reply.plan', key);
     if (old) { if (old.payload_hash !== hashPayload(payload)) throw conflict('IDEMPOTENCY_CONFLICT', '相同幂等键不能用于不同请求'); return responseFor(old); }
+    deps.authorizeWorkflow?.(actor, id, version);
+    const definition = store.get<RecordValue>("SELECT workflow_id,version,contract_json FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version);
+    if (!definition) throw new AppError(404, 'WORKFLOW_NOT_FOUND', '流程版本不存在或未启用');
     store.run('INSERT INTO idempotency(id,user_id,scope,idem_key,payload_hash,status,created_at) VALUES(?,?,?,?,?,?,?)', randomId('idem'), actor.user_id, 'reply.plan', key, hashPayload(payload), 'pending', store.now());
     try {
       const knowledge = await deps.knowledgeRetrieve({ userId: actor.user_id, knowledgeSetId: setId, version: setVersion, query, topK });
@@ -121,10 +126,12 @@ export function registerReplyPlanRoutes(app: FastifyInstance, deps: ReplyPlanRou
       const generated = await deps.providerReplyPlan({ workflowId: id, version, params, idempotencyKey: key, knowledge: { ...knowledge, results: snippets }, targets });
       if (!generated || typeof generated !== 'object' || Array.isArray(generated) || Object.keys(generated).some((field) => !['publicReply', 'privateReply'].includes(field))) throw new AppError(503, 'REPLY_PLAN_INVALID', '模型返回了未支持的字段');
       const publicReply = strictReply(generated?.publicReply, 'publicReply'); const privateReply = strictReply(generated?.privateReply, 'privateReply');
-      const frozenParams = { ...params, publicReply, privateReply, knowledgeSetId: knowledge.knowledgeSetId, knowledgeSetVersion: knowledge.version, replyPlan: { publicReply, privateReply, knowledgeSetId: knowledge.knowledgeSetId, knowledgeSetVersion: knowledge.version, snippets: snippets.map((item) => ({ chunkId: item.chunkId ?? null, documentId: item.documentId ?? null, title: item.title ?? null, score: item.score ?? null })) } };
+      const contractHash = hashPayload(parseJson<RecordValue>(definition.contract_json, {}));
+      const policyFingerprint = hashPayload({ workflowId: id, version, contractHash, knowledgeSetVersion: knowledge.version });
+      const policyVersion = Math.max(1, Number.parseInt(policyFingerprint.slice(0, 8), 16) % 1_000_000_000);
+      const policyRef = { policyId: `workflow-policy:${id}`, policyVersion, knowledgeSetVersion: knowledge.version };
+      const frozenParams = { ...params, publicReply, privateReply, policyRef, knowledgeSetId: knowledge.knowledgeSetId, knowledgeSetVersion: knowledge.version, replyPlan: { publicReply, privateReply, policyRef, knowledgeSetId: knowledge.knowledgeSetId, knowledgeSetVersion: knowledge.version, snippets: snippets.map((item) => ({ chunkId: item.chunkId ?? null, documentId: item.documentId ?? null, title: item.title ?? null, score: item.score ?? null })) } };
       if (Buffer.byteLength(json(frozenParams), 'utf8') > 24_000) throw new AppError(503, 'REPLY_PLAN_INVALID', '冻结话术计划过大');
-      const definition = store.get<RecordValue>("SELECT workflow_id,version FROM workflow_definitions WHERE workflow_id=? AND version=? AND status='active'", id, version);
-      if (!definition) throw new AppError(404, 'WORKFLOW_NOT_FOUND', '流程版本不存在或未启用');
       const planId = randomId('plan'); const now = store.now(); const issued = { status: 'issued', planId, workflowId: id, version, params: frozenParams, knowledgeSet: { id: knowledge.knowledgeSetId, version: knowledge.version }, issuedAt: now, expiresAt: now + 10 * 60 * 1000, idempotencyKey: key };
       store.transaction(() => { store.run('INSERT INTO workflow_plans(id,user_id,workflow_id,workflow_version,params_json,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)', planId, actor.user_id, id, version, json(frozenParams), 'issued', now, now + 10 * 60 * 1000); store.run('UPDATE idempotency SET status=\'completed\',response_json=? WHERE user_id=? AND scope=? AND idem_key=?', json(issued), actor.user_id, 'reply.plan', key); audit(store, actor.user_id, 'reply.plan.issue', { planId, workflowId: id, version, knowledgeSetId: setId, knowledgeSetVersion: knowledge.version, paramsHash: hashPayload(frozenParams) }); });
       return issued;

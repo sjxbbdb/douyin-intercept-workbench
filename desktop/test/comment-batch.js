@@ -12,6 +12,7 @@ const baseParams = {
   excludeKeywords: ['广告'],
   publicReply: '谢谢关注',
   privateReply: '请查看详情',
+  policyRef: { policyId: 'workflow-policy', policyVersion: 1 },
   maxComments: 10,
   maxSends: 10
 };

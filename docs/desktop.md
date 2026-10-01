@@ -83,13 +83,14 @@ window.agentApi = {
   searchTargets({ keyword, maxVideos, scrollRounds })
   listWorkflows(), startWorkflow(request), chat({ message, context }),
   resumeWorkflow({ runId, platformAccountId }), pauseWorkflow(runId),
+  prepareReplyPlan({ workflowId, version, params, knowledgeSetId, query, targets }),
   knowledgeListSets(), knowledgeCreateSet({ name, description }),
   knowledgeListDocuments(knowledgeSetId), knowledgeAddDocument(document),
   knowledgeRetrieve({ knowledgeSetId, query, topK })
 }
 ```
 
-知识库 IPC 由主进程代持授权 token；renderer 只接收知识集、文档摘要和检索结果。进入评论区或直播间页面后启动的是服务端登记的固定批次流程：评论批次按“采集 → 冻结计划 → 公屏逐条确认 → 仅对确认成功目标私信 → 报告”执行，直播批次使用同样的公屏确认门禁。模型不参与步骤执行，`UNKNOWN` 或 `WAITING_HUMAN` 会停在原检查点。
+知识库 IPC 由主进程代持授权 token；renderer 只接收知识集、文档摘要和检索结果。进入评论区或直播间页面后启动的是服务端登记的固定批次流程：评论批次按“采集 → 冻结计划 → 公屏逐条确认 → 仅对确认成功目标私信 → 报告”执行，直播批次使用同样的公屏确认门禁。选择知识集时，`prepareReplyPlan` 先让授权端完成租户隔离的向量检索和双渠道话术冻结；只有 `status: "issued"` 的服务端计划可以启动运行。模型不参与步骤执行，`UNKNOWN` 或 `WAITING_HUMAN` 会停在原检查点。
 
 主进程对每次 IPC 校验 `event.sender` 必须是主窗口的 `webContents.id`，并再次校验 URL、字段长度和任务状态。没有通用 `executeJavaScript` IPC；DOM 脚本只能由 `browser-bridge.js` 使用固定脚本执行。
 

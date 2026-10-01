@@ -345,6 +345,20 @@ class WorkflowRuntime {
     return clone(run);
   }
 
+  manualComplete(runId, proofId) {
+    const value = requiredText(proofId, 'manual proof id', 180);
+    const data = this.#readData();
+    const run = this.#findOwned(data, runId);
+    if (![RUN_STATES.WAITING_HUMAN, RUN_STATES.UNKNOWN, RUN_STATES.PAUSED].includes(run.status)) throw new Error(`workflow cannot be manually completed from ${run.status}`);
+    run.status = RUN_STATES.COMPLETED;
+    run.checkpoint = { ...(run.checkpoint || {}), phase: 'manual', status: 'manual_confirmed', proofId: value };
+    run.lastError = null;
+    run.resultDecision = { decision: 'manual_complete', proofId: value, at: this.clock() };
+    run.updatedAt = this.clock();
+    this.#writeData(data);
+    return clone(run);
+  }
+
   invalidate(reason = 'session_invalidated') {
     const data = this.#readData();
     const pauseReason = requiredText(reason, 'invalidation reason', 300);
