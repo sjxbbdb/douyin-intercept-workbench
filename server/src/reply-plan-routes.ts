@@ -142,4 +142,3 @@ export function registerReplyPlanRoutes(app: FastifyInstance, deps: ReplyPlanRou
     }
   });
 }
-

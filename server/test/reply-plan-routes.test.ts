@@ -48,4 +48,3 @@ test('provider timeout is returned as unknown and same key can be queried withou
     const body = { workflowId: 'comment.batch', version: '1', params: {}, knowledgeSetId: 'set-a', query: '证据', idempotencyKey: 'reply-plan-unknown' }; const first = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.equal(first.json().status, 'UNKNOWN'); const second = await app.inject({ method: 'POST', url: '/v1/reply-plans', payload: body }); assert.deepEqual(second.json(), first.json()); const lookup = await app.inject({ method: 'GET', url: '/v1/reply-plans/reply-plan-unknown' }); assert.deepEqual(lookup.json(), first.json()); assert.equal(calls, 1); await app.close();
   } finally { await f.close(); }
 });
-
