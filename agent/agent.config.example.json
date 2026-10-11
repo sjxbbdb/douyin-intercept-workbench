@@ -1,0 +1,7 @@
+{
+  "_说明": "复制成 agent/agent.config.json 后改成本机路径。里面【不含】任何密码或 Cookie；本工具不代办登录。",
+  "stateDir": "D:\\dy-run\\state",
+  "profileDir": "D:\\deep seek\\dy-main",
+  "port": 9222,
+  "python": "python"
+}

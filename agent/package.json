@@ -1,0 +1,19 @@
+{
+  "name": "douyin-agent-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "抖音截流 Agent 工具服务（形态 A：零第三方依赖 stdio 工具服务）。BP0 = 4 个只读工具。",
+  "main": "src/registry.js",
+  "bin": {
+    "douyin-agent-tools": "bin/agent-tools.js"
+  },
+  "scripts": {
+    "start": "node bin/agent-tools.js",
+    "import-leads": "node bin/import-leads.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {}
+}
