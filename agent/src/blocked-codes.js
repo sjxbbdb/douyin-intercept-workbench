@@ -19,6 +19,7 @@ const PLATFORM_CONFIRMED = 'sent_confirmed';
 // 协议错误码 -> 业务阻断码。出处逐条核实过，见契约 §6.1。
 const PROTOCOL_TO_BLOCKED = {
   invalid_input: 'blocked/invalid_input',
+  unsupported: 'blocked/unsupported',
   invalid_request: 'unknown/internal',
   invalid_config: 'unknown/internal',
   request_too_large: 'unknown/internal',

@@ -53,7 +53,9 @@
 
 **一个账号一个进程**：`account_scope` 由 profile 路径推导，两个人共用同一个 profile 就等于共用同一个账号作用域。
 
-## 工具（BP0 恰好 4 个，全部只读）
+## 工具（12 个，三层）
+
+### read（4 个，只看本地台账，不碰浏览器）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -61,6 +63,30 @@
 | `query_leads` | 查线索（**只回哈希后的标识，绝不回 sec_uid / 昵称 / 原文**） |
 | `get_stats` | 台账统计（`sent_confirmed` 只来自**落库原始状态**） |
 | `explain_failure` | 归因；`unknown` 一律 `nextAction: "none"` |
+
+### capture（6 个，用浏览器**读**平台内容，不写入任何内容）
+
+| 工具 | 作用 |
+| --- | --- |
+| `search_videos` | **按关键词搜视频**（分页、相关度、发布时间区间） |
+| `list_video_pool` | 看已抓到的候选视频，拿 `videoId` 交给评论区 |
+| `collect_comments` | **抓评论区**，按关键词/排除词/去重给出目标批次 |
+| `collect_live` | **抓直播间**可见互动（一次） |
+| `live_listen` | 直播间监听一轮，并入队列（可重复调用） |
+| `get_batch_report` | 批次报告：逐条状态、检查点、"哪些够条件"的只读候选清单 |
+
+### lifecycle（2 个，只管那个专用 Chrome 进程）
+
+| 工具 | 作用 |
+| --- | --- |
+| `start_browser` | 启动/连接 sidecar 持有的专用 Chrome（采集的前提） |
+| `close_browser` | 关掉它（不影响你自己的其他浏览器窗口） |
+
+**典型用法**：`start_browser` → `search_videos(关键词)` → `list_video_pool` →
+`collect_comments(videoId, commentKeywords)` → `get_batch_report`。
+
+⚠️ **这里没有"发出去"的能力。** 没有发评论、没有发私信、没有审批、没有 `send_*`。
+采集回来的候选都带 `candidatesAreSendable: false` —— 因为工具表里根本没有发送工具，不是靠提示词拦。
 
 ## 线索从哪里来
 

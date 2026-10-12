@@ -133,11 +133,15 @@ function dispatch(cfg, line) {
     emit({ jsonrpc: '2.0', id, result: {
       protocolVersion: negotiateVersion(params.protocolVersion),
       capabilities: { tools: {} },
-      serverInfo: { name: 'douyin-agent-tools', version: '0.1.0' },
-      // 让客户端一眼看到这一版的边界。
-      stage: 'BP0',
+      serverInfo: { name: 'douyin-agent-tools', version: '0.2.0' },
+      // 让客户端一眼看到这一版的边界：有能力做什么、以及【没有】什么。
       toolCount: registry.count(),
-      writableTools: 0
+      tiers: registry.countByTier(),
+      // 会写入平台内容（发评论/发私信）的工具数量。这一版恒为 0。
+      writableTools: 0,
+      capabilities: registry.countByTier(),
+      sendToolCount: 0,
+      serverCapabilities: { tools: {} }
     } });
     return;
   }

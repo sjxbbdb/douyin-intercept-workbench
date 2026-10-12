@@ -41,6 +41,10 @@ test('逐个钉住关键映射（评审点名的几条）', function () {
   assert.strictEqual(codes.toBlocked('no_replyable_comment'), 'empty/no_replyable_comment');
 });
 
+test('unsupported 有明确归属，不落进 unknown', function () {
+  assert.strictEqual(codes.toBlocked('unsupported'), 'blocked/unsupported');
+});
+
 test('未知码不得原样透传', function () {
   assert.strictEqual(codes.toBlocked('something_brand_new'), 'unknown/internal');
   assert.strictEqual(codes.toBlocked(undefined), 'unknown/internal');

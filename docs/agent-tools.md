@@ -190,6 +190,40 @@
 
 ---
 
+## 三之二、采集层与生命周期（**已实现**，2026-09-29）
+
+> ⚠️ 与 §三 的关系要说清楚：§三 的 T-01~T-08 是 v3 计划里为"审批型 Agent"设计的 8 个工具。
+> 使用者要求**把真正干活的功能（关键词搜视频 / 评论区 / 直播间）交给 Agent**，因此在契约之外
+> **新增了 8 个采集与生命周期工具**，总数变成 **12**。这不是把 T-06/T-07 提前做了 ——
+> **审批（review_batch / approve_batch）与任何发送能力仍然没有实现，也不在本层。**
+
+采集层的定位：**用浏览器读平台内容，但不写入任何内容。**
+它们会导航、会滚动、会触发页面，所以【会】遇到验证码 —— 遇到就停机等人，绝不绕过、绝不重试。
+
+| 工具 | tier | 底层 sidecar 方法 | 会碰浏览器 | 会写入平台内容 |
+| --- | --- | --- | --- | --- |
+| `search_videos` | capture | `search` | 是 | 否 |
+| `list_video_pool` | capture | `search_pool` | 否 | 否 |
+| `collect_comments` | capture | `collect_comments` | 是 | 否 |
+| `collect_live` | capture | `collect_live` | 是 | 否 |
+| `live_listen` | capture | `live_listen` | 是 | 否 |
+| `get_batch_report` | capture | `comment_result` / `live_result` | 否 | 否 |
+| `start_browser` | lifecycle | `launch` | 启动 | 否 |
+| `close_browser` | lifecycle | `close` | 关闭 | 否 |
+
+### 采集层的额外约定
+
+1. **验证码 / 登录失效是停机信号**：原样抬到最外层（`blocked/captcha_requires_manual_action` /
+   `blocked/not_authorized`），带上 sidecar 的原始观测，**不自动重试、不做任何补救**。
+2. **隐私**：评论/互动**正文会返回**（这是这几项功能的意义），但**作者身份只出账号内加盐哈希** ——
+   `authorId` / `authorName` / 创作者 `sec_uid` 一律不出本层。
+   理由：工具出参会被送进 LLM 上下文，可能是第三方云端模型，身份不该跟着走。
+3. **候选不等于可发送**：`collect_comments` 的 `candidates` 与 `get_batch_report` 的
+   `privateCandidates` 都带 `candidatesAreSendable: false` —— 因为本层没有发送工具。
+4. **不暴露 `open`**：任意跳转不是任何一项功能需要的，`open` 列入禁止清单。
+5. **`autoEligible`**：除 `list_video_pool` 与 `get_batch_report`（纯本地只读）外，
+   采集类与生命周期类一律 `autoEligible: false`。
+
 ## 四、闭集枚举（必须严格实现，不得自由文本）
 
 - `sourceType`: `comment | live`

@@ -28,12 +28,11 @@ function runServer(cfg, requests) {
   return { responses: lines.map(function (l) { return JSON.parse(l); }), stderr: String(result.stderr || '') };
 }
 
-test('initialize 声明 BP0 边界：4 个工具、0 个可写工具', function () {
+test('initialize 声明能力边界：12 个工具、0 个会写入平台内容的工具', function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE });
   const out = runServer(cfg, [{ jsonrpc: '2.0', id: 1, method: 'initialize' }]);
   const result = out.responses[0].result;
-  assert.strictEqual(result.stage, 'BP0');
-  assert.strictEqual(result.toolCount, 4);
+  assert.strictEqual(result.toolCount, 12);
   assert.strictEqual(result.writableTools, 0);
 });
 
@@ -50,12 +49,14 @@ test('initialize 按规范协商协议版本：支持的回同一个，不支持
 test('tools/list 只列只读工具，且都带声明字段', function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE });
   const out = runServer(cfg, [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]);
+  const registry = require('../src/registry');
   const tools = out.responses[0].result.tools;
-  assert.strictEqual(tools.length, 4);
+  assert.strictEqual(tools.length, 12);
+  const declared = registry.listTools().map(function (t) { return t.name; });
   tools.forEach(function (tool) {
     assert.ok(tool.declaration && tool.declaration.validation, tool.name);
-    assert.ok(['get_account_health', 'query_leads', 'get_stats', 'explain_failure'].indexOf(tool.name) !== -1,
-      '出现了契约外的工具: ' + tool.name);
+    assert.ok(tool.declaration.tier, tool.name + ' 缺少 tier');
+    assert.ok(declared.indexOf(tool.name) !== -1, '出现了契约外的工具: ' + tool.name);
   });
 });
 

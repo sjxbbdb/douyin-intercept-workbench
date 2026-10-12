@@ -27,8 +27,12 @@ function makeConfig(overrides) {
   }, overrides || {});
 }
 
-// 假 sidecar：只实现 capabilities / doctor，够 BP0 的只读工具用。
-// 用 node 来跑（测试里把 config.python 设为 process.execPath）。
+// 假 sidecar：用 node 来跑（测试里把 config.python 设为 process.execPath）。
+//
+// plan 支持：
+//   accountScope / limits / login / captcha / doctorError —— 与之前一致
+//   methods: { <方法名>: <结果对象> }                      —— 采集类方法的固定应答
+//   methodError: { <方法名>: { code, message } }           —— 让某个方法报协议错误
 function writeFakeSidecar(cfg, plan) {
   const script = [
     "'use strict';",
@@ -38,28 +42,32 @@ function writeFakeSidecar(cfg, plan) {
     "process.stdin.on('end', function () {",
     "  const request = JSON.parse(raw.split(/\\r?\\n/)[0]);",
     "  const method = request.method;",
+    "  function ok(result) {",
+    "    process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: result }) + '\\n');",
+    "  }",
+    "  function err(error) {",
+    "    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: error }) + '\\n');",
+    "  }",
+    "  if (plan.methodError && plan.methodError[method]) { err(plan.methodError[method]); return; }",
     "  if (method === 'capabilities') {",
-    "    process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: {",
-    "      protocolVersion: 1,",
+    "    ok({ protocolVersion: 1,",
     "      sendStatuses: ['unknown', 'failed', 'blocked'],",
     "      limits: plan.limits || { per_user: 1, hourly: 20, daily: 50 },",
     "      accountScope: plan.accountScope || 'testscope000000000000000000000000',",
-    "      capability: {}",
-    "    } }) + '\\n');",
+    "      capability: {} });",
     "    return;",
     "  }",
     "  if (method === 'doctor') {",
-    "    if (plan.doctorError) {",
-    "      process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: plan.doctorError }) + '\\n');",
-    "      return;",
-    "    }",
-    "    process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: {",
-    "      status: 'ok', url: 'https://www.douyin.com/', login: plan.login || 'ok', captcha: plan.captcha === true,",
-    "      browser: { port: 9222, pid: 1234 }",
-    "    } }) + '\\n');",
+    "    if (plan.doctorError) { err(plan.doctorError); return; }",
+    "    ok({ status: 'ok', url: 'https://www.douyin.com/', login: plan.login || 'ok',",
+    "         captcha: plan.captcha === true, browser: { port: 9222, pid: 1234 } });",
     "    return;",
     "  }",
-    "  process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: { code: 'unknown_method', message: method } }) + '\\n');",
+    "  if (plan.methods && Object.prototype.hasOwnProperty.call(plan.methods, method)) {",
+    "    ok(plan.methods[method]);",
+    "    return;",
+    "  }",
+    "  err({ code: 'unknown_method', message: method });",
     "});"
   ].join('\n');
   fs.mkdirSync(path.dirname(cfg.sidecarScript), { recursive: true });

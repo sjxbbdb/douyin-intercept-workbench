@@ -22,11 +22,22 @@ function walk(dir) {
   return out;
 }
 
-test('BP0 恰好注册 4 个工具', function () {
-  assert.strictEqual(registry.count(), 4, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
+test('工具清单是这 12 个，一个不多一个不少', function () {
+  assert.strictEqual(registry.count(), 12, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
   const names = registry.listTools().map(function (t) { return t.name; }).sort();
-  assert.deepStrictEqual(names,
-    ['explain_failure', 'get_account_health', 'get_stats', 'query_leads']);
+  assert.deepStrictEqual(names, [
+    'close_browser', 'collect_comments', 'collect_live', 'explain_failure',
+    'get_account_health', 'get_batch_report', 'get_stats', 'list_video_pool',
+    'live_listen', 'query_leads', 'search_videos', 'start_browser'
+  ]);
+});
+
+test('清单里没有任何发送能力（发送层刻意不存在）', function () {
+  const names = registry.listTools().map(function (t) { return t.name; });
+  ['send_private', 'send_comment', 'comment_reply', 'comment_private',
+   'live_reply', 'live_private', 'approve_batch', 'review_batch'].forEach(function (forbidden) {
+    assert.strictEqual(names.indexOf(forbidden), -1, '清单里出现了发送能力: ' + forbidden);
+  });
 });
 
 test('没有任何工具名命中执行类模式（发送/点击/输入/滚动/求值/急停/改策略）', function () {
