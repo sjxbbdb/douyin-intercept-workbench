@@ -11,6 +11,7 @@ const collectLive = require('./tools/collect_live');
 const liveListen = require('./tools/live_listen');
 const getBatchReport = require('./tools/get_batch_report');
 const browserLifecycle = require('./tools/browser_lifecycle');
+const exportLeads = require('./tools/export_leads');
 
 // 工具注册表 = Agent 的全部能力边界。
 //
@@ -19,7 +20,7 @@ const browserLifecycle = require('./tools/browser_lifecycle');
 // 都必须先改 docs/agent-tools.md 的契约，而不是先改这个数组。
 //
 // 三层能力（按"离平台写入有多远"排）：
-//   read      —— 只看本地台账/额度，不碰浏览器
+//   read      —— 只看本地台账/额度/线索，不碰浏览器
 //   capture   —— 用浏览器【读】平台内容（搜视频、抓评论、抓直播互动），不写入任何内容
 //   lifecycle —— 只管理 sidecar 启动的专用浏览器进程
 // 发送层（sending）刻意不存在，见 FORBIDDEN_SIDECAR_METHODS。
@@ -53,12 +54,37 @@ const TOOLS = [
         region: { type: 'string' },
         sinceMs: { type: 'number' },
         untilMs: { type: 'number' },
+        keyword: { type: 'string', description: '按正文摘要做子串筛选' },
+        roomId: { type: 'string', description: '只看某条视频/某个直播间来的线索' },
+        excludeComplaint: { type: 'boolean', description: 'true 时排除投诉（投诉一律转人工）' },
         limit: { type: 'number', description: '<= 200；超出即拒，调用方不可扩大上限' }
       },
       additionalProperties: false
     },
     declaration: { implemented: true, autoEligible: true, validation: 'offline_unit_tests' },
     handler: queryLeads
+  },
+  {
+    name: 'export_leads',
+    tier: 'read',
+    description: '把线索导出成 CSV/JSON（只落在 agent 状态目录的 exports/ 下）。身份仍是加盐哈希。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        format: { type: 'string', enum: ['csv', 'json'] },
+        intent: { type: 'string' },
+        region: { type: 'string' },
+        keyword: { type: 'string' },
+        roomId: { type: 'string' },
+        excludeComplaint: { type: 'boolean' },
+        sinceMs: { type: 'number' },
+        untilMs: { type: 'number' },
+        limit: { type: 'number', description: '1..5000' }
+      },
+      additionalProperties: false
+    },
+    declaration: { implemented: true, autoEligible: true, validation: 'offline_unit_tests' },
+    handler: exportLeads
   },
   {
     name: 'get_stats',

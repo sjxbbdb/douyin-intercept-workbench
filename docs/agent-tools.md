@@ -224,6 +224,33 @@
 5. **`autoEligible`**：除 `list_video_pool` 与 `get_batch_report`（纯本地只读）外，
    采集类与生命周期类一律 `autoEligible: false`。
 
+## 三之三、线索与意图（read 层，**已实现**）
+
+采集能抓到评论之后，缺的是"抓到的怎么变成能用的东西"。这一层补上。
+
+| 能力 | 落在哪 | 说明 |
+| --- | --- | --- |
+| 意图判据 | `agent/src/intent.js` | **规则版**：可解释（说得出命中了哪个词）、零推理成本、商家可自配 |
+| 自配规则 | `<agent-state-dir>/accounts/<scope>/intent-rules.json` | 给了就整体替换默认规则；JSON 坏掉或 intent 越出闭集，**整体退回默认**并告警 |
+| 线索正文 | `leads.jsonl` 的 `textExcerpt`（前 120 字） | 使用者必须看得见线索在问什么；身份仍然只出加盐哈希 |
+| 筛选 | `query_leads` 的 `keyword` / `roomId` / `excludeComplaint` | 投诉默认可以单独拎出来转人工 |
+| 导出 | `export_leads` | CSV/JSON，只落在 `<agent-state-dir>/exports/` 下 |
+
+**为什么意图先用规则而不是 LLM**：① 可解释、商家能自己核对与修改；② 零推理成本、不引入新的未知；
+③ v3 章程的原意就是"商家自配话术池与判据，改完即生效"。LLM 意图识别（T-04）要背准确率 ≥85%、
+complaint 召回 ≥95% 的硬门槛与评估集，那是后面的一步，不是第一步。
+
+**投诉召回优先**：`complaint` 规则排在最前，一命中就停，不被后面的规则抢走；
+关键词宁宽勿窄 —— 漏掉一条投诉的代价远大于多拦一条。
+
+**真机观察（2026-10-12，764 条真实线索）**：`purchase_intent` 127（大多命中"求带"）、
+`feature_question` 18、`irrelevant` 20、`after_sales` 1、`unknown` 598。
+598 条 unknown 里绝大多数正文就是 `666` ——
+**这是"抓取关键词"和"意图关键词"被混为一谈的直接后果**：用 `111 666` 抓来的是捧场，
+不是买家。产品上应当把两者当成两套独立的配置。
+
+---
+
 ## 四、闭集枚举（必须严格实现，不得自由文本）
 
 - `sourceType`: `comment | live`

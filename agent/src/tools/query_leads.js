@@ -24,7 +24,8 @@ function run(ctx, params) {
     total: queried.total == null ? queried.leads.length : queried.total,
     truncated: Boolean(queried.truncated),
     source: queried.source,
-    privacy: 'hashed_identifiers_only'
+    intentCounts: queried.intentCounts || null,
+    privacy: 'identity_hashed_comment_excerpt_included'
   } };
 }
 

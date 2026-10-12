@@ -55,7 +55,7 @@
 
 ## 工具（12 个，三层）
 
-### read（4 个，只看本地台账，不碰浏览器）
+### read（5 个，只看本地台账/线索，不碰浏览器）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -63,6 +63,11 @@
 | `query_leads` | 查线索（**只回哈希后的标识，绝不回 sec_uid / 昵称 / 原文**） |
 | `get_stats` | 台账统计（`sent_confirmed` 只来自**落库原始状态**） |
 | `explain_failure` | 归因；`unknown` 一律 `nextAction: "none"` |
+| `export_leads` | 把线索导出成 CSV/JSON（只落在 agent 状态目录的 exports/ 下） |
+
+线索的**意图**用规则判据：默认规则内置，商家可以放一份
+`<agent-state-dir>/accounts/<scope>/intent-rules.json` 整体替换它（JSON 坏掉或 intent 越出闭集就整体退回默认并告警）。
+**投诉优先**：`complaint` 排在最前，一命中就停——漏掉一条投诉的代价远大于多拦一条。
 
 ### capture（6 个，用浏览器**读**平台内容，不写入任何内容）
 

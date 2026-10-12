@@ -5,6 +5,7 @@ const config = require('../src/config');
 const ledger = require('../src/ledger');
 const leads = require('../src/store/leads');
 const scope = require('../src/scope');
+const intentRules = require('../src/intent');
 
 // 把现有台账【投影】成线索库。这是脚本，不是工具：
 // 工具表必须是只读的（BP0 恰好 4 个），投影是离线的一次性动作。
@@ -27,7 +28,7 @@ function rows(stateDir, ledgerName, scopeId) {
   try {
     if (!ledger.hasTable(handle, 'live_events')) return { ok: true, rows: [] };
     const found = ledger.all(handle,
-      'SELECT author_id, room_id, state, seen_at, updated_at FROM live_events WHERE account_scope=?',
+      'SELECT author_id, room_id, state, text, seen_at, updated_at FROM live_events WHERE account_scope=?',
       [scopeId]);
     return { ok: true, rows: found };
   } finally {
@@ -51,6 +52,9 @@ function main() {
   }
   const accountScope = resolved.accountScope;
   const salt = leads.ensureSalt(cfg.agentStateDir, accountScope);
+  const rules = intentRules.loadRules(cfg.agentStateDir, accountScope);
+  if (rules.warning) process.stderr.write('提示: ' + rules.warning + '\n');
+  const intentCounts = {};
 
   const existing = leads.readAll(cfg.agentStateDir, accountScope);
   const seenIds = new Set((existing.leads || []).map(function (l) { return String(l.leadId); }));
@@ -72,13 +76,21 @@ function main() {
       // SQLite 里存的是浮点秒；对外一律整数毫秒，避免上游拿到 1790592755966.3857 这种时间戳。
       const seenAtMs = Math.round(Number(row.seen_at) * 1000);
       const updatedAtMs = Math.round(Number(row.updated_at) * 1000);
+      const judged = intentRules.classify(row.text, rules.rules);
+      intentCounts[judged.intent] = (intentCounts[judged.intent] || 0) + 1;
       const current = byLead.get(leadId);
       if (!current) {
         byLead.set(leadId, {
           leadId,
           sourceType: source.name,
-          intent: 'unknown',   // BP0 没有意图分析；不猜。
+          // 规则判据（商家可自配 intent-rules.json）；判不出来就是 unknown，不猜。
+          intent: judged.intent,
+          intentMatched: judged.matched.slice(0, 5),
+          reasonCode: judged.reasonCode,
           region: null,
+          // 正文摘要：只留前 120 字。身份仍是加盐哈希，原文不外传。
+          textExcerpt: String(row.text || '').slice(0, 120),
+          roomId: String(row.room_id || ''),
           firstSeenMs: seenAtMs,
           lastSeenMs: updatedAtMs,
           state: String(row.state),
@@ -107,7 +119,8 @@ function main() {
     alreadyKnown: byLead.size - fresh.length,
     skippedMaskedAuthorIds: skippedMasked,
     leadsFile: leads.leadsFile(cfg.agentStateDir, accountScope),
-    intent: 'unknown (no intent analysis in BP0)'
+    intentRules: rules.source,
+    intentCounts
   }, null, 2) + '\n');
   return 0;
 }

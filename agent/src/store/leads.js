@@ -10,7 +10,10 @@ const path = require('node:path');
 // 因此这里的 read() 只白名单投影字段，不把整行原样透传。
 
 const MAX_LIMIT = 200;
-const OUTPUT_FIELDS = ['leadId', 'sourceType', 'intent', 'region',
+// 白名单投影。textExcerpt 是【有意】放行的：使用者必须看得见这条线索在问什么，
+// 否则线索库没有意义。身份（sec_uid / 昵称）仍然只出加盐哈希。
+const OUTPUT_FIELDS = ['leadId', 'sourceType', 'intent', 'intentMatched', 'reasonCode',
+                       'region', 'textExcerpt', 'roomId',
                        'firstSeenMs', 'lastSeenMs', 'state'];
 
 function saltFile(agentStateDir, accountScope) {
@@ -91,17 +94,36 @@ function query(agentStateDir, accountScope, params) {
   if (p.region != null && typeof p.region !== 'string') {
     return { ok: false, code: 'blocked/invalid_input', reason: 'region must be a string' };
   }
+  if (p.keyword != null && typeof p.keyword !== 'string') {
+    return { ok: false, code: 'blocked/invalid_input', reason: 'keyword must be a string' };
+  }
+  if (p.roomId != null && typeof p.roomId !== 'string') {
+    return { ok: false, code: 'blocked/invalid_input', reason: 'roomId must be a string' };
+  }
+  if (p.excludeComplaint != null && typeof p.excludeComplaint !== 'boolean') {
+    return { ok: false, code: 'blocked/invalid_input', reason: 'excludeComplaint must be a boolean' };
+  }
   const all = readAll(agentStateDir, accountScope);
   if (!all.ok) return all;
   const filtered = all.leads.filter(function (lead) {
     if (p.intent && String(lead.intent || '') !== String(p.intent)) return false;
     if (p.region && String(lead.region || '') !== String(p.region)) return false;
+    // 投诉必须转人工，默认不混进"可回复的线索"里。
+    if (p.excludeComplaint === true && String(lead.intent || '') === 'complaint') return false;
+    if (p.keyword && String(lead.textExcerpt || '').indexOf(String(p.keyword)) === -1) return false;
+    if (p.roomId && String(lead.roomId || '') !== String(p.roomId)) return false;
     if (p.sinceMs != null && Number(lead.lastSeenMs || 0) < Number(p.sinceMs)) return false;
     if (p.untilMs != null && Number(lead.firstSeenMs || 0) > Number(p.untilMs)) return false;
     return true;
   });
+  // 意图分布：使用者一眼看到"这批线索里有多少是投诉"。
+  const intentCounts = {};
+  filtered.forEach(function (lead) {
+    const key = String(lead.intent || 'unknown');
+    intentCounts[key] = (intentCounts[key] || 0) + 1;
+  });
   return { ok: true, leads: filtered.slice(0, limit), total: filtered.length,
-           truncated: filtered.length > limit, source: all.source };
+           truncated: filtered.length > limit, source: all.source, intentCounts };
 }
 
 function appendMany(agentStateDir, accountScope, rows) {

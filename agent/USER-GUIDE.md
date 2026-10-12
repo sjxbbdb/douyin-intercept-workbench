@@ -89,6 +89,32 @@
 ⚠️ 中途**遇到验证码或登录失效，工具会直接停下并告诉你人工处理** —— 这是设计，不是故障。
 处理完再重跑，不要让它自己重试。
 
+## 三之三、把抓到的变成能用的线索
+
+抓完评论还不算完，接下来两步：
+
+1. **投影成线索**（命令行跑一次，或以后由界面触发）：
+
+       node agent/bin/import-leads.js --config agent/agent.config.json
+
+   它会读台账、按规则判**意图**、把结果写进线索库。跑完会打印意图分布，例如：
+
+       intentCounts: { purchase_intent: 130, feature_question: 19, unknown: 634, irrelevant: 22, after_sales: 1 }
+
+2. **查 / 导出**（用工具）：
+
+   - `query_leads { "intent": "purchase_intent", "limit": 50 }` —— 按意图查
+   - `query_leads { "excludeComplaint": true }` —— 把投诉剔掉（投诉一律人工处理）
+   - `export_leads { "format": "csv" }` —— 导出成表格，只落在 `<agent-state-dir>/exports/` 下
+
+**意图判据是可以自己配的**：放一份 `<agent-state-dir>/accounts/<账号作用域>/intent-rules.json`，
+形如 `{"rules":[{"intent":"price_inquiry","priority":60,"keywords":["多少钱"]}]}` 就整体替换默认规则。
+文件写坏了、或 intent 不在闭集里，程序会**整体退回默认规则并告警**，不会带着半套规则跑。
+
+> 💡 一个真机观察：**"抓取关键词"和"意图关键词"是两回事**。
+> 用 `666` 这类词去抓，抓来的是捧场；用 `多少钱`、`求带` 去抓，抓来的才是买家。
+> 建议在配置里把这两套词分开写。
+
 ## 四、红线（这些不是可选项）
 
 - **不发消息**：12 个工具里没有任何发送能力，越权面为零。
