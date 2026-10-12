@@ -291,6 +291,17 @@ Agent 看到的是**业务阻断码**（闭集）；sidecar 抛的是**协议错
 | `event_not_in_plan` | 批次成员判定 | `blocked/event_not_in_plan` |
 | `no_replyable_comment` | `_reply_reachable_split` | `empty/no_replyable_comment`（**空，不是错误**） |
 | `captcha_requires_manual_action` | `send_actions.py:925` | `blocked/captcha_requires_manual_action` |
+| `page_not_ready` | `sidecar.py:765`（真机实测踩过：没映射会被降级成 unknown/internal） | `blocked/page_not_ready` |
+| `browser_start_timeout` / `browser_unavailable` | 浏览器生命周期 | 同名 `blocked/*` |
+| `port_owned_elsewhere` / `port_owner_mismatch` | 端口归属校验 | 同名 `blocked/*` |
+| `unknown_batch` / `unknown_event` / `batch_expired` / `target_not_found` | 批次与事件 | 同名 `blocked/*` |
+| `invalid_policy_ref` | 策略身份校验 | `blocked/policy_ref_invalid` |
+| `unsupported` | 页面/入口类型不支持 | `blocked/unsupported` |
+| `invalid_port` / `invalid_path` | 参数类 | `blocked/invalid_input` |
+
+> **防漂移**：`agent/test/blocked-codes.test.js` 会扫 `probe/**/*.py` 里所有
+> `raise *Error("<code>")`，**任何一个码没进映射表就让测试失败**（`month` 是裸 ValueError、
+> `boom` 是测试替身，已在豁免名单里）。这样"新加错误码忘了映射"不会悄悄降级成 `unknown/internal`。
 
 ### 6.2 返回体里的 blocked reason（不是错误码）
 

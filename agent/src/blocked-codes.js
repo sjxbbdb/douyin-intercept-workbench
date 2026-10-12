@@ -48,6 +48,21 @@ const PROTOCOL_TO_BLOCKED = {
   browser_not_visible: 'blocked/browser_not_visible',
   page_visibility_unknown: 'blocked/page_visibility_unknown',
   browser_not_found: 'blocked/browser_not_found',
+  // 浏览器生命周期类（真机实测踩过：page_not_ready 没映射，被降级成 unknown/internal，
+  // 上层就看不出"只是页面还没就绪"）。
+  page_not_ready: 'blocked/page_not_ready',
+  browser_start_timeout: 'blocked/browser_start_timeout',
+  browser_unavailable: 'blocked/browser_unavailable',
+  port_owned_elsewhere: 'blocked/port_owned_elsewhere',
+  port_owner_mismatch: 'blocked/port_owner_mismatch',
+  invalid_port: 'blocked/invalid_input',
+  invalid_path: 'blocked/invalid_input',
+  // 批次/事件类
+  unknown_batch: 'blocked/unknown_batch',
+  unknown_event: 'blocked/unknown_event',
+  batch_expired: 'blocked/batch_expired',
+  target_not_found: 'blocked/target_not_found',
+  invalid_policy_ref: 'blocked/policy_ref_invalid',
   unknown_video_id: 'blocked/unknown_video_id',
   cursor_account_mismatch: 'blocked/cursor_account_mismatch',
   event_not_in_plan: 'blocked/event_not_in_plan',

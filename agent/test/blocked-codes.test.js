@@ -41,6 +41,40 @@ test('逐个钉住关键映射（评审点名的几条）', function () {
   assert.strictEqual(codes.toBlocked('no_replyable_comment'), 'empty/no_replyable_comment');
 });
 
+test('probe 里 raise 出来的稳定码，映射表必须全覆盖（防漂移）', function () {
+  // 与 probe 的 test_protocol_doc_contract.py 同一个思路：让"加了新错误码却忘了映射"
+  // 变成一条会失败的测试，而不是悄悄降级成 unknown/internal。
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const probeDir = path.resolve(__dirname, '..', '..', 'probe');
+  // 这两个不是协议码：month 是裸 ValueError，boom 是测试替身抛的。
+  const NOT_PROTOCOL = ['month', 'boom'];
+  const found = new Set();
+  function walk(dir) {
+    fs.readdirSync(dir, { withFileTypes: true }).forEach(function (entry) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); return; }
+      if (!entry.name.endsWith('.py')) return;
+      const text = fs.readFileSync(full, 'utf8');
+      const pattern = /raise [A-Za-z]*(?:Error|Refusal)\(['"]([a-z_]+)['"]/g;
+      let match = pattern.exec(text);
+      while (match) { found.add(match[1]); match = pattern.exec(text); }
+    });
+  }
+  walk(probeDir);
+  assert.ok(found.size > 10, '没扫到错误码，说明这条断言本身失效了');
+  const missing = Array.from(found).filter(function (code) {
+    return NOT_PROTOCOL.indexOf(code) === -1 && !codes.PROTOCOL_TO_BLOCKED[code];
+  }).sort();
+  assert.deepStrictEqual(missing, [], 'probe 新增了错误码但没进映射表: ' + missing.join(', '));
+});
+
+test('浏览器与页面类错误码不再降级成 unknown/internal', function () {
+  assert.strictEqual(codes.toBlocked('page_not_ready'), 'blocked/page_not_ready');
+  assert.strictEqual(codes.toBlocked('port_owner_mismatch'), 'blocked/port_owner_mismatch');
+  assert.strictEqual(codes.toBlocked('unknown_batch'), 'blocked/unknown_batch');
+});
+
 test('unsupported 有明确归属，不落进 unknown', function () {
   assert.strictEqual(codes.toBlocked('unsupported'), 'blocked/unsupported');
 });
