@@ -1,0 +1,14 @@
+{
+  "name": "douyin-send-authority",
+  "version": "0.1.0",
+  "private": true,
+  "description": "发送授权服务（服务端权威 / 甲）：逐次授权 + 服务端计数 + 审计。零第三方依赖。",
+  "main": "src/authorize.js",
+  "bin": { "douyin-send-authority": "bin/serve.js" },
+  "scripts": {
+    "start": "node bin/serve.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=22.13.0" },
+  "dependencies": {}
+}
