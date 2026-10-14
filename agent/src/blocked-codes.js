@@ -78,6 +78,14 @@ const RESULT_REASON_TO_BLOCKED = {
   send_pending_or_interrupted: 'blocked/send_pending_or_interrupted'
 };
 
+// 授权层（agent 侧 authority-client）自己的原因码。它们不是 probe 的协议码，
+// 但同样以 blocked/* 出现，好让上层用一套前缀判断。
+const AUTHORITY_REASONS = [
+  'authorization_unavailable',
+  'authorization_not_configured',
+  'authorization_not_authenticated'
+];
+
 function toBlocked(code) {
   const key = String(code == null ? '' : code);
   if (PROTOCOL_TO_BLOCKED[key]) return PROTOCOL_TO_BLOCKED[key];
@@ -98,6 +106,7 @@ module.exports = {
   PLATFORM_CONFIRMED,
   PROTOCOL_TO_BLOCKED,
   RESULT_REASON_TO_BLOCKED,
+  AUTHORITY_REASONS,
   toBlocked,
   isRetryAllowed
 };

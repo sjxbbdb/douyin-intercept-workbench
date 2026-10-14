@@ -9,7 +9,8 @@ const path = require('node:path');
 // 优先级：命令行 > 环境变量 > --config 指定的 JSON 文件 > 内置默认。
 // 配置文件是为了让使用者只写一次路径（见 agent.config.example.json）。
 
-const FILE_KEYS = ['stateDir', 'profileDir', 'port', 'python', 'probeDir', 'agentStateDir', 'sidecarScript'];
+const FILE_KEYS = ['stateDir', 'profileDir', 'port', 'python', 'probeDir', 'agentStateDir',
+                   'sidecarScript', 'authorityUrl', 'authorityToken'];
 
 function readConfigFile(file) {
   try {
@@ -40,7 +41,10 @@ function fromEnvAndArgs(argv, env) {
     agentStateDir: e.DOUYIN_AGENT_STATE_ROOT || null,
     // sidecar 入口脚本。生产环境永远是 probe/sidecar.py；
     // 允许覆盖是为了让离线测试塞一个假 sidecar，避免测试依赖浏览器或 Python。
-    sidecarScript: e.DOUYIN_AGENT_SIDECAR_SCRIPT || null
+    sidecarScript: e.DOUYIN_AGENT_SIDECAR_SCRIPT || null,
+    // 服务端权威（甲）。没有配置 = "还没接"，如实标注，不冒充服务端策略。
+    authorityUrl: e.DOUYIN_AGENT_AUTHORITY_URL || null,
+    authorityToken: e.DOUYIN_AGENT_AUTHORITY_TOKEN || null
   };
   // 谁显式给过值，谁就压过配置文件。默认值不算"显式"。
   const explicit = {};
@@ -48,6 +52,8 @@ function fromEnvAndArgs(argv, env) {
   if (e.DOUYIN_AGENT_PROBE_DIR) explicit.probeDir = true;
   if (e.DOUYIN_AGENT_STATE_ROOT) explicit.agentStateDir = true;
   if (e.DOUYIN_AGENT_SIDECAR_SCRIPT) explicit.sidecarScript = true;
+  if (e.DOUYIN_AGENT_AUTHORITY_URL) explicit.authorityUrl = true;
+  if (e.DOUYIN_AGENT_AUTHORITY_TOKEN) explicit.authorityToken = true;
   if (e.DOUYIN_AGENT_STATE_DIR) { out.stateDir = e.DOUYIN_AGENT_STATE_DIR; explicit.stateDir = true; }
   if (e.DOUYIN_AGENT_PROFILE_DIR) { out.profileDir = e.DOUYIN_AGENT_PROFILE_DIR; explicit.profileDir = true; }
   if (e.DOUYIN_AGENT_PORT) { out.port = Number(e.DOUYIN_AGENT_PORT); explicit.port = true; }
@@ -61,6 +67,8 @@ function fromEnvAndArgs(argv, env) {
     else if (key === '--probe-dir') { out.probeDir = value; explicit.probeDir = true; i += 1; }
     else if (key === '--agent-state-dir') { out.agentStateDir = value; explicit.agentStateDir = true; i += 1; }
     else if (key === '--sidecar-script') { out.sidecarScript = value; explicit.sidecarScript = true; i += 1; }
+    else if (key === '--authority-url') { out.authorityUrl = value; explicit.authorityUrl = true; i += 1; }
+    else if (key === '--authority-token') { out.authorityToken = value; explicit.authorityToken = true; i += 1; }
     else if (key === '--config') { out.configFile = value; i += 1; }
     else if (key === '--print-config') { out.printConfig = true; }
     else if (key === '--json') { out.json = true; }

@@ -12,6 +12,7 @@ const liveListen = require('./tools/live_listen');
 const getBatchReport = require('./tools/get_batch_report');
 const browserLifecycle = require('./tools/browser_lifecycle');
 const exportLeads = require('./tools/export_leads');
+const planBatch = require('./tools/plan_reply_batch');
 
 // 工具注册表 = Agent 的全部能力边界。
 //
@@ -230,6 +231,33 @@ const TOOLS = [
     handler: getBatchReport
   },
 
+  // ---------- plan（冻结计划；仍然不发送）----------
+  {
+    name: 'plan_batch',
+    tier: 'plan',
+    description: '建评论批次并冻结计划。只采集与冻结，不发送；必须带服务端签发的策略身份，否则 fail-closed。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '视频地址；与 videoId 二选一' },
+        videoId: { type: 'string', description: '搜索池里的 videoId；与 url 二选一' },
+        publicText: { type: 'string', description: '公屏话术（宿主提供，只能选不能造）' },
+        privateText: { type: 'string', description: '私信话术' },
+        commentKeywords: { type: 'string' },
+        matchMode: { type: 'string', enum: ['seg', 'full'] },
+        minDigg: { type: 'number' },
+        maxItems: { type: 'number' },
+        windowSeconds: { type: 'number' },
+        collectMaxItems: { type: 'number' },
+        scrollRounds: { type: 'number' }
+      },
+      required: ['publicText', 'privateText'],
+      additionalProperties: false
+    },
+    declaration: { implemented: true, autoEligible: false, validation: 'offline_unit_tests' },
+    handler: planBatch
+  },
+
   // ---------- lifecycle ----------
   {
     name: 'start_browser',
@@ -263,14 +291,18 @@ const FORBIDDEN_NAME_PATTERNS = [
 const READ_SIDECAR_METHODS = ['capabilities', 'doctor', 'search_pool', 'comment_result', 'live_result'];
 const CAPTURE_SIDECAR_METHODS = ['search', 'collect_comments', 'collect_live', 'live_listen'];
 const LIFECYCLE_SIDECAR_METHODS = ['launch', 'close'];
+// plan 层：只冻结计划，不发送。comment_plan / live_plan 会开浏览器采集，
+// 但不写入任何平台内容 —— 真正的发送方法仍然在禁止清单里。
+const PLAN_SIDECAR_METHODS = ['comment_plan'];
 const ALLOWED_SIDECAR_METHODS = READ_SIDECAR_METHODS
   .concat(CAPTURE_SIDECAR_METHODS)
+  .concat(PLAN_SIDECAR_METHODS)
   .concat(LIFECYCLE_SIDECAR_METHODS);
 
 // 明确禁止出现在工具源码里的 sidecar 方法：写入平台内容，或与发送批次有关。
 // open 也在其中 —— 任意跳转不是任何一项功能需要的，暴露它只是白白扩大攻击面。
 const FORBIDDEN_SIDECAR_METHODS = [
-  'open', 'comment_plan', 'comment_reply', 'comment_private',
+  'open', 'comment_reply', 'comment_private',
   'live_plan', 'live_reply', 'live_private', 'send_private', 'send_comment'
 ];
 
@@ -307,6 +339,7 @@ module.exports = {
   FORBIDDEN_NAME_PATTERNS,
   READ_SIDECAR_METHODS,
   CAPTURE_SIDECAR_METHODS,
+  PLAN_SIDECAR_METHODS,
   LIFECYCLE_SIDECAR_METHODS,
   ALLOWED_SIDECAR_METHODS,
   FORBIDDEN_SIDECAR_METHODS,

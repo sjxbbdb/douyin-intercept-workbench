@@ -41,7 +41,8 @@ function blockedError(code, reason) {
   return { code: isBusiness ? raw : toBlocked(raw), message: reason || raw };
 }
 
-function handleCall(cfg, name, args) {
+// 工具处理器可以是同步的，也可以返回 Promise（例如要访问授权服务的那些）。
+async function handleCall(cfg, name, args) {
   const tool = registry.find(name);
   if (!tool) {
     // 未注册的工具 = 不存在的能力。这里必须拒绝，而不是"尽力而为"。
@@ -54,7 +55,7 @@ function handleCall(cfg, name, args) {
   };
   let outcome;
   try {
-    outcome = tool.handler.run(ctx, args || {});
+    outcome = await tool.handler.run(ctx, args || {});
   } catch (error) {
     outcome = { ok: false, code: 'unknown/internal', reason: error && error.message ? error.message : String(error) };
   }
@@ -101,6 +102,14 @@ function main() {
   }
   cfg.agentStateDir = cfg.agentStateDir || path.join(cfg.stateDir, 'agent');
 
+  // 请求【串行】处理：授权服务要等网络，异步工具不能把响应顺序打乱。
+  //
+  // 🔴 真机踩过：把 dispatch 改成异步之后，stdin 一结束就 process.exit(0)，
+  //    异步工具的响应还没写出去，进程就被杀了 —— 上层看到的是"工具没反应"。
+  //    所以退出必须等队列排空。
+  let queue = Promise.resolve();
+  let pending = 0;
+  let ended = false;
   let buffer = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', function (chunk) {
@@ -109,15 +118,28 @@ function main() {
     while (index !== -1) {
       const line = buffer.slice(0, index).trim();
       buffer = buffer.slice(index + 1);
-      if (line) dispatch(cfg, line);
+      if (line) {
+        pending += 1;
+        queue = queue.then(function () { return dispatch(cfg, line); })
+          .catch(function (error) {
+            process.stderr.write('dispatch failed: ' + String(error && error.message ? error.message : error) + '\n');
+          })
+          .then(function () {
+            pending -= 1;
+            if (ended && pending === 0) process.exit(0);
+          });
+      }
       index = buffer.indexOf('\n');
     }
   });
-  process.stdin.on('end', function () { process.exit(0); });
+  process.stdin.on('end', function () {
+    ended = true;
+    if (pending === 0) process.exit(0);
+  });
   return null;
 }
 
-function dispatch(cfg, line) {
+async function dispatch(cfg, line) {
   let request;
   try {
     request = JSON.parse(line);
@@ -153,7 +175,7 @@ function dispatch(cfg, line) {
   if (method === 'tools/call') {
     const name = params.name;
     const args = params.arguments || params.args || {};
-    const outcome = handleCall(cfg, name, args);
+    const outcome = await handleCall(cfg, name, args);
     if (outcome.isError) {
       emit({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify(outcome.error) }] } });
     } else {

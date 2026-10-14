@@ -16,9 +16,9 @@ function ctx(cfg) {
   return { config: cfg, agentStateDir: cfg.agentStateDir, accountScope: null };
 }
 
-test('没显式探查浏览器时 canWork=false，并说明是没查而不是不能用', function () {
+test('没显式探查浏览器时 canWork=false，并说明是没查而不是不能用', async function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE });
-  const out = health.run(ctx(cfg), {});
+  const out = await health.run(ctx(cfg), {});
   assert.strictEqual(out.ok, true, out.reason);
   assert.strictEqual(out.result.canWork, false);
   assert.strictEqual(out.result.blockedBy, 'unknown/browser_not_probed');
@@ -30,54 +30,56 @@ test('没显式探查浏览器时 canWork=false，并说明是没查而不是不
   assert.strictEqual(out.result.observation.source, 'absent_in_probe');
 });
 
-test('探查浏览器且一切正常时 canWork=true，额度读的是台账已用数', function () {
+test('探查浏览器且一切正常时 canWork=true，额度读的是台账已用数', async function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE, login: 'ok' });
   const now = Date.now();
   helpers.seedSends(cfg, [
     { accountScope: SCOPE, sendId: 's1', status: 'sent_confirmed', createdAtMs: now - 60000 }
   ]);
-  const out = health.run(ctx(cfg), { probeBrowser: true });
+  const out = await health.run(ctx(cfg), { probeBrowser: true });
   assert.strictEqual(out.ok, true, out.reason);
   assert.strictEqual(out.result.canWork, true, JSON.stringify(out.result));
   assert.strictEqual(out.result.quota.usedHour, 1);
   assert.strictEqual(out.result.quota.remainingHour, 19);
-  assert.strictEqual(out.result.quota.sourceOfLimits, 'local_gate_defaults');
+  // 没有配授权服务时如实标注 local_default，绝不冒充服务端策略。
+  assert.strictEqual(out.result.quota.sourceOfLimits, 'local_default');
+  assert.strictEqual(out.result.authority.configured, false);
 });
 
-test('验证码命中 -> 停机转人工，canWork=false', function () {
+test('验证码命中 -> 停机转人工，canWork=false', async function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE, captcha: true });
-  const out = health.run(ctx(cfg), { probeBrowser: true });
+  const out = await health.run(ctx(cfg), { probeBrowser: true });
   assert.strictEqual(out.result.canWork, false);
   assert.strictEqual(out.result.blockedBy, 'blocked/captcha_requires_manual_action');
 });
 
-test('浏览器不属于本侧车 -> 原样报阻断码，不是工具故障', function () {
+test('浏览器不属于本侧车 -> 原样报阻断码，不是工具故障', async function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), {
     accountScope: SCOPE,
     doctorError: { code: 'browser_not_owned', message: 'port belongs to someone else' }
   });
-  const out = health.run(ctx(cfg), { probeBrowser: true });
+  const out = await health.run(ctx(cfg), { probeBrowser: true });
   assert.strictEqual(out.ok, true, out.reason);
   assert.strictEqual(out.result.canWork, false);
   assert.strictEqual(out.result.blockedBy, 'blocked/browser_not_owned');
 });
 
-test('额度用尽 -> canWork=false 且指向具体额度', function () {
+test('额度用尽 -> canWork=false 且指向具体额度', async function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), {
     accountScope: SCOPE, limits: { per_user: 1, hourly: 1, daily: 50 }
   });
   helpers.seedSends(cfg, [
     { accountScope: SCOPE, sendId: 's1', status: 'sent_confirmed', createdAtMs: Date.now() - 60000 }
   ]);
-  const out = health.run(ctx(cfg), { probeBrowser: true });
+  const out = await health.run(ctx(cfg), { probeBrowser: true });
   assert.strictEqual(out.result.canWork, false);
   assert.strictEqual(out.result.blockedBy, 'blocked/local_quota_hourly');
   assert.strictEqual(out.result.quota.remainingHour, 0);
 });
 
-test('sidecar 起不来时 health 报 state_unavailable，不猜', function () {
+test('sidecar 起不来时 health 报 state_unavailable，不猜', async function () {
   const cfg = helpers.makeConfig(); // 没有写假 sidecar
-  const out = health.run(ctx(cfg), {});
+  const out = await health.run(ctx(cfg), {});
   assert.strictEqual(out.ok, false);
   assert.strictEqual(out.code, 'unknown/state_unavailable');
 });

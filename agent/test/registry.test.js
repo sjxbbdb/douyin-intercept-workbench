@@ -23,12 +23,12 @@ function walk(dir) {
 }
 
 test('工具清单是这 12 个，一个不多一个不少', function () {
-  assert.strictEqual(registry.count(), 13, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
+  assert.strictEqual(registry.count(), 14, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
   const names = registry.listTools().map(function (t) { return t.name; }).sort();
   assert.deepStrictEqual(names, [
     'close_browser', 'collect_comments', 'collect_live', 'explain_failure', 'export_leads',
     'get_account_health', 'get_batch_report', 'get_stats', 'list_video_pool',
-    'live_listen', 'query_leads', 'search_videos', 'start_browser'
+    'live_listen', 'plan_batch', 'query_leads', 'search_videos', 'start_browser'
   ]);
 });
 

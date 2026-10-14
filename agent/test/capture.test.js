@@ -37,8 +37,8 @@ function sampleEvent(extra) {
 }
 
 test('三层能力各有几个工具，总数固定', function () {
-  assert.strictEqual(registry.count(), 13, '工具数量变化必须同步改 docs/agent-tools.md');
-  assert.deepStrictEqual(registry.countByTier(), { read: 5, capture: 6, lifecycle: 2 });
+  assert.strictEqual(registry.count(), 14, '工具数量变化必须同步改 docs/agent-tools.md');
+  assert.deepStrictEqual(registry.countByTier(), { read: 5, capture: 6, plan: 1, lifecycle: 2 });
 });
 
 test('新增的采集/生命周期工具名都不命中执行类模式', function () {
@@ -47,7 +47,7 @@ test('新增的采集/生命周期工具名都不命中执行类模式', functio
 
 test('每个工具都标了 tier 与声明字段', function () {
   registry.listTools().forEach(function (tool) {
-    assert.ok(['read', 'capture', 'lifecycle'].indexOf(tool.declaration.tier) !== -1, tool.name);
+    assert.ok(['read', 'capture', 'plan', 'lifecycle'].indexOf(tool.declaration.tier) !== -1, tool.name);
     assert.strictEqual(typeof tool.declaration.implemented, 'boolean', tool.name);
     assert.strictEqual(typeof tool.declaration.autoEligible, 'boolean', tool.name);
     // 采集类会驱动真实浏览器，拿不到"平台送达"证据之前不许自动执行。
