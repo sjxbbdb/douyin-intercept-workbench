@@ -13,6 +13,8 @@ const getBatchReport = require('./tools/get_batch_report');
 const browserLifecycle = require('./tools/browser_lifecycle');
 const exportLeads = require('./tools/export_leads');
 const planBatch = require('./tools/plan_reply_batch');
+const reviewBatch = require('./tools/review_batch');
+const approveBatch = require('./tools/approve_batch');
 
 // 工具注册表 = Agent 的全部能力边界。
 //
@@ -258,6 +260,53 @@ const TOOLS = [
     handler: planBatch
   },
 
+  {
+    name: 'review_batch',
+    tier: 'plan',
+    description: '读冻结批次的候选清单（只读）。投诉与无关由代码预筛排除，不进候选。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        batchId: { type: 'string' },
+        maxItems: { type: 'number', description: '1..100' }
+      },
+      required: ['batchId'],
+      additionalProperties: false
+    },
+    declaration: { implemented: true, autoEligible: true, validation: 'offline_unit_tests' },
+    handler: reviewBatch
+  },
+  {
+    name: 'approve_batch',
+    tier: 'execute',
+    description: '唯一会真正发送的工具：按 approve/reject/skip 逐条向服务端申请授权后交给执行器。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        batchId: { type: 'string' },
+        sourceType: { type: 'string', enum: ['comment', 'live'] },
+        decisions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              eventId: { type: 'string' },
+              sendId: { type: 'string' },
+              action: { type: 'string', enum: ['approve', 'reject', 'skip'] },
+              publicSendId: { type: 'string' }
+            },
+            required: ['eventId', 'sendId', 'action'],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ['batchId', 'decisions'],
+      additionalProperties: false
+    },
+    declaration: { implemented: true, autoEligible: false, validation: 'offline_unit_tests' },
+    handler: approveBatch
+  },
+
   // ---------- lifecycle ----------
   {
     name: 'start_browser',
@@ -294,16 +343,21 @@ const LIFECYCLE_SIDECAR_METHODS = ['launch', 'close'];
 // plan 层：只冻结计划，不发送。comment_plan / live_plan 会开浏览器采集，
 // 但不写入任何平台内容 —— 真正的发送方法仍然在禁止清单里。
 const PLAN_SIDECAR_METHODS = ['comment_plan'];
+// execute 层：真正会写入平台内容的两个方法。只有 approve_batch 用得到它们，
+// 而 approve_batch 必须先拿到服务端逐条授权。
+const EXECUTE_SIDECAR_METHODS = ['comment_reply', 'live_reply'];
 const ALLOWED_SIDECAR_METHODS = READ_SIDECAR_METHODS
   .concat(CAPTURE_SIDECAR_METHODS)
   .concat(PLAN_SIDECAR_METHODS)
+  .concat(EXECUTE_SIDECAR_METHODS)
   .concat(LIFECYCLE_SIDECAR_METHODS);
 
 // 明确禁止出现在工具源码里的 sidecar 方法：写入平台内容，或与发送批次有关。
 // open 也在其中 —— 任意跳转不是任何一项功能需要的，暴露它只是白白扩大攻击面。
+// 仍然禁止：私信（第二阶段必须单独审批）、任意跳转、单发入口。
 const FORBIDDEN_SIDECAR_METHODS = [
-  'open', 'comment_reply', 'comment_private',
-  'live_plan', 'live_reply', 'live_private', 'send_private', 'send_comment'
+  'open', 'comment_private', 'live_private',
+  'live_plan', 'send_private', 'send_comment'
 ];
 
 function forbiddenTools() {
@@ -340,6 +394,7 @@ module.exports = {
   READ_SIDECAR_METHODS,
   CAPTURE_SIDECAR_METHODS,
   PLAN_SIDECAR_METHODS,
+  EXECUTE_SIDECAR_METHODS,
   LIFECYCLE_SIDECAR_METHODS,
   ALLOWED_SIDECAR_METHODS,
   FORBIDDEN_SIDECAR_METHODS,

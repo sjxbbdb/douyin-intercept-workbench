@@ -1,15 +1,14 @@
 'use strict';
 
+const batches = require('../store/batches');
 const scope = require('../scope');
 const capture = require('./_capture');
 const authority = require('../authority-client');
 
 // 建评论批次并【冻结】计划（S4）。
 //
-// 这一步【不发送任何内容】：它只采集评论、筛出目标、把话术与策略身份冻进计划。
-// 但它是"发送"的前置，所以它必须带上服务端签发的策略身份 ——
-// probe 的 _require_policy 会记住这个身份，之后任何一次执行都必须带回来且一致
-// （缺失 policy_ref_missing、不一致 policy_ref_mismatch）。
+// 这一步【不发送任何内容】：它只采集评论、筛出目标、把话术与策略身份冻进计划，
+// 并把这一批【落盘】—— 审批阶段要按冻结时的事实来判断，而不是事后再去平台反查。
 //
 // 🔴 只传【身份】，绝不传策略内容：probe 见到调用方自带策略内容会直接
 //    policy_not_server_issued 拒绝。上限的权威在服务端，不在这个请求里。
@@ -40,8 +39,7 @@ function run(ctx, params) {
 
   return authority.policy(ctx).then(function (serverPolicy) {
     if (!serverPolicy.available) {
-      // 拿不到服务端策略就不建批次。绝不用本地默认值凑一个计划出来。
-      return capture.fail('blocked/' + (serverPolicy.reason || 'authorization_unavailable'),
+      return capture.fail('blocked/' + String(serverPolicy.reason || 'authorization_unavailable'),
         'cannot plan a batch without a server-issued policy: ' + String(serverPolicy.detail || serverPolicy.reason));
     }
     const sent = {
@@ -58,7 +56,6 @@ function run(ctx, params) {
 
     const result = outcome.result || {};
     if (result.status === 'empty' || result.empty) {
-      // 采不到命中目标就不建批次 —— 这是 probe 的既有语义，照实返回。
       return { ok: true, result: {
         ok: true, accountScope: resolved.accountScope, status: 'empty',
         batchId: null, matched: 0,
@@ -67,26 +64,56 @@ function run(ctx, params) {
         note: '这一批没有命中目标；换视频或换关键词，而不是放宽策略'
       } };
     }
+
     const batch = result.batch || {};
-    const targets = capture.maskEvents(ctx, resolved.accountScope, result.targets || batch.targets);
+    const batchId = batch.batchId == null ? null : String(batch.batchId);
+    const rawTargets = Array.isArray(result.targets) ? result.targets
+      : (Array.isArray(batch.targets) ? batch.targets : []);
+    const masked = capture.maskEvents(ctx, resolved.accountScope, rawTargets);
+    // 落盘：审批阶段据此判断"谁在计划里、话术是什么"。
+    const record = {
+      batchId,
+      accountScope: resolved.accountScope,
+      sourceType: 'comment',
+      frozenAtMs: Date.now(),
+      policyRef: serverPolicy.policyRef,
+      policySource: serverPolicy.source,
+      replyMode: batch.replyMode == null ? null : String(batch.replyMode),
+      replyVia: batch.replyVia == null ? null : String(batch.replyVia),
+      blocked: result.blocked || null,
+      targets: masked.map(function (event, index) {
+        const raw = rawTargets[index] || {};
+        return {
+          eventId: String(event.id || raw.eventId || ''),
+          authorHash: event.authorHash,
+          text: String(raw.text || event.text || ''),
+          publicText: String(raw.publicText || ''),
+          privateText: String(raw.privateText || '')
+        };
+      })
+    };
+    let file = null;
+    try {
+      file = batches.write(ctx.agentStateDir, resolved.accountScope, record);
+    } catch (error) {
+      return capture.fail('unknown/state_unavailable',
+        'cannot persist the frozen batch: ' + (error && error.message ? error.message : String(error)));
+    }
+
     return { ok: true, result: {
       ok: true,
       accountScope: resolved.accountScope,
       status: outcome.status,
-      batchId: batch.batchId == null ? null : String(batch.batchId),
-      matched: targets.length,
-      candidates: targets,
-      blocked: result.blocked || null,
-      filter: result.filter || null,
-      // 冻结进计划的策略身份：之后执行必须带回来，probe 会校验。
+      batchId,
+      matched: record.targets.length,
+      recordFile: file,
+      blocked: record.blocked,
       policyRef: serverPolicy.policyRef,
       policySource: serverPolicy.source,
       candidatesAreSendable: false,
-      note: '计划已冻结，但这一层没有任何发送工具；执行阶段由审批层负责'
+      note: '计划已冻结并落盘；用 review_batch 看候选，approve_batch 才可能发送'
     } };
   });
 }
 
-// 名字里刻意【不含 reply】—— 注册表的名字守卫会把 "reply" 判成执行能力泄漏。
-// 这个工具只冻结计划，不回复。
 module.exports = { name: 'plan_batch', run };

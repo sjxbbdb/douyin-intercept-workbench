@@ -71,8 +71,9 @@ function main() {
     if (!found.ok) return;
     found.rows.forEach(function (row) {
       if (isMasked(row.author_id)) { skippedMasked += 1; return; }
-      const subject = source.name + ':' + String(row.author_id);
-      const leadId = leads.hashSubject(salt, subject);
+      // 身份哈希口径与 agent 侧 maskEvent 一致：只用 author_id，不带 source 前缀，
+      // 这样审批层才能把"批次候选"和"线索意图"按同一个哈希对上。
+      const leadId = leads.hashSubject(salt, String(row.author_id));
       // SQLite 里存的是浮点秒；对外一律整数毫秒，避免上游拿到 1790592755966.3857 这种时间戳。
       const seenAtMs = Math.round(Number(row.seen_at) * 1000);
       const updatedAtMs = Math.round(Number(row.updated_at) * 1000);

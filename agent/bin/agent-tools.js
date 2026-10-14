@@ -159,8 +159,10 @@ async function dispatch(cfg, line) {
       // 让客户端一眼看到这一版的边界：有能力做什么、以及【没有】什么。
       toolCount: registry.count(),
       tiers: registry.countByTier(),
-      // 会写入平台内容（发评论/发私信）的工具数量。这一版恒为 0。
-      writableTools: 0,
+      // 会写入平台内容的工具数量。现在只有 approve_batch（execute 层），
+      // 而且它必须先拿到服务端【逐条】授权。
+      writableTools: registry.TOOLS.filter(function (tool) { return tool.tier === 'execute'; }).length,
+      sendToolCount: registry.TOOLS.filter(function (tool) { return tool.tier === 'execute'; }).length,
       capabilities: registry.countByTier(),
       sendToolCount: 0,
       serverCapabilities: { tools: {} }

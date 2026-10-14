@@ -32,8 +32,9 @@ test('initialize 声明能力边界：12 个工具、0 个会写入平台内容�
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE });
   const out = runServer(cfg, [{ jsonrpc: '2.0', id: 1, method: 'initialize' }]);
   const result = out.responses[0].result;
-  assert.strictEqual(result.toolCount, 14);
-  assert.strictEqual(result.writableTools, 0);
+  assert.strictEqual(result.toolCount, 16);
+  // 唯一会写入平台内容的工具是 approve_batch。
+  assert.strictEqual(result.writableTools, 1);
 });
 
 test('initialize 按规范协商协议版本：支持的回同一个，不支持的回自己的', function () {
@@ -51,7 +52,7 @@ test('tools/list 只列只读工具，且都带声明字段', function () {
   const out = runServer(cfg, [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }]);
   const registry = require('../src/registry');
   const tools = out.responses[0].result.tools;
-  assert.strictEqual(tools.length, 14);
+  assert.strictEqual(tools.length, 16);
   const declared = registry.listTools().map(function (t) { return t.name; });
   tools.forEach(function (tool) {
     assert.ok(tool.declaration && tool.declaration.validation, tool.name);

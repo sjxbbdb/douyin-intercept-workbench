@@ -64,6 +64,10 @@ function identityFor(ctx, accountScope, raw) {
 // 把一条采集事件投影成可以安全交给上层（可能是个云端模型）的形状。
 function maskEvent(ctx, accountScope, event) {
   const row = event || {};
+  // 🔴 身份哈希口径必须与线索库一致（import-leads）：
+  //    只用 authorId 做加盐哈希，不带 source 前缀。
+  //    否则"批次里的候选"和"线索库里的意图"永远对不上，
+  //    审批层就没法按意图把投诉挑出来转人工。
   const authorKey = row.authorId || row.authorName || '';
   return {
     id: String(row.id == null ? '' : row.id),

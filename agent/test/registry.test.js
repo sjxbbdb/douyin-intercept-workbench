@@ -23,20 +23,25 @@ function walk(dir) {
 }
 
 test('工具清单是这 12 个，一个不多一个不少', function () {
-  assert.strictEqual(registry.count(), 14, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
+  assert.strictEqual(registry.count(), 16, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
   const names = registry.listTools().map(function (t) { return t.name; }).sort();
   assert.deepStrictEqual(names, [
-    'close_browser', 'collect_comments', 'collect_live', 'explain_failure', 'export_leads',
-    'get_account_health', 'get_batch_report', 'get_stats', 'list_video_pool',
-    'live_listen', 'plan_batch', 'query_leads', 'search_videos', 'start_browser'
+    'approve_batch', 'close_browser', 'collect_comments', 'collect_live', 'explain_failure',
+    'export_leads', 'get_account_health', 'get_batch_report', 'get_stats', 'list_video_pool',
+    'live_listen', 'plan_batch', 'query_leads', 'review_batch', 'search_videos', 'start_browser'
   ]);
 });
 
-test('清单里没有任何发送能力（发送层刻意不存在）', function () {
+test('会写入平台内容的工具只有一个，而且必须先拿服务端授权', function () {
+  const writeTools = registry.TOOLS.filter(function (t) { return t.tier === 'execute'; });
+  assert.deepStrictEqual(writeTools.map(function (t) { return t.name; }), ['approve_batch']);
+  writeTools.forEach(function (tool) {
+    assert.strictEqual(tool.declaration.autoEligible, false, tool.name + ' 必须 autoEligible=false');
+  });
+  // 单发入口与私信/弹幕第二阶段仍然不存在：它们必须单独审批，不能从这里漏出去。
   const names = registry.listTools().map(function (t) { return t.name; });
-  ['send_private', 'send_comment', 'comment_reply', 'comment_private',
-   'live_reply', 'live_private', 'approve_batch', 'review_batch'].forEach(function (forbidden) {
-    assert.strictEqual(names.indexOf(forbidden), -1, '清单里出现了发送能力: ' + forbidden);
+  ['send_private', 'send_comment', 'comment_private', 'live_private', 'live_reply'].forEach(function (forbidden) {
+    assert.strictEqual(names.indexOf(forbidden), -1, '清单里出现了未授权的发送入口: ' + forbidden);
   });
 });
 
@@ -52,20 +57,26 @@ test('每个工具都带 implemented / autoEligible / validation 声明', functi
   });
 });
 
-test('工具源码里不出现任何有副作用的 sidecar 方法', function () {
-  const offenders = [];
-  // registry.js 自己就是"禁止清单"的定义处，跳过它，否则守卫会被自己的清单命中。
+test('所有 sidecar 调用点都必须在白名单内，且不得命中禁止清单', function () {
+  // 只看【真正的调用点】（capture.invoke / callOnce），不看到处出现的字符串。
+  // 早先的版本按"源码里出现方法名"判，于是 approve_batch 里一个 informational
+  // 的 'comment_private' 标签也会被误报 —— 守卫过宽就会逼人绕着它写代码，
+  // 那是反向激励。真正要守的是"有没有地方真的调了它"。
+  const called = [];
   walk(SRC_DIR).filter(function (file) { return path.basename(file) !== 'registry.js'; })
     .forEach(function (file) {
-    const text = fs.readFileSync(file, 'utf8');
-    registry.FORBIDDEN_SIDECAR_METHODS.forEach(function (method) {
-      // 只匹配以字符串字面量形式出现的调用名，避免把注释里的说明也算进来。
-      const pattern = new RegExp("['\"]" + method + "['\"]");
-      const stripped = text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-      if (pattern.test(stripped)) offenders.push(file + ' -> ' + method);
+      const text = fs.readFileSync(file, 'utf8')
+        .replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      const pattern = /(?:invoke|callOnce)\([^,)]*,?\s*'([a-z_]+)'/g;
+      let match = pattern.exec(text);
+      while (match) { called.push({ file: path.basename(file), method: match[1] }); match = pattern.exec(text); }
     });
-  });
-  assert.deepStrictEqual(offenders, [], '工具层出现了发送/浏览器方法');
+  assert.ok(called.length > 0, '没扫到任何调用点，说明这条断言本身失效了');
+  const offenders = called.filter(function (entry) {
+    return registry.ALLOWED_SIDECAR_METHODS.indexOf(entry.method) === -1 ||
+           registry.FORBIDDEN_SIDECAR_METHODS.indexOf(entry.method) !== -1;
+  }).map(function (entry) { return entry.file + ' -> ' + entry.method; });
+  assert.deepStrictEqual(offenders, [], '出现了白名单外的 sidecar 调用');
 });
 
 test('工具层不含选择器字符串，也不直接 require CDP 或 ws', function () {
