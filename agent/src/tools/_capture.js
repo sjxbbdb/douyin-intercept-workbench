@@ -68,7 +68,11 @@ function maskEvent(ctx, accountScope, event) {
   //    只用 authorId 做加盐哈希，不带 source 前缀。
   //    否则"批次里的候选"和"线索库里的意图"永远对不上，
   //    审批层就没法按意图把投诉挑出来转人工。
-  const authorKey = row.authorId || row.authorName || '';
+  // 🔴 只用 authorId 做哈希。绝不用昵称兜底：
+  //    线索库是按 author_id 建键的，用昵称算出来的哈希永远对不上它，
+  //    结果就是"批次候选和线索意图永远接不上" —— 投诉也就筛不出来。
+  //    没有 authorId 时宁可给 null 并说明原因，也不给一个对不上的哈希。
+  const authorId = String(row.authorId == null ? '' : row.authorId).trim();
   return {
     id: String(row.id == null ? '' : row.id),
     source: String(row.source == null ? '' : row.source),
@@ -76,8 +80,8 @@ function maskEvent(ctx, accountScope, event) {
     text: String(row.text == null ? '' : row.text),
     observedAt: row.observedAt == null ? null : String(row.observedAt),
     fingerprint: row.fingerprint == null ? null : String(row.fingerprint),
-    authorHash: identityFor(ctx, accountScope, authorKey),
-    authorIdentity: 'salted_hash_of_author_id_or_nickname'
+    authorHash: authorId ? identityFor(ctx, accountScope, authorId) : null,
+    authorIdentity: authorId ? 'salted_hash_of_author_id' : 'missing_author_id'
   };
 }
 
@@ -95,7 +99,9 @@ function maskCandidates(ctx, accountScope, candidates) {
       eventId: String(row.eventId == null ? '' : row.eventId),
       sendId: String(row.sendId == null ? '' : row.sendId),
       publicSendId: row.publicSendId == null ? null : String(row.publicSendId),
-      authorHash: identityFor(ctx, accountScope, row.authorId || row.authorName || ''),
+      // 同样只用 authorId；缺失就给 null，不拿昵称凑。
+      authorHash: String(row.authorId == null ? '' : row.authorId).trim()
+        ? identityFor(ctx, accountScope, String(row.authorId).trim()) : null,
       reason: row.reason == null ? null : String(row.reason)
     };
   });

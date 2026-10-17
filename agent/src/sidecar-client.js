@@ -2,6 +2,7 @@
 
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const allowlist = require('./sidecar-allowlist');
 
 // probe/sidecar.py 是【一次进程一次请求】的 line-JSON 协议：
 // 主循环读一行、dispatch、回一行、退出。所以这里按调用起进程，不做长连接。
@@ -13,6 +14,12 @@ const DEFAULT_TIMEOUT_MS = 60000;
 
 function callOnce(config, method, params, options) {
   const opts = options || {};
+  // 🔴 运行时闸门：任何一次 sidecar 调用都必须过白名单。
+  //    这是"抗越权"的真正落点 —— 不是靠扫源码，而是让不该出现的方法根本发不出去。
+  const refusal = allowlist.check(method);
+  if (refusal) {
+    return { ok: false, error: { code: refusal.code.replace(/^blocked\//, ''), message: refusal.reason } };
+  }
   const args = [
     config.sidecarScript || path.join(config.probeDir, 'sidecar.py'),
     '--state-dir', config.stateDir,

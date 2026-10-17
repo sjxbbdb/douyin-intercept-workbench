@@ -336,29 +336,19 @@ const FORBIDDEN_NAME_PATTERNS = [
   /emergency/i, /^set_/i, /configure/i, /policy_write/i, /reply/i, /private_message/i
 ];
 
-// 允许调用的 sidecar 方法。分三层，任何一层之外的方法都不许出现在工具层。
-const READ_SIDECAR_METHODS = ['capabilities', 'doctor', 'search_pool', 'comment_result', 'live_result'];
-const CAPTURE_SIDECAR_METHODS = ['search', 'collect_comments', 'collect_live', 'live_listen'];
-const LIFECYCLE_SIDECAR_METHODS = ['launch', 'close'];
-// plan 层：只冻结计划，不发送。comment_plan / live_plan 会开浏览器采集，
-// 但不写入任何平台内容 —— 真正的发送方法仍然在禁止清单里。
-const PLAN_SIDECAR_METHODS = ['comment_plan'];
-// execute 层：真正会写入平台内容的两个方法。只有 approve_batch 用得到它们，
-// 而 approve_batch 必须先拿到服务端逐条授权。
-const EXECUTE_SIDECAR_METHODS = ['comment_reply', 'live_reply'];
-const ALLOWED_SIDECAR_METHODS = READ_SIDECAR_METHODS
-  .concat(CAPTURE_SIDECAR_METHODS)
-  .concat(PLAN_SIDECAR_METHODS)
-  .concat(EXECUTE_SIDECAR_METHODS)
-  .concat(LIFECYCLE_SIDECAR_METHODS);
-
-// 明确禁止出现在工具源码里的 sidecar 方法：写入平台内容，或与发送批次有关。
-// open 也在其中 —— 任意跳转不是任何一项功能需要的，暴露它只是白白扩大攻击面。
-// 仍然禁止：私信（第二阶段必须单独审批）、任意跳转、单发入口。
-const FORBIDDEN_SIDECAR_METHODS = [
-  'open', 'comment_private', 'live_private',
-  'live_plan', 'send_private', 'send_comment'
-];
+// 清单的【单一事实来源】在 sidecar-allowlist.js（叶子模块，避免与 tools 成环）。
+//
+// 真正的闸门在【调用现场】：capture.invoke / sidecar-client.callOnce 都会过
+// allowlist.check(method)。这里只做再导出，好让测试与文档引用同一份数据。
+// 早前的做法是"扫源码里有没有出现方法名"，那挡不住双引号写法，也挡不住算出来的方法名。
+const allowlist = require('./sidecar-allowlist');
+const READ_SIDECAR_METHODS = allowlist.READ_SIDECAR_METHODS;
+const CAPTURE_SIDECAR_METHODS = allowlist.CAPTURE_SIDECAR_METHODS;
+const PLAN_SIDECAR_METHODS = allowlist.PLAN_SIDECAR_METHODS;
+const EXECUTE_SIDECAR_METHODS = allowlist.EXECUTE_SIDECAR_METHODS;
+const LIFECYCLE_SIDECAR_METHODS = allowlist.LIFECYCLE_SIDECAR_METHODS;
+const ALLOWED_SIDECAR_METHODS = allowlist.ALLOWED_SIDECAR_METHODS;
+const FORBIDDEN_SIDECAR_METHODS = allowlist.FORBIDDEN_SIDECAR_METHODS;
 
 function forbiddenTools() {
   return TOOLS.filter(function (tool) {

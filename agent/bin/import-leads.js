@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
+const fs = require('node:fs');
 const config = require('../src/config');
 const ledger = require('../src/ledger');
 const leads = require('../src/store/leads');
@@ -56,6 +57,13 @@ function main() {
   if (rules.warning) process.stderr.write('提示: ' + rules.warning + '\n');
   const intentCounts = {};
 
+  // --rebuild：整份重建。身份哈希口径变过（旧版本带 source 前缀），
+  // 旧文件里的 leadId 与现在的口径对不上，只追加会留下永远匹配不上的陈数据。
+  const rebuild = process.argv.indexOf('--rebuild') !== -1;
+  if (rebuild) {
+    const old = leads.leadsFile(cfg.agentStateDir, accountScope);
+    if (fs.existsSync(old)) fs.renameSync(old, old + '.bak');
+  }
   const existing = leads.readAll(cfg.agentStateDir, accountScope);
   const seenIds = new Set((existing.leads || []).map(function (l) { return String(l.leadId); }));
 
@@ -114,6 +122,7 @@ function main() {
   process.stdout.write(JSON.stringify({
     ok: true,
     accountScope,
+    rebuilt: rebuild,
     scannedLedgers: sources.map(function (s) { return s.ledger; }),
     distinctLeads: byLead.size,
     imported: fresh.length,
