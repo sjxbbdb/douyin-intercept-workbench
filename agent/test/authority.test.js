@@ -74,6 +74,31 @@ test('S3：服务端可达时，上限与服务端策略一致', async function 
   }
 });
 
+test('登录态 verified 必须被认作已登录（真机踩过：写成 ok/authorized 是假阴性）', async function () {
+  // probe 的 login_state 只有 required / verified / unknown 三种取值。
+  // 写成 'ok'/'authorized' 会让"明明登录着"的账号被判成未授权。
+  const fake = await startAuthority(function (request, response) {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(okPolicy()));
+  });
+  try {
+    const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE, login: 'verified' });
+    cfg.authorityUrl = fake.base;
+    const out = await health.run(ctx(cfg), { probeBrowser: true });
+    assert.strictEqual(out.result.login, 'verified');
+    assert.notStrictEqual(out.result.blockedBy, 'blocked/not_authorized', '登录着不该报未授权');
+    assert.strictEqual(out.result.canWork, true, JSON.stringify(out.result));
+  } finally {
+    await fake.close();
+  }
+
+  // 真的弹了登录框就必须拦
+  const required = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE, login: 'required' });
+  const blocked = await health.run(ctx(required), { probeBrowser: true });
+  assert.strictEqual(blocked.result.canWork, false);
+  assert.strictEqual(blocked.result.blockedBy, 'blocked/not_authorized');
+});
+
 test('S3（fail-closed）：配了授权服务但连不上 -> canWork=false，绝不退回本地默认', async function () {
   const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE });
   cfg.authorityUrl = 'http://127.0.0.1:1';   // 必然连不上

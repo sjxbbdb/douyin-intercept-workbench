@@ -41,7 +41,12 @@ function invoke(ctx, method, params) {
     // 原样带上 sidecar 的观测，便于使用者判断是页面级还是账号级。
     return Object.assign(fail(terminal.code, terminal.reason, status), { observed: result });
   }
-  if (status !== 'ok') {
+  // 这些 status 是【合法结果】，不是错误，由调用方自己处理：
+  //   ok    —— 正常
+  //   empty —— 采不到命中目标（probe 的契约就是"返回 empty，宿主换视频或换关键词"）
+  // 早先把 empty 也当阻断，结果 plan_batch 永远看不到"没命中"这个真实原因。
+  const HANDLED_STATUS = { ok: true, empty: true };
+  if (!HANDLED_STATUS[status]) {
     // 🔴 真机实测踩过：sidecar 会用 status 表达"这次没干成"
     //    （例如 collect_comments 遇到不支持的页面类型返回 status="unsupported"）。
     //    以前这里只看 ok 就往下走，结果是"ok:true + 0 条"，

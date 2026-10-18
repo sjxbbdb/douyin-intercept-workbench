@@ -125,7 +125,9 @@ function runChecks(cfg, options) {
       const login = String((doctor.result && doctor.result.login) || 'unknown');
       const captcha = Boolean(doctor.result && doctor.result.captcha);
       // 有验证码就等于不能干活 —— 登录态看着正常也不行（页面被风控拦住了）。
-      const loginOk = (login === 'ok' || login === 'authorized') && !captcha;
+      // probe 的登录态只有 required / verified / unknown 三种（见 probe/douyin.py）。
+      // 写成 'ok'/'authorized' 会【明明登录着却判不通过】。
+      const loginOk = (login === 'verified' || login === 'ok' || login === 'authorized') && !captcha;
       checks.push(check('browser_login', loginOk,
         'login=' + login + ' captcha=' + captcha + ' url=' + String((doctor.result && doctor.result.url) || ''),
         captcha

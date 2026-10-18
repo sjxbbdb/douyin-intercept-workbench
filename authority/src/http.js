@@ -20,13 +20,29 @@ const MAX_BODY = 64 * 1024;
 const POLICY_OVERRIDE_FIELDS = ['limits', 'policy', 'policyVersion', 'hourly', 'daily', 'perUser',
                                 'observation', 'minIntervalMs', 'activeHours'];
 
+// 读 token 表。
+//
+// 🔴 真机踩过：用 PowerShell 的 Set-Content -Encoding utf8 写出来的 JSON 带 BOM，
+//    JSON.parse 直接抛错 —— 而这里如果 catch 掉返回 {}，表现是【所有 token 都无效】，
+//    报出来却是 401 not_authenticated，排查方向会被带偏到"token 配错了"。
+//    所以：先剥 BOM；解析失败要【大声说】，不能静默当成空表。
 function loadTokens(stateDir) {
   const file = path.join(path.resolve(stateDir), 'tokens.json');
   if (!fs.existsSync(file)) return {};
+  let raw;
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    process.stderr.write('tokens.json 读不了: ' + (error && error.message ? error.message : String(error)) + '\n');
+    return {};
+  }
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);   // 剥掉 BOM
+  try {
+    const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch (error) {
+    process.stderr.write('tokens.json 不是合法 JSON（这条会让所有请求都 401）: ' +
+      (error && error.message ? error.message : String(error)) + '\n');
     return {};
   }
 }

@@ -12,6 +12,10 @@ const { callOnce } = require('../sidecar-client');
 //      —— 绝不允许"服务端挂了就先用本地默认上限继续发"；
 //   3) 没有配授权服务时，如实标注 sourceOfLimits="local_default"，不冒充服务端策略。
 
+// probe 的登录态只有这三种取值（probe/douyin.py:login_state 的 docstring 写明）。
+const LOGIN_OK_STATES = new Set(['verified', 'ok', 'authorized']);
+const LOGIN_REQUIRED_STATES = new Set(['required']);
+
 function fail(code, reason) {
   return { ok: false, code, reason };
 }
@@ -138,7 +142,10 @@ async function run(ctx, params) {
     } else if (observation.active && Number(observation.dailyLimit) === 0) {
       // 观察期上限为 0，且没有跳过入口。
       canWork = false; blockedBy = 'blocked/observation_period';
-    } else if (browser.probed && login !== 'ok' && login !== 'authorized') {
+    } else if (browser.probed && !LOGIN_OK_STATES.has(login)) {
+      // 🔴 真机踩过：probe 的 login_state 只返回 required / verified / unknown，
+      //    写成 'ok' / 'authorized' 两个都不存在 —— 结果是【明明登录着却报未授权】。
+      //    这种假阴性最坑：它把"能用"说成"不能用"，还让人去查登录。
       canWork = false; blockedBy = login === 'unknown' ? 'unknown/login_state_unconfirmed' : 'blocked/not_authorized';
     } else if (!browser.probed) {
       canWork = false; blockedBy = 'unknown/browser_not_probed';
