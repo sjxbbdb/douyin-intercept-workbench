@@ -115,4 +115,35 @@ async function requestAuthorization(ctx, input, options) {
   }
 }
 
-module.exports = { policy, requestAuthorization, configured, DEFAULT_TIMEOUT_MS };
+// 了结一次授权：把【真实结果】报回服务端。
+//
+// 🔴 这一步不是可选的：服务端只有见过某次公屏被 commit 成 sent_confirmed，
+//    才会在私信授权时认这个 publicSendId。不 commit，私信永远拿不到授权。
+//    state 必须是终态；上报的值要来自台账（页面回显不算）。
+async function commitAuthorization(ctx, authorizationId, outcome, options) {
+  const cfg = ctx.config || {};
+  if (!configured(cfg)) return { ok: false, reason: 'authorization_not_configured', configured: false };
+  const opts = options || {};
+  const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const url = String(cfg.authorityUrl).replace(/\/+$/, '') +
+    '/v1/send-authorizations/' + encodeURIComponent(String(authorizationId)) + '/commit';
+  const controller = new AbortController();
+  const timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + String(cfg.authorityToken || '') },
+      body: JSON.stringify({ state: outcome.state, reason: outcome.reason == null ? null : outcome.reason }),
+      signal: controller.signal
+    });
+    const body = await response.json().catch(function () { return {}; });
+    if (response.ok && body.ok !== false) return { ok: true, state: body.state || outcome.state, idempotent: Boolean(body.idempotent) };
+    return { ok: false, reason: String((body && body.reason) || 'commit_failed') };
+  } catch (error) {
+    return { ok: false, reason: String(error && error.message ? error.message : error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+module.exports = { policy, requestAuthorization, commitAuthorization, configured, DEFAULT_TIMEOUT_MS };

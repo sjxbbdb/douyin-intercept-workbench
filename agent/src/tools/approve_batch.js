@@ -1,8 +1,13 @@
 'use strict';
 
+const ledger = require('../ledger');
 const scope = require('../scope');
 const capture = require('./_capture');
 const authority = require('../authority-client');
+
+// 台账里的终态。只有这四种可以上报给服务端；
+// reserved/started 表示"还在路上"，一律按 unknown 上报 —— 绝不冒充成功。
+const TERMINAL_LEDGER_STATES = ['sent_confirmed', 'unknown', 'failed', 'blocked'];
 const { ACTIONS } = require('../blocked-codes');
 
 // 唯一的写工具：把审批结果交给 probe 执行。
@@ -123,6 +128,36 @@ function run(ctx, params) {
                grantedCount: granted.length, blocked };
     }
     const result = outcome.result || {};
+
+    // 🔴 真机发现的漏洞：执行完【从不】把结果报回服务端。
+    //    后果有两个，都很致命：
+    //      ① 授权停在 reserved，服务端配额永远不释放 —— 会被自己的账拖死；
+    //      ② 服务端从没见过某次公屏"确认成功"，于是私信授权永远拿不到
+    //         （public_not_confirmed），两阶段契约在服务端侧就断了。
+    //
+    //    上报的值必须来自【台账原始状态】，不是 probe 的对外 status：
+    //    对外 status 故意把 sent_confirmed 投影成 unknown（避免过度宣称），
+    //    拿它上报会把成功记成未知，私信同样进不去。
+    const authorityCommits = [];
+    for (const entry of granted) {
+      const sendId = String(entry.decision.sendId);
+      const row = ledger.sendRow(ctx.config.stateDir, resolved.accountScope, sendId);
+      const ledgerState = row.ok && row.row ? String(row.row.status) : 'unreadable';
+      const state = TERMINAL_LEDGER_STATES.indexOf(ledgerState) === -1 ? 'unknown' : ledgerState;
+      const committed = await authority.commitAuthorization(ctx, entry.authorizationId, {
+        state: state,
+        reason: 'probe_' + ledgerState
+      });
+      authorityCommits.push({
+        sendId,
+        authorizationId: entry.authorizationId,
+        ledgerState,
+        committedState: state,
+        ok: committed.ok,
+        error: committed.ok ? null : String(committed.reason || 'commit_failed')
+      });
+    }
+
     return { ok: true, result: {
       ok: true,
       accountScope: resolved.accountScope,
@@ -131,6 +166,9 @@ function run(ctx, params) {
       blocked,
       results: result.results || null,
       queuedSendIds: granted.map(function (e) { return String(e.decision.sendId); }),
+      // 每条授权在服务端的了结情况：这是私信能不能拿到的前提。
+      authorityCommits,
+      authorityCommitFailed: authorityCommits.filter(function (c) { return !c.ok; }).length,
       checkpoint: result.checkpoint == null ? null : result.checkpoint,
       // 两阶段的第二阶段（私信）必须另走一次审批：只有公屏拿到平台回执
       // （sent_confirmed）之后才谈得上。

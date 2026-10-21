@@ -58,6 +58,8 @@ function authorityHandler(grantedSendIds) {
   };
 }
 
+const agentSendId = 'agent:b-1:e1';
+
 function seedBatch(cfg, targets) {
   return batches.write(cfg.agentStateDir, SCOPE, {
     batchId: 'b-1', accountScope: SCOPE, sourceType: 'comment', frozenAtMs: Date.now(),
@@ -169,6 +171,106 @@ test('approve_batch：只发被服务端授权的那几条，未授权的一条�
     assert.deepStrictEqual(call.params.items.map(function (i) { return i.sendId; }), ['agent:b-1:e1']);
     // 两阶段：公屏阶段的 items 不带 publicSendId
     assert.strictEqual(call.params.items[0].publicSendId, null);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('approve_batch：执行完把【台账原始状态】commit 回服务端（私信的前提）', async function () {
+  // 真机发现的漏洞：执行完从不 commit。后果是服务端配额不释放，
+  // 而且服务端从没见过"公屏已确认"，私信授权永远拿不到。
+  // 上报必须用台账原始状态：probe 对外 status 会把 sent_confirmed 投影成 unknown。
+  const commits = [];
+  const fake = await startAuthority(function (request, response) {
+    let raw = '';
+    request.on('data', function (c) { raw += c; });
+    request.on('end', function () {
+      response.setHeader('content-type', 'application/json');
+      if (request.method === 'GET') {
+        response.writeHead(200);
+        response.end(JSON.stringify({ ok: true, source: 'server_settings',
+          policyRef: { policyId: 'send-policy:' + TENANT, policyVersion: 1 },
+          limits: { perUser: 1, hourly: 20, daily: 50 }, observation: { active: false } }));
+        return;
+      }
+      if (request.url.indexOf('/commit') !== -1) {
+        commits.push({ url: request.url, body: JSON.parse(raw || '{}') });
+        response.writeHead(200);
+        response.end(JSON.stringify({ ok: true, state: JSON.parse(raw || '{}').state }));
+        return;
+      }
+      const body = JSON.parse(raw || '{}');
+      response.writeHead(200);
+      response.end(JSON.stringify({ ok: true, status: 'granted', authorizationId: 'auth-' + body.sendId, expiresAtMs: Date.now() + 60000 }));
+    });
+  });
+  try {
+    const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), {
+      accountScope: SCOPE,
+      methods: { comment_reply: { status: 'ok', results: [{ eventId: 'e1', status: 'unknown' }] } }
+    });
+    cfg.authorityUrl = fake.base;
+    cfg.authorityToken = TOKEN;
+    helpers.seedSends(cfg, [
+      { accountScope: SCOPE, sendId: agentSendId, targetKey: 't1', kind: 'comment', status: 'sent_confirmed', createdAtMs: Date.now() - 1000 }
+    ]);
+    const out = await approveBatch.run(ctx(cfg), {
+      batchId: 'b-1', decisions: [{ eventId: 'e1', sendId: agentSendId, action: 'approve' }]
+    });
+    assert.strictEqual(out.ok, true, out.reason || out.message);
+    assert.strictEqual(out.result.authorityCommitFailed, 0);
+    assert.strictEqual(out.result.authorityCommits[0].ledgerState, 'sent_confirmed');
+    assert.strictEqual(out.result.authorityCommits[0].committedState, 'sent_confirmed',
+      '必须上报台账里的真实状态，而不是 probe 对外投影的 unknown');
+    assert.strictEqual(commits.length, 1);
+    assert.strictEqual(commits[0].body.state, 'sent_confirmed');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('approve_batch：台账说 unknown 就上报 unknown，绝不冒充成功', async function () {
+  const commits = [];
+  const fake = await startAuthority(function (request, response) {
+    let raw = '';
+    request.on('data', function (c) { raw += c; });
+    request.on('end', function () {
+      response.setHeader('content-type', 'application/json');
+      if (request.method === 'GET') {
+        response.writeHead(200);
+        response.end(JSON.stringify({ ok: true, source: 'server_settings',
+          policyRef: { policyId: 'send-policy:' + TENANT, policyVersion: 1 },
+          limits: { perUser: 1, hourly: 20, daily: 50 }, observation: { active: false } }));
+        return;
+      }
+      if (request.url.indexOf('/commit') !== -1) {
+        commits.push(JSON.parse(raw || '{}'));
+        response.writeHead(200); response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      const body = JSON.parse(raw || '{}');
+      response.writeHead(200);
+      response.end(JSON.stringify({ ok: true, status: 'granted', authorizationId: 'auth-' + body.sendId }));
+    });
+  });
+  try {
+    const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), {
+      accountScope: SCOPE, methods: { comment_reply: { status: 'ok' } }
+    });
+    cfg.authorityUrl = fake.base;
+    cfg.authorityToken = TOKEN;
+    helpers.seedSends(cfg, [
+      { accountScope: SCOPE, sendId: 'raw-unknown', targetKey: 't1', kind: 'comment', status: 'unknown', createdAtMs: Date.now() - 1000 },
+      { accountScope: SCOPE, sendId: 'raw-reserved', targetKey: 't2', kind: 'comment', status: 'reserved', createdAtMs: Date.now() - 1000 }
+    ]);
+    // 台账里是 unknown / reserved -> 都必须上报 unknown
+    for (const sendId of ['raw-unknown', 'raw-reserved']) {
+      const out = await approveBatch.run(ctx(cfg), {
+        batchId: 'b-1', decisions: [{ eventId: 'e1', sendId: sendId, action: 'approve' }]
+      });
+      assert.strictEqual(out.result.authorityCommits[0].committedState, 'unknown', sendId);
+    }
+    assert.deepStrictEqual(commits.map(function (c) { return c.state; }), ['unknown', 'unknown']);
   } finally {
     await fake.close();
   }
