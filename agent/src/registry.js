@@ -15,6 +15,7 @@ const exportLeads = require('./tools/export_leads');
 const planBatch = require('./tools/plan_reply_batch');
 const reviewBatch = require('./tools/review_batch');
 const approveBatch = require('./tools/approve_batch');
+const approvePrivate = require('./tools/approve_private');
 
 // 工具注册表 = Agent 的全部能力边界。
 //
@@ -305,6 +306,34 @@ const TOOLS = [
     },
     declaration: { implemented: true, autoEligible: false, validation: 'offline_unit_tests' },
     handler: approveBatch
+  },
+  {
+    name: 'approve_private',
+    tier: 'execute',
+    description: '第二阶段：私信（会写平台内容）。必须绑一条已确认的公屏回复，逐条向服务端申请授权。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        batchId: { type: 'string' },
+        sourceType: { type: 'string', enum: ['comment'] },
+        decisions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              eventId: { type: 'string' },
+              action: { type: 'string', enum: ['approve', 'reject', 'skip'] }
+            },
+            required: ['eventId', 'action'],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ['batchId', 'decisions'],
+      additionalProperties: false
+    },
+    declaration: { implemented: true, autoEligible: false, validation: 'offline_unit_tests' },
+    handler: approvePrivate
   },
 
   // ---------- lifecycle ----------

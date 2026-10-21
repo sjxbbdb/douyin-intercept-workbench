@@ -37,9 +37,9 @@ function sampleEvent(extra) {
 }
 
 test('三层能力各有几个工具，总数固定', function () {
-  assert.strictEqual(registry.count(), 16, '工具数量变化必须同步改 docs/agent-tools.md');
+  assert.strictEqual(registry.count(), 17, '工具数量变化必须同步改 docs/agent-tools.md');
   assert.deepStrictEqual(registry.countByTier(),
-    { read: 5, capture: 6, plan: 2, execute: 1, lifecycle: 2 });
+    { read: 5, capture: 6, plan: 2, execute: 2, lifecycle: 2 });
 });
 
 test('新增的采集/生命周期工具名都不命中执行类模式', function () {

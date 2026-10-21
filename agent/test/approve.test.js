@@ -10,6 +10,7 @@ const test = require('node:test');
 const batches = require('../src/store/batches');
 const reviewBatch = require('../src/tools/review_batch');
 const approveBatch = require('../src/tools/approve_batch');
+const approvePrivate = require('../src/tools/approve_private');
 const helpers = require('./helpers');
 
 // 评审项：发送是 probe 早就实现并真机验证过的能力；agent 层现在把它接出来了，
@@ -295,6 +296,71 @@ test('approve_batch：一条都没授权时，连 probe 都不碰', async functi
   } finally {
     await fake.close();
   }
+});
+
+test('approve_private：把公屏 sendId 作为 publicSendId 带回去（两阶段的绑定点）', async function () {
+  const recorded = path.join(os.tmpdir(), 'dm-' + Date.now() + '.jsonl');
+  const fake = await startAuthority(authorityHandler(null));
+  try {
+    const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), {
+      accountScope: SCOPE, recordParamsTo: recorded,
+      methods: { comment_private: { status: 'ok', results: [{ eventId: 'e1', status: 'unknown' }] } }
+    });
+    cfg.authorityUrl = fake.base;
+    cfg.authorityToken = TOKEN;
+    seedBatch(cfg, [{ eventId: 'e1', authorHash: 'h1', text: '多少钱', publicText: 'p', privateText: 'v' }]);
+    helpers.seedSends(cfg, [
+      { accountScope: SCOPE, sendId: batches.privateSendIdFor('b-1', 'e1'), targetKey: 't1',
+        kind: 'private', status: 'unknown', createdAtMs: Date.now() - 1000 }
+    ]);
+    const out = await approvePrivate.run(ctx(cfg), {
+      batchId: 'b-1', sourceType: 'comment', decisions: [{ eventId: 'e1', action: 'approve' }]
+    });
+    assert.strictEqual(out.ok, true, out.reason || out.message);
+    assert.strictEqual(out.result.approved, 1);
+    // 私信有自己的 sendId，公屏那个只是 publicSendId
+    assert.strictEqual(out.result.queuedSendIds[0], batches.privateSendIdFor('b-1', 'e1'));
+    assert.strictEqual(out.result.publicSendIds[0], batches.sendIdFor('b-1', 'e1'));
+
+    const lines = fs.readFileSync(recorded, 'utf8').trim().split(/\r?\n/).map(function (l) { return JSON.parse(l); });
+    const call = lines.find(function (l) { return l.method === 'comment_private'; });
+    assert.ok(call, '应当调用过 comment_private');
+    assert.strictEqual(call.params.items[0].publicSendId, batches.sendIdFor('b-1', 'e1'),
+      'publicSendId 必须是公屏那一次的 sendId');
+    assert.strictEqual(call.params.items[0].sendId, batches.privateSendIdFor('b-1', 'e1'));
+    // 台账是 unknown -> 只能上报 unknown
+    assert.strictEqual(out.result.authorityCommits[0].committedState, 'unknown');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('approve_private：不在冻结计划里的事件不发，也不碰执行器', async function () {
+  const recorded = path.join(os.tmpdir(), 'dm-none-' + Date.now() + '.jsonl');
+  const fake = await startAuthority(authorityHandler(null));
+  try {
+    const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE, recordParamsTo: recorded });
+    cfg.authorityUrl = fake.base;
+    seedBatch(cfg, [{ eventId: 'e1', authorHash: 'h1' }]);
+    const out = await approvePrivate.run(ctx(cfg), {
+      batchId: 'b-1', decisions: [{ eventId: 'ghost', action: 'approve' }]
+    });
+    assert.strictEqual(out.ok, true, out.reason || out.message);
+    assert.strictEqual(out.result.approved, 0);
+    assert.strictEqual(out.result.blocked[0].code, 'blocked/event_not_in_plan');
+    assert.ok(!fs.existsSync(recorded), '不该调用执行器');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('approve_private：文案必须来自冻结计划，调用方自带即拒', async function () {
+  const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), { accountScope: SCOPE });
+  const out = await approvePrivate.run(ctx(cfg), {
+    batchId: 'b-1', decisions: [{ eventId: 'e1', action: 'approve', text: '我自己编的私信' }]
+  });
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(out.code, 'blocked/invalid_input');
 });
 
 test('approve_batch：文案只能来自冻结计划，调用方自带即拒', async function () {

@@ -23,24 +23,28 @@ function walk(dir) {
 }
 
 test('工具清单是这 12 个，一个不多一个不少', function () {
-  assert.strictEqual(registry.count(), 16, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
+  assert.strictEqual(registry.count(), 17, '工具数量变化必须同步改 docs/agent-tools.md 的契约');
   const names = registry.listTools().map(function (t) { return t.name; }).sort();
   assert.deepStrictEqual(names, [
-    'approve_batch', 'close_browser', 'collect_comments', 'collect_live', 'explain_failure',
-    'export_leads', 'get_account_health', 'get_batch_report', 'get_stats', 'list_video_pool',
-    'live_listen', 'plan_batch', 'query_leads', 'review_batch', 'search_videos', 'start_browser'
+    'approve_batch', 'approve_private', 'close_browser', 'collect_comments', 'collect_live',
+    'explain_failure', 'export_leads', 'get_account_health', 'get_batch_report', 'get_stats',
+    'list_video_pool', 'live_listen', 'plan_batch', 'query_leads', 'review_batch',
+    'search_videos', 'start_browser'
   ]);
 });
 
-test('会写入平台内容的工具只有一个，而且必须先拿服务端授权', function () {
+test('会写入平台内容的工具只有这两个，而且都必须先拿服务端授权', function () {
   const writeTools = registry.TOOLS.filter(function (t) { return t.tier === 'execute'; });
-  assert.deepStrictEqual(writeTools.map(function (t) { return t.name; }), ['approve_batch']);
+  assert.deepStrictEqual(writeTools.map(function (t) { return t.name; }).sort(),
+    ['approve_batch', 'approve_private']);
   writeTools.forEach(function (tool) {
     assert.strictEqual(tool.declaration.autoEligible, false, tool.name + ' 必须 autoEligible=false');
   });
   // 单发入口与私信/弹幕第二阶段仍然不存在：它们必须单独审批，不能从这里漏出去。
   const names = registry.listTools().map(function (t) { return t.name; });
-  ['send_private', 'send_comment', 'comment_private', 'live_private', 'live_reply'].forEach(function (forbidden) {
+  // comment_private 走的是批次入口（有 approve_private 单独审批），
+  // 但【单发】入口与直播通路仍然不许出现。
+  ['send_private', 'send_comment', 'live_private'].forEach(function (forbidden) {
     assert.strictEqual(names.indexOf(forbidden), -1, '清单里出现了未授权的发送入口: ' + forbidden);
   });
 });

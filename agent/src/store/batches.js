@@ -44,4 +44,10 @@ function sendIdFor(batchId, eventId) {
   return 'agent:' + String(batchId) + ':' + String(eventId);
 }
 
-module.exports = { dirFor, fileFor, write, read, sendIdFor };
+// 私信是【另一条】发送动作，必须有自己的幂等键：
+// 复用公屏的 sendId 会被台账当成同一次发送的重放，私信根本发不出去。
+function privateSendIdFor(batchId, eventId) {
+  return 'agent:' + String(batchId) + ':' + String(eventId) + ':private';
+}
+
+module.exports = { dirFor, fileFor, write, read, sendIdFor, privateSendIdFor };

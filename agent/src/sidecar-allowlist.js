@@ -16,7 +16,9 @@ const CAPTURE_SIDECAR_METHODS = ['search', 'collect_comments', 'collect_live', '
 const PLAN_SIDECAR_METHODS = ['comment_plan'];
 // execute：真正写入平台内容的方法。只有 approve_batch 用得到，
 // 而且它必须先拿到服务端【逐条】授权。
-const EXECUTE_SIDECAR_METHODS = ['comment_reply', 'live_reply'];
+// execute：真正写入平台内容的方法。只有 approve_batch / approve_private 用得到，
+// 且每一步都必须先拿到服务端【逐条】授权。
+const EXECUTE_SIDECAR_METHODS = ['comment_reply', 'live_reply', 'comment_private'];
 const LIFECYCLE_SIDECAR_METHODS = ['launch', 'close'];
 
 const ALLOWED_SIDECAR_METHODS = [].concat(
@@ -28,9 +30,11 @@ const ALLOWED_SIDECAR_METHODS = [].concat(
 );
 
 // 明确禁止：私信（第二阶段必须单独审批）、任意跳转、单发入口、直播建计划。
+// 仍然禁止：单发入口（绕过批次）、任意跳转、直播建计划。
+// 私信的【批次】入口 comment_private 已进 execute 层（有单独审批工具与两阶段绑定）；
+// 但单发私信 send_private 依旧禁止 —— 它没有批次与 publicSendId 的强制上下文。
 const FORBIDDEN_SIDECAR_METHODS = [
-  'open', 'comment_private', 'live_private',
-  'live_plan', 'send_private', 'send_comment'
+  'open', 'live_private', 'live_plan', 'send_private', 'send_comment'
 ];
 
 function isAllowed(method) {
