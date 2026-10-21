@@ -27,7 +27,11 @@ const TERMINAL_STATUS = {
                     reason: '登录态失效：请在专用 Chrome 里人工登录后重跑' }
 };
 
-function invoke(ctx, method, params) {
+// options.dataStatus：某些方法返回的是【报告数据】，里面的 status 指的是批次状态
+// （例如 comment_result 的 status="frozen"），不是这次操作的结果。
+// 早先按统一规则解释它，于是把一份正常报告判成了 blocked/unknown/internal。
+function invoke(ctx, method, params, options) {
+  const opts = options || {};
   const res = callOnce(ctx.config, method, params || {});
   if (!res.ok) {
     const protocolCode = String((res.error && res.error.code) || 'request_failed');
@@ -36,6 +40,10 @@ function invoke(ctx, method, params) {
   }
   const result = res.result || {};
   const status = String(result.status || 'ok');
+  if (opts.dataStatus) {
+    // 报告类方法的 status 是数据，不是结果 —— 原样交给调用方解释。
+    return { ok: true, result, status };
+  }
   const terminal = TERMINAL_STATUS[status];
   if (terminal) {
     // 原样带上 sidecar 的观测，便于使用者判断是页面级还是账号级。

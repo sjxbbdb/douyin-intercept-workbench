@@ -54,9 +54,26 @@ function run(ctx, params) {
 
   return (async function () {
     const phase = sourceType === 'live' ? 'danmaku_reply' : 'comment';
-    const phasePrivate = sourceType === 'live' ? 'live_private_reply' : 'private';
     const granted = [];
     const blocked = [];
+
+    // 🔴 真机踩过：建批次时把【服务端策略身份】冻进了计划，执行时必须带回来，
+    //    否则 probe 的 _require_policy 直接拒（policy_ref_missing）——
+    //    这是它该有的行为，缺的是我这里没把身份带回去。
+    //
+    //    这里重新向服务端取【当前】身份，而不是回放本地副本：
+    //      · 服务端没变 -> 与冻结值一致，放行；
+    //      · 服务端改过版本 -> probe 报 policy_ref_mismatch，强制重新建批次。
+    //    回放本地副本只是自证，证明不了"这个身份是服务端现在认可的"。
+    const serverPolicy = await authority.policy(ctx);
+    if (!serverPolicy.available) {
+      return capture.fail('blocked/' + String(serverPolicy.reason || 'authorization_unavailable'),
+        'cannot execute without a server-issued policy: ' + String(serverPolicy.detail || serverPolicy.reason));
+    }
+    const policyRef = {
+      policyId: serverPolicy.policyRef.policyId,
+      policyVersion: serverPolicy.policyRef.policyVersion
+    };
 
     for (let i = 0; i < decisions.length; i += 1) {
       const item = decisions[i];
@@ -97,7 +114,7 @@ function run(ctx, params) {
     });
     const outcome = capture.invoke(ctx,
       sourceType === 'live' ? 'live_reply' : 'comment_reply',
-      { batchId: batchId, items: items });
+      { batchId: batchId, items: items, policyRef: policyRef });
 
     if (!outcome.ok) {
       // 执行失败：把已授权的条目如实报出来（它们已经消耗了服务端配额）。

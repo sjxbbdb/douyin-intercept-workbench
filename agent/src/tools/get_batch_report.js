@@ -20,7 +20,8 @@ function run(ctx, params) {
   if (!resolved.ok) return resolved;
 
   const method = sourceType === 'live' ? 'live_result' : 'comment_result';
-  const outcome = capture.invoke(ctx, method, { batchId });
+  // 报告里的 status 是【批次状态】，不是操作结果，所以按 dataStatus 处理。
+  const outcome = capture.invoke(ctx, method, { batchId }, { dataStatus: true });
   if (!outcome.ok) return outcome;
 
   const result = outcome.result || {};
@@ -29,7 +30,7 @@ function run(ctx, params) {
     accountScope: resolved.accountScope,
     sourceType,
     batchId,
-    status: outcome.status,
+    batchStatus: outcome.status,
     counts: result.counts || null,
     privateCounts: result.privateCounts || null,
     checkpoint: result.checkpoint == null ? null : result.checkpoint,
