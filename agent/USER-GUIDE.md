@@ -1,0 +1,134 @@
+# 给别人用的上手说明
+
+> 这份文档面向"拿到这份代码的另一个人"。三步走完就能跑。
+>
+> **它能做**：按关键词搜视频、抓评论区、抓直播间互动、看台账与额度、查归因。
+> **它不能做**：发评论、发私信、审批、任何"替你操作账号"的动作 —— 工具表里没有这些能力。
+
+## 一、你需要准备什么
+
+| 需要 | 版本/说明 |
+| --- | --- |
+| Node | **≥ 22.13**（只读台账用 Node 内置 `node:sqlite`；22.x 会打印一条 ExperimentalWarning，功能正常） |
+| Python | **3.12 / 3.13**，纯标准库，不需要 pip install 任何东西 |
+| 一个**你自己的、已登录的** Chrome | 本工具**不代办登录**，也用不了别人的登录态 |
+| 一个状态目录 | 台账放在这里。不同的人用不同目录 = 天然隔离 |
+
+**一个账号一个进程**：账号作用域由 Chrome profile 路径推导。两个人共用同一个 profile，就等于共用同一个账号。
+
+## 二、三步
+
+### 第 1 步：拿到代码
+
+    git clone <仓库地址> && cd <仓库目录>
+
+### 第 2 步：写配置 + 跑自检
+
+复制示例配置，改成你自己的路径：
+
+    cp agent/agent.config.example.json agent/agent.config.json
+    # 编辑 agent/agent.config.json
+
+然后跑自检（**只读：不启动浏览器、不登录、不发送任何内容**）：
+
+    node agent/bin/agent-doctor.js --config agent/agent.config.json
+
+它会逐项告诉你缺什么，并为每一项给出"怎么办"。全通过时会直接打印一段**可以粘贴的 MCP 客户端配置**。
+
+想连浏览器一并检查登录状态（仍然是只读）：
+
+    node agent/bin/agent-doctor.js --config agent/agent.config.json --probe-browser
+
+> 有验证码时自检会判为**不可用**并提示人工处理 —— 本工具**绝不绕过验证码**。
+
+### 第 3 步：接进你的客户端
+
+把自检打印出来的那段 JSON 粘进客户端的 MCP 配置即可，形状是：
+
+    {
+      "mcpServers": {
+        "douyin-agent-tools": {
+          "command": "node",
+          "args": ["<绝对路径>/agent/bin/agent-tools.js",
+                   "--state-dir", "<你的状态目录>",
+                   "--profile-dir", "<你的 Chrome 用户目录>",
+                   "--port", "9222"]
+        }
+      }
+    }
+
+⚠️ **未验证边界**：协议只在 stdio 层用自制客户端验证过（`initialize` / `tools/list` / `tools/call`），
+**还没接过真实的第三方 MCP 客户端**。"在 Claude Desktop / Cursor 里能不能跑"目前是 **unknown**。
+
+## 三、自检报错对照表
+
+| 报的项 | 什么意思 | 怎么办 |
+| --- | --- | --- |
+| `node_version` | Node 太老 | 升到 ≥ 22.13 |
+| `node_sqlite` | 当前 Node 没有 node:sqlite | 同上（本工具不引第三方依赖，所以不装 sqlite 驱动） |
+| `python` | 找不到 Python | 装 3.12/3.13，或用 `--python <路径>` |
+| `sidecar_script` | 找不到 `probe/sidecar.py` | `--probe-dir` 指向仓库里的 `probe/` |
+| `state_dir` | 状态目录不存在 | 先跑一次 sidecar 让它建台账，或指向已有目录 |
+| `agent_state_dir` | 目录不可写 | `--agent-state-dir <一个可写目录>` |
+| `sidecar_capabilities` | sidecar 起不来 | 照它给的那行命令手工跑一遍看原始报错 |
+| `browser_login` | 浏览器没连上 / 没登录 / 有验证码 | 启动专用 Chrome 并把它放到前台保持可见；人工登录；人工过验证码 |
+
+## 三之二、跑一次完整流程（搜视频 → 抓评论）
+
+接上客户端后，让 Agent 按这个顺序调用即可：
+
+1. `start_browser` —— 启动那个专用 Chrome（第一次必须；窗口要保持**可见**，被遮挡时读取会失效）
+2. `search_videos { "keyword": "怎么学习ai" }` —— 返回这一页候选 + 下一页游标 + 相关度
+3. `list_video_pool` —— 看这次搜索到底攒了哪些候选，挑一个 `videoId`
+4. `collect_comments { "videoId": "...", "commentKeywords": "111 666 怎么学习" }` —— 抓评论区并筛出目标批次
+5. `get_batch_report { "batchId": "..." }` —— 看这一批的逐条状态与检查点
+
+直播间的流程同理：`collect_live { "url": "https://live.douyin.com/xxx" }`，
+或者用 `live_listen` 反复监听同一个房间，把互动累积进队列。
+
+⚠️ 中途**遇到验证码或登录失效，工具会直接停下并告诉你人工处理** —— 这是设计，不是故障。
+处理完再重跑，不要让它自己重试。
+
+## 三之三、把抓到的变成能用的线索
+
+抓完评论还不算完，接下来两步：
+
+1. **投影成线索**（命令行跑一次，或以后由界面触发）：
+
+       node agent/bin/import-leads.js --config agent/agent.config.json
+
+   它会读台账、按规则判**意图**、把结果写进线索库。跑完会打印意图分布，例如：
+
+       intentCounts: { purchase_intent: 130, feature_question: 19, unknown: 634, irrelevant: 22, after_sales: 1 }
+
+2. **查 / 导出**（用工具）：
+
+   - `query_leads { "intent": "purchase_intent", "limit": 50 }` —— 按意图查
+   - `query_leads { "excludeComplaint": true }` —— 把投诉剔掉（投诉一律人工处理）
+   - `export_leads { "format": "csv" }` —— 导出成表格，只落在 `<agent-state-dir>/exports/` 下
+
+**意图判据是可以自己配的**：放一份 `<agent-state-dir>/accounts/<账号作用域>/intent-rules.json`，
+形如 `{"rules":[{"intent":"price_inquiry","priority":60,"keywords":["多少钱"]}]}` 就整体替换默认规则。
+文件写坏了、或 intent 不在闭集里，程序会**整体退回默认规则并告警**，不会带着半套规则跑。
+
+> 💡 一个真机观察：**"抓取关键词"和"意图关键词"是两回事**。
+> 用 `666` 这类词去抓，抓来的是捧场；用 `多少钱`、`求带` 去抓，抓来的才是买家。
+> 建议在配置里把这两套词分开写。
+
+## 四、红线（这些不是可选项）
+
+- **不自己发消息**：16 个工具里只有 `approve_batch` 一个会真正发送，而且它必须先拿到
+  服务端【逐条】授权（服务端不点头就不发）。`send_private` / `comment_private` 这类单发入口
+  仍然不存在 —— 私信必须等公屏拿到平台回执后单独审批。
+- **采集不是发送**：搜视频、抓评论、抓直播都只是"读"，不会替你回复任何人。
+- **不绕验证码**：命中验证码一律停机转人工。
+- **隐私**：只出加盐哈希与计数，不出 `sec_uid`、昵称、头像、评论原文。
+- **审计**：每次工具调用都落一行审计；写不进审计，调用就失败。
+- **未知即未知**：读不到就报 `unknown`，绝不猜；`unknown` 一律不允许自动重试。
+
+## 五、今天还没有的
+
+- **分发方式**：代码目前只在开发者的本地分支上，还没有推送/打包；这一步没做之前，别人**拿不到**。
+- **开箱即用**：现在需要使用者自己装 Node 与 Python。面向非技术用户的一键包应该走桌面端（那里已经把 sidecar 打成一个可执行文件），不在本工具的范围内。
+- **真实客户端联调**：见上面的 unknown。
+- **审批闭环与任何发送能力**：属于 BP1 及以后，当前版本故意没有。
