@@ -193,22 +193,26 @@ test('collect_live / live_listen：最大条数边界与排队信息', function 
   assert.strictEqual(listen.result.queue.total, 5);
 });
 
-test('get_batch_report：只读报告，候选清单同样只出哈希', function () {
+test('get_batch_report：只读报告；候选是条数、被拒明细只出哈希', async function () {
+  // 注意 probe 的真实形状：privateCandidates 是【数字】，privateRejected 才是列表。
   const cfg = capturable({ methods: { comment_result: {
+    status: 'frozen',
     counts: { sent_confirmed: 2, unknown: 1 },
-    privateCounts: { allowed: 2 },
+    privateCounts: {},
     checkpoint: { version: 3 },
-    privateCandidates: [{ eventId: 'e1', sendId: 's1', publicSendId: 'p1', authorId: SEC_UID }],
+    privateCandidates: 2,
     privateRejected: [{ eventId: 'e2', reason: 'public_unknown', authorId: SEC_UID }],
     limits: { per_user: 1 }
   } } });
-  assert.strictEqual(getBatchReport.run(ctx(cfg), {}).code, 'blocked/invalid_input');
-  assert.strictEqual(getBatchReport.run(ctx(cfg), { batchId: 'b', sourceType: 'weibo' }).code, 'blocked/invalid_input');
-  const out = getBatchReport.run(ctx(cfg), { batchId: 'b-1' });
-  assert.strictEqual(out.ok, true, out.reason);
+  assert.strictEqual((await getBatchReport.run(ctx(cfg), {})).code, 'blocked/invalid_input');
+  assert.strictEqual((await getBatchReport.run(ctx(cfg), { batchId: 'b', sourceType: 'weibo' })).code, 'blocked/invalid_input');
+  const out = await getBatchReport.run(ctx(cfg), { batchId: 'b-1' });
+  assert.strictEqual(out.ok, true, out.reason || out.message);
   assert.strictEqual(out.result.counts.sent_confirmed, 2);
-  assert.strictEqual(out.result.privateCandidates.length, 1);
-  assert.ok(out.result.privateCandidates[0].authorHash);
+  assert.strictEqual(out.result.privateCandidateCount, 2);
+  assert.strictEqual(out.result.privatePhaseUnlocked, true);
+  assert.strictEqual(out.result.privateRejected.length, 1);
+  assert.strictEqual(out.result.privateRejected[0].authorHash !== null, true, '被拒明细仍应给哈希');
   assert.ok(JSON.stringify(out).indexOf(SEC_UID) === -1, 'sec_uid 泄漏了');
   assert.strictEqual(out.result.candidatesAreSendable, false);
 });

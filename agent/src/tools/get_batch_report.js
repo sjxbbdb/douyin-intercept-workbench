@@ -25,6 +25,16 @@ function run(ctx, params) {
   if (!outcome.ok) return outcome;
 
   const result = outcome.result || {};
+
+  // 🔴 真机踩过：probe 报告里的 privateCandidates 是【一个数字】（允许进入私信的条数），
+  //    不是列表（probe/live_flow.py:759 "privateCandidates": len(allowed)）。
+  //    之前把它当列表去 mask，Array.isArray(1)===false -> 变成 []，
+  //    于是"两阶段闸门已经放行 1 条"被误报成"一条都没有"。
+  //    这种把成功伪装成失败的错，比报错更危险：它会让人去改本来是对的东西。
+  const privateCandidateCount = typeof result.privateCandidates === 'number'
+    ? result.privateCandidates
+    : null;
+
   return { ok: true, result: {
     ok: true,
     accountScope: resolved.accountScope,
@@ -36,10 +46,12 @@ function run(ctx, params) {
     checkpoint: result.checkpoint == null ? null : result.checkpoint,
     queue: result.queue || null,
     limits: result.limits || null,
-    privateCandidates: capture.maskCandidates(ctx, resolved.accountScope, result.privateCandidates),
+    // 条数来自 probe；被拒的明细是列表，可以逐条看原因。
+    privateCandidateCount,
     privateRejected: capture.maskCandidates(ctx, resolved.accountScope, result.privateRejected),
+    privatePhaseUnlocked: privateCandidateCount != null && privateCandidateCount > 0,
     candidatesAreSendable: false,
-    note: 'BP0 只有只读能力：这里给出"哪些够条件"，但没有发私信的工具'
+    note: '私信候选是"够条件"，不是"可以发"：本层没有私信工具，私信必须单独审批'
   } };
 }
 

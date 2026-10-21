@@ -67,6 +67,31 @@ function seedBatch(cfg, targets) {
   });
 }
 
+test('get_batch_report：probe 的 privateCandidates 是【条数】，不能被吞成空数组', async function () {
+  // 真机踩过：probe 返回 privateCandidates: 1（len(allowed)），
+  // 我按列表去 mask -> Array.isArray(1) 为 false -> [] ——
+  // "两阶段已放行 1 条"被误报成"一条都没有"。
+  const getBatchReport = require('../src/tools/get_batch_report');
+  const cfg = helpers.writeFakeSidecar(helpers.makeConfig(), {
+    accountScope: SCOPE,
+    methods: { comment_result: {
+      status: 'frozen',
+      counts: { planned: 1, sent_confirmed: 1 },
+      privateCandidates: 1,
+      privateRejected: [{ eventId: 'e2', reason: 'public_planned' }],
+      privateCounts: {}
+    } }
+  });
+  const out = await getBatchReport.run({ config: cfg, agentStateDir: cfg.agentStateDir, accountScope: null },
+    { batchId: 'b-1' });
+  assert.strictEqual(out.ok, true, out.reason || out.message);
+  assert.strictEqual(out.result.batchStatus, 'frozen');
+  assert.strictEqual(out.result.privateCandidateCount, 1, '条数必须原样报出来');
+  assert.strictEqual(out.result.privatePhaseUnlocked, true);
+  assert.strictEqual(out.result.privateRejected.length, 1);
+  assert.strictEqual(out.result.privateRejected[0].reason, 'public_planned');
+});
+
 test('review_batch：投诉与无关由【代码】预筛，不进候选', async function () {
   const fake = await startAuthority(authorityHandler(null));
   try {
